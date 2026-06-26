@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log"
 	"net/http"
@@ -20,6 +21,14 @@ var hopByHopHeaders = map[string]bool{
 
 func isHopByHop(key string) bool {
 	return hopByHopHeaders[http.CanonicalHeaderKey(key)]
+}
+
+func isQuotaExhausted(status int) bool {
+	return status == 402 || status == 429
+}
+
+func upstreamContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), upstreamTimeout)
 }
 
 func NewProxyHandler(pool *Pool) http.Handler {
@@ -60,12 +69,13 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		req, err := http.NewRequestWithContext(r.Context(), "POST", acc.BaseURL()+"/chat/completions", bytes.NewReader(bodyBytes))
+		ctx, cancel := upstreamContext()
+		req, err := http.NewRequestWithContext(ctx, "POST", acc.BaseURL()+"/chat/completions", bytes.NewReader(bodyBytes))
 		if err != nil {
+			cancel()
 			log.Printf("proxy: failed to create request for %s: %v", acc.Name(), err)
 			continue
 		}
-		// Copy original request headers, skipping hop-by-hop and Authorization
 		for k, vs := range r.Header {
 			if isHopByHop(k) {
 				continue
@@ -81,20 +91,24 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Authorization", "Bearer "+acc.Key())
 
 		resp, err := acc.Client().Do(req)
+		cancel()
 		if err != nil {
-			log.Printf("proxy: chat retry via %s: %v", acc.Name(), err)
-			acc.MarkExhausted()
+			log.Printf("proxy: chat retry via %s (upstream error, not marking exhausted): %v", acc.Name(), err)
 			continue
 		}
 
-		if resp.StatusCode == 402 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
+		if isQuotaExhausted(resp.StatusCode) {
 			acc.MarkExhausted()
 			resp.Body.Close()
-			log.Printf("account %s: exhausted (%d), trying next", acc.Name(), resp.StatusCode)
+			log.Printf("account %s: quota exhausted (%d), trying next", acc.Name(), resp.StatusCode)
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			resp.Body.Close()
+			log.Printf("proxy: chat retry via %s (upstream %d, not marking exhausted)", acc.Name(), resp.StatusCode)
 			continue
 		}
 
-		// Forward response headers to client (filter hop-by-hop)
 		for k, vs := range resp.Header {
 			if isHopByHop(k) {
 				continue
@@ -128,12 +142,13 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":{"message":"No healthy accounts","code":"no_accounts"}}`, 503)
 			return
 		}
-		req, err := http.NewRequestWithContext(r.Context(), "GET", acc.BaseURL()+"/models", nil)
+		ctx, cancel := upstreamContext()
+		req, err := http.NewRequestWithContext(ctx, "GET", acc.BaseURL()+"/models", nil)
 		if err != nil {
+			cancel()
 			log.Printf("proxy: failed to create models request for %s: %v", acc.Name(), err)
 			continue
 		}
-		// Copy original request headers, skipping hop-by-hop and Authorization
 		for k, vs := range r.Header {
 			if isHopByHop(k) {
 				continue
@@ -147,18 +162,22 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request) {
 		}
 		req.Header.Set("Authorization", "Bearer "+acc.Key())
 		resp, err := acc.Client().Do(req)
+		cancel()
 		if err != nil {
-			log.Printf("proxy: models retry via %s: %v", acc.Name(), err)
-			acc.MarkExhausted()
+			log.Printf("proxy: models retry via %s (upstream error, not marking exhausted): %v", acc.Name(), err)
 			continue
 		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			log.Printf("proxy: %s models returned status %d, marking exhausted", acc.Name(), resp.StatusCode)
+		if isQuotaExhausted(resp.StatusCode) {
+			log.Printf("proxy: %s models quota exhausted (%d), marking exhausted", acc.Name(), resp.StatusCode)
 			acc.MarkExhausted()
 			resp.Body.Close()
 			continue
 		}
-		// Forward response headers to client (filter hop-by-hop)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			resp.Body.Close()
+			log.Printf("proxy: models retry via %s (status %d, not marking exhausted)", acc.Name(), resp.StatusCode)
+			continue
+		}
 		for k, vs := range resp.Header {
 			if isHopByHop(k) {
 				continue
