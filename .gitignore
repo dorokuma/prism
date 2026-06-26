@@ -1,3 +1,4 @@
 reasonix-lb
 config.yaml
+.env
 .audit*.md

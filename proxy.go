@@ -121,6 +121,13 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			}
 			defer resp.Body.Close()
 
+			if resp.StatusCode == 401 || resp.StatusCode == 403 {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				acc.MarkExhausted()
+				log.Printf("proxy: %s unauthorized (status=%d), marking exhausted", acc.Name(), resp.StatusCode)
+				return false, nil
+			}
 			if resp.StatusCode == 429 {
 				resp.Body.Close()
 				acc.SetCooldown(2 * time.Minute)
@@ -195,6 +202,13 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			}
 			defer resp.Body.Close()
 
+			if resp.StatusCode == 401 || resp.StatusCode == 403 {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				acc.MarkExhausted()
+				log.Printf("proxy: %s unauthorized (status=%d), marking exhausted", acc.Name(), resp.StatusCode)
+				return false
+			}
 			if resp.StatusCode == 429 {
 				resp.Body.Close()
 				acc.SetCooldown(2 * time.Minute)
