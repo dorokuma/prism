@@ -1,0 +1,9 @@
+listen: ":18790"
+probe_interval: 10m
+accounts:
+  - name: account-1
+    key: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    base_url: https://opencode.ai/zen/go/v1
+  - name: account-2
+    key: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    base_url: https://opencode.ai/zen/go/v1
