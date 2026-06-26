@@ -10,6 +10,9 @@ import (
 // StartProbeLoop periodically probes exhausted accounts to check if their quota has refreshed.
 // Sends GET {baseURL}/models; 200 → mark healthy, any other response → stays exhausted.
 func StartProbeLoop(pool *Pool, interval time.Duration, stop <-chan struct{}) {
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
 	log.Printf("probe loop started (interval=%v)", interval)
 	go func() {
 		// Probe immediately, then periodically
@@ -46,7 +49,9 @@ func probeExhausted(pool *Pool) {
 			log.Printf("probe %s: request failed: %v", acc.Name(), err)
 			continue
 		}
-		io.Copy(io.Discard, resp.Body)
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			log.Printf("probe %s: body drain: %v", acc.Name(), err)
+		}
 		resp.Body.Close()
 		if resp.StatusCode == 200 {
 			acc.MarkHealthy()

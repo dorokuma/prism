@@ -87,7 +87,7 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if resp.StatusCode == 402 || resp.StatusCode == 429 {
+		if resp.StatusCode == 402 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
 			acc.MarkExhausted()
 			resp.Body.Close()
 			log.Printf("account %s: exhausted (%d), trying next", acc.Name(), resp.StatusCode)
@@ -104,11 +104,15 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		if _, err := io.Copy(w, resp.Body); err != nil {
-			log.Printf("proxy: failed to copy response body for %s: %v", acc.Name(), err)
-		}
+		n, err := io.Copy(w, resp.Body)
 		resp.Body.Close()
-		log.Printf("proxy: chat done via %s, status=%d, elapsed=%v", acc.Name(), resp.StatusCode, time.Since(start))
+		if err != nil {
+			log.Printf("proxy: failed to copy response body for %s: %v", acc.Name(), err)
+		} else if cl := resp.Header.Get("Content-Length"); cl != "" {
+			log.Printf("proxy: chat done via %s, status=%d, written=%d, content-length=%s, elapsed=%v", acc.Name(), resp.StatusCode, n, cl, time.Since(start))
+		} else {
+			log.Printf("proxy: chat done via %s, status=%d, written=%d, elapsed=%v", acc.Name(), resp.StatusCode, n, time.Since(start))
+		}
 		return
 	}
 	log.Printf("proxy: chat failed, all exhausted")
@@ -164,11 +168,13 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		if _, err := io.Copy(w, resp.Body); err != nil {
-			log.Printf("proxy: failed to copy models response body for %s: %v", acc.Name(), err)
-		}
+		n, err := io.Copy(w, resp.Body)
 		resp.Body.Close()
-		log.Printf("proxy: models done via %s, status=%d", acc.Name(), resp.StatusCode)
+		if err != nil {
+			log.Printf("proxy: failed to copy models response body for %s: %v", acc.Name(), err)
+		} else {
+			log.Printf("proxy: models done via %s, status=%d, written=%d", acc.Name(), resp.StatusCode, n)
+		}
 		return
 	}
 	log.Printf("proxy: models failed, all exhausted")
