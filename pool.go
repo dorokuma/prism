@@ -13,6 +13,8 @@ const (
 	StatusExhausted
 )
 
+const upstreamTimeout = 10 * time.Minute
+
 type Account struct {
 	cfg         AccountConfig
 	status      AccountStatus
@@ -65,7 +67,7 @@ func NewPool(cfgs []AccountConfig) *Pool {
 		accs[i] = &Account{
 			cfg:    cfg,
 			status: StatusHealthy,
-			client: &http.Client{Timeout: 30 * time.Second},
+			client: &http.Client{Timeout: upstreamTimeout},
 		}
 	}
 	return &Pool{accounts: accs}
