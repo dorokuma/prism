@@ -27,8 +27,8 @@ func isQuotaExhausted(status int) bool {
 	return status == 402 || status == 429
 }
 
-func upstreamContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), upstreamTimeout)
+func upstreamContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), upstreamTimeout)
 }
 
 func copyClientHeaders(dst http.Header, src http.Header) {
@@ -78,6 +78,8 @@ func NewProxyHandler(pool *Pool) http.Handler {
 func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	defer r.Body.Close()
+	const maxBodySize = 10 << 20 // 10 MB
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("proxy: chat request from %s, body read error: %v", r.RemoteAddr, err)
@@ -93,12 +95,17 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":{"message":"All accounts exhausted","code":"all_exhausted"}}`, 503)
 			return
 		}
+		defer acc.Release()
 
 		done, streamErr := func() (bool, error) {
-			ctx, cancel := upstreamContext()
+			ctx, cancel := upstreamContext(r)
 			defer cancel() // keep ctx alive until body is fully read — early cancel truncates SSE
 
-			req, err := http.NewRequestWithContext(ctx, "POST", acc.BaseURL()+"/chat/completions", bytes.NewReader(bodyBytes))
+			targetURL := acc.BaseURL() + "/chat/completions"
+			if r.URL.RawQuery != "" {
+				targetURL += "?" + r.URL.RawQuery
+			}
+			req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(bodyBytes))
 			if err != nil {
 				log.Printf("proxy: failed to create request for %s: %v", acc.Name(), err)
 				return false, nil
@@ -114,9 +121,15 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			}
 			defer resp.Body.Close()
 
-			if isQuotaExhausted(resp.StatusCode) {
+			if resp.StatusCode == 429 {
+				resp.Body.Close()
+				acc.SetCooldown(2 * time.Minute)
+				log.Printf("proxy: %s rate-limited (429), cooling down for 2m", acc.Name())
+				return false, nil
+			}
+			if resp.StatusCode == 402 {
 				acc.MarkExhausted()
-				log.Printf("account %s: quota exhausted (%d), trying next", acc.Name(), resp.StatusCode)
+				log.Printf("account %s: quota exhausted (402), marking exhausted", acc.Name())
 				return false, nil
 			}
 			if resp.StatusCode >= 500 {
@@ -157,12 +170,17 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":{"message":"No healthy accounts","code":"no_accounts"}}`, 503)
 			return
 		}
+		defer acc.Release()
 
 		done := func() bool {
-			ctx, cancel := upstreamContext()
+			ctx, cancel := upstreamContext(r)
 			defer cancel()
 
-			req, err := http.NewRequestWithContext(ctx, "GET", acc.BaseURL()+"/models", nil)
+			targetURL := acc.BaseURL() + "/models"
+			if r.URL.RawQuery != "" {
+				targetURL += "?" + r.URL.RawQuery
+			}
+			req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 			if err != nil {
 				log.Printf("proxy: failed to create models request for %s: %v", acc.Name(), err)
 				return false
@@ -177,9 +195,15 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request) {
 			}
 			defer resp.Body.Close()
 
-			if isQuotaExhausted(resp.StatusCode) {
-				log.Printf("proxy: %s models quota exhausted (%d), marking exhausted", acc.Name(), resp.StatusCode)
+			if resp.StatusCode == 429 {
+				resp.Body.Close()
+				acc.SetCooldown(2 * time.Minute)
+				log.Printf("proxy: %s models rate-limited (429), cooling down for 2m", acc.Name())
+				return false
+			}
+			if resp.StatusCode == 402 {
 				acc.MarkExhausted()
+				log.Printf("proxy: %s models quota exhausted (402), marking exhausted", acc.Name())
 				return false
 			}
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {

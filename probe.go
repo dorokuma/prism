@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -36,28 +38,56 @@ func probeExhausted(pool *Pool) {
 	if len(exhausted) == 0 {
 		return
 	}
+
+	const maxAttempts = 3
+	const retryDelay = 2 * time.Second
+
+	var wg sync.WaitGroup
 	for _, acc := range exhausted {
-		url := acc.BaseURL() + "/models"
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			log.Printf("probe %s: bad url %s: %v", acc.Name(), url, err)
-			continue
-		}
-		req.Header.Set("Authorization", "Bearer "+acc.Key())
-		resp, err := acc.Client().Do(req)
-		if err != nil {
-			log.Printf("probe %s: request failed: %v", acc.Name(), err)
-			continue
-		}
-		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-			log.Printf("probe %s: body drain: %v", acc.Name(), err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode == 200 {
-			acc.MarkHealthy()
-			log.Printf("probe %s: recovered (200), returned to pool", acc.Name())
-		} else {
-			log.Printf("probe %s: still exhausted (status=%d)", acc.Name(), resp.StatusCode)
-		}
+		wg.Add(1)
+		go func(acc *Account) {
+			defer wg.Done()
+
+			for attempt := 1; attempt <= maxAttempts; attempt++ {
+				url := acc.BaseURL() + "/models"
+				req, err := http.NewRequest("GET", url, nil)
+				if err != nil {
+					log.Printf("probe %s: failed to create request: %v", acc.Name(), err)
+					return
+				}
+				req.Header.Set("Authorization", "Bearer "+acc.Key())
+
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				req = req.WithContext(ctx)
+				resp, err := acc.Client().Do(req)
+				cancel()
+
+				if err != nil {
+					log.Printf("probe %s: request failed (attempt %d/%d): %v", acc.Name(), attempt, maxAttempts, err)
+					if attempt < maxAttempts {
+						time.Sleep(retryDelay)
+						continue
+					}
+					return
+				}
+
+				if resp.StatusCode == 200 {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+					acc.MarkHealthy()
+					log.Printf("probe %s: recovered (200), returned to pool", acc.Name())
+					return
+				}
+
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				log.Printf("probe %s: still exhausted (status=%d, attempt %d/%d)", acc.Name(), resp.StatusCode, attempt, maxAttempts)
+
+				if attempt < maxAttempts {
+					time.Sleep(retryDelay)
+				}
+			}
+		}(acc)
 	}
+	wg.Wait()
 }
