@@ -1,14 +1,16 @@
 package main
 
 import (
+	"fmt"
 	"gopkg.in/yaml.v3"
 	"os"
+	"strings"
 	"time"
 )
 
 type AccountConfig struct {
 	Name    string `yaml:"name"`
-	Key     string `yaml:"key"`
+	Key     string `yaml:"key,omitempty"`
 	BaseURL string `yaml:"base_url"`
 }
 
@@ -32,6 +34,15 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.ProbeInterval == 0 {
 		cfg.ProbeInterval = 10 * time.Minute
+	}
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].Key == "" {
+			envVar := "LB_KEY_" + strings.ToUpper(strings.ReplaceAll(cfg.Accounts[i].Name, "-", "_"))
+			cfg.Accounts[i].Key = os.Getenv(envVar)
+			if cfg.Accounts[i].Key == "" {
+				return nil, fmt.Errorf("account %s: key not set in config and env var %s is empty", cfg.Accounts[i].Name, envVar)
+			}
+		}
 	}
 	return cfg, nil
 }
