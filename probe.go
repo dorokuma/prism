@@ -12,6 +12,8 @@ import (
 func StartProbeLoop(pool *Pool, interval time.Duration, stop <-chan struct{}) {
     log.Printf("probe loop started (interval=%v)", interval)
     go func() {
+        // Probe immediately, then periodically
+        probeExhausted(pool)
         ticker := time.NewTicker(interval)
         defer ticker.Stop()
         for {

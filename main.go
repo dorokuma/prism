@@ -35,7 +35,7 @@ func main() {
         srv.Shutdown(ctx)
     }()
 
-    if err := srv.ListenAndServe(); err != nil {
+    if err := srv.ListenAndServe(); err != http.ErrServerClosed {
         log.Fatalf("listen: %v", err)
     }
 }
