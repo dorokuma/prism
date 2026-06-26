@@ -61,6 +61,18 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
             log.Printf("proxy: failed to create request for %s: %v", acc.Name(), err)
             continue
         }
+        // Copy original request headers, skipping hop-by-hop and Authorization
+        for k, vs := range r.Header {
+            if isHopByHop(k) {
+                continue
+            }
+            if http.CanonicalHeaderKey(k) == "Authorization" {
+                continue
+            }
+            for _, v := range vs {
+                req.Header.Add(k, v)
+            }
+        }
         req.Header.Set("Content-Type", "application/json")
         req.Header.Set("Authorization", "Bearer "+acc.Key())
 
@@ -71,10 +83,10 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
             continue
         }
 
-        if resp.StatusCode == 402 {
+        if resp.StatusCode == 402 || resp.StatusCode == 429 {
             acc.MarkExhausted()
             resp.Body.Close()
-            log.Printf("account %s: exhausted (402), trying next", acc.Name())
+            log.Printf("account %s: exhausted (%d), trying next", acc.Name(), resp.StatusCode)
             continue
         }
 
@@ -110,6 +122,18 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request) {
             log.Printf("proxy: failed to create models request for %s: %v", acc.Name(), err)
             continue
         }
+        // Copy original request headers, skipping hop-by-hop and Authorization
+        for k, vs := range r.Header {
+            if isHopByHop(k) {
+                continue
+            }
+            if http.CanonicalHeaderKey(k) == "Authorization" {
+                continue
+            }
+            for _, v := range vs {
+                req.Header.Add(k, v)
+            }
+        }
         req.Header.Set("Authorization", "Bearer "+acc.Key())
         resp, err := acc.Client().Do(req)
         if err != nil {
@@ -117,7 +141,12 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request) {
             acc.MarkExhausted()
             continue
         }
-        defer resp.Body.Close()
+        if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+            log.Printf("proxy: %s models returned status %d, marking exhausted", acc.Name(), resp.StatusCode)
+            acc.MarkExhausted()
+            resp.Body.Close()
+            continue
+        }
         // Forward response headers to client (filter hop-by-hop)
         for k, vs := range resp.Header {
             if isHopByHop(k) {
@@ -131,6 +160,7 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request) {
         if _, err := io.Copy(w, resp.Body); err != nil {
             log.Printf("proxy: failed to copy models response body for %s: %v", acc.Name(), err)
         }
+        resp.Body.Close()
         return
     }
     http.Error(w, `{"error":{"message":"All accounts exhausted for /models","code":"all_exhausted"}}`, 503)
