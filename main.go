@@ -19,6 +19,9 @@ func main() {
 	pool := NewPool(cfg.Accounts)
 	log.Printf("loaded %d accounts, listening on %s", len(cfg.Accounts), cfg.Listen)
 
+	// Initial health probe: check all accounts on startup, warn but don't block
+	probeExhausted(pool)
+
 	stop := make(chan struct{})
 	StartProbeLoop(pool, cfg.ProbeInterval, stop)
 

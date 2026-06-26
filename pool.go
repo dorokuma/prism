@@ -55,7 +55,7 @@ func (a *Account) Status() AccountStatus {
 
 type Pool struct {
 	accounts []*Account
-	nextIdx  int
+	nextIdx  uint64
 	mu       sync.Mutex
 }
 
@@ -79,7 +79,7 @@ func (p *Pool) Select() *Account {
 		return nil
 	}
 	for range p.accounts {
-		idx := p.nextIdx % len(p.accounts)
+		idx := int(p.nextIdx % uint64(len(p.accounts)))
 		p.nextIdx++
 		acc := p.accounts[idx]
 		if acc.IsHealthy() {
