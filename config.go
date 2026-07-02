@@ -15,9 +15,12 @@ type AccountConfig struct {
 }
 
 type Config struct {
-	Listen        string          `yaml:"listen"`
-	ProbeInterval time.Duration   `yaml:"probe_interval"`
-	Accounts      []AccountConfig `yaml:"accounts"`
+	Listen        string            `yaml:"listen"`
+	ProbeInterval time.Duration     `yaml:"probe_interval"`
+	WireAPI       string            `yaml:"wire_api"`
+	Accounts      []AccountConfig   `yaml:"accounts"`
+	ModelRemap    map[string]string `yaml:"model_remap"`
+	DefaultModel  string            `yaml:"default_model"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -35,6 +38,12 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.ProbeInterval == 0 {
 		cfg.ProbeInterval = 10 * time.Minute
 	}
+	if cfg.WireAPI == "" {
+		cfg.WireAPI = "both"
+	}
+	if _, err := ParseWireAPIMode(cfg.WireAPI); err != nil {
+		return nil, err
+	}
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].Key == "" {
 			envVar := "LB_KEY_" + strings.ToUpper(strings.ReplaceAll(cfg.Accounts[i].Name, "-", "_"))
@@ -45,4 +54,19 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// RemapModel translates a model name using the configured remap table.
+// If no mapping exists and a default_model is set, returns the default.
+// If neither is set, returns the original model name.
+func (c *Config) RemapModel(model string) string {
+	if c.ModelRemap != nil {
+		if mapped, ok := c.ModelRemap[model]; ok {
+			return mapped
+		}
+	}
+	if c.DefaultModel != "" {
+		return c.DefaultModel
+	}
+	return model
 }
