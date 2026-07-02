@@ -12,7 +12,7 @@ cp config.yaml.example config.yaml   # 填写真实 key
 ./reasonix-lb
 ```
 
-默认监听 `:18790`，所有请求通过 `/v1/chat/completions` 转发。
+默认监听 `:18790`。通过 `wire_api` 切换对外协议（上游始终是各账号的 OpenAI **Chat Completions**）。
 
 ## 配置
 
@@ -20,7 +20,18 @@ cp config.yaml.example config.yaml   # 填写真实 key
 |------|------|--------|------|
 | `listen` | string | `:18790` | 监听地址 |
 | `probe_interval` | duration | `10m` | 探测已耗尽账号的间隔 |
+| `wire_api` | string | `both` | `legacy` / `responses` / `both`，见下文 |
 | `accounts` | array | 必填 | 上游账号列表 |
+
+### `wire_api`（新/旧 OpenAI 兼容）
+
+| 值 | 对外路径 | 典型客户端 |
+|----|----------|------------|
+| `legacy` | 仅 `POST /v1/chat/completions` | Reasonix、DeepSeek 官方 API 直连配置 |
+| `responses` | 仅 `POST /v1/responses` | Codex CLI（`wire_api = "responses"`） |
+| `both` | 两条路径都开 | 同一端口同时给 Reasonix 和 Codex 用 |
+
+`responses` 模式下，lb 会把 Responses 请求体转成 Chat Completions 再转发到 `base_url/chat/completions`，并把响应（含 SSE）转回 Responses 事件格式。
 
 每个 account：
 
@@ -63,13 +74,31 @@ accounts:
 
 | 路径 | 方法 | 说明 |
 |------|------|------|
-| `/v1/chat/completions` | POST | 转发到上游 `/chat/completions`，支持 SSE 流式响应 |
+| `/v1/chat/completions` | POST | 转发到上游 `/chat/completions`（`wire_api` 含 `legacy` 时） |
+| `/v1/responses` | POST | Responses↔Chat 转换后转发（`wire_api` 含 `responses` 时） |
 | `/v1/models` | GET | 从首个可用账号获取模型列表 |
 | `/health` | GET | 健康检查，返回 `ok` (200) |
 
 ### 健康检查
 
 `GET /health` 直接返回 200 + `ok`，不依赖上游。用于 load balancer / k8s probe。
+
+### Codex 示例
+
+`~/.codex/config.toml`（或 profile 覆盖）：
+
+```toml
+[model_providers.reasonix-lb]
+name = "reasonix-lb"
+base_url = "http://127.0.0.1:18790/v1"
+wire_api = "responses"
+env_key = "OPENAI_API_KEY"   # 任意占位；真实 key 由 lb 账号配置注入
+
+model_provider = "reasonix-lb"
+model = "deepseek-v4-pro"    # 或 opencode-go 文档中的 model id
+```
+
+Reasonix / 旧客户端仍指向 `http://127.0.0.1:18790/v1`，`wire_api: both` 时无需改路径。
 
 ## License
 

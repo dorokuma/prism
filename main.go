@@ -18,7 +18,8 @@ func main() {
 	}
 
 	pool := NewPool(cfg.Accounts)
-	log.Printf("loaded %d accounts, listening on %s", len(cfg.Accounts), cfg.Listen)
+	wire, _ := ParseWireAPIMode(cfg.WireAPI)
+	log.Printf("loaded %d accounts, wire_api=%s, listening on %s", len(cfg.Accounts), wire, cfg.Listen)
 
 	// Initial health probe: check all accounts on startup, warn but don't block
 	probeExhausted(pool)
@@ -60,7 +61,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           NewProxyHandler(pool),
+		Handler:           NewProxyHandler(pool, wire, cfg),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,

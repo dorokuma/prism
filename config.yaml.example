@@ -1,5 +1,10 @@
 listen: ":18790"
 probe_interval: 10m
+# wire_api: legacy | responses | both (default both)
+#   legacy    — /v1/chat/completions only (Reasonix, DeepSeek 等旧兼容客户端)
+#   responses — /v1/responses only (Codex wire_api=responses)，自动转成上游 chat/completions
+#   both      — 同时开放两条路径
+wire_api: both
 accounts:
   - name: account-1
     key: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"

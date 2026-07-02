@@ -1,0 +1,374 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+func responsesToChatCompletions(body []byte) (chatBody []byte, stream bool, err error) {
+	var raw map[string]json.RawMessage
+	if err = json.Unmarshal(body, &raw); err != nil {
+		return nil, false, fmt.Errorf("responses body: %w", err)
+	}
+	model, _ := rawStringField(raw, "model")
+	if model == "" {
+		return nil, false, fmt.Errorf("responses body: missing model")
+	}
+	stream = rawBoolField(raw, "stream")
+	messages, err := inputToMessages(raw["input"])
+	if err != nil {
+		return nil, false, err
+	}
+	if instr, ok := rawStringField(raw, "instructions"); ok && strings.TrimSpace(instr) != "" {
+		messages = append([]map[string]any{{"role": "system", "content": instr}}, messages...)
+	}
+	if len(messages) == 0 {
+		return nil, false, fmt.Errorf("responses body: empty input")
+	}
+	messages = normalizeMessagesForChatAPI(messages)
+	out := map[string]any{"model": model, "messages": messages, "stream": stream}
+	if v, ok := raw["tools"]; ok && len(v) > 0 && string(v) != "null" {
+		if tools := sanitizeToolsForChatCompletions(v); tools != nil {
+			out["tools"] = tools
+			copyOptionalRaw(raw, out, "tool_choice")
+		}
+	}
+	copyOptionalRaw(raw, out, "temperature", "top_p", "stream_options", "thinking")
+	if v, ok := raw["max_output_tokens"]; ok {
+		out["max_tokens"] = jsonRawToAny(v)
+	}
+	if effort := reasoningEffortFromRaw(raw["reasoning"]); effort != "" {
+		out["reasoning_effort"] = effort
+	} else if v, ok := raw["reasoning_effort"]; ok {
+		out["reasoning_effort"] = jsonRawToAny(v)
+	}
+	chatBody, err = json.Marshal(out)
+	return chatBody, stream, err
+}
+
+func copyOptionalRaw(raw map[string]json.RawMessage, out map[string]any, keys ...string) {
+	for _, k := range keys {
+		if v, ok := raw[k]; ok && len(v) > 0 && string(v) != "null" {
+			out[k] = jsonRawToAny(v)
+		}
+	}
+}
+
+func inputToMessages(input json.RawMessage) ([]map[string]any, error) {
+	if len(input) == 0 || string(input) == "null" {
+		return nil, nil
+	}
+	var asString string
+	if err := json.Unmarshal(input, &asString); err == nil {
+		return []map[string]any{{"role": "user", "content": asString}}, nil
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(input, &items); err != nil {
+		return nil, fmt.Errorf("input: %w", err)
+	}
+	messages := make([]map[string]any, 0, len(items))
+	for i, item := range items {
+		m, err := responseItemToMessage(item)
+		if err != nil {
+			return nil, fmt.Errorf("input[%d]: %w", i, err)
+		}
+		if m != nil {
+			messages = append(messages, m)
+		}
+	}
+
+	// Merge consecutive assistant + tool_calls turns into one assistant message.
+	messages = mergeConsecutiveAssistantMessages(messages)
+
+	return messages, nil
+}
+
+func responseItemToMessage(item json.RawMessage) (map[string]any, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(item, &obj); err != nil {
+		return nil, err
+	}
+	typ, _ := rawStringField(obj, "type")
+	if typ == "" {
+		if role, _ := rawStringField(obj, "role"); role != "" {
+			return map[string]any{"role": role, "content": contentFromRaw(obj["content"])}, nil
+		}
+		return nil, fmt.Errorf("missing type")
+	}
+	switch typ {
+	case "message":
+		role, _ := rawStringField(obj, "role")
+		if role == "" {
+			role = "user"
+		}
+		if role == "developer" {
+			role = "system"
+		}
+		return map[string]any{"role": role, "content": contentFromRaw(obj["content"])}, nil
+	case "function_call_output":
+		callID, _ := rawStringField(obj, "call_id")
+		if callID == "" {
+			callID, _ = rawStringField(obj, "tool_call_id")
+		}
+		out, _ := rawStringField(obj, "output")
+		return map[string]any{"role": "tool", "tool_call_id": callID, "content": out}, nil
+	case "function_call":
+		name, _ := rawStringField(obj, "name")
+		name = PrefixNamespaceTool(name)
+		args, _ := rawStringField(obj, "arguments")
+		if args == "" { args = "{}" }
+		callID, _ := rawStringField(obj, "call_id")
+		if callID == "" {
+			callID, _ = rawStringField(obj, "id")
+		}
+		msg := map[string]any{
+			"role": "assistant",
+			"tool_calls": []map[string]any{{
+				"id": callID, "type": "function",
+				"function": map[string]any{"name": name, "arguments": args},
+			}},
+		}
+		if rc, ok := obj["reasoning_content"]; ok && len(rc) > 0 && string(rc) != "null" {
+			msg["reasoning_content"] = jsonRawToAny(rc)
+		}
+		return msg, nil
+	case "reasoning":
+		text := extractReasoningText(obj)
+		if text == "" {
+			return nil, nil
+		}
+		return map[string]any{"role": "assistant", "content": "", "reasoning_content": text}, nil
+	case "item_reference":
+		return nil, nil
+	default:
+		if role, _ := rawStringField(obj, "role"); role != "" {
+			return map[string]any{"role": role, "content": contentFromRaw(obj["content"])}, nil
+		}
+		return nil, fmt.Errorf("unsupported item type %q", typ)
+	}
+}
+
+func contentFromRaw(raw json.RawMessage) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var parts []map[string]any
+	if err := json.Unmarshal(raw, &parts); err == nil {
+		return flattenResponseContentParts(parts)
+	}
+	return jsonRawToAny(raw)
+}
+
+func flattenResponseContentParts(parts []map[string]any) any {
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		if t, _ := parts[0]["type"].(string); t == "input_text" || t == "output_text" {
+			if text, ok := parts[0]["text"].(string); ok {
+				return text
+			}
+		}
+	}
+	out := make([]map[string]any, 0, len(parts))
+	for _, p := range parts {
+		typ, _ := p["type"].(string)
+		switch typ {
+		case "input_text", "output_text":
+			out = append(out, map[string]any{"type": "text", "text": p["text"]})
+		case "input_image":
+				// Handle both string and object {"url": "..."} formats
+				var urlVal any
+				if u, ok := p["image_url"].(string); ok {
+					urlVal = u
+				} else if u, ok := p["image_url"].(map[string]any); ok {
+					urlVal = u
+				} else {
+					urlVal = p["image_url"]
+				}
+				out = append(out, map[string]any{"type": "image_url", "image_url": urlVal})
+				continue
+		default:
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func extractReasoningText(obj map[string]json.RawMessage) string {
+	if s, ok := rawStringField(obj, "summary"); ok && s != "" {
+		return s
+	}
+	if raw, ok := obj["content"]; ok {
+		var parts []map[string]any
+		if err := json.Unmarshal(raw, &parts); err == nil {
+			var b strings.Builder
+			for _, p := range parts {
+				if t, _ := p["type"].(string); t == "reasoning_text" || t == "summary_text" {
+					if text, ok := p["text"].(string); ok {
+						b.WriteString(text)
+					}
+				}
+			}
+			return b.String()
+		}
+	}
+	return ""
+}
+
+func reasoningEffortFromRaw(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+	if e, ok := obj["effort"].(string); ok {
+		return e
+	}
+	return ""
+}
+
+func chatCompletionToResponse(body []byte, model string) ([]byte, error) {
+	var comp chatCompletionResponse
+	if err := json.Unmarshal(body, &comp); err != nil {
+		return nil, err
+	}
+	if len(comp.Choices) == 0 {
+		return nil, fmt.Errorf("chat completion: no choices")
+	}
+	ch := comp.Choices[0]
+	respID := "resp_" + randomID()
+	output := make([]map[string]any, 0)
+	if ch.Message.ReasoningContent != "" {
+		output = append(output, map[string]any{
+			"type": "reasoning", "id": "rs_" + randomID(), "status": "completed",
+			"summary": []map[string]any{{"type": "summary_text", "text": ch.Message.ReasoningContent}},
+		})
+	}
+	if ch.Message.Refusal != "" {
+		output = append(output, map[string]any{
+			"type": "message", "id": "msg_" + randomID(), "role": "assistant", "status": "completed",
+			"content": []map[string]any{{"type": "output_text", "text": ch.Message.Refusal}},
+		})
+	} else if ch.Message.Content != nil && contentString(ch.Message.Content) != "" {
+		output = append(output, map[string]any{
+			"type": "message", "id": "msg_" + randomID(), "role": "assistant", "status": "completed",
+			"content": []map[string]any{{"type": "output_text", "text": contentString(ch.Message.Content)}},
+		})
+	}
+	for _, tc := range ch.Message.ToolCalls {
+		name := ResolveNamespaceTool(tc.Function.Name)
+		ns := NamespaceForTool(tc.Function.Name)
+		item := map[string]any{
+			"type": "function_call", "id": "fc_" + randomID(), "call_id": tc.ID,
+			"name": name, "arguments": tc.Function.Arguments, "status": "completed",
+		}
+		if ns != "" {
+			item["namespace"] = ns
+		}
+		output = append(output, item)
+	}
+	usage := map[string]any{}
+	if comp.Usage != nil {
+		usage = map[string]any{
+			"input_tokens": comp.Usage.PromptTokens, "output_tokens": comp.Usage.CompletionTokens,
+			"total_tokens": comp.Usage.TotalTokens,
+		}
+	}
+	return json.Marshal(map[string]any{
+		"id": respID, "object": "response", "status": "completed",
+		"model": firstNonEmpty(comp.Model, model), "output": output, "usage": usage,
+	})
+}
+
+type chatCompletionResponse struct {
+	Model   string `json:"model"`
+	Choices []struct {
+		Message struct {
+			Role             string `json:"role"`
+			Content          any    `json:"content"`
+			Refusal          string `json:"refusal"`
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"message"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
+func contentString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case nil:
+		return ""
+	case []any:
+		// Multimodal content parts: extract text portions
+		var b strings.Builder
+		for _, part := range t {
+			if m, ok := part.(map[string]any); ok {
+				if text, ok := m["text"].(string); ok {
+					b.WriteString(text)
+				}
+			}
+		}
+		return b.String()
+	default:
+		b, _ := json.Marshal(t)
+		return string(b)
+	}
+}
+
+func rawStringField(m map[string]json.RawMessage, key string) (string, bool) {
+	raw, ok := m[key]
+	if !ok || len(raw) == 0 {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+func rawBoolField(m map[string]json.RawMessage, key string) bool {
+	raw, ok := m[key]
+	if !ok {
+		return false
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return false
+	}
+	return b
+}
+
+func jsonRawToAny(raw json.RawMessage) any {
+	var v any
+	_ = json.Unmarshal(raw, &v)
+	return v
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
