@@ -21,6 +21,7 @@ type Config struct {
 	Accounts      []AccountConfig   `yaml:"accounts"`
 	ModelRemap    map[string]string `yaml:"model_remap"`
 	DefaultModel  string            `yaml:"default_model"`
+	Debug         bool              `yaml:"debug"`
 }
 
 func LoadConfig(path string) (*Config, error) {

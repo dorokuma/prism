@@ -168,10 +168,11 @@ func flattenToolEntry(item json.RawMessage) []map[string]any {
 		} else {
 			fnObj["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
-		return []map[string]any{{
+		result := []map[string]any{{
 			"type":     "function",
 			"function": fnObj,
 		}}
+		return result
 	}
 	if t := asFunctionTool(m); t != nil {
 		return []map[string]any{t}

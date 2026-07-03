@@ -6,25 +6,25 @@ import (
 	"strings"
 )
 
-func responsesToChatCompletions(body []byte) (chatBody []byte, stream bool, err error) {
+func responsesToChatCompletions(body []byte) (chatBody []byte, stream bool, reqTools json.RawMessage, err error) {
 	var raw map[string]json.RawMessage
 	if err = json.Unmarshal(body, &raw); err != nil {
-		return nil, false, fmt.Errorf("responses body: %w", err)
+		return nil, false, nil, fmt.Errorf("responses body: %w", err)
 	}
 	model, _ := rawStringField(raw, "model")
 	if model == "" {
-		return nil, false, fmt.Errorf("responses body: missing model")
+		return nil, false, nil, fmt.Errorf("responses body: missing model")
 	}
 	stream = rawBoolField(raw, "stream")
 	messages, err := inputToMessages(raw["input"])
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	if instr, ok := rawStringField(raw, "instructions"); ok && strings.TrimSpace(instr) != "" {
 		messages = append([]map[string]any{{"role": "system", "content": instr}}, messages...)
 	}
 	if len(messages) == 0 {
-		return nil, false, fmt.Errorf("responses body: empty input")
+		return nil, false, nil, fmt.Errorf("responses body: empty input")
 	}
 	messages = normalizeMessagesForChatAPI(messages)
 	out := map[string]any{"model": model, "messages": messages, "stream": stream}
@@ -44,7 +44,7 @@ func responsesToChatCompletions(body []byte) (chatBody []byte, stream bool, err 
 		out["reasoning_effort"] = jsonRawToAny(v)
 	}
 	chatBody, err = json.Marshal(out)
-	return chatBody, stream, err
+	return chatBody, stream, raw["tools"], err
 }
 
 func copyOptionalRaw(raw map[string]json.RawMessage, out map[string]any, keys ...string) {
@@ -235,7 +235,7 @@ func reasoningEffortFromRaw(raw json.RawMessage) string {
 	return ""
 }
 
-func chatCompletionToResponse(body []byte, model string) ([]byte, error) {
+func chatCompletionToResponse(body []byte, model string, reqTools json.RawMessage) ([]byte, error) {
 	var comp chatCompletionResponse
 	if err := json.Unmarshal(body, &comp); err != nil {
 		return nil, err
@@ -282,10 +282,14 @@ func chatCompletionToResponse(body []byte, model string) ([]byte, error) {
 			"total_tokens": comp.Usage.TotalTokens,
 		}
 	}
-	return json.Marshal(map[string]any{
+	resp := map[string]any{
 		"id": respID, "object": "response", "status": "completed",
 		"model": firstNonEmpty(comp.Model, model), "output": output, "usage": usage,
-	})
+	}
+	if len(reqTools) > 0 && string(reqTools) != "null" {
+		resp["tools"] = jsonRawToAny(reqTools)
+	}
+	return json.Marshal(resp)
 }
 
 type chatCompletionResponse struct {

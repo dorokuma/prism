@@ -216,7 +216,9 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 		http.Error(w, "failed to read body", 500)
 		return
 	}
-	chatBody, stream, err := responsesToChatCompletions(bodyBytes)
+	chatBody, stream, reqTools, err := responsesToChatCompletions(bodyBytes)
+	dumpDebugResponsesBody(bodyBytes)
+	dumpDebugChatBody(chatBody)
 	if err != nil {
 		log.Printf("proxy: responses convert error: %v", err)
 		http.Error(w, fmt.Sprintf(`{"error":{"message":%q,"code":"invalid_request"}}`, err.Error()), http.StatusBadRequest)
@@ -233,6 +235,7 @@ log.Printf("proxy: responses request from %s, stream=%v, chat_body=%d bytes", r.
 		responsesOut: true,
 		stream:       stream,
 		model:        reqModel,
+		reqTools:     reqTools,
 	}, cfg)
 }
 
@@ -240,6 +243,7 @@ type chatForwardOpts struct {
 	responsesOut bool
 	stream       bool
 	model        string
+	reqTools     json.RawMessage
 }
 
 func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) {
@@ -260,13 +264,20 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 	// Remap model name if configured
 	bodyBytes = remapModelInBody(bodyBytes, cfg)
 	maxAttempts := len(pool.accounts) * 2
+	requestID := randomID()
+	log.Printf("proxy: req=%s path=%s stream=%v responsesOut=%v totalStart=%s", requestID, r.URL.Path, opts.stream, opts.responsesOut, start.Format(time.RFC3339Nano))
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
 		if attempts > 0 {
 			time.Sleep(200 * time.Millisecond)
 		}
 
-		acc, err := pool.Select(r.Context())
+		selectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		selectStart := time.Now()
+		acc, err := pool.Select(selectCtx)
+		selectDuration := time.Since(selectStart).Milliseconds()
+		cancel()
+		log.Printf("proxy: req=%s attempt=%d pool.select_done=%dms account=%s err=%v", requestID, attempts, selectDuration, func() string { if acc != nil { return acc.Name() }; return "nil" }(), err)
 		if err != nil {
 			log.Printf("proxy: select account failed: %v", err)
 			http.Error(w, `{"error":{"message":"No healthy accounts available","code":"no_accounts"}}`, 503)
@@ -295,6 +306,11 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 
 			resp, err := acc.Client().Do(req)
 			if err != nil {
+				// If client disconnected, don't retry
+				if r.Context().Err() != nil {
+					log.Printf("proxy: req=%s client disconnected, aborting retry", requestID)
+					return true, fmt.Errorf("client disconnected: %w", r.Context().Err())
+				}
 				log.Printf("proxy: chat retry via %s (upstream error): %v", acc.Name(), err)
 				return false, nil
 			}
@@ -348,23 +364,32 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				w.Header().Set("Cache-Control", "no-cache")
 				w.Header().Set("Connection", "keep-alive")
 				w.WriteHeader(http.StatusOK)
-				err = translateChatStreamToResponses(w, resp.Body, opts.model)
-				if err != nil {
-					log.Printf("proxy: responses stream translate via %s: %v", acc.Name(), err)
-					return true, err
-				}
-				log.Printf("proxy: responses stream done via %s, elapsed=%v", acc.Name(), time.Since(start))
+			translateStart := time.Now()
+			log.Printf("proxy: req=%s account=%s mode=responses_stream translate.start=%s", requestID, acc.Name(), translateStart.Format(time.RFC3339Nano))
+			err = translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools)
+			translateElapsed := time.Since(translateStart).Milliseconds()
+			if err != nil {
+				log.Printf("proxy: req=%s account=%s mode=responses_stream translate.error=%v translate_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, time.Since(start))
+				return true, err
+			}
+			log.Printf("proxy: req=%s account=%s mode=responses_stream translate.done translate_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, time.Since(start))
 				return true, nil
 			}
 
 			if opts.responsesOut && !opts.stream {
+				bodyReadStart := time.Now()
 				rawBody, err := io.ReadAll(resp.Body)
+				bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 				if err != nil {
+					log.Printf("proxy: req=%s account=%s mode=responses_json body_read_error body_ms=%d elapsed=%v", requestID, acc.Name(), bodyReadElapsed, time.Since(start))
 					return true, err
 				}
-				out, err := chatCompletionToResponse(rawBody, opts.model)
+				dumpDebugUpstreamResponse(rawBody)
+				translateStart := time.Now()
+				out, err := chatCompletionToResponse(rawBody, opts.model, opts.reqTools)
+				translateElapsed := time.Since(translateStart).Milliseconds()
 				if err != nil {
-					log.Printf("proxy: responses json convert via %s: %v", acc.Name(), err)
+					log.Printf("proxy: req=%s account=%s mode=responses_json translate.error translate_ms=%d body_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, bodyReadElapsed, time.Since(start))
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusOK)
 					_, _ = w.Write(rawBody)
@@ -373,20 +398,23 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				n, _ := w.Write(out)
-				log.Printf("proxy: responses json done via %s, written=%d, elapsed=%v", acc.Name(), n, time.Since(start))
+				log.Printf("proxy: req=%s account=%s mode=responses_json done written=%d body_ms=%d translate_ms=%d elapsed=%v", requestID, acc.Name(), n, bodyReadElapsed, translateElapsed, time.Since(start))
 				return true, nil
 			}
 
 			copyUpstreamHeaders(w, resp.Header)
 			w.WriteHeader(resp.StatusCode)
+			bodyReadStart := time.Now()
 			n, err := streamResponseBody(w, resp.Body, r, acc.Name())
+			bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 			if err != nil {
+				log.Printf("proxy: req=%s account=%s mode=legacy_stream body_read_error body_ms=%d elapsed=%v", requestID, acc.Name(), bodyReadElapsed, time.Since(start))
 				return true, err
 			}
 			if cl := resp.Header.Get("Content-Length"); cl != "" {
-				log.Printf("proxy: chat done via %s, status=%d, written=%d, content-length=%s, elapsed=%v", acc.Name(), resp.StatusCode, n, cl, time.Since(start))
+				log.Printf("proxy: req=%s account=%s mode=legacy_stream done status=%d written=%d content-length=%s body_read_ms=%d elapsed=%v", requestID, acc.Name(), resp.StatusCode, n, cl, bodyReadElapsed, time.Since(start))
 			} else {
-				log.Printf("proxy: chat done via %s, status=%d, written=%d, elapsed=%v", acc.Name(), resp.StatusCode, n, time.Since(start))
+				log.Printf("proxy: req=%s account=%s mode=legacy_stream done status=%d written=%d body_read_ms=%d elapsed=%v", requestID, acc.Name(), resp.StatusCode, n, bodyReadElapsed, time.Since(start))
 			}
 			return true, nil
 		}()
@@ -397,7 +425,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 			return
 		}
 	}
-	log.Printf("proxy: chat failed, all exhausted")
+	log.Printf("proxy: req=%s channel=all_exhausted attempts=%d elapsed=%v", requestID, maxAttempts, time.Since(start))
 	http.Error(w, `{"error":{"message":"All accounts exhausted after retries","code":"all_exhausted"}}`, 503)
 }
 

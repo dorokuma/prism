@@ -17,9 +17,10 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	debugMode = cfg.Debug
 	pool := NewPool(cfg.Accounts)
 	wire, _ := ParseWireAPIMode(cfg.WireAPI)
-	log.Printf("loaded %d accounts, wire_api=%s, listening on %s", len(cfg.Accounts), wire, cfg.Listen)
+	log.Printf("loaded %d accounts, wire_api=%s, listening on %s, debug=%v", len(cfg.Accounts), wire, cfg.Listen, debugMode)
 
 	// Initial health probe: check all accounts on startup, warn but don't block
 	probeExhausted(pool)

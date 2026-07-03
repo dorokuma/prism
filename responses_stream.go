@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -141,7 +142,7 @@ func (t *responsesStreamTranslator) ensureContentPart(w io.Writer) error {
 	return nil
 }
 
-func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model string) error {
+func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model string, reqTools json.RawMessage) error {
 	flusher, _ := w.(http.Flusher)
 	dst := io.Writer(w)
 	if flusher != nil {
@@ -179,6 +180,9 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		// model reasoning metadata rejects reasoning SSE — only forward assistant text.
 		_ = d.ReasoningContent
 		if d.Content != "" {
+			if debugMode {
+				log.Printf("stream: content chunk: %q", d.Content)
+			}
 			tr.hadMessageContent = true
 			tr.textBuf.WriteString(d.Content)
 			if err := tr.ensureContentPart(dst); err != nil {
@@ -213,6 +217,9 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 				st.namespace = NamespaceForTool(tc.Function.Name)
 			}
 			if !st.added && st.name != "" {
+				if debugMode {
+					log.Printf("stream: tool_call name=%s callID=%s", st.name, st.callID)
+				}
 				st.added = true
 				st.outputIndex = tr.nextOutputIdx
 				tr.nextOutputIdx++
@@ -245,11 +252,18 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 	}
 	if err := sc.Err(); err != nil {
+		if debugMode {
+			log.Printf("stream: scanner done, err=%v", err)
+		}
 		return err
 	}
 
 	if err := tr.ensureCreated(dst); err != nil {
 		return err
+	}
+
+	if debugMode {
+		log.Printf("stream: ended, hadContent=%v, tools=%d", tr.hadMessageContent, len(tr.tools))
 	}
 
 	for _, st := range tr.tools {
@@ -305,6 +319,9 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	}
 
 	resp := map[string]any{"id": tr.respID, "object": "response", "status": "completed", "model": tr.model}
+	if len(reqTools) > 0 && string(reqTools) != "null" {
+		resp["tools"] = jsonRawToAny(reqTools)
+	}
 	if usage != nil {
 		resp["usage"] = usage
 	}
