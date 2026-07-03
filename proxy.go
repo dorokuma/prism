@@ -268,6 +268,7 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) 
 func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyBytes []byte, start time.Time, opts chatForwardOpts, cfg *Config) {
 	// Remap model name if configured
 	bodyBytes = remapModelInBody(bodyBytes, cfg)
+	bodyBytes = remapThinkingForDeepSeek(bodyBytes)
 	maxAttempts := len(pool.accounts) * 2
 	requestID := randomID()
 	log.Printf("proxy: req=%s path=%s stream=%v responsesOut=%v totalStart=%s", requestID, r.URL.Path, opts.stream, opts.responsesOut, start.Format(time.RFC3339Nano))
@@ -359,7 +360,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				w.WriteHeader(http.StatusOK)
 			translateStart := time.Now()
 			log.Printf("proxy: req=%s account=%s mode=responses_stream translate.start=%s", requestID, acc.Name(), translateStart.Format(time.RFC3339Nano))
-			err = translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools)
+			err = translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools, getSearchToolCache())
 			translateElapsed := time.Since(translateStart).Milliseconds()
 			if err != nil {
 				log.Printf("proxy: req=%s account=%s mode=responses_stream translate.error=%v translate_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, time.Since(start))

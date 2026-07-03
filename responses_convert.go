@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"fmt"
 	"strings"
 )
@@ -373,3 +374,77 @@ func jsonRawToAny(raw json.RawMessage) any {
 	return v
 }
 
+
+// isDeepSeekModel reports whether the upstream model name indicates a DeepSeek model.
+func isDeepSeekModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(model), "deepseek")
+}
+
+// mapThoughtLevel maps Codex thinking level to DeepSeek-compatible level.
+// low/medium/high → high, xhigh → max. Other values pass through unchanged.
+func mapThoughtLevel(level string) string {
+	switch strings.ToLower(level) {
+	case "low", "medium", "high":
+		return "high"
+	case "xhigh":
+		return "max"
+	default:
+		return level
+	}
+}
+
+// remapThinkingForDeepSeek rewrites thinking.level and reasoning_effort fields
+// in a Chat Completions JSON body when the upstream model is DeepSeek.
+func remapThinkingForDeepSeek(body []byte) []byte {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return body
+	}
+	model, _ := rawStringField(raw, "model")
+	if !isDeepSeekModel(model) {
+		return body
+	}
+	changed := false
+
+	// Remap thinking.level
+	if thinkRaw, ok := raw["thinking"]; ok && len(thinkRaw) > 0 && string(thinkRaw) != "null" {
+		var thinking map[string]any
+		if err := json.Unmarshal(thinkRaw, &thinking); err == nil {
+			if level, ok := thinking["level"].(string); ok {
+				mapped := mapThoughtLevel(level)
+				if mapped != level {
+					log.Printf("proxy: thinking level remap model=%s level=%s -> %s", model, level, mapped)
+					thinking["level"] = mapped
+					if b, err := json.Marshal(thinking); err == nil {
+						raw["thinking"] = json.RawMessage(b)
+						changed = true
+					}
+				}
+			}
+		}
+	}
+
+	// Remap reasoning_effort
+	if effortRaw, ok := raw["reasoning_effort"]; ok && len(effortRaw) > 0 && string(effortRaw) != "null" {
+		var effort string
+		if err := json.Unmarshal(effortRaw, &effort); err == nil {
+			mapped := mapThoughtLevel(effort)
+			if mapped != effort {
+				log.Printf("proxy: reasoning_effort remap model=%s effort=%s -> %s", model, effort, mapped)
+				if b, err := json.Marshal(mapped); err == nil {
+					raw["reasoning_effort"] = json.RawMessage(b)
+					changed = true
+				}
+			}
+		}
+	}
+
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return body
+	}
+	return out
+}
