@@ -59,7 +59,7 @@ func main() {
 	StartProbeLoop(pool, cfg.ProbeInterval, stop)
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -70,13 +70,22 @@ func main() {
 		// WriteTimeout=0: allow long-lived streaming responses to clients.
 	}
 	go func() {
-		<-sigCh
-		log.Printf("shutting down...")
-		close(stop)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("shutdown: %v", err)
+		for sig := range sigCh {
+			if sig == syscall.SIGHUP {
+				log.Printf("received SIGHUP, reloading mcp_tools.json")
+				clearMCPCache()
+				loadMCPTools(cfg.MCPToolsJSON)
+				log.Printf("mcp_tools.json reloaded")
+				continue
+			}
+			log.Printf("shutting down sig=%v...", sig)
+			close(stop)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(ctx); err != nil {
+				log.Printf("shutdown: %v", err)
+			}
+			return
 		}
 	}()
 

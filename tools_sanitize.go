@@ -39,6 +39,11 @@ func cacheMCPTool(tool map[string]any) {
 	mcpCache = append(mcpCache, tool)
 }
 
+func clearMCPCache() {
+	mcpCacheMu.Lock()
+	defer mcpCacheMu.Unlock()
+	mcpCache = nil
+}
 // NamespaceForTool returns the namespace for a prefixed tool name via string parsing.
 func NamespaceForTool(prefixedName string) string {
 	ns, _ := splitNamespaceTool(prefixedName)
