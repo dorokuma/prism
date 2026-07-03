@@ -7,10 +7,8 @@ import (
 	"sync"
 )
 
-// splitNamespaceTool splits a prefixed tool name like "mcp__codegraph__search"
-// into (namespace, tool) using the last "__" as the boundary.
-// Namespace: "mcp__codegraph", Tool: "search".
-// Falls back to ("", name) if no "__" is found.
+// splitNamespaceTool splits "mcp__codegraph__search" into ("mcp__codegraph", "search").
+// Uses the last "__" as the boundary. Tool names must not contain "__".
 func splitNamespaceTool(prefixed string) (namespace, tool string) {
 	if idx := strings.LastIndex(prefixed, "__"); idx >= 0 {
 		return prefixed[:idx], prefixed[idx+2:]
@@ -18,33 +16,33 @@ func splitNamespaceTool(prefixed string) (namespace, tool string) {
 	return "", prefixed
 }
 
-// toolNamespaceCache maps short tool names to their namespace.
-// Populated from namespace bundles in requests and from mcp_tools.json.
+// mcpCache stores MCP tool definitions discovered from Codex namespace bundles.
+// Populated automatically each time a namespace bundle passes through flattenToolEntry.
+// No disk file needed — rebuilt from requests after restart.
 var (
-	toolNamespaceCache   = map[string]string{}
-	toolNamespaceCacheMu sync.RWMutex
+	mcpCache   []map[string]any
+	mcpCacheMu sync.Mutex
 )
 
-// registerToolNamespace records the namespace for an un-prefixed tool name.
-func registerToolNamespace(shortName, namespace string) {
-	toolNamespaceCacheMu.Lock()
-	defer toolNamespaceCacheMu.Unlock()
-	toolNamespaceCache[shortName] = namespace
+func cacheMCPTool(tool map[string]any) {
+	mcpCacheMu.Lock()
+	defer mcpCacheMu.Unlock()
+	for _, existing := range mcpCache {
+		if fn, ok := existing["function"].(map[string]any); ok {
+			if nf, ok := tool["function"].(map[string]any); ok {
+				if fn["name"] == nf["name"] {
+					return // already cached
+				}
+			}
+		}
+	}
+	mcpCache = append(mcpCache, tool)
 }
 
-// lookupToolNamespace returns the namespace for an un-prefixed tool name.
-func lookupToolNamespace(shortName string) string {
-	toolNamespaceCacheMu.RLock()
-	defer toolNamespaceCacheMu.RUnlock()
-	return toolNamespaceCache[shortName]
-}
 // NamespaceForTool returns the namespace for a prefixed tool name via string parsing.
 func NamespaceForTool(prefixedName string) string {
 	ns, _ := splitNamespaceTool(prefixedName)
-	if ns != "" {
-		return ns
-	}
-	return lookupToolNamespace(prefixedName)
+	return ns
 }
 
 // ResolveNamespaceTool returns the original tool name from a prefixed name.
@@ -53,18 +51,13 @@ func ResolveNamespaceTool(name string) string {
 	return tool
 }
 
-// PrefixNamespaceTool reconstructs the prefixed name from namespace + tool name.
-// Used when converting Codex function_call history back to Chat Completions format.
-// If the name is already prefixed, returns as-is.
-// The caller in responseItemToMessage should concatenate namespace + "__" + name
-// when both are available from the Codex request.
+// PrefixNamespaceTool is a no-op; namespace reconstruction is handled
+// by responseItemToMessage which reads the namespace field from Codex requests.
 func PrefixNamespaceTool(name string) string {
 	return name
 }
 
 // sanitizeToolsForChatCompletions converts Responses API tools to Chat Completions format.
-// Filters out Codex-internal types that have no Chat Completions equivalent.
-// Namespace bundles are flattened with prefixed names to preserve routing info.
 func sanitizeToolsForChatCompletions(raw json.RawMessage) any {
 	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
@@ -119,7 +112,7 @@ func flattenToolEntry(item json.RawMessage) []map[string]any {
 			},
 		}}
 	}
-	// Namespace / MCP bundle: { name, description, tools: [...] }
+	// Namespace / MCP bundle: extract tools and cache for tool_search
 	if nested, ok := m["tools"]; ok && len(nested) > 0 && string(nested) != "null" {
 		bundleName, _ := rawStringField(m, "name")
 		var sub []json.RawMessage
@@ -142,22 +135,19 @@ func flattenToolEntry(item json.RawMessage) []map[string]any {
 				}
 			}
 			if t := asFunctionTool(sm); t != nil {
-				// Prefix with bundle name to preserve namespace routing.
-				// Resolution is done via string splitting at the last "__",
-				// so no mapping table is needed.
 				if bundleName != "" && subName != "" {
 					prefixed := bundleName + "__" + subName
 					if fnObj, ok := t["function"].(map[string]any); ok {
 						fnObj["name"] = prefixed
 					}
-					registerToolNamespace(subName, bundleName)
 				}
+				cacheMCPTool(t)
 				out = append(out, t)
 			}
 		}
 		return out
 	}
-	// tool_search: deferred MCP tool discovery (Codex v0.142.5+)
+	// tool_search: append cached MCP tools so non-GPT models can see them
 	if typ == "tool_search" {
 		desc, _ := rawStringField(m, "description")
 		fnObj := map[string]any{"name": "tool_search"}
@@ -173,7 +163,9 @@ func flattenToolEntry(item json.RawMessage) []map[string]any {
 			"type":     "function",
 			"function": fnObj,
 		}}
-		result = append(result, mcpInjectTools...)
+		mcpCacheMu.Lock()
+		result = append(result, mcpCache...)
+		mcpCacheMu.Unlock()
 		return result
 	}
 	if t := asFunctionTool(m); t != nil {

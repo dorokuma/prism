@@ -6,8 +6,9 @@ import (
 	"os"
 )
 
-var mcpInjectTools []map[string]any
-
+// loadMCPTools reads mcp_tools.json at startup and populates
+// the runtime MCP cache so tool_search responses include real definitions
+// even before the first namespace bundle arrives from Codex.
 func loadMCPTools(path string) {
 	if path == "" {
 		return
@@ -29,10 +30,10 @@ func loadMCPTools(path string) {
 		log.Printf("mcp_inject: failed to parse %s: %v", path, err)
 		return
 	}
+	count := 0
 	for _, ns := range namespaces {
 		for _, t := range ns.Tools {
 			prefixed := ns.Namespace + "__" + t.Name
-			registerToolNamespace(t.Name, ns.Namespace)
 			fnObj := map[string]any{"name": prefixed}
 			if t.Description != "" {
 				fnObj["description"] = t.Description
@@ -42,11 +43,12 @@ func loadMCPTools(path string) {
 			} else {
 				fnObj["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
 			}
-			mcpInjectTools = append(mcpInjectTools, map[string]any{
+			cacheMCPTool(map[string]any{
 				"type":     "function",
 				"function": fnObj,
 			})
+			count++
 		}
 	}
-	log.Printf("mcp_inject: loaded %d tools from %d namespaces", len(mcpInjectTools), len(namespaces))
+	log.Printf("mcp_inject: loaded %d tools from %d namespaces into runtime cache", count, len(namespaces))
 }
