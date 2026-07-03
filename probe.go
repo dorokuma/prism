@@ -66,7 +66,7 @@ func probeExhausted(pool *Pool, probeModel string) {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				req = req.WithContext(ctx)
 				resp, err := acc.Client().Do(req)
-				defer cancel()
+				cancel()
 
 				if err != nil {
 					log.Printf("probe %s: request failed (attempt %d/%d): %v", acc.Name(), attempt, maxAttempts, err)

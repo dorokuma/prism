@@ -352,6 +352,29 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 	}
 
+	// Complete reasoning output item if it was started
+	if tr.reasoningAdded {
+		if tr.reasoningPartAdded {
+			if err := tr.emit(dst, map[string]any{
+				"type":          "response.reasoning_summary.done",
+				"item_id":       tr.reasoningItemID,
+				"output_index":  tr.reasoningOutputIdx,
+				"summary_index": 0,
+				"text":          tr.reasoningBuf.String(),
+			}); err != nil {
+				return err
+			}
+		}
+		if err := tr.emit(dst, map[string]any{
+			"type": "response.output_item.done", "output_index": tr.reasoningOutputIdx,
+			"item": map[string]any{
+				"type": "reasoning", "id": tr.reasoningItemID, "status": "completed",
+			},
+		}); err != nil {
+			return err
+		}
+	}
+
 	if tr.msgAdded || tr.hadMessageContent {
 		if !tr.msgAdded {
 			if err := tr.ensureMessageStream(dst); err != nil {
