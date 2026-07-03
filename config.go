@@ -20,7 +20,8 @@ type Config struct {
 	WireAPI       string            `yaml:"wire_api"`
 	Accounts      []AccountConfig   `yaml:"accounts"`
 	ModelRemap    map[string]string `yaml:"model_remap"`
-	DefaultModel  string            `yaml:"default_model"`
+	ModelTiers    map[string]string `yaml:"model_tiers"`
+	DefaultTier   string            `yaml:"default_tier"`
 	Debug         bool              `yaml:"debug"`
 	MCPToolsJSON  string            `yaml:"mcp_tools_json"`
 }
@@ -46,6 +47,9 @@ func LoadConfig(path string) (*Config, error) {
 	if _, err := ParseWireAPIMode(cfg.WireAPI); err != nil {
 		return nil, err
 	}
+	if cfg.ModelTiers == nil {
+		cfg.ModelTiers = map[string]string{}
+	}
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].Key == "" {
 			envVar := "LB_KEY_" + strings.ToUpper(strings.ReplaceAll(cfg.Accounts[i].Name, "-", "_"))
@@ -58,17 +62,48 @@ func LoadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// RemapModel translates a model name using the configured remap table.
-// If no mapping exists and a default_model is set, returns the default.
-// If neither is set, returns the original model name.
+// RemapModel resolves a virtual model name to an upstream model via tier lookup.
+// virtual model → tier (model_remap) → upstream model (model_tiers).
+// Falls back to default_tier → model_tiers, then returns the input unchanged.
 func (c *Config) RemapModel(model string) string {
 	if c.ModelRemap != nil {
-		if mapped, ok := c.ModelRemap[model]; ok {
-			return mapped
+		if tier, ok := c.ModelRemap[model]; ok {
+			if upstream, ok := c.ModelTiers[tier]; ok && upstream != "" {
+				return upstream
+			}
 		}
 	}
-	if c.DefaultModel != "" {
-		return c.DefaultModel
+	if c.DefaultTier != "" {
+		if upstream, ok := c.ModelTiers[c.DefaultTier]; ok && upstream != "" {
+			return upstream
+		}
 	}
 	return model
+}
+
+// ReverseRemapModel maps an upstream model name back to a virtual model.
+// Scans model_remap keys that resolve to the same upstream via model_tiers.
+// Returns the first match or the model name unchanged.
+func (c *Config) ReverseRemapModel(upstream string) string {
+	if c.ModelTiers == nil || c.ModelRemap == nil {
+		return upstream
+	}
+	for virtual, tier := range c.ModelRemap {
+		if t, ok := c.ModelTiers[tier]; ok && t == upstream {
+			return virtual
+		}
+	}
+	return upstream
+}
+
+// VirtualModels returns the list of virtual model names exposed to clients.
+func (c *Config) VirtualModels() []string {
+	if c.ModelRemap == nil {
+		return nil
+	}
+	models := make([]string, 0, len(c.ModelRemap))
+	for k := range c.ModelRemap {
+		models = append(models, k)
+	}
+	return models
 }

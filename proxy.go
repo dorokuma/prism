@@ -224,17 +224,16 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 		http.Error(w, fmt.Sprintf(`{"error":{"message":%q,"code":"invalid_request"}}`, err.Error()), http.StatusBadRequest)
 		return
 	}
-	var reqModel string
+	var virtualModel string
 	var raw map[string]json.RawMessage
 	_ = json.Unmarshal(bodyBytes, &raw)
-	reqModel, _ = rawStringField(raw, "model")
-	reqModel = cfg.RemapModel(reqModel)
+	virtualModel, _ = rawStringField(raw, "model")
 
-log.Printf("proxy: responses request from %s, stream=%v, chat_body=%d bytes", r.RemoteAddr, stream, len(chatBody))
+log.Printf("proxy: responses request from %s model=%s stream=%v chat_body=%d bytes", r.RemoteAddr, virtualModel, stream, len(chatBody))
 	proxyChatWithBody(pool, w, r, chatBody, start, chatForwardOpts{
 		responsesOut: true,
 		stream:       stream,
-		model:        reqModel,
+		model:        virtualModel,
 		reqTools:     reqTools,
 	}, cfg)
 }
@@ -432,18 +431,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) {
 	log.Printf("proxy: models request from %s", r.RemoteAddr)
 
-	// Build model list from model_remap keys (the GPT model names users see).
-	modelIDs := make([]string, 0, len(cfg.ModelRemap)+1)
-	seen := make(map[string]bool)
-	for k := range cfg.ModelRemap {
-		if !seen[k] {
-			modelIDs = append(modelIDs, k)
-			seen[k] = true
-		}
-	}
-	if cfg.DefaultModel != "" && !seen[cfg.DefaultModel] {
-		modelIDs = append(modelIDs, cfg.DefaultModel)
-	}
+	modelIDs := cfg.VirtualModels()
 	if len(modelIDs) == 0 {
 		http.Error(w, `{"error":{"message":"No models configured","code":"no_models"}}`, 503)
 		return

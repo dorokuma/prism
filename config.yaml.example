@@ -1,14 +1,28 @@
 listen: ":18790"
 probe_interval: 10m
 # wire_api: legacy | responses | both (default both)
-#   legacy    — /v1/chat/completions only (Reasonix, DeepSeek 等旧兼容客户端)
-#   responses — /v1/responses only (Codex wire_api=responses)，自动转成上游 chat/completions
-#   both      — 同时开放两条路径
 wire_api: both
+
+# Tier → upstream model. Decouples virtual model names from upstream identifiers.
+model_tiers:
+  frontier: deepseek-v4-pro
+  standard: deepseek-v4-flash
+default_tier: standard
+
+# Virtual model → tier. Every model exposed via /v1/models must have an entry here.
+model_remap:
+  gpt-5.5: frontier
+  gpt-5.5-pro: frontier
+  gpt-5.4: standard
+  gpt-5.4-mini: standard
+  gpt-5.3-codex: standard
+
 accounts:
   - name: account-1
-    key: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    key: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     base_url: https://opencode.ai/zen/go/v1
   - name: account-2
-    key: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    key: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     base_url: https://opencode.ai/zen/go/v1
+
+mcp_tools_json: "/root/reasonix-lb/mcp_tools.json"

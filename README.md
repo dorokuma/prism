@@ -1,104 +1,123 @@
 # reasonix-lb
 
-一个轻量级 HTTP 反向代理 + 负载均衡器，专门为兼容 OpenAI API 格式的 LLM 后端（如 opencode.ai）设计。在多 API Key 之间做选号、自动耗尽标记、配额探测恢复和 429 限流冷却。
+Lightweight HTTP reverse proxy + load balancer for OpenAI-compatible LLM backends.
+Multi-account round-robin selection, automatic exhaustion marking, quota recovery probing,
+429 cooldown, and Chat↔Responses API format translation.
 
-## 快速开始
+## Quick Start
 
 ```bash
 git clone <repo>
 cd reasonix-lb
 go build -o reasonix-lb .
-cp config.yaml.example config.yaml   # 填写真实 key
+cp config.yaml.example config.yaml
 ./reasonix-lb
 ```
 
-默认监听 `:18790`。通过 `wire_api` 切换对外协议（上游始终是各账号的 OpenAI **Chat Completions**）。
+Listens on `:18790` by default. Use `wire_api` to control protocol surface.
 
-## 配置
+## Configuration
 
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `listen` | string | `:18790` | 监听地址 |
-| `probe_interval` | duration | `10m` | 探测已耗尽账号的间隔 |
-| `wire_api` | string | `both` | `legacy` / `responses` / `both`，见下文 |
-| `accounts` | array | 必填 | 上游账号列表 |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `listen` | string | `:18790` | Listen address |
+| `probe_interval` | duration | `10m` | Exhausted account probe interval |
+| `wire_api` | string | `both` | `legacy` / `responses` / `both` |
+| `accounts` | array | required | Upstream account list |
+| `model_tiers` | map | — | Tier name → upstream model identifier |
+| `model_remap` | map | — | Virtual model name → tier name |
+| `default_tier` | string | — | Fallback tier for unmapped models |
 
-### `wire_api`（新/旧 OpenAI 兼容）
+### `wire_api`
 
-| 值 | 对外路径 | 典型客户端 |
-|----|----------|------------|
-| `legacy` | 仅 `POST /v1/chat/completions` | Reasonix、DeepSeek 官方 API 直连配置 |
-| `responses` | 仅 `POST /v1/responses` | Codex CLI（`wire_api = "responses"`） |
-| `both` | 两条路径都开 | 同一端口同时给 Reasonix 和 Codex 用 |
+| Value | Path | Typical client |
+|-------|------|----------------|
+| `legacy` | `POST /v1/chat/completions` only | Reasonix, legacy clients |
+| `responses` | `POST /v1/responses` only | Codex CLI (`wire_api = "responses"`) |
+| `both` | Both paths | Mixed usage on same port |
 
-`responses` 模式下，lb 会把 Responses 请求体转成 Chat Completions 再转发到 `base_url/chat/completions`，并把响应（含 SSE）转回 Responses 事件格式。
+### Model tiers
 
-每个 account：
-
-| 字段 | 说明 |
-|------|------|
-| `name` | 标识名，用于日志 |
-| `key` | API Key（Bearer token） |
-| `base_url` | 上游 API 基础地址 |
-
-示例：
+Tiers decouple virtual model names from upstream identifiers.
+Change the upstream model in one place without touching any client config.
 
 ```yaml
-listen: ":18790"
-probe_interval: 10m
-accounts:
-  - name: acc-1
-    key: sk-xxx
-    base_url: https://opencode.ai/zen/go/v1
+model_tiers:
+  frontier: deepseek-v4-pro
+  standard: deepseek-v4-flash
+default_tier: standard
 ```
 
-## 核心机制
+### Model remap
+
+Maps virtual model names (shown to clients) to tiers.
+
+```yaml
+model_remap:
+  gpt-5.5: frontier
+  gpt-5.5-pro: frontier
+  gpt-5.4: standard
+  gpt-5.4-mini: standard
+```
+
+### Accounts
+
+| Field | Description |
+|-------|-------------|
+| `name` | Account label for logs |
+| `key` | API key (or read from env `LB_KEY_{NAME}`) |
+| `base_url` | Upstream API base URL |
+
+## Core mechanism
 
 ```
-请求进入 → Select(round-robin) → 转发
-  ├─ 402 → MarkExhausted(移出池) → 重试下一个账号
-  ├─ 429 → SetCooldown(2min 冷却) → 重试下一个账号
-  ├─ 5xx → 重试下一个账号(不标记耗尽)
-  └─ 2xx → 返回响应
+Request → Select (round-robin) → Forward
+  ├─ 402/401/403 → MarkExhausted → retry next account
+  ├─ 429 → SetCooldown → retry next account
+  ├─ 5xx (×5 consecutive) → MarkExhausted
+  └─ 2xx → Return response
 
-后台探针(定时):
-  └─ GET /models → 200 回复 → MarkHealthy(重新加入池)
+Background probe (periodic):
+  └─ GET /models → 200 → MarkHealthy (rejoin pool)
 ```
 
-- **选号**: round-robin 轮询，跳过冷却中和已耗尽的账号，成功借出（`TryBorrow`）即用，防止并发重复选到同一个账号。
-- **耗尽标记**: 上游返回 402 Payment Required 时标记为 `StatusExhausted`，移出选号池。
-- **探针恢复**: 定时（`probe_interval`，启动即执行一次）对已耗尽账号发 `GET /models`，连续重试 3 次（间隔 2s），任意一次 200 即恢复。
-- **429 冷却**: 上游返回 429 Too Many Requests 时设置 2 分钟冷却，冷却期内绕过该账号。
+## Endpoints
 
-## 端点
+| Path | Method | Description |
+|------|--------|-------------|
+| `/v1/chat/completions` | POST | Proxy to upstream `/chat/completions` (legacy/both mode) |
+| `/v1/responses` | POST | Responses↔Chat conversion then proxy (responses/both mode) |
+| `/v1/models` | GET | Return virtual model list from `model_remap` keys |
+| `/health` | GET | Health check, returns `ok` (200) |
 
-| 路径 | 方法 | 说明 |
-|------|------|------|
-| `/v1/chat/completions` | POST | 转发到上游 `/chat/completions`（`wire_api` 含 `legacy` 时） |
-| `/v1/responses` | POST | Responses↔Chat 转换后转发（`wire_api` 含 `responses` 时） |
-| `/v1/models` | GET | 从首个可用账号获取模型列表 |
-| `/health` | GET | 健康检查，返回 `ok` (200) |
+### Codex config
 
-### 健康检查
-
-`GET /health` 直接返回 200 + `ok`，不依赖上游。用于 load balancer / k8s probe。
-
-### Codex 示例
-
-`~/.codex/config.toml`（或 profile 覆盖）：
+`~/.codex/config.toml`:
 
 ```toml
 [model_providers.reasonix-lb]
 name = "reasonix-lb"
 base_url = "http://127.0.0.1:18790/v1"
+requires_openai_auth = false
+api_key = "lb-local-placeholder"
 wire_api = "responses"
-env_key = "OPENAI_API_KEY"   # 任意占位；真实 key 由 lb 账号配置注入
 
 model_provider = "reasonix-lb"
-model = "deepseek-v4-pro"    # 或 opencode-go 文档中的 model id
+model = "gpt-5.5"
 ```
 
-Reasonix / 旧客户端仍指向 `http://127.0.0.1:18790/v1`，`wire_api: both` 时无需改路径。
+### MCP tools
+
+MCP tool definitions are auto-generated from `~/.codex/config.toml` by
+`scripts/generate_mcp_tools.py`. Install new MCP servers normally in Codex,
+then run the script before restarting LB:
+
+```bash
+python3 scripts/generate_mcp_tools.py mcp_tools.json
+systemctl restart reasonix-lb
+```
+
+Or use `scripts/codex-wrapper.sh` to chain generation before each Codex launch.
 
 ## License
 
