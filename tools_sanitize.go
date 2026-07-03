@@ -56,12 +56,6 @@ func ResolveNamespaceTool(name string) string {
 	return tool
 }
 
-// PrefixNamespaceTool is a no-op; namespace reconstruction is handled
-// by responseItemToMessage which reads the namespace field from Codex requests.
-func PrefixNamespaceTool(name string) string {
-	return name
-}
-
 // sanitizeToolsForChatCompletions converts Responses API tools to Chat Completions format.
 func sanitizeToolsForChatCompletions(raw json.RawMessage) any {
 	var items []json.RawMessage
