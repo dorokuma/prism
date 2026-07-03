@@ -24,7 +24,7 @@ func main() {
 	log.Printf("loaded %d accounts, wire_api=%s, listening on %s, debug=%v", len(cfg.Accounts), wire, cfg.Listen, debugMode)
 
 	// Initial health probe: check all accounts on startup, warn but don't block
-	probeExhausted(pool)
+	probeExhausted(pool, cfg.ProbeModel)
 
 	// 启动时验证所有账号的连通性
 	log.Println("starting initial health check for all accounts...")
@@ -56,7 +56,7 @@ func main() {
 	}
 
 	stop := make(chan struct{})
-	StartProbeLoop(pool, cfg.ProbeInterval, stop)
+	StartProbeLoop(pool, cfg.ProbeModel, cfg.ProbeInterval, stop)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)

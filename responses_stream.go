@@ -38,10 +38,10 @@ type responsesStreamTranslator struct {
 	contentPartAdded   bool
 	hadMessageContent  bool
 	textBuf            strings.Builder
+	reasoningBuf        strings.Builder
 	// tool_search interception
 	searchToolCache    []map[string]any
 	pendingSearchID    string
-	searchIntercepted  bool
 }
 
 func newResponsesStreamTranslator(model string, searchToolCache []map[string]any) *responsesStreamTranslator {
@@ -53,6 +53,7 @@ func newResponsesStreamTranslator(model string, searchToolCache []map[string]any
 		tools:           make(map[int]*streamToolState),
 		nextOutputIdx:   0,
 		searchToolCache: searchToolCache,
+		reasoningBuf:       strings.Builder{},
 	}
 }
 
@@ -183,7 +184,24 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		d := chunk.Choices[0].Delta
 		// Upstream Chat may stream reasoning_content (e.g. DeepSeek). Codex without
 		// model reasoning metadata rejects reasoning SSE — only forward assistant text.
-		_ = d.ReasoningContent
+			if d.ReasoningContent != "" {
+				if debugMode {
+					log.Printf("stream: reasoning chunk: %q", d.ReasoningContent)
+				}
+				tr.reasoningBuf.WriteString(d.ReasoningContent)
+				if err := tr.ensureReasoningStream(dst); err != nil {
+					return err
+				}
+				if err := tr.emit(dst, map[string]any{
+					"type":          "response.reasoning_summary.delta",
+					"item_id":       tr.reasoningItemID,
+					"output_index":  tr.reasoningOutputIdx,
+					"summary_index": 0,
+					"delta":         d.ReasoningContent,
+				}); err != nil {
+					return err
+				}
+			}
 		if d.Content != "" {
 			if debugMode {
 				log.Printf("stream: content chunk: %q", d.Content)
@@ -317,7 +335,6 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			if debugMode {
 				log.Printf("stream: tool_search synthetic result emitted (%d tools)", len(searchTools))
 			}
-			tr.searchIntercepted = true
 			continue
 		}
 		item := map[string]any{

@@ -24,6 +24,7 @@ type Config struct {
 	DefaultTier   string            `yaml:"default_tier"`
 	Debug         bool              `yaml:"debug"`
 	MCPToolsJSON  string            `yaml:"mcp_tools_json"`
+	ProbeModel    string            `yaml:"probe_model"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -44,6 +45,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.WireAPI == "" {
 		cfg.WireAPI = "both"
 	}
+	if cfg.ProbeModel == "" {
+		cfg.ProbeModel = "gpt-4o-mini"
+	}
 	if _, err := ParseWireAPIMode(cfg.WireAPI); err != nil {
 		return nil, err
 	}
@@ -62,27 +66,45 @@ func LoadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// RemapModel resolves a virtual model name to an upstream model via tier lookup.
-// virtual model → tier (model_remap) → upstream model (model_tiers).
-// Falls back to default_tier → model_tiers, then returns the input unchanged.
+// RemapModel resolves a virtual model name to its upstream model via
+// model_remap → model_tiers. Models NOT in model_remap (real upstream names)
+// pass through unchanged. Models IN model_remap whose tier has no upstream
+// mapping fall back to default_tier.
 func (c *Config) RemapModel(model string) string {
 	if c.ModelRemap != nil {
 		if tier, ok := c.ModelRemap[model]; ok {
 			if upstream, ok := c.ModelTiers[tier]; ok && upstream != "" {
 				return upstream
 			}
-		}
-	}
-	if c.DefaultTier != "" {
-		if upstream, ok := c.ModelTiers[c.DefaultTier]; ok && upstream != "" {
-			return upstream
+			// Virtual model found but its tier has no upstream → fallback
+			if c.DefaultTier != "" {
+				if upstream, ok := c.ModelTiers[c.DefaultTier]; ok && upstream != "" {
+					return upstream
+				}
+			}
 		}
 	}
 	return model
 }
 
+// AllModels returns both virtual model names (model_remap keys) and real
+// upstream model names (model_tiers values) for /v1/models.
+func (c *Config) AllModels() []string {
+	seen := make(map[string]bool)
+	var out []string
+	for k := range c.ModelRemap {
+		seen[k] = true
+		out = append(out, k)
+	}
+	for _, upstream := range c.ModelTiers {
+		if upstream != "" && !seen[upstream] {
+			seen[upstream] = true
+			out = append(out, upstream)
+		}
+	}
+	return out
+}
 
-// VirtualModels returns the list of virtual model names exposed to clients.
 func (c *Config) VirtualModels() []string {
 	if c.ModelRemap == nil {
 		return nil

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"sort"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -105,7 +106,7 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 	if isPermanentCredentialError(bodyBytes) {
 		acc.MarkExhausted()
 		log.Printf("proxy: %s permanent credential error (status=%d), marking exhausted. body: %s",
-			acc.Name(), resp.StatusCode, string(bodyBytes))
+			acc.Name(), resp.StatusCode, redactBody(bodyBytes))
 		return
 	}
 
@@ -114,7 +115,7 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 			acc.MarkExhausted()
 			acc.ResetFailures()
 			log.Printf("proxy: %s 429+quota exhaustion, marking exhausted. body: %s",
-				acc.Name(), string(bodyBytes))
+				acc.Name(), redactBody(bodyBytes))
 			return
 		}
 		cd := parseRetryAfter(resp)
@@ -127,7 +128,7 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 		acc.SetCooldown(cd)
 		acc.ResetFailures()
 		log.Printf("proxy: %s rate-limited 429, cooling down %v. body: %s",
-			acc.Name(), cd, string(bodyBytes))
+			acc.Name(), cd, redactBody(bodyBytes))
 		return
 	}
 
@@ -135,7 +136,7 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 		acc.MarkExhausted()
 		acc.ResetFailures()
 		log.Printf("proxy: %s insufficient_quota (status=%d), marking exhausted. body: %s",
-			acc.Name(), resp.StatusCode, string(bodyBytes))
+			acc.Name(), resp.StatusCode, redactBody(bodyBytes))
 		return
 	}
 
@@ -143,11 +144,11 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 	if failures >= 5 {
 		acc.MarkExhausted()
 		log.Printf("proxy: %s consecutive failures >= 5 (status=%d), marking exhausted. body: %s",
-			acc.Name(), resp.StatusCode, string(bodyBytes))
+			acc.Name(), resp.StatusCode, redactBody(bodyBytes))
 	} else {
 		acc.SetCooldown(30 * time.Second)
 		log.Printf("proxy: %s temporary error (status=%d), cooling down 30s (failures=%d). body: %s",
-			acc.Name(), resp.StatusCode, failures, string(bodyBytes))
+			acc.Name(), resp.StatusCode, failures, redactBody(bodyBytes))
 	}
 }
 
@@ -188,6 +189,10 @@ func NewProxyHandler(pool *Pool, wire WireAPIMode, cfg *Config) http.Handler {
 			return
 		}
 		if r.URL.Path == "/v1/models" {
+			if r.Method != http.MethodGet {
+				http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+				return
+			}
 			proxyModels(pool, w, r, cfg)
 			return
 		}
@@ -283,7 +288,9 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		acc, err := pool.Select(selectCtx)
 		selectDuration := time.Since(selectStart).Milliseconds()
 		cancel()
-		log.Printf("proxy: req=%s attempt=%d pool.select_done=%dms account=%s err=%v", requestID, attempts, selectDuration, func() string { if acc != nil { return acc.Name() }; return "nil" }(), err)
+		accName := "nil"
+		if acc != nil { accName = acc.Name() }
+		log.Printf("proxy: req=%s attempt=%d pool.select_done=%dms account=%s err=%v", requestID, attempts, selectDuration, accName, err)
 		if err != nil {
 			log.Printf("proxy: select account failed: %v", err)
 			http.Error(w, `{"error":{"message":"No healthy accounts available","code":"no_accounts"}}`, 503)
@@ -341,10 +348,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				}
 				// Still forward the error to client this time
 				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				if resp.StatusCode >= 400 {
-	
-				}
-				log.Printf("proxy: chat upstream error via %s, status=%d, body=%s", acc.Name(), resp.StatusCode, string(errBody))
+				log.Printf("proxy: chat upstream error via %s, status=%d, body=%s", acc.Name(), resp.StatusCode, redactBody(errBody))
 				copyUpstreamHeaders(w, resp.Header)
 				w.WriteHeader(resp.StatusCode)
 				n, _ := w.Write(errBody)
@@ -426,7 +430,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) {
 	log.Printf("proxy: models request from %s", r.RemoteAddr)
 
-	modelIDs := cfg.VirtualModels()
+	modelIDs := cfg.AllModels()
 	if len(modelIDs) == 0 {
 		http.Error(w, `{"error":{"message":"No models configured","code":"no_models"}}`, 503)
 		return
@@ -451,6 +455,16 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config
 	log.Printf("proxy: models returning %d models", len(modelIDs))
 }
 
+
+// redactBody masks common sensitive patterns in error response bodies for safe logging.
+func redactBody(body []byte) string {
+	s := string(body)
+	// Mask OpenAI-style API keys: sk- followed by alphanumeric chars
+	// Also mask Bearer tokens
+	result := regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`).ReplaceAllString(s, "sk-***")
+	result = regexp.MustCompile(`Bearer [A-Za-z0-9]{20,}`).ReplaceAllString(result, "Bearer ***")
+	return result
+}
 
 // remapModelInBody replaces the model field in a JSON chat completions body.
 func remapModelInBody(body []byte, cfg *Config) []byte {

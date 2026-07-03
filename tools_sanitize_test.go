@@ -22,7 +22,7 @@ func TestSanitizeToolsFlattensNamespaceAndConvertsWebSearch(t *testing.T) {
 	if fn1["name"] != "web_search" {
 		t.Fatalf("got[1] name=%v, want web_search", fn1["name"])
 	}
-	if fn2["name"] != "close_agent" {
-		t.Fatalf("got[2] name=%v, want close_agent", fn2["name"])
+	if fn2["name"] != "multi_agent_v1__close_agent" {
+		t.Fatalf("got[2] name=%v, want multi_agent_v1__close_agent", fn2["name"])
 	}
 }
