@@ -81,20 +81,6 @@ func (c *Config) RemapModel(model string) string {
 	return model
 }
 
-// ReverseRemapModel maps an upstream model name back to a virtual model.
-// Scans model_remap keys that resolve to the same upstream via model_tiers.
-// Returns the first match or the model name unchanged.
-func (c *Config) ReverseRemapModel(upstream string) string {
-	if c.ModelTiers == nil || c.ModelRemap == nil {
-		return upstream
-	}
-	for virtual, tier := range c.ModelRemap {
-		if t, ok := c.ModelTiers[tier]; ok && t == upstream {
-			return virtual
-		}
-	}
-	return upstream
-}
 
 // VirtualModels returns the list of virtual model names exposed to clients.
 func (c *Config) VirtualModels() []string {

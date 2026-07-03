@@ -229,7 +229,7 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 	_ = json.Unmarshal(bodyBytes, &raw)
 	virtualModel, _ = rawStringField(raw, "model")
 
-log.Printf("proxy: responses request from %s model=%s stream=%v chat_body=%d bytes", r.RemoteAddr, virtualModel, stream, len(chatBody))
+	log.Printf("proxy: responses request from %s model=%s stream=%v chat_body=%d bytes", r.RemoteAddr, virtualModel, stream, len(chatBody))
 	proxyChatWithBody(pool, w, r, chatBody, start, chatForwardOpts{
 		responsesOut: true,
 		stream:       stream,
@@ -345,18 +345,6 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				return true, nil
 			}
 
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				if resp.StatusCode >= 400 {
-	
-				}
-				log.Printf("proxy: chat upstream error via %s, status=%d, body=%s", acc.Name(), resp.StatusCode, string(errBody))
-				copyUpstreamHeaders(w, resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				n, _ := w.Write(errBody)
-				log.Printf("proxy: chat upstream error via %s, written=%d", acc.Name(), n)
-				return true, nil
-			}
 
 			if opts.responsesOut && opts.stream {
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -456,16 +444,6 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config
 	log.Printf("proxy: models returning %d models", len(modelIDs))
 }
 
-// readBodyPreview reads up to 4KB from resp.Body for inspection and closes it.
-
-func readBodyPreview(resp *http.Response) []byte {
-	if resp == nil || resp.Body == nil {
-		return nil
-	}
-	preview, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	resp.Body.Close()
-	return preview
-}
 
 // remapModelInBody replaces the model field in a JSON chat completions body.
 func remapModelInBody(body []byte, cfg *Config) []byte {

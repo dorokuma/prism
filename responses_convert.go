@@ -287,7 +287,7 @@ func chatCompletionToResponse(body []byte, model string, reqTools json.RawMessag
 	}
 	resp := map[string]any{
 		"id": respID, "object": "response", "status": "completed",
-		"model": firstNonEmpty(comp.Model, model), "output": output, "usage": usage,
+		"model": model, "output": output, "usage": usage,
 	}
 	if len(reqTools) > 0 && string(reqTools) != "null" {
 		resp["tools"] = jsonRawToAny(reqTools)
@@ -373,9 +373,3 @@ func jsonRawToAny(raw json.RawMessage) any {
 	return v
 }
 
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
-}
