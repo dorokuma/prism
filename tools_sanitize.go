@@ -213,3 +213,12 @@ func asFunctionTool(m map[string]json.RawMessage) map[string]any {
 		"function": fnObj,
 	}
 }
+
+// getSearchToolCache returns a snapshot of cached MCP tools for tool_search interception.
+func getSearchToolCache() []map[string]any {
+	mcpCacheMu.Lock()
+	defer mcpCacheMu.Unlock()
+	out := make([]map[string]any, len(mcpCache))
+	copy(out, mcpCache)
+	return out
+}

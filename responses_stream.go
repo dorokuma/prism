@@ -38,9 +38,13 @@ type responsesStreamTranslator struct {
 	contentPartAdded   bool
 	hadMessageContent  bool
 	textBuf            strings.Builder
+	// tool_search interception
+	searchToolCache    []map[string]any
+	pendingSearchID    string
+	searchIntercepted  bool
 }
 
-func newResponsesStreamTranslator(model string) *responsesStreamTranslator {
+func newResponsesStreamTranslator(model string, searchToolCache []map[string]any) *responsesStreamTranslator {
 	return &responsesStreamTranslator{
 		model:           model,
 		respID:          "resp_" + randomID(),
@@ -48,6 +52,7 @@ func newResponsesStreamTranslator(model string) *responsesStreamTranslator {
 		reasoningItemID: "rs_" + randomID(),
 		tools:           make(map[int]*streamToolState),
 		nextOutputIdx:   0,
+		searchToolCache: searchToolCache,
 	}
 }
 
@@ -142,13 +147,13 @@ func (t *responsesStreamTranslator) ensureContentPart(w io.Writer) error {
 	return nil
 }
 
-func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model string, reqTools json.RawMessage) error {
+func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model string, reqTools json.RawMessage, searchToolCache []map[string]any) error {
 	flusher, _ := w.(http.Flusher)
 	dst := io.Writer(w)
 	if flusher != nil {
 		dst = &flushWriter{w: w, f: flusher}
 	}
-	tr := newResponsesStreamTranslator(model)
+	tr := newResponsesStreamTranslator(model, searchToolCache)
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	var usage map[string]any
@@ -220,6 +225,13 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 				if debugMode {
 					log.Printf("stream: tool_call name=%s callID=%s", st.name, st.callID)
 				}
+				// Intercept tool_search for synthetic response
+				if st.name == "tool_search" && len(tr.searchToolCache) > 0 {
+					tr.pendingSearchID = st.itemID
+					if debugMode {
+						log.Printf("stream: tool_search intercepted, %d cached tools", len(tr.searchToolCache))
+					}
+				}
 				st.added = true
 				st.outputIndex = tr.nextOutputIdx
 				tr.nextOutputIdx++
@@ -268,6 +280,44 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 
 	for _, st := range tr.tools {
 		if !st.added {
+			continue
+		}
+		// If this is the intercepted tool_search, emit synthetic result
+		if st.name == "tool_search" && tr.pendingSearchID == st.itemID && len(tr.searchToolCache) > 0 {
+			searchTools := make([]any, 0, len(tr.searchToolCache))
+			for _, t := range tr.searchToolCache {
+				searchTools = append(searchTools, t)
+			}
+			outputIdx := tr.nextOutputIdx
+			tr.nextOutputIdx++
+			searchResultID := "ts_" + randomID()
+			if err := tr.ensureCreated(dst); err != nil {
+				return err
+			}
+			if err := tr.emit(dst, map[string]any{
+				"type": "response.output_item.added", "output_index": outputIdx,
+				"item": map[string]any{
+					"type": "tool_search_output", "id": searchResultID,
+					"call_id": st.callID, "status": "completed", "execution": "client",
+					"tools": searchTools,
+				},
+			}); err != nil {
+				return err
+			}
+			if err := tr.emit(dst, map[string]any{
+				"type": "response.output_item.done", "output_index": outputIdx,
+				"item": map[string]any{
+					"type": "tool_search_output", "id": searchResultID,
+					"call_id": st.callID, "status": "completed", "execution": "client",
+					"tools": searchTools,
+				},
+			}); err != nil {
+				return err
+			}
+			if debugMode {
+				log.Printf("stream: tool_search synthetic result emitted (%d tools)", len(searchTools))
+			}
+			tr.searchIntercepted = true
 			continue
 		}
 		item := map[string]any{

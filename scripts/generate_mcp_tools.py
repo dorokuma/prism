@@ -38,113 +38,6 @@ COLLAB_INPUT_ITEMS_SCHEMA = {
     },
 }
 
-MULTI_AGENT_V1_TOOLS = {
-    "multi_agent_v1": {
-        "namespace": "multi_agent_v1",
-        "tools": [
-            {
-                "name": "spawn_agent",
-                "description": (
-                    "Spawn a sub-agent for a well-scoped task. Returns the spawned agent id "
-                    "plus the user-facing nickname when available. Spawned agents inherit your "
-                    "current model by default. Omit `model` to use that preferred default; set "
-                    "`model` only when an explicit override is needed.\n\n"
-                    "Do not spawn sub-agents unless the user explicitly asks for sub-agents, delegation, "
-                    "or parallel agent work.\n"
-                    "Requests for depth, thoroughness, research, investigation, or detailed codebase "
-                    "analysis do not count as permission to spawn.\n\n"
-                    "### When to delegate vs. do the subtask yourself\n"
-                    "- Use a subagent when a subtask is easy enough for it to handle and can run in "
-                    "parallel with your local work. Prefer delegating concrete, bounded sidecar tasks "
-                    "that materially advance the main task without blocking your immediate next local step.\n"
-                    "- Do not delegate urgent blocking work when your immediate next step depends on "
-                    "that result.\n"
-                    "- Keep work local when the subtask is too difficult to delegate well.\n\n"
-                    "### Designing delegated subtasks\n"
-                    "- Subtasks must be concrete, well-defined, and self-contained.\n"
-                    "- Delegated subtasks must materially advance the main task.\n"
-                    "- Do not duplicate work between the main rollout and delegated subtasks.\n"
-                    "- For coding tasks, prefer delegating concrete code-change worker subtasks.\n\n"
-                    "### After you delegate\n"
-                    "- Call wait_agent very sparingly. Only call wait_agent when you need the result "
-                    "immediately for the next critical-path step and you are blocked until it returns.\n"
-                    "- Do not redo delegated subagent tasks yourself; focus on integrating results.\n"
-                    "- While the subagent is running in the background, do meaningful non-overlapping "
-                    "work immediately.\n\n"
-                    "### Parallel delegation patterns\n"
-                    "- Run multiple independent information-seeking subtasks in parallel when you have "
-                    "distinct questions that can be answered independently.\n"
-                    "- Split implementation into disjoint codebase slices and spawn multiple agents for "
-                    "them in parallel when the write scopes do not overlap."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "message": {"type": "string", "description": "Initial plain-text task for the new agent. Use either message or items."},
-                        "items": COLLAB_INPUT_ITEMS_SCHEMA,
-                        "agent_type": {"type": "string", "description": "Agent role for the new agent."},
-                        "fork_context": {"type": "boolean", "description": "True forks the current thread history into the new agent; false or omitted starts with only the initial prompt."},
-                        "model": {"type": "string", "description": "Model override for the new agent. Omit unless an explicit override is needed."},
-                        "reasoning_effort": {"type": "string", "description": "Reasoning effort override for the new agent. Omit to inherit the parent effort."},
-                        "service_tier": {"type": "string", "description": "Service tier override for the new agent. Omit unless explicitly requested."},
-                    },
-                },
-            },
-            {
-                "name": "send_input",
-                "description": "Send a message to an existing agent. Use interrupt=true to redirect work immediately. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target": {"type": "string", "description": "Agent id to message (from spawn_agent)."},
-                        "message": {"type": "string", "description": "Legacy plain-text message to send to the agent. Use either message or items."},
-                        "items": COLLAB_INPUT_ITEMS_SCHEMA,
-                        "interrupt": {"type": "boolean", "description": "True interrupts the current task and handles this message immediately; false or omitted queues it."},
-                    },
-                    "required": ["target"],
-                },
-            },
-            {
-                "name": "resume_agent",
-                "description": "Resume a previously closed agent by id so it can receive send_input and wait_agent calls.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Agent id to resume."},
-                    },
-                    "required": ["id"],
-                },
-            },
-            {
-                "name": "wait_agent",
-                "description": "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches a final status, a notification message will be received containing the same completed status.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "targets": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first.",
-                        },
-                        "timeout_ms": {"type": "number", "description": "Timeout in milliseconds. Defaults to 600000, min 10000, max 3600000. Prefer longer waits (minutes) to avoid busy polling."},
-                    },
-                    "required": ["targets"],
-                },
-            },
-            {
-                "name": "close_agent",
-                "description": "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Completed agents remain open and count toward the concurrency limit until closed. Don't keep agents open for too long if they are not needed anymore.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target": {"type": "string", "description": "Agent id to close (from spawn_agent)."},
-                    },
-                    "required": ["target"],
-                },
-            },
-        ],
-    },
-}
 
 
 def parse_toml_mcp_servers(path):
@@ -315,11 +208,6 @@ def main():
         result[name] = {"namespace": namespace, "tools": tool_defs}
         print(f"  {name}: {len(tool_defs)} tools OK", file=sys.stderr)
 
-    # Inject built-in Codex deferred tools (not from MCP servers)
-    for key, entry in MULTI_AGENT_V1_TOOLS.items():
-        if key not in result:
-            result[key] = entry
-            print(f"  {key}: {len(entry['tools'])} tools injected (built-in deferred)", file=sys.stderr)
 
     if not result:
         print("No tools discovered from any server", file=sys.stderr)

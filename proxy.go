@@ -60,6 +60,12 @@ func isQuotaError(body []byte) bool {
 	var errResp OpenAIErrorResponse
 	_ = json.Unmarshal(body, &errResp)
 
+	if errResp.Error.Type != "" {
+		typ := strings.ToLower(errResp.Error.Type)
+		if typ == "gousagelimiterror" {
+			return true
+		}
+	}
 	if errResp.Error.Code != "" {
 		code := strings.ToLower(errResp.Error.Code)
 		if code == "insufficient_quota" {
@@ -105,9 +111,9 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 
 	if resp.StatusCode == 429 {
 		if isQuotaError(bodyBytes) {
-			acc.SetCooldown(30 * time.Minute)
+			acc.MarkExhausted()
 			acc.ResetFailures()
-			log.Printf("proxy: %s 429+quota exhaustion, cooling down 30m. body: %s",
+			log.Printf("proxy: %s 429+quota exhaustion, marking exhausted. body: %s",
 				acc.Name(), string(bodyBytes))
 			return
 		}
@@ -126,9 +132,9 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 	}
 
 	if isQuotaError(bodyBytes) {
-		acc.SetCooldown(30 * time.Minute)
+		acc.MarkExhausted()
 		acc.ResetFailures()
-		log.Printf("proxy: %s insufficient_quota (status=%d), cooling down 30m. body: %s",
+		log.Printf("proxy: %s insufficient_quota (status=%d), marking exhausted. body: %s",
 			acc.Name(), resp.StatusCode, string(bodyBytes))
 		return
 	}
