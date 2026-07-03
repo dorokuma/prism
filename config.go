@@ -22,6 +22,7 @@ type Config struct {
 	ModelRemap    map[string]string `yaml:"model_remap"`
 	DefaultModel  string            `yaml:"default_model"`
 	Debug         bool              `yaml:"debug"`
+	MCPToolsJSON  string            `yaml:"mcp_tools_json"`
 }
 
 func LoadConfig(path string) (*Config, error) {

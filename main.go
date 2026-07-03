@@ -18,6 +18,7 @@ func main() {
 	}
 
 	debugMode = cfg.Debug
+	loadMCPTools(cfg.MCPToolsJSON)
 	pool := NewPool(cfg.Accounts)
 	wire, _ := ParseWireAPIMode(cfg.WireAPI)
 	log.Printf("loaded %d accounts, wire_api=%s, listening on %s, debug=%v", len(cfg.Accounts), wire, cfg.Listen, debugMode)

@@ -115,7 +115,10 @@ func responseItemToMessage(item json.RawMessage) (map[string]any, error) {
 		return map[string]any{"role": "tool", "tool_call_id": callID, "content": out}, nil
 	case "function_call":
 		name, _ := rawStringField(obj, "name")
-		name = PrefixNamespaceTool(name)
+		ns, _ := rawStringField(obj, "namespace")
+		if ns != "" {
+			name = ns + "__" + name
+		}
 		args, _ := rawStringField(obj, "arguments")
 		if args == "" { args = "{}" }
 		callID, _ := rawStringField(obj, "call_id")
