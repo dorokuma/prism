@@ -103,6 +103,13 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 	limitReader := io.LimitReader(resp.Body, 4096)
 	bodyBytes, _ := io.ReadAll(limitReader)
 
+	if resp.StatusCode == 401 || resp.StatusCode == 402 {
+		acc.MarkExhausted()
+		log.Printf("proxy: %s status %d, marking exhausted. body: %s",
+			acc.Name(), resp.StatusCode, redactBody(bodyBytes))
+		return
+	}
+
 	if isPermanentCredentialError(bodyBytes) {
 		acc.MarkExhausted()
 		log.Printf("proxy: %s permanent credential error (status=%d), marking exhausted. body: %s",
@@ -227,7 +234,8 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 		http.Error(w, "failed to read body", 500)
 		return
 	}
-	chatBody, stream, reqTools, err := responsesToChatCompletions(bodyBytes)
+	tenantID := getTenantID(r)
+	chatBody, stream, reqTools, err := responsesToChatCompletions(bodyBytes, tenantID)
 	dumpDebugResponsesBody(bodyBytes)
 	dumpDebugChatBody(chatBody)
 	if err != nil {
@@ -246,6 +254,7 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 		stream:       stream,
 		model:        virtualModel,
 		reqTools:     reqTools,
+		tenantID:     tenantID,
 	}, cfg)
 }
 
@@ -254,6 +263,7 @@ type chatForwardOpts struct {
 	stream       bool
 	model        string
 	reqTools     json.RawMessage
+	tenantID     string
 }
 
 func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) {
@@ -267,7 +277,10 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) 
 		http.Error(w, "failed to read body", 500)
 		return
 	}
-	proxyChatWithBody(pool, w, r, bodyBytes, start, chatForwardOpts{}, cfg)
+	tenantID := getTenantID(r)
+	proxyChatWithBody(pool, w, r, bodyBytes, start, chatForwardOpts{
+		tenantID: tenantID,
+	}, cfg)
 }
 
 func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyBytes []byte, start time.Time, opts chatForwardOpts, cfg *Config) {
@@ -324,7 +337,14 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 					log.Printf("proxy: req=%s client disconnected, aborting retry", requestID)
 					return true, fmt.Errorf("client disconnected: %w", r.Context().Err())
 				}
-				log.Printf("proxy: chat retry via %s (upstream error): %v", acc.Name(), err)
+				failures := acc.IncrementFailures()
+				if failures >= 5 {
+					acc.MarkExhausted()
+					log.Printf("proxy: chat retry via %s (upstream connection error, failures=%d), marking exhausted: %v", acc.Name(), failures, err)
+				} else {
+					acc.SetCooldown(30 * time.Second)
+					log.Printf("proxy: chat retry via %s (upstream connection error, failures=%d), cooling down 30s: %v", acc.Name(), failures, err)
+				}
 				return false, nil
 			}
 			defer resp.Body.Close()
@@ -362,14 +382,14 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				w.Header().Set("Cache-Control", "no-cache")
 				w.Header().Set("Connection", "keep-alive")
 				w.WriteHeader(http.StatusOK)
-			translateStart := time.Now()
-			log.Printf("proxy: req=%s account=%s mode=responses_stream translate.start=%s", requestID, acc.Name(), translateStart.Format(time.RFC3339Nano))
-			err = translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools, getSearchToolCache())
-			translateElapsed := time.Since(translateStart).Milliseconds()
-			if err != nil {
-				log.Printf("proxy: req=%s account=%s mode=responses_stream translate.error=%v translate_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, time.Since(start))
-				return true, err
-			}
+				translateStart := time.Now()
+				log.Printf("proxy: req=%s account=%s mode=responses_stream translate.start=%s", requestID, acc.Name(), translateStart.Format(time.RFC3339Nano))
+				err = translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools, getSearchToolCache(opts.tenantID))
+				translateElapsed := time.Since(translateStart).Milliseconds()
+				if err != nil {
+					log.Printf("proxy: req=%s account=%s mode=responses_stream translate.error=%v translate_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, time.Since(start))
+					return true, err
+				}
 			log.Printf("proxy: req=%s account=%s mode=responses_stream translate.done translate_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, time.Since(start))
 				return true, nil
 			}
@@ -488,4 +508,16 @@ func remapModelInBody(body []byte, cfg *Config) []byte {
 	}
 	log.Printf("proxy: model remap %s -> %s", model, remapped)
 	return out
+}
+
+func getTenantID(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if auth != "" {
+		parts := strings.Split(auth, " ")
+		if len(parts) > 1 {
+			return parts[1]
+		}
+		return auth
+	}
+	return r.RemoteAddr
 }

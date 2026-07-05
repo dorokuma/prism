@@ -5,6 +5,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 )
 
 // splitNamespaceTool splits "mcp__codegraph__search" into ("mcp__codegraph", "search").
@@ -19,15 +20,52 @@ func splitNamespaceTool(prefixed string) (namespace, tool string) {
 // mcpCache stores MCP tool definitions discovered from Codex namespace bundles.
 // Populated automatically each time a namespace bundle passes through flattenToolEntry.
 // No disk file needed — rebuilt from requests after restart.
+type tenantCache struct {
+	tools      []map[string]any
+	lastAccess time.Time
+}
+
 var (
-	mcpCache   []map[string]any
+	mcpCache   = make(map[string]*tenantCache)
 	mcpCacheMu sync.Mutex
 )
 
-func cacheMCPTool(tool map[string]any) {
+func init() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		for range ticker.C {
+			mcpCacheMu.Lock()
+			now := time.Now()
+			for tenantID, tc := range mcpCache {
+				if now.Sub(tc.lastAccess) > 1*time.Hour {
+					delete(mcpCache, tenantID)
+					log.Printf("tools_sanitize: cleared expired cache for tenant %q", tenantID)
+				}
+			}
+			mcpCacheMu.Unlock()
+		}
+	}()
+}
+
+func cacheMCPTool(tenantID string, tool map[string]any) {
+	if tenantID == "" {
+		tenantID = "default"
+	}
 	mcpCacheMu.Lock()
 	defer mcpCacheMu.Unlock()
-	for _, existing := range mcpCache {
+
+	tc, ok := mcpCache[tenantID]
+	if !ok {
+		tc = &tenantCache{}
+		mcpCache[tenantID] = tc
+	}
+	tc.lastAccess = time.Now()
+
+	if len(tc.tools) >= 100 {
+		return // limit to 100 tools per tenant to prevent memory exhaustion
+	}
+
+	for _, existing := range tc.tools {
 		if fn, ok := existing["function"].(map[string]any); ok {
 			if nf, ok := tool["function"].(map[string]any); ok {
 				if fn["name"] == nf["name"] {
@@ -36,13 +74,30 @@ func cacheMCPTool(tool map[string]any) {
 			}
 		}
 	}
-	mcpCache = append(mcpCache, tool)
+	tc.tools = append(tc.tools, tool)
 }
 
 func clearMCPCache() {
 	mcpCacheMu.Lock()
 	defer mcpCacheMu.Unlock()
-	mcpCache = nil
+	mcpCache = make(map[string]*tenantCache)
+}
+
+func getTenantMCPTools(tenantID string) []map[string]any {
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	mcpCacheMu.Lock()
+	defer mcpCacheMu.Unlock()
+
+	tc, ok := mcpCache[tenantID]
+	if !ok {
+		return nil
+	}
+	tc.lastAccess = time.Now()
+	out := make([]map[string]any, len(tc.tools))
+	copy(out, tc.tools)
+	return out
 }
 // NamespaceForTool returns the namespace for a prefixed tool name via string parsing.
 func NamespaceForTool(prefixedName string) string {
@@ -57,14 +112,14 @@ func ResolveNamespaceTool(name string) string {
 }
 
 // sanitizeToolsForChatCompletions converts Responses API tools to Chat Completions format.
-func sanitizeToolsForChatCompletions(raw json.RawMessage) any {
+func sanitizeToolsForChatCompletions(raw json.RawMessage, tenantID string) any {
 	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return jsonRawToAny(raw)
 	}
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
-		out = append(out, flattenToolEntry(item)...)
+		out = append(out, flattenToolEntry(item, tenantID)...)
 	}
 	if len(out) == 0 {
 		return nil
@@ -72,7 +127,7 @@ func sanitizeToolsForChatCompletions(raw json.RawMessage) any {
 	return out
 }
 
-func flattenToolEntry(item json.RawMessage) []map[string]any {
+func flattenToolEntry(item json.RawMessage, tenantID string) []map[string]any {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(item, &m); err != nil {
 		return nil
@@ -140,7 +195,7 @@ func flattenToolEntry(item json.RawMessage) []map[string]any {
 						fnObj["name"] = prefixed
 					}
 				}
-				cacheMCPTool(t)
+				cacheMCPTool(tenantID, t)
 				out = append(out, t)
 			}
 		}
@@ -162,9 +217,7 @@ func flattenToolEntry(item json.RawMessage) []map[string]any {
 			"type":     "function",
 			"function": fnObj,
 		}}
-		mcpCacheMu.Lock()
-		result = append(result, mcpCache...)
-		mcpCacheMu.Unlock()
+		result = append(result, getTenantMCPTools(tenantID)...)
 		return result
 	}
 	if t := asFunctionTool(m); t != nil {
@@ -215,10 +268,6 @@ func asFunctionTool(m map[string]json.RawMessage) map[string]any {
 }
 
 // getSearchToolCache returns a snapshot of cached MCP tools for tool_search interception.
-func getSearchToolCache() []map[string]any {
-	mcpCacheMu.Lock()
-	defer mcpCacheMu.Unlock()
-	out := make([]map[string]any, len(mcpCache))
-	copy(out, mcpCache)
-	return out
+func getSearchToolCache(tenantID string) []map[string]any {
+	return getTenantMCPTools(tenantID)
 }

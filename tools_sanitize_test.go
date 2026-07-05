@@ -8,7 +8,7 @@ func TestSanitizeToolsFlattensNamespaceAndConvertsWebSearch(t *testing.T) {
 	  {"type":"web_search"},
 	  {"name":"multi_agent_v1","tools":[{"name":"close_agent","parameters":{"type":"object"}}]}
 	]`)
-	got := sanitizeToolsForChatCompletions(raw).([]map[string]any)
+	got := sanitizeToolsForChatCompletions(raw, "test-tenant").([]map[string]any)
 	// web_search is now converted to a function tool (not dropped)
 	if len(got) != 3 {
 		t.Fatalf("len=%d want 3", len(got))

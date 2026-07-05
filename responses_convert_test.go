@@ -13,7 +13,7 @@ func TestResponsesToChatCompletions(t *testing.T) {
 		"reasoning": {"effort": "high"},
 		"tools": [{"type":"function","name":"shell","parameters":{"type":"object"}}]
 	}`)
-	chat, stream, _, err := responsesToChatCompletions(body)
+	chat, stream, _, err := responsesToChatCompletions(body, "test-tenant")
 	if err != nil {
 		t.Fatal(err)
 	}

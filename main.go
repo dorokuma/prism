@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -28,29 +30,45 @@ func main() {
 
 	// 启动时验证所有账号的连通性
 	log.Println("starting initial health check for all accounts...")
+	probeBody, _ := json.Marshal(map[string]any{
+		"model":      cfg.ProbeModel,
+		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+		"max_tokens": 1,
+	})
 	for _, acc := range pool.AllAccounts() {
 		go func(a *Account) {
-			url := a.BaseURL() + "/models"
-			req, err := http.NewRequest("GET", url, nil)
+			url := a.BaseURL() + "/chat/completions"
+			req, err := http.NewRequest("POST", url, bytes.NewReader(probeBody))
 			if err != nil {
 				log.Printf("startup check %s: failed to create request: %v", a.Name(), err)
 				return
 			}
+			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Authorization", "Bearer "+a.Key())
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			req = req.WithContext(ctx)
 			resp, err := a.Client().Do(req)
 			if err != nil {
-				log.Printf("startup check %s: request failed: %v", a.Name(), err)
+				log.Printf("startup check %s: request failed: %v, cooling down", a.Name(), err)
+				a.SetCooldown(5 * time.Minute)
 				return
 			}
-			io.Copy(io.Discard, resp.Body)
+			limitReader := io.LimitReader(resp.Body, 4096)
+			bodyBytes, _ := io.ReadAll(limitReader)
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
 				log.Printf("startup check %s: OK (200)", a.Name())
+				a.ResetFailures()
+			} else if resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 403 || isPermanentCredentialError(bodyBytes) || isQuotaError(bodyBytes) {
+				log.Printf("startup check %s: permanent error status=%d, marking exhausted. body: %s", a.Name(), resp.StatusCode, string(bodyBytes))
+				a.MarkExhausted()
+			} else if resp.StatusCode == 429 {
+				log.Printf("startup check %s: temporary quota error status=429, cooling down. body: %s", a.Name(), string(bodyBytes))
+				a.SetCooldown(2 * time.Minute)
 			} else {
-				log.Printf("startup check %s: WARNING status=%d", a.Name(), resp.StatusCode)
+				log.Printf("startup check %s: temporary error status=%d, cooling down. body: %s", a.Name(), resp.StatusCode, string(bodyBytes))
+				a.SetCooldown(5 * time.Minute)
 			}
 		}(acc)
 	}

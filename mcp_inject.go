@@ -43,7 +43,7 @@ func loadMCPTools(path string) {
 			} else {
 				fnObj["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
 			}
-			cacheMCPTool(map[string]any{
+			cacheMCPTool("default", map[string]any{
 				"type":     "function",
 				"function": fnObj,
 			})

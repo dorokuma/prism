@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-func responsesToChatCompletions(body []byte) (chatBody []byte, stream bool, reqTools json.RawMessage, err error) {
+func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, stream bool, reqTools json.RawMessage, err error) {
 	var raw map[string]json.RawMessage
 	if err = json.Unmarshal(body, &raw); err != nil {
 		return nil, false, nil, fmt.Errorf("responses body: %w", err)
@@ -30,7 +30,7 @@ func responsesToChatCompletions(body []byte) (chatBody []byte, stream bool, reqT
 	messages = normalizeMessagesForChatAPI(messages)
 	out := map[string]any{"model": model, "messages": messages, "stream": stream}
 	if v, ok := raw["tools"]; ok && len(v) > 0 && string(v) != "null" {
-		if tools := sanitizeToolsForChatCompletions(v); tools != nil {
+		if tools := sanitizeToolsForChatCompletions(v, tenantID); tools != nil {
 			out["tools"] = tools
 			copyOptionalRaw(raw, out, "tool_choice")
 		}

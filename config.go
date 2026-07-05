@@ -46,7 +46,7 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.WireAPI = "both"
 	}
 	if cfg.ProbeModel == "" {
-		cfg.ProbeModel = "gpt-4o-mini"
+		cfg.ProbeModel = "deepseek-chat"
 	}
 	if _, err := ParseWireAPIMode(cfg.WireAPI); err != nil {
 		return nil, err
