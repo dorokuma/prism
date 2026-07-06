@@ -171,35 +171,22 @@ data: [DONE]
 
 	events := parseSSE(t, rec.Body.String())
 
-	// We expect: created → reasoning output_item.added → reasoning_summary_part.added →
-	//           reasoning_summary.delta → reasoning_summary.delta →
-	//           message output_item.added → content_part.added → output_text.delta →
-	//           output_text.done → message output_item.done →
-	//           reasoning_summary.done → reasoning output_item.done → completed
-	if len(events) < 10 {
-		t.Fatalf("expected >= 10 events, got %d", len(events))
+	// reasoning_summary_text.delta (Codex 0.142.5); no reasoning_summary.done
+	if len(events) < 9 {
+		t.Fatalf("expected >= 9 events, got %d", len(events))
 	}
 
-	// Verify reasoning delta events
 	foundReasoningDeltas := 0
 	for _, ev := range events {
-		if ev.Type == "response.reasoning_summary.delta" {
+		if ev.Type == "response.reasoning_summary_text.delta" {
 			foundReasoningDeltas++
+		}
+		if ev.Type == "response.reasoning_summary.delta" || ev.Type == "response.reasoning_summary.done" {
+			t.Fatalf("unexpected legacy reasoning event %q", ev.Type)
 		}
 	}
 	if foundReasoningDeltas != 2 {
-		t.Fatalf("expected 2 reasoning_summary.delta events, got %d", foundReasoningDeltas)
-	}
-
-	// Verify reasoning summary done text
-	for _, ev := range events {
-		if ev.Type == "response.reasoning_summary.done" {
-			text := getStringField(t, ev.Raw, "text")
-			if text != "Step 1: thinkStep 2: more" {
-				t.Fatalf("reasoning done text = %q, want concatenated text", text)
-			}
-			break
-		}
+		t.Fatalf("expected 2 reasoning_summary_text.delta events, got %d", foundReasoningDeltas)
 	}
 
 	// Verify final content
@@ -233,10 +220,10 @@ data: [DONE]
 
 	events := parseSSE(t, rec.Body.String())
 
-	// Expect: created → output_item.added (function_call) →
-	//         function_call_arguments.delta → output_item.done (completed) → completed
-	if len(events) < 5 {
-		t.Fatalf("expected >= 5 events, got %d", len(events))
+	// Expect: created → output_item.added (function_call) → output_item.done → completed
+	// (no function_call_arguments.delta — Codex does not handle it)
+	if len(events) < 4 {
+		t.Fatalf("expected >= 4 events, got %d", len(events))
 	}
 
 	// Find the output_item.added event for function_call
@@ -253,10 +240,7 @@ data: [DONE]
 			}
 		}
 		if ev.Type == "response.function_call_arguments.delta" {
-			delta := getStringField(t, ev.Raw, "delta")
-			if delta != "ls -la" {
-				t.Fatalf("arguments delta = %q, want 'ls -la'", delta)
-			}
+			t.Fatal("unexpected function_call_arguments.delta event")
 		}
 		if ev.Type == "response.output_item.done" {
 			itemType := getStringField(t, ev.Raw, "item", "type")
@@ -329,7 +313,7 @@ data: [DONE]
 
 func TestTranslateStream_ToolSearchInterception_NoCache(t *testing.T) {
 	// When tool_search is called but no cached tools → no synthetic output
-	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"tool_search","arguments":""}}]}}]}}
+	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"tool_search","arguments":""}}]}}]}
 
 data: [DONE]
 `
@@ -371,45 +355,48 @@ data: [DONE]
 	events := parseSSE(t, rec.Body.String())
 
 	// Must have: reasoning events + content events + tool_call events
-	var hasReasoning, hasContent, hasToolCall bool
+	var hasReasoning, hasContent, hasToolCallDone bool
 	for _, ev := range events {
 		switch ev.Type {
-		case "response.reasoning_summary.delta":
+		case "response.reasoning_summary_text.delta":
 			hasReasoning = true
 		case "response.output_text.delta":
 			hasContent = true
+		case "response.output_item.done":
+			if getStringField(t, ev.Raw, "item", "type") == "function_call" {
+				hasToolCallDone = true
+			}
 		case "response.function_call_arguments.delta":
-			hasToolCall = true
+			t.Fatal("unexpected function_call_arguments.delta event")
 		}
 	}
 	if !hasReasoning {
-		t.Fatal("expected reasoning delta events")
+		t.Fatal("expected reasoning_summary_text.delta events")
 	}
 	if !hasContent {
 		t.Fatal("expected content delta events")
 	}
-	if !hasToolCall {
-		t.Fatal("expected tool call delta events")
+	if !hasToolCallDone {
+		t.Fatal("expected function_call output_item.done")
 	}
 }
 
 func TestTranslateStream_EmptyInput(t *testing.T) {
 	rec := httptest.NewRecorder()
 	err := translateChatStreamToResponses(rec, strings.NewReader(""), "gpt-5.5", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err != ErrEmptyUpstreamStream {
+		t.Fatalf("expected ErrEmptyUpstreamStream, got %v", err)
 	}
 
 	events := parseSSE(t, rec.Body.String())
-	// Even empty input should produce created + completed
 	if len(events) != 2 {
-		t.Fatalf("expected 2 events (created + completed), got %d", len(events))
+		t.Fatalf("expected 2 events (created + failed), got %d", len(events))
 	}
 	if events[0].Type != "response.created" {
 		t.Fatalf("event[0].type = %q, want response.created", events[0].Type)
 	}
-	if events[1].Type != "response.completed" {
-		t.Fatalf("event[1].type = %q, want response.completed", events[1].Type)
+	if events[1].Type != "response.failed" {
+		t.Fatalf("event[1].type = %q, want response.failed", events[1].Type)
 	}
 }
 
@@ -508,7 +495,7 @@ data: [DONE]
 }
 
 func TestTranslateStream_NamespacePrefixedToolName(t *testing.T) {
-	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"nc_1","type":"function","function":{"name":"mcp__codegraph__search","arguments":""}}]}}]}}
+	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"nc_1","type":"function","function":{"name":"mcp__codegraph__search","arguments":""}}]}}]}
 
 data: [DONE]
 `

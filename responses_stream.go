@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
 )
+
+// ErrEmptyUpstreamStream is returned when the chat completion stream has no model output.
+var ErrEmptyUpstreamStream = errors.New("empty upstream chat completion stream")
 
 type streamToolState struct {
 	itemID      string
@@ -182,9 +186,9 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			continue
 		}
 		d := chunk.Choices[0].Delta
-		// Upstream Chat may stream reasoning_content (e.g. DeepSeek). Codex without
-		// model reasoning metadata rejects reasoning SSE — only forward assistant text.
-			if d.ReasoningContent != "" {
+		// Upstream may stream reasoning_content (e.g. DeepSeek). Codex 0.142.5 expects
+		// response.reasoning_summary_text.delta (not reasoning_summary.delta).
+		if d.ReasoningContent != "" {
 				if debugMode {
 					log.Printf("stream: reasoning chunk: %q", d.ReasoningContent)
 				}
@@ -193,7 +197,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 					return err
 				}
 				if err := tr.emit(dst, map[string]any{
-					"type":          "response.reasoning_summary.delta",
+					"type":          "response.reasoning_summary_text.delta",
 					"item_id":       tr.reasoningItemID,
 					"output_index":  tr.reasoningOutputIdx,
 					"summary_index": 0,
@@ -272,12 +276,8 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			}
 			if tc.Function.Arguments != "" {
 				st.args += tc.Function.Arguments
-				if err := tr.emit(dst, map[string]any{
-					"type": "response.function_call_arguments.delta",
-					"item_id": st.itemID, "output_index": st.outputIndex, "delta": tc.Function.Arguments,
-				}); err != nil {
-					return err
-				}
+				// Codex 0.142.5 does not handle function_call_arguments.delta; arguments
+				// are delivered in response.output_item.done for the function_call item.
 			}
 		}
 	}
@@ -290,6 +290,34 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 
 	if err := tr.ensureCreated(dst); err != nil {
 		return err
+	}
+
+	hasSubstantive := tr.reasoningBuf.Len() > 0 || tr.hadMessageContent
+	if !hasSubstantive {
+		for _, st := range tr.tools {
+			if st.added {
+				hasSubstantive = true
+				break
+			}
+		}
+	}
+	if !hasSubstantive {
+		if debugMode {
+			log.Printf("stream: empty upstream, emitting response.failed")
+		}
+		if err := tr.emit(dst, map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"id": tr.respID, "object": "response", "status": "failed", "model": tr.model,
+				"error": map[string]any{
+					"code":    "empty_upstream_stream",
+					"message": "upstream chat completion stream contained no model output",
+				},
+			},
+		}); err != nil {
+			return err
+		}
+		return ErrEmptyUpstreamStream
 	}
 
 	if debugMode {
@@ -352,19 +380,8 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 	}
 
-	// Complete reasoning output item if it was started
+	// Complete reasoning output item if it was started (no reasoning_summary.done — Codex ignores it)
 	if tr.reasoningAdded {
-		if tr.reasoningPartAdded {
-			if err := tr.emit(dst, map[string]any{
-				"type":          "response.reasoning_summary.done",
-				"item_id":       tr.reasoningItemID,
-				"output_index":  tr.reasoningOutputIdx,
-				"summary_index": 0,
-				"text":          tr.reasoningBuf.String(),
-			}); err != nil {
-				return err
-			}
-		}
 		if err := tr.emit(dst, map[string]any{
 			"type": "response.output_item.done", "output_index": tr.reasoningOutputIdx,
 			"item": map[string]any{
