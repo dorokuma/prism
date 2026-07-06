@@ -390,7 +390,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 					log.Printf("proxy: req=%s account=%s mode=responses_stream translate.error=%v translate_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, time.Since(start))
 					return true, err
 				}
-			log.Printf("proxy: req=%s account=%s mode=responses_stream translate.done translate_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, time.Since(start))
+				log.Printf("proxy: req=%s account=%s mode=responses_stream translate.done translate_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, time.Since(start))
 				return true, nil
 			}
 
@@ -511,13 +511,5 @@ func remapModelInBody(body []byte, cfg *Config) []byte {
 }
 
 func getTenantID(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if auth != "" {
-		parts := strings.Split(auth, " ")
-		if len(parts) > 1 {
-			return parts[1]
-		}
-		return auth
-	}
-	return r.RemoteAddr
+	return "default"
 }

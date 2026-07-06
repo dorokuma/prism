@@ -30,22 +30,6 @@ var (
 	mcpCacheMu sync.Mutex
 )
 
-func init() {
-	go func() {
-		ticker := time.NewTicker(10 * time.Minute)
-		for range ticker.C {
-			mcpCacheMu.Lock()
-			now := time.Now()
-			for tenantID, tc := range mcpCache {
-				if now.Sub(tc.lastAccess) > 1*time.Hour {
-					delete(mcpCache, tenantID)
-					log.Printf("tools_sanitize: cleared expired cache for tenant %q", tenantID)
-				}
-			}
-			mcpCacheMu.Unlock()
-		}
-	}()
-}
 
 func cacheMCPTool(tenantID string, tool map[string]any) {
 	if tenantID == "" {
