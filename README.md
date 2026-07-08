@@ -1,6 +1,6 @@
-# reasonix-lb
+# prism
 
-Lightweight HTTP reverse proxy + load balancer for OpenAI-compatible LLM backends.
+LLM API Load Balancer
 Multi-account round-robin selection, automatic exhaustion marking, quota recovery probing,
 429 cooldown, and Chat↔Responses API format translation.
 
@@ -8,10 +8,10 @@ Multi-account round-robin selection, automatic exhaustion marking, quota recover
 
 ```bash
 git clone <repo>
-cd reasonix-lb
-go build -o reasonix-lb .
+cd prism
+go build -o prism .
 cp config.yaml.example config.yaml
-./reasonix-lb
+./prism
 ```
 
 Listens on `:18790` by default. Use `wire_api` to control protocol surface.
@@ -32,7 +32,7 @@ Listens on `:18790` by default. Use `wire_api` to control protocol surface.
 
 | Value | Path | Typical client |
 |-------|------|----------------|
-| `legacy` | `POST /v1/chat/completions` only | Reasonix, legacy clients |
+| `legacy` | `POST /v1/chat/completions` only | Prism, legacy clients |
 | `responses` | `POST /v1/responses` only | Codex CLI (`wire_api = "responses"`) |
 | `both` | Both paths | Mixed usage on same port |
 
@@ -95,14 +95,14 @@ Background probe (periodic):
 `~/.codex/config.toml`:
 
 ```toml
-[model_providers.reasonix-lb]
-name = "reasonix-lb"
+[model_providers.prism]
+name = "prism"
 base_url = "http://127.0.0.1:18790/v1"
 requires_openai_auth = false
 api_key = "lb-local-placeholder"
 wire_api = "responses"
 
-model_provider = "reasonix-lb"
+model_provider = "prism"
 model = "gpt-5.5"
 ```
 
@@ -114,7 +114,7 @@ then run the script before restarting LB:
 
 ```bash
 python3 scripts/generate_mcp_tools.py mcp_tools.json
-systemctl restart reasonix-lb
+systemctl restart prism
 ```
 
 Or use `scripts/codex-wrapper.sh` to chain generation before each Codex launch.

@@ -25,4 +25,4 @@ accounts:
     key: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     base_url: https://opencode.ai/zen/go/v1
 
-mcp_tools_json: "/root/reasonix-lb/mcp_tools.json"
+mcp_tools_json: "/root/prism/mcp_tools.json"

@@ -2,7 +2,7 @@
   "models": [
     {
       "display_name": "GPT-5.5",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -60,7 +60,7 @@
     },
     {
       "display_name": "GPT-5.5 Pro",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -118,7 +118,7 @@
     },
     {
       "display_name": "GPT-5.6 Luna",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -176,7 +176,7 @@
     },
     {
       "display_name": "GPT-5.6 Sol",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -234,7 +234,7 @@
     },
     {
       "display_name": "GPT-5.6 Terra",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -292,7 +292,7 @@
     },
     {
       "display_name": "GPT-5.4",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -350,7 +350,7 @@
     },
     {
       "display_name": "GPT-5.4 Mini",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -408,7 +408,7 @@
     },
     {
       "display_name": "GPT-5.4 Nano",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -466,7 +466,7 @@
     },
     {
       "display_name": "GPT-5.3 Codex",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -524,7 +524,7 @@
     },
     {
       "display_name": "GPT-5.2",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -582,7 +582,7 @@
     },
     {
       "display_name": "GPT-5.2 Codex",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -640,7 +640,7 @@
     },
     {
       "display_name": "GPT-5.1 Codex Mini",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -698,7 +698,7 @@
     },
     {
       "display_name": "GPT-5.1 Codex Max",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -756,7 +756,7 @@
     },
     {
       "display_name": "Codex Auto Review",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -814,7 +814,7 @@
     },
     {
       "display_name": "GPT-4.1 Mini",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -872,7 +872,7 @@
     },
     {
       "display_name": "GPT-4.1 Nano",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
@@ -930,7 +930,7 @@
     },
     {
       "display_name": "O4 Mini",
-      "description": "GPT model via reasonix-lb",
+      "description": "GPT model via prism",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {

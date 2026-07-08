@@ -1,4 +1,4 @@
-module github.com/dorokuma/reasonix-lb
+module github.com/dorokuma/prism
 
 go 1.24.4
 

@@ -1,4 +1,5 @@
-reasonix-lb
+prism
 config.yaml
 .env
 .audit*.md
+scripts/__pycache__/

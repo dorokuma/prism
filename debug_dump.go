@@ -9,7 +9,7 @@ import (
 var debugMode bool
 
 func initDebugDumpDir() string {
-	dir := filepath.Join(os.TempDir(), "reasonix-lb-debug")
+	dir := filepath.Join(os.TempDir(), "prism-debug")
 	_ = os.MkdirAll(dir, 0o700)
 	return dir
 }

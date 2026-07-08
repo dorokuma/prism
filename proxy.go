@@ -463,7 +463,7 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config
 			"id":       id,
 			"object":   "model",
 			"created":  1700000000,
-			"owned_by": "reasonix-lb",
+			"owned_by": "prism",
 		}
 	}
 	resp := map[string]any{

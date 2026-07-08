@@ -24,7 +24,7 @@ KEY='model_catalog_json'
 # Must live at file root — appending after [tui.*] tables breaks TOML parsing.
 grep -v "^${KEY}" "$CFG" > "${CFG}.tmp" && mv "${CFG}.tmp" "$CFG"
 {
-  echo "# OpenCode Go models (reasonix-lb); see scripts/opencode-go-codex-models.json"
+  echo "# OpenCode Go models (prism); see scripts/opencode-go-codex-models.json"
   echo "${KEY} = \"${DEST}\""
   echo
   cat "$CFG"

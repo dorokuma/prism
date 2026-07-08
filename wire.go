@@ -7,7 +7,7 @@ import (
 
 // WireAPIMode controls which client-facing OpenAI-compatible surfaces are exposed.
 //
-//   - legacy:    POST /v1/chat/completions only (Reasonix, old clients)
+//   - legacy:    POST /v1/chat/completions only (Prism, old clients)
 //   - responses: POST /v1/responses only (Codex wire_api=responses), translated to upstream chat
 //   - both:      expose both paths (default)
 type WireAPIMode string
