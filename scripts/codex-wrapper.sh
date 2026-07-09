@@ -7,7 +7,7 @@ set -euo pipefail
 
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 CONFIG="${CODEX_HOME}/config.toml"
-TOOLS_JSON="${PRISM_TOOLS_JSON:-/root/prism/mcp_tools.json}"
+TOOLS_JSON="${PRISM_TOOLS_JSON:-/var/lib/prism/mcp_tools.json}"
 GENERATOR="${PRISM_GENERATOR:-/root/prism/scripts/generate_mcp_tools.py}"
 CODEX_BIN="${CODEX_BIN:-$(which codex 2>/dev/null || echo /usr/local/bin/codex)}"
 

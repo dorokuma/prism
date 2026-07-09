@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -35,8 +37,20 @@ func main() {
 		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
 		"max_tokens": 1,
 	})
+	sem := make(chan struct{}, 10)
+	var startupWg sync.WaitGroup
 	for _, acc := range pool.AllAccounts() {
+		sem <- struct{}{}
+		startupWg.Add(1)
 		go func(a *Account) {
+			defer startupWg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("panic in startup health check for %s: %v\n%s", a.Name(), r, debug.Stack())
+				}
+			}()
+
 			url := a.BaseURL() + "/chat/completions"
 			req, err := http.NewRequest("POST", url, bytes.NewReader(probeBody))
 			if err != nil {
@@ -72,6 +86,7 @@ func main() {
 			}
 		}(acc)
 	}
+	startupWg.Wait()
 
 	stop := make(chan struct{})
 	StartProbeLoop(pool, cfg.ProbeModel, cfg.ProbeInterval, stop)
@@ -79,15 +94,28 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
+	proxyHandler := NewProxyHandler(pool, wire, cfg)
 	srv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           NewProxyHandler(pool, wire, cfg),
+		Addr: cfg.Listen,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Add a 15-minute total timeout for every request to prevent
+			// indefinite hanging. Streaming paths also get this limit,
+			// which is generous enough for typical long-lived connections.
+			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
+			defer cancel()
+			proxyHandler.ServeHTTP(w, r.WithContext(ctx))
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		// WriteTimeout=0: allow long-lived streaming responses to clients.
 	}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("panic in signal handler: %v\n%s", r, debug.Stack())
+			}
+		}()
 		for sig := range sigCh {
 			if sig == syscall.SIGHUP {
 				log.Printf("received SIGHUP, reloading mcp_tools.json")

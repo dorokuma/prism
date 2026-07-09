@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"gopkg.in/yaml.v3"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -57,9 +58,14 @@ func LoadConfig(path string) (*Config, error) {
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].Key == "" {
 			envVar := "LB_KEY_" + strings.ToUpper(strings.ReplaceAll(cfg.Accounts[i].Name, "-", "_"))
-			cfg.Accounts[i].Key = os.Getenv(envVar)
+			// Try systemd LoadCredential first, then env var
+			key := getCredential(envVar)
+			if key == "" {
+				key = os.Getenv(envVar)
+			}
+			cfg.Accounts[i].Key = key
 			if cfg.Accounts[i].Key == "" {
-				return nil, fmt.Errorf("account %s: key not set in config and env var %s is empty", cfg.Accounts[i].Name, envVar)
+				return nil, fmt.Errorf("account %s: key not set in config and credential/env var %s is empty", cfg.Accounts[i].Name, envVar)
 			}
 		}
 	}
@@ -114,4 +120,19 @@ func (c *Config) VirtualModels() []string {
 		models = append(models, k)
 	}
 	return models
+}
+
+// getCredential reads a credential file from the systemd LoadCredential
+// directory (CREDENTIALS_DIRECTORY). Returns the trimmed contents on success,
+// or "" if CREDENTIALS_DIRECTORY is unset or the file cannot be read.
+func getCredential(name string) string {
+	credDir := os.Getenv("CREDENTIALS_DIRECTORY")
+	if credDir == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(credDir, name))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }

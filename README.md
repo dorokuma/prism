@@ -1,98 +1,97 @@
 # prism
 
-LLM API Load Balancer
-Multi-account round-robin selection, automatic exhaustion marking, quota recovery probing,
-429 cooldown, and Chat↔Responses API format translation.
+LLM API Load Balancer  
+Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
 
-## Quick Start
+## Quick start (local)
 
 ```bash
 git clone <repo>
 cd prism
 go build -o prism .
 cp config.yaml.example config.yaml
+# set keys (pick one):
+#   export LB_KEY_ACCOUNT_1=... LB_KEY_ACCOUNT_2=...
+#   or put key: in config.yaml (local only, never commit)
 ./prism
 ```
 
-Listens on `:18790` by default. Use `wire_api` to control protocol surface.
+Default listen: `:18790` if unset. Prefer `127.0.0.1:18790` in production.
+
+## Production layout (eqi / systemd)
+
+| Piece | Path |
+|-------|------|
+| Binary | `/usr/local/bin/prism` |
+| Runtime config | `/var/lib/prism/config.yaml` |
+| Tool cache (optional) | `/var/lib/prism/mcp_tools.json` |
+| Account secrets | `/etc/credstore/prism/LB_KEY_*` via `LoadCredential` |
+| Unit | `/etc/systemd/system/prism.service` (see `scripts/prism.service.example`) |
+
+Source tree (`/root/prism` or the git clone) is for build only — **no production `config.yaml` / `.env`**.
+
+### Account keys
+
+For each account `name` (e.g. `go-plan-1`), if `key` is empty in YAML the process loads:
+
+1. **systemd LoadCredential** file named `LB_KEY_GO_PLAN_1` under `$CREDENTIALS_DIRECTORY`
+2. else environment **`LB_KEY_GO_PLAN_1`**
+
+Hyphens in the account name become underscores in the credential/env name.
+
+### Deploy / update binary
+
+```bash
+cd /path/to/prism
+go build -o prism .
+install -m 755 prism /usr/local/bin/prism
+# config edits: edit /var/lib/prism/config.yaml then:
+systemctl restart prism   # only when you intend downtime / reload
+# or: systemctl kill -s HUP prism   # if process supports SIGHUP for partial reload
+```
 
 ## Configuration
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen` | string | `:18790` | Listen address |
-| `probe_interval` | duration | `10m` | Exhausted account probe interval |
+| `probe_interval` | duration | `10m` | Exhausted-account probe interval |
 | `wire_api` | string | `both` | `legacy` / `responses` / `both` |
-| `accounts` | array | required | Upstream account list |
-| `model_tiers` | map | — | Tier name → upstream model identifier |
-| `model_remap` | map | — | Virtual model name → tier name |
-| `default_tier` | string | — | Fallback tier for unmapped models |
+| `accounts` | array | required | Upstream accounts |
+| `model_tiers` | map | — | Tier → upstream model |
+| `model_remap` | map | — | Virtual model → tier |
+| `default_tier` | string | — | Fallback tier |
+| `mcp_tools_json` | string | — | Optional path to tool-definitions JSON |
+| `probe_model` | string | `deepseek-chat` | Startup/probe model id |
 
 ### `wire_api`
 
 | Value | Path | Typical client |
 |-------|------|----------------|
-| `legacy` | `POST /v1/chat/completions` only | Prism, legacy clients |
-| `responses` | `POST /v1/responses` only | Codex CLI (`wire_api = "responses"`) |
-| `both` | Both paths | Mixed usage on same port |
-
-### Model tiers
-
-Tiers decouple virtual model names from upstream identifiers.
-Change the upstream model in one place without touching any client config.
-
-```yaml
-model_tiers:
-  frontier: deepseek-v4-pro
-  standard: deepseek-v4-flash
-default_tier: standard
-```
-
-### Model remap
-
-Maps virtual model names (shown to clients) to tiers.
-
-```yaml
-model_remap:
-  gpt-5.5: frontier
-  gpt-5.5-pro: frontier
-  gpt-5.4: standard
-  gpt-5.4-mini: standard
-```
+| `legacy` | `POST /v1/chat/completions` only | Legacy clients |
+| `responses` | `POST /v1/responses` only | Codex CLI |
+| `both` | Both | Mixed |
 
 ### Accounts
 
 | Field | Description |
 |-------|-------------|
-| `name` | Account label for logs |
-| `key` | API key (or read from env `LB_KEY_{NAME}`) |
-| `base_url` | Upstream API base URL |
-
-## Core mechanism
-
-```
-Request → Select (round-robin) → Forward
-  ├─ 402/401/403 → MarkExhausted → retry next account
-  ├─ 429 → SetCooldown → retry next account
-  ├─ 5xx (×5 consecutive) → MarkExhausted
-  └─ 2xx → Return response
-
-Background probe (periodic):
-  └─ GET /models → 200 → MarkHealthy (rejoin pool)
-```
+| `name` | Label; also builds `LB_KEY_*` name |
+| `key` | Optional inline key (avoid in production) |
+| `base_url` | Upstream API base |
 
 ## Endpoints
 
 | Path | Method | Description |
 |------|--------|-------------|
-| `/v1/chat/completions` | POST | Proxy to upstream `/chat/completions` (legacy/both mode) |
-| `/v1/responses` | POST | Responses↔Chat conversion then proxy (responses/both mode) |
-| `/v1/models` | GET | Return virtual model list from `model_remap` keys |
-| `/health` | GET | Health check, returns `ok` (200) |
+| `/v1/chat/completions` | POST | Chat proxy |
+| `/v1/responses` | POST | Responses path |
+| `/v1/models` | GET | Virtual models |
+| `/health` | GET | `ok` |
 
-### Codex config
+### Codex
 
-`~/.codex/config.toml`:
+`~/.codex/config.toml` example:
 
 ```toml
 [model_providers.prism]
@@ -106,18 +105,14 @@ model_provider = "prism"
 model = "gpt-5.5"
 ```
 
-### MCP tools
+### Tool definitions cache
 
-MCP tool definitions are auto-generated from `~/.codex/config.toml` by
-`scripts/generate_mcp_tools.py`. Install new MCP servers normally in Codex,
-then run the script before restarting LB:
+Optional JSON used when injecting tool schemas for some clients. Generate from Codex MCP config:
 
 ```bash
-python3 scripts/generate_mcp_tools.py mcp_tools.json
-systemctl restart prism
+python3 scripts/generate_mcp_tools.py /var/lib/prism/mcp_tools.json
+systemctl kill -s HUP prism   # or restart
 ```
-
-Or use `scripts/codex-wrapper.sh` to chain generation before each Codex launch.
 
 ## License
 

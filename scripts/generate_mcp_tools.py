@@ -148,22 +148,6 @@ MULTI_AGENT_V1_TOOLS = {
 }
 
 
-def parse_toml_mcp_servers(path):
-    servers = {}
-    current = None
-    in_env = False
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("[") and line.endswith("]"):
-                rest = line[1:-1]
-                if rest.startswith("mcp_servers."):
-                    name = rest[len("mcp_servers."):]
-                    if "." not in name:
-                        current = name
-                        in_env = False
 
 
 def parse_toml_mcp_servers(path):

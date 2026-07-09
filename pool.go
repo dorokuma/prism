@@ -190,14 +190,6 @@ func (p *Pool) removeWaiterAndTransfer(elem *list.Element) {
 	if w.active {
 		p.waiters.Remove(elem)
 		w.active = false
-	} else {
-		if p.waiters.Len() > 0 {
-			nextElem := p.waiters.Front()
-			p.waiters.Remove(nextElem)
-			nextW := nextElem.Value.(*waiter)
-			nextW.active = false
-			close(nextW.ch)
-		}
 	}
 }
 

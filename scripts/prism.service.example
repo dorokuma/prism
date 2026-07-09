@@ -1,0 +1,42 @@
+[Unit]
+Description=Prism — LLM API Load Balancer
+After=network.target
+
+[Service]
+Type=simple
+User=prism
+Group=prism
+WorkingDirectory=/var/lib/prism
+ExecStart=/usr/local/bin/prism
+Restart=always
+RestartSec=3
+TimeoutStopSec=35
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+
+# File names must match LB_KEY_<ACCOUNT> (hyphens → underscores).
+# Store secret files under /etc/credstore/prism/ (root-only).
+LoadCredential=LB_KEY_ACCOUNT_1:/etc/credstore/prism/LB_KEY_ACCOUNT_1
+LoadCredential=LB_KEY_ACCOUNT_2:/etc/credstore/prism/LB_KEY_ACCOUNT_2
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=1G
+TasksMax=256
+ReadOnlyPaths=/var/lib/prism
+# Do NOT set PRISM_AUTH_KEY here (breaks some local clients).
+
+[Install]
+WantedBy=multi-user.target

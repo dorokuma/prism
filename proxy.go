@@ -102,6 +102,10 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 	}
 	limitReader := io.LimitReader(resp.Body, 4096)
 	bodyBytes, _ := io.ReadAll(limitReader)
+	defer func() {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 
 	if resp.StatusCode == 401 || resp.StatusCode == 402 {
 		acc.MarkExhausted()

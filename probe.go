@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -17,6 +18,11 @@ func StartProbeLoop(pool *Pool, probeModel string, interval time.Duration, stop 
 	}
 	log.Printf("probe loop started (interval=%v, model=%s)", interval, probeModel)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("panic in probe loop: %v\n%s", r, debug.Stack())
+			}
+		}()
 		probeExhausted(pool, probeModel)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -52,6 +58,11 @@ func probeExhausted(pool *Pool, probeModel string) {
 		wg.Add(1)
 		go func(acc *Account) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("panic in probe for %s: %v\n%s", acc.Name(), r, debug.Stack())
+				}
+			}()
 
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
 				url := acc.BaseURL() + "/chat/completions"
@@ -64,9 +75,9 @@ func probeExhausted(pool *Pool, probeModel string) {
 				req.Header.Set("Content-Type", "application/json")
 
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
 				req = req.WithContext(ctx)
 				resp, err := acc.Client().Do(req)
-				cancel()
 
 				if err != nil {
 					log.Printf("probe %s: request failed (attempt %d/%d): %v", acc.Name(), attempt, maxAttempts, err)

@@ -1,15 +1,31 @@
-listen: ":18790"
+# Prism config template.
+#
+# Production (systemd on this host):
+#   WorkingDirectory = /var/lib/prism
+#   Install:  cp config.yaml.example /var/lib/prism/config.yaml
+#             edit /var/lib/prism/config.yaml
+#   Binary:   install -m 755 ./prism /usr/local/bin/prism
+#   Keys:     systemd LoadCredential (see scripts/prism.service.example)
+#             OR env LB_KEY_<NAME>  (hyphens in account name → underscores)
+#   Do NOT commit real keys. Source tree must not hold production config.yaml.
+#
+# Local dev:
+#   cp config.yaml.example config.yaml
+#   export LB_KEY_ACCOUNT_1=...
+#   ./prism
+
+debug: false
+listen: "127.0.0.1:18790"
 probe_interval: 10m
-# wire_api: legacy | responses | both (default both)
+probe_model: "deepseek-chat"
+# wire_api: legacy | responses | both
 wire_api: both
 
-# Tier → upstream model. Decouples virtual model names from upstream identifiers.
 model_tiers:
   frontier: deepseek-v4-pro
   standard: deepseek-v4-flash
 default_tier: standard
 
-# Virtual model → tier. Every model exposed via /v1/models must have an entry here.
 model_remap:
   gpt-5.5: frontier
   gpt-5.5-pro: frontier
@@ -18,11 +34,13 @@ model_remap:
   gpt-5.3-codex: standard
 
 accounts:
+  # name "account-1" → credential/env LB_KEY_ACCOUNT_1
   - name: account-1
-    key: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    # key: "sk-..."   # optional; omit in production and use LoadCredential/env
     base_url: https://opencode.ai/zen/go/v1
   - name: account-2
-    key: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     base_url: https://opencode.ai/zen/go/v1
 
-mcp_tools_json: "/root/prism/mcp_tools.json"
+# Optional: tool definitions cache for request injection (Codex-related).
+# Production path matches service data dir:
+mcp_tools_json: "/var/lib/prism/mcp_tools.json"
