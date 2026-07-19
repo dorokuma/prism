@@ -177,9 +177,27 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			continue
 		}
 		if chunk.Usage != nil {
+			hit := chunk.Usage.PromptCacheHitTokens
+			miss := chunk.Usage.PromptCacheMissTokens
+			if hit == 0 && chunk.Usage.PromptTokensDetails != nil {
+				hit = chunk.Usage.PromptTokensDetails.CachedTokens
+			}
+			if miss == 0 && hit > 0 && chunk.Usage.PromptTokens > hit {
+				miss = chunk.Usage.PromptTokens - hit
+			}
 			usage = map[string]any{
-				"input_tokens": chunk.Usage.PromptTokens, "output_tokens": chunk.Usage.CompletionTokens,
-				"total_tokens": chunk.Usage.TotalTokens,
+				"input_tokens":              chunk.Usage.PromptTokens,
+				"output_tokens":             chunk.Usage.CompletionTokens,
+				"total_tokens":              chunk.Usage.TotalTokens,
+				"prompt_tokens":             chunk.Usage.PromptTokens,
+				"completion_tokens":         chunk.Usage.CompletionTokens,
+				"prompt_cache_hit_tokens":   hit,
+				"prompt_cache_miss_tokens":  miss,
+			}
+			if chunk.Usage.CompletionTokensDetails != nil {
+				usage["completion_tokens_details"] = map[string]any{
+					"reasoning_tokens": chunk.Usage.CompletionTokensDetails.ReasoningTokens,
+				}
 			}
 		}
 		if len(chunk.Choices) == 0 {
@@ -452,8 +470,16 @@ type chatStreamChunk struct {
 		} `json:"delta"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
+		PromptTokens            int `json:"prompt_tokens"`
+		CompletionTokens        int `json:"completion_tokens"`
+		TotalTokens             int `json:"total_tokens"`
+		PromptCacheHitTokens    int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens   int `json:"prompt_cache_miss_tokens"`
+		PromptTokensDetails     *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		CompletionTokensDetails *struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 }

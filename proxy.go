@@ -151,16 +151,9 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 		return
 	}
 
-	failures := acc.IncrementFailures()
-	if failures >= 5 {
-		acc.MarkExhausted()
-		log.Printf("proxy: %s consecutive failures >= 5 (status=%d), marking exhausted. body: %s",
-			acc.Name(), resp.StatusCode, redactBody(bodyBytes))
-	} else {
-		acc.SetCooldown(30 * time.Second)
-		log.Printf("proxy: %s temporary error (status=%d), cooling down 30s (failures=%d). body: %s",
-			acc.Name(), resp.StatusCode, failures, redactBody(bodyBytes))
-	}
+	acc.SetCooldown(30 * time.Second)
+	log.Printf("proxy: %s temporary error (status=%d), cooling down 30s. body: %s",
+		acc.Name(), resp.StatusCode, redactBody(bodyBytes))
 }
 
 func upstreamContext(r *http.Request) (context.Context, context.CancelFunc) {
@@ -341,14 +334,8 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 					log.Printf("proxy: req=%s client disconnected, aborting retry", requestID)
 					return true, fmt.Errorf("client disconnected: %w", r.Context().Err())
 				}
-				failures := acc.IncrementFailures()
-				if failures >= 5 {
-					acc.MarkExhausted()
-					log.Printf("proxy: chat retry via %s (upstream connection error, failures=%d), marking exhausted: %v", acc.Name(), failures, err)
-				} else {
-					acc.SetCooldown(30 * time.Second)
-					log.Printf("proxy: chat retry via %s (upstream connection error, failures=%d), cooling down 30s: %v", acc.Name(), failures, err)
-				}
+				acc.SetCooldown(30 * time.Second)
+				log.Printf("proxy: chat retry via %s (upstream connection error), cooling down 30s: %v", acc.Name(), err)
 				return false, nil
 			}
 			defer resp.Body.Close()
@@ -362,14 +349,8 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				acc.ResetFailures()
 			} else {
 				// Non-2xx not in special list (503, 500, 502, etc.)
-				failures := acc.IncrementFailures()
-				if failures >= 5 {
-					acc.MarkExhausted()
-					log.Printf("proxy: %s non-2xx failures >= 5 (status=%d), marking exhausted", acc.Name(), resp.StatusCode)
-				} else {
-					acc.SetCooldown(30 * time.Second)
-					log.Printf("proxy: %s non-2xx error (status=%d), cooling down 30s (failures=%d)", acc.Name(), resp.StatusCode, failures)
-				}
+				acc.SetCooldown(30 * time.Second)
+				log.Printf("proxy: %s non-2xx error (status=%d), cooling down 30s", acc.Name(), resp.StatusCode)
 				// Still forward the error to client this time
 				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 				log.Printf("proxy: chat upstream error via %s, status=%d, body=%s", acc.Name(), resp.StatusCode, redactBody(errBody))

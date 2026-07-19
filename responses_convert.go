@@ -281,9 +281,26 @@ func chatCompletionToResponse(body []byte, model string, reqTools json.RawMessag
 	}
 	usage := map[string]any{}
 	if comp.Usage != nil {
+		hit := comp.Usage.PromptCacheHitTokens
+		miss := comp.Usage.PromptCacheMissTokens
+		if hit == 0 && comp.Usage.PromptTokensDetails != nil {
+			hit = comp.Usage.PromptTokensDetails.CachedTokens
+		}
+		if miss == 0 && hit > 0 && comp.Usage.PromptTokens > hit {
+			miss = comp.Usage.PromptTokens - hit
+		}
 		usage = map[string]any{
 			"input_tokens": comp.Usage.PromptTokens, "output_tokens": comp.Usage.CompletionTokens,
 			"total_tokens": comp.Usage.TotalTokens,
+			"prompt_tokens": comp.Usage.PromptTokens,
+			"completion_tokens": comp.Usage.CompletionTokens,
+			"prompt_cache_hit_tokens": hit,
+			"prompt_cache_miss_tokens": miss,
+		}
+		if comp.Usage.CompletionTokensDetails != nil {
+			usage["completion_tokens_details"] = map[string]any{
+				"reasoning_tokens": comp.Usage.CompletionTokensDetails.ReasoningTokens,
+			}
 		}
 	}
 	resp := map[string]any{
@@ -315,9 +332,17 @@ type chatCompletionResponse struct {
 		} `json:"message"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
+		PromptTokens            int `json:"prompt_tokens"`
+		CompletionTokens        int `json:"completion_tokens"`
+		TotalTokens             int `json:"total_tokens"`
+		PromptCacheHitTokens    int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens   int `json:"prompt_cache_miss_tokens"`
+		PromptTokensDetails     *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		CompletionTokensDetails *struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 }
 
