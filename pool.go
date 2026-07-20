@@ -19,6 +19,8 @@ const (
 )
 
 
+// Account represents an upstream API account with its key, base URL, HTTP client,
+// and health/cooldown state for pool selection.
 type Account struct {
 	cfg           AccountConfig
 	status        AccountStatus
@@ -106,6 +108,8 @@ type waiter struct {
 	active bool
 }
 
+// Pool manages a set of upstream accounts with round-robin selection and
+// a FIFO wait queue for contention when all accounts are busy.
 type Pool struct {
 	accounts []*Account
 	nextIdx  uint64
@@ -189,7 +193,10 @@ func (p *Pool) trySelectLocked() *Account {
 	return nil
 }
 
+// ErrNoHealthyAccounts is returned when no healthy upstream accounts are available in the pool.
 var ErrNoHealthyAccounts = errors.New("no healthy accounts available")
+
+// ErrSelectTimeout is returned when waiting for an available account exceeds the configured timeout.
 var ErrSelectTimeout = errors.New("select account timeout")
 
 func (p *Pool) Select(ctx context.Context) (*Account, error) {

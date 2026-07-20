@@ -24,7 +24,7 @@ func stripCodexUpstreamBloat(system string) string {
 	if utf8.RuneCountInString(s) > systemPromptMaxRunes {
 		// Truncate to systemPromptMaxRunes runes, preserving complete UTF-8 characters
 		runes := []rune(s)
-		return string(runes[:systemPromptMaxRunes]) + "\n\n[... truncated for upstream compatibility]"
+		return string(runes[:systemPromptMaxRunes]) + truncationSuffix
 	}
 	return s
 }

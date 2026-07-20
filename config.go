@@ -12,12 +12,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// AccountConfig holds configuration for a single upstream API account.
 type AccountConfig struct {
 	Name    string `yaml:"name"`
 	Key     string `yaml:"key,omitempty"`
 	BaseURL string `yaml:"base_url"`
 }
 
+// Config holds the top-level application configuration loaded from a YAML file.
 type Config struct {
 	Listen        string              `yaml:"listen"`
 	ProbeInterval time.Duration       `yaml:"probe_interval"`

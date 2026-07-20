@@ -54,6 +54,7 @@ func isHopByHop(key string) bool {
 	return hopByHopHeaders[http.CanonicalHeaderKey(key)]
 }
 
+// OpenAIErrorResponse represents an OpenAI API error response body.
 type OpenAIErrorResponse struct {
 	Error struct {
 		Message string      `json:"message"`
@@ -125,6 +126,7 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
 	}
+	defer resp.Body.Close()
 	limitReader := io.LimitReader(resp.Body, 4096)
 	bodyBytes, err := io.ReadAll(limitReader)
 	if err != nil {
@@ -207,6 +209,12 @@ func copyClientHeaders(dst http.Header, src http.Header) {
 	}
 }
 
+// copyUpstreamHeaders copies all non-hop-by-hop headers from the upstream
+// response to the client. This is a transparent proxy by design: all upstream
+// headers (including Server, Via, X-RateLimit-* and other upstream fingerprints)
+// are forwarded as-is. This is intentional for full transparency; if hiding
+// upstream implementation details becomes important in the future, switch to
+// an allowlist approach.
 func copyUpstreamHeaders(dst http.ResponseWriter, src http.Header) {
 	for k, vs := range src {
 		if isHopByHop(k) {
@@ -423,7 +431,8 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				}
 				log.Printf("proxy: %s upstream 4xx status=%d body=%s", acc.Name(), resp.StatusCode, redactBody(errBody))
 				recordError()
-				// Copy upstream headers for transparency, then remove
+				// Transparent proxy: forward all non-hop-by-hop upstream headers
+				// (see copyUpstreamHeaders godoc for design rationale), then remove
 				// headers that become invalid after body redaction.
 				copyUpstreamHeaders(w, resp.Header)
 				w.Header().Del("Content-Length")

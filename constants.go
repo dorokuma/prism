@@ -26,6 +26,7 @@ const (
 
 	// System prompt
 	systemPromptMaxRunes = 12000
+	truncationSuffix     = "\n\n[... truncated for upstream compatibility]"
 
 	// Stream scanner
 	streamScannerInitialBuf = 64 * 1024
