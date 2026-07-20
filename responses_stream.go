@@ -16,6 +16,22 @@ import (
 // ErrEmptyUpstreamStream is returned when the chat completion stream has no model output.
 var ErrEmptyUpstreamStream = errors.New("empty upstream chat completion stream")
 
+type reasoningPhase uint8
+
+const (
+	reasoningIdle      reasoningPhase = iota // 0: not started
+	reasoningItemOpen                         // 1: output_item.added emitted
+	reasoningPartOpen                         // 2: reasoning_summary_part.added emitted
+)
+
+type messagePhase uint8
+
+const (
+	messageIdle      messagePhase = iota // 0: not started
+	messageItemOpen                        // 1: output_item.added emitted
+	messagePartOpen                        // 2: content_part.added emitted
+)
+
 type streamToolState struct {
 	itemID      string
 	callID      string
@@ -42,6 +58,8 @@ type responsesStreamTranslator struct {
 	reasoningPartAdded bool
 	contentPartAdded   bool
 	hadMessageContent  bool
+	reasoningPhase     reasoningPhase
+	messagePhase       messagePhase
 	textBuf            strings.Builder
 	reasoningBuf        strings.Builder
 	// tool_search interception
