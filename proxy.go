@@ -571,14 +571,17 @@ func stripUnsupportedFields(body []byte) []byte {
 	model, _ := rawStringField(raw, "model")
 	modelLower := strings.ToLower(model)
 
-	// GLM/z-ai upstream doesn't support prompt_cache_retention
-	if strings.Contains(modelLower, "glm") || strings.Contains(modelLower, "z-ai") {
-		if _, ok := raw["prompt_cache_retention"]; ok {
-			delete(raw, "prompt_cache_retention")
-			log.Printf("proxy: stripped prompt_cache_retention for model %s", model)
-		}
+	// Only GLM/z-ai upstream is known to reject prompt_cache_retention;
+	// other models pass through unchanged.
+	if !strings.Contains(modelLower, "glm") && !strings.Contains(modelLower, "z-ai") {
+		return body
+	}
+	if _, ok := raw["prompt_cache_retention"]; !ok {
+		return body
 	}
 
+	delete(raw, "prompt_cache_retention")
+	log.Printf("proxy: stripped prompt_cache_retention for model %s", model)
 	out, err := json.Marshal(raw)
 	if err != nil {
 		return body
