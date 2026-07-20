@@ -26,6 +26,12 @@ model_tiers:
   standard: deepseek-v4-flash
 default_tier: standard
 
+# 按 tier 声明上游不支持、需要在转发前剥离的请求字段。
+# 匹配发生在 model remap 之后，按上游真实模型名所属的 tier 命中。
+strip_fields:
+  # glm-standard:  # example: uncomment and adjust tier name as needed
+  #   - prompt_cache_retention
+
 model_remap:
   gpt-5.5: frontier
   gpt-5.5-pro: frontier

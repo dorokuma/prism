@@ -21,8 +21,9 @@ type Config struct {
 	WireAPI       string            `yaml:"wire_api"`
 	Accounts      []AccountConfig   `yaml:"accounts"`
 	ModelRemap    map[string]string `yaml:"model_remap"`
-	ModelTiers    map[string]string `yaml:"model_tiers"`
-	DefaultTier   string            `yaml:"default_tier"`
+	ModelTiers    map[string]string   `yaml:"model_tiers"`
+	DefaultTier   string              `yaml:"default_tier"`
+	StripFields   map[string][]string `yaml:"strip_fields"`
 	Debug         bool              `yaml:"debug"`
 	MCPToolsJSON  string            `yaml:"mcp_tools_json"`
 	ProbeModel    string            `yaml:"probe_model"`

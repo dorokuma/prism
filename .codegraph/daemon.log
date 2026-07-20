@@ -106,3 +106,14 @@
 2026/07/20 13:58:46 indexed 0 files, 0 nodes (schema=15)
 2026/07/20 13:58:46 auto-sync enabled
 2026/07/20 14:04:33 daemon shutting down (idle timeout; clients=0)
+2026/07/20 16:21:23 codegraph-go starting, workdir=/root/prism
+2026/07/20 16:21:23 daemon listening on /root/prism/.codegraph/daemon.sock (pid 2366123, v0.5.4). idle timeout 5m0s
+2026/07/20 16:21:23 indexing project in background...
+2026/07/20 16:21:23 resolved 38 edges (116 failed, 3 retried)
+2026/07/20 16:21:23 indexed 2 files, 33 nodes (schema=15)
+2026/07/20 16:21:23 auto-sync enabled
+2026/07/20 16:22:03 auto-sync: 1 files, 7 nodes
+2026/07/20 16:22:07 auto-sync: 1 files, 19 nodes
+2026/07/20 16:22:21 auto-sync: 1 files, 18 nodes
+2026/07/20 16:22:29 auto-sync: 1 files, 16 nodes
+2026/07/20 16:23:00 auto-sync: 1 files, 11 nodes

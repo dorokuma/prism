@@ -306,10 +306,7 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) 
 }
 
 func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyBytes []byte, start time.Time, opts chatForwardOpts, cfg *Config) {
-	// Remap model name if configured
-	bodyBytes = remapModelInBody(bodyBytes, cfg)
-	bodyBytes = remapThinkingForDeepSeek(bodyBytes)
-	bodyBytes = stripUnsupportedFields(bodyBytes)
+	bodyBytes = transformRequestBody(bodyBytes, cfg)
 	if len(pool.accounts) == 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(503)
@@ -528,8 +525,10 @@ func redactBody(body []byte) string {
 	return result
 }
 
-// remapModelInBody replaces the model field in a JSON chat completions body.
-func remapModelInBody(body []byte, cfg *Config) []byte {
+// transformRequestBody applies model remap, thinking field remap (for DeepSeek),
+// and strips unsupported fields (per config) in a single JSON parse/marshal pass.
+// Returns the original body unchanged if no transformation was needed.
+func transformRequestBody(body []byte, cfg *Config) []byte {
 	if cfg == nil {
 		return body
 	}
@@ -537,51 +536,79 @@ func remapModelInBody(body []byte, cfg *Config) []byte {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return body
 	}
+	changed := false
+
+	// Step 1: Model name remap
 	model, ok := rawStringField(raw, "model")
-	if !ok || model == "" {
-		return body
-	}
-	remapped := cfg.RemapModel(model)
-	if remapped == model {
-		return body
-	}
-	rawBytes, marshalErr := json.Marshal(remapped)
-	if marshalErr != nil {
-		return body
-	}
-	raw["model"] = json.RawMessage(rawBytes)
-	out, err := json.Marshal(raw)
-	if err != nil {
-		return body
-	}
-	log.Printf("proxy: model remap %s -> %s", model, remapped)
-	return out
-}
-
-// stripUnsupportedFields removes fields from the request body that are not
-// supported by certain upstream providers. Currently handles:
-//   - prompt_cache_retention: not supported by GLM/z-ai upstream ("Error from
-//     provider: Extra inputs are not permitted, field: 'prompt_cache_retention'")
-func stripUnsupportedFields(body []byte) []byte {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return body
+	if ok && model != "" {
+		remapped := cfg.RemapModel(model)
+		if remapped != model {
+			rawBytes, _ := json.Marshal(remapped)
+			raw["model"] = json.RawMessage(rawBytes)
+			changed = true
+			log.Printf("proxy: model remap %s -> %s", model, remapped)
+			model = remapped // use remapped name for downstream steps
+		}
 	}
 
-	model, _ := rawStringField(raw, "model")
-	modelLower := strings.ToLower(model)
+	// Step 2: Thinking field remap for DeepSeek models
+	if isDeepSeekModel(model) {
+		if thinkRaw, ok := raw["thinking"]; ok && len(thinkRaw) > 0 && string(thinkRaw) != "null" {
+			var thinking map[string]any
+			if err := json.Unmarshal(thinkRaw, &thinking); err == nil {
+				if level, ok := thinking["level"].(string); ok {
+					mapped := mapThoughtLevel(level)
+					if mapped != level {
+						log.Printf("proxy: thinking level remap model=%s level=%s -> %s", model, level, mapped)
+						thinking["level"] = mapped
+						if b, err := json.Marshal(thinking); err == nil {
+							raw["thinking"] = json.RawMessage(b)
+							changed = true
+						}
+					}
+				}
+			}
+		}
+		if effortRaw, ok := raw["reasoning_effort"]; ok && len(effortRaw) > 0 && string(effortRaw) != "null" {
+			var effort string
+			if err := json.Unmarshal(effortRaw, &effort); err == nil {
+				mapped := mapThoughtLevel(effort)
+				if mapped != effort {
+					log.Printf("proxy: reasoning_effort remap model=%s effort=%s -> %s", model, effort, mapped)
+					if b, err := json.Marshal(mapped); err == nil {
+						raw["reasoning_effort"] = json.RawMessage(b)
+						changed = true
+					}
+				}
+			}
+		}
+	}
 
-	// Only GLM/z-ai upstream is known to reject prompt_cache_retention;
-	// other models pass through unchanged.
-	if !strings.Contains(modelLower, "glm") && !strings.Contains(modelLower, "z-ai") {
+	// Step 3: Strip unsupported fields per tier config
+	if len(cfg.StripFields) > 0 && model != "" {
+		var tier string
+		for t, upstream := range cfg.ModelTiers {
+			if upstream == model {
+				tier = t
+				break
+			}
+		}
+		if tier != "" {
+			if fields, ok := cfg.StripFields[tier]; ok && len(fields) > 0 {
+				for _, field := range fields {
+					if _, exists := raw[field]; exists {
+						delete(raw, field)
+						changed = true
+						log.Printf("proxy: stripped field %q for model %s (tier %s)", field, model, tier)
+					}
+				}
+			}
+		}
+	}
+
+	if !changed {
 		return body
 	}
-	if _, ok := raw["prompt_cache_retention"]; !ok {
-		return body
-	}
-
-	delete(raw, "prompt_cache_retention")
-	log.Printf("proxy: stripped prompt_cache_retention for model %s", model)
 	out, err := json.Marshal(raw)
 	if err != nil {
 		return body
