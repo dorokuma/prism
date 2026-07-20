@@ -8,9 +8,9 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strconv"
-	"sort"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,6 +24,11 @@ var hopByHopHeaders = map[string]bool{
 	"Trailer":             true,
 	"Upgrade":             true,
 }
+
+var (
+	reAPIKey = regexp.MustCompile(`sk-[A-Za-z0-9_-]{10,}`)
+	reBearer = regexp.MustCompile(`Bearer [A-Za-z0-9_-]{10,}`)
+)
 
 func isHopByHop(key string) bool {
 	return hopByHopHeaders[http.CanonicalHeaderKey(key)]
@@ -103,7 +108,6 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 	limitReader := io.LimitReader(resp.Body, 4096)
 	bodyBytes, _ := io.ReadAll(limitReader)
 	defer func() {
-		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}()
 
@@ -124,7 +128,6 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 	if resp.StatusCode == 429 {
 		if isQuotaError(bodyBytes) {
 			acc.MarkExhausted()
-			acc.ResetFailures()
 			log.Printf("proxy: %s 429+quota exhaustion, marking exhausted. body: %s",
 				acc.Name(), redactBody(bodyBytes))
 			return
@@ -137,7 +140,6 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 			cd = 5 * time.Minute
 		}
 		acc.SetCooldown(cd)
-		acc.ResetFailures()
 		log.Printf("proxy: %s rate-limited 429, cooling down %v. body: %s",
 			acc.Name(), cd, redactBody(bodyBytes))
 		return
@@ -145,7 +147,6 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 
 	if isQuotaError(bodyBytes) {
 		acc.MarkExhausted()
-		acc.ResetFailures()
 		log.Printf("proxy: %s insufficient_quota (status=%d), marking exhausted. body: %s",
 			acc.Name(), resp.StatusCode, redactBody(bodyBytes))
 		return
@@ -194,7 +195,11 @@ func NewProxyHandler(pool *Pool, wire WireAPIMode, cfg *Config) http.Handler {
 		}
 		if r.URL.Path == "/v1/models" {
 			if r.Method != http.MethodGet {
-				http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]any{"message": "method not allowed", "code": "method_not_allowed"},
+				})
 				return
 			}
 			proxyModels(pool, w, r, cfg)
@@ -202,7 +207,11 @@ func NewProxyHandler(pool *Pool, wire WireAPIMode, cfg *Config) http.Handler {
 		}
 		if r.URL.Path == "/v1/chat/completions" {
 			if !wire.allowsLegacy() {
-				http.Error(w, `{"error":{"message":"wire_api=responses: /v1/chat/completions disabled","code":"disabled"}}`, http.StatusNotFound)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]any{"message": "wire_api=responses: /v1/chat/completions disabled", "code": "disabled"},
+				})
 				return
 			}
 			proxyChat(pool, w, r, cfg)
@@ -210,13 +219,21 @@ func NewProxyHandler(pool *Pool, wire WireAPIMode, cfg *Config) http.Handler {
 		}
 		if r.URL.Path == "/v1/responses" {
 			if !wire.allowsResponses() {
-				http.Error(w, `{"error":{"message":"wire_api=legacy: /v1/responses disabled","code":"disabled"}}`, http.StatusNotFound)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]any{"message": "wire_api=legacy: /v1/responses disabled", "code": "disabled"},
+				})
 				return
 			}
 			proxyResponses(pool, w, r, cfg)
 			return
 		}
-		http.Error(w, "not found", 404)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{"message": "not found", "code": "not_found"},
+		})
 	})
 }
 
@@ -237,7 +254,15 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 	dumpDebugChatBody(chatBody)
 	if err != nil {
 		log.Printf("proxy: responses convert error: %v", err)
-		http.Error(w, fmt.Sprintf(`{"error":{"message":%q,"code":"invalid_request"}}`, err.Error()), http.StatusBadRequest)
+		errBody, marshalErr := json.Marshal(map[string]any{
+			"error": map[string]any{"message": err.Error(), "code": "invalid_request"},
+		})
+		if marshalErr != nil {
+			errBody = []byte(`{"error":{"message":"internal error","code":"internal"}}`)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(errBody)
 		return
 	}
 	var virtualModel string
@@ -284,6 +309,14 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 	// Remap model name if configured
 	bodyBytes = remapModelInBody(bodyBytes, cfg)
 	bodyBytes = remapThinkingForDeepSeek(bodyBytes)
+	if len(pool.accounts) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{"message": "No accounts configured", "code": "no_accounts"},
+		})
+		return
+	}
 	maxAttempts := len(pool.accounts) * 2
 	requestID := randomID()
 	log.Printf("proxy: req=%s path=%s stream=%v responsesOut=%v totalStart=%s", requestID, r.URL.Path, opts.stream, opts.responsesOut, start.Format(time.RFC3339Nano))
@@ -299,11 +332,18 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		selectDuration := time.Since(selectStart).Milliseconds()
 		cancel()
 		accName := "nil"
-		if acc != nil { accName = acc.Name() }
+		if acc != nil {
+			accName = acc.Name()
+		}
 		log.Printf("proxy: req=%s attempt=%d pool.select_done=%dms account=%s err=%v", requestID, attempts, selectDuration, accName, err)
 		if err != nil {
 			log.Printf("proxy: select account failed: %v", err)
-			http.Error(w, `{"error":{"message":"No healthy accounts available","code":"no_accounts"}}`, 503)
+			recordError()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(503)
+			json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{"message": "No healthy accounts available", "code": "no_accounts"},
+			})
 			return
 		}
 
@@ -321,6 +361,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 			req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(bodyBytes))
 			if err != nil {
 				log.Printf("proxy: failed to create request for %s: %v", acc.Name(), err)
+				recordUpstreamRetry()
 				return false, nil
 			}
 			copyClientHeaders(req.Header, r.Header)
@@ -332,23 +373,26 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				// If client disconnected, don't retry
 				if r.Context().Err() != nil {
 					log.Printf("proxy: req=%s client disconnected, aborting retry", requestID)
+					recordError()
 					return true, fmt.Errorf("client disconnected: %w", r.Context().Err())
 				}
 				acc.SetCooldown(30 * time.Second)
 				log.Printf("proxy: chat retry via %s (upstream connection error), cooling down 30s: %v", acc.Name(), err)
+				recordUpstreamRetry()
 				return false, nil
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode == 429 || resp.StatusCode == 402 || resp.StatusCode == 401 || resp.StatusCode == 403 {
 				handleUpstreamError(acc, resp)
+				recordUpstreamRetry()
 				return false, nil
 			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				acc.ResetFailures()
+				recordRequest(time.Since(start))
 			} else {
-				// Non-2xx not in special list (503, 500, 502, etc.)
+				recordError()
 				acc.SetCooldown(30 * time.Second)
 				log.Printf("proxy: %s non-2xx error (status=%d), cooling down 30s", acc.Name(), resp.StatusCode)
 				// Still forward the error to client this time
@@ -361,7 +405,6 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				return true, nil
 			}
 
-
 			if opts.responsesOut && opts.stream {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Header().Set("Cache-Control", "no-cache")
@@ -373,9 +416,11 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				translateElapsed := time.Since(translateStart).Milliseconds()
 				if err != nil {
 					log.Printf("proxy: req=%s account=%s mode=responses_stream translate.error=%v translate_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, time.Since(start))
+					recordError()
 					return true, err
 				}
 				log.Printf("proxy: req=%s account=%s mode=responses_stream translate.done translate_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, time.Since(start))
+				recordRequest(time.Since(start))
 				return true, nil
 			}
 
@@ -393,15 +438,18 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				translateElapsed := time.Since(translateStart).Milliseconds()
 				if err != nil {
 					log.Printf("proxy: req=%s account=%s mode=responses_json translate.error translate_ms=%d body_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, bodyReadElapsed, time.Since(start))
+					recordError()
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusOK)
 					_, _ = w.Write(rawBody)
+					recordRequest(time.Since(start))
 					return true, nil
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				n, _ := w.Write(out)
 				log.Printf("proxy: req=%s account=%s mode=responses_json done written=%d body_ms=%d translate_ms=%d elapsed=%v", requestID, acc.Name(), n, bodyReadElapsed, translateElapsed, time.Since(start))
+				recordRequest(time.Since(start))
 				return true, nil
 			}
 
@@ -412,6 +460,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 			bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 			if err != nil {
 				log.Printf("proxy: req=%s account=%s mode=legacy_stream body_read_error body_ms=%d elapsed=%v", requestID, acc.Name(), bodyReadElapsed, time.Since(start))
+				recordError()
 				return true, err
 			}
 			if cl := resp.Header.Get("Content-Length"); cl != "" {
@@ -419,6 +468,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 			} else {
 				log.Printf("proxy: req=%s account=%s mode=legacy_stream done status=%d written=%d body_read_ms=%d elapsed=%v", requestID, acc.Name(), resp.StatusCode, n, bodyReadElapsed, time.Since(start))
 			}
+			recordRequest(time.Since(start))
 			return true, nil
 		}()
 		if done {
@@ -429,7 +479,12 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		}
 	}
 	log.Printf("proxy: req=%s channel=all_exhausted attempts=%d elapsed=%v", requestID, maxAttempts, time.Since(start))
-	http.Error(w, `{"error":{"message":"All accounts exhausted after retries","code":"all_exhausted"}}`, 503)
+	recordError()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(503)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{"message": "All accounts exhausted after retries", "code": "all_exhausted"},
+	})
 }
 
 func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) {
@@ -437,7 +492,11 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config
 
 	modelIDs := cfg.AllModels()
 	if len(modelIDs) == 0 {
-		http.Error(w, `{"error":{"message":"No models configured","code":"no_models"}}`, 503)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{"message": "No models configured", "code": "no_models"},
+		})
 		return
 	}
 	sort.Strings(modelIDs)
@@ -460,19 +519,19 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config
 	log.Printf("proxy: models returning %d models", len(modelIDs))
 }
 
-
 // redactBody masks common sensitive patterns in error response bodies for safe logging.
 func redactBody(body []byte) string {
 	s := string(body)
-	// Mask OpenAI-style API keys: sk- followed by alphanumeric chars
-	// Also mask Bearer tokens
-	result := regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`).ReplaceAllString(s, "sk-***")
-	result = regexp.MustCompile(`Bearer [A-Za-z0-9]{20,}`).ReplaceAllString(result, "Bearer ***")
+	result := reAPIKey.ReplaceAllString(s, "sk-***")
+	result = reBearer.ReplaceAllString(result, "Bearer ***")
 	return result
 }
 
 // remapModelInBody replaces the model field in a JSON chat completions body.
 func remapModelInBody(body []byte, cfg *Config) []byte {
+	if cfg == nil {
+		return body
+	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return body
@@ -485,7 +544,10 @@ func remapModelInBody(body []byte, cfg *Config) []byte {
 	if remapped == model {
 		return body
 	}
-	rawBytes, _ := json.Marshal(remapped)
+	rawBytes, marshalErr := json.Marshal(remapped)
+	if marshalErr != nil {
+		return body
+	}
 	raw["model"] = json.RawMessage(rawBytes)
 	out, err := json.Marshal(raw)
 	if err != nil {
@@ -495,6 +557,9 @@ func remapModelInBody(body []byte, cfg *Config) []byte {
 	return out
 }
 
+// getTenantID returns the tenant identifier for the request.
+// Currently always returns "default" as multi-tenancy is not yet implemented.
+// TODO: implement per-tenant isolation when multi-tenant support is needed.
 func getTenantID(r *http.Request) string {
 	return "default"
 }

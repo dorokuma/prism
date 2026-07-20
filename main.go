@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"expvar"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -73,15 +75,14 @@ func main() {
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
 				log.Printf("startup check %s: OK (200)", a.Name())
-				a.ResetFailures()
 			} else if resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 403 || isPermanentCredentialError(bodyBytes) || isQuotaError(bodyBytes) {
-				log.Printf("startup check %s: permanent error status=%d, marking exhausted. body: %s", a.Name(), resp.StatusCode, string(bodyBytes))
+				log.Printf("startup check %s: permanent error status=%d, marking exhausted. body: %s", a.Name(), resp.StatusCode, redactBody(bodyBytes))
 				a.MarkExhausted()
 			} else if resp.StatusCode == 429 {
-				log.Printf("startup check %s: temporary quota error status=429, cooling down. body: %s", a.Name(), string(bodyBytes))
+				log.Printf("startup check %s: temporary quota error status=429, cooling down. body: %s", a.Name(), redactBody(bodyBytes))
 				a.SetCooldown(2 * time.Minute)
 			} else {
-				log.Printf("startup check %s: temporary error status=%d, cooling down. body: %s", a.Name(), resp.StatusCode, string(bodyBytes))
+				log.Printf("startup check %s: temporary error status=%d, cooling down. body: %s", a.Name(), resp.StatusCode, redactBody(bodyBytes))
 				a.SetCooldown(5 * time.Minute)
 			}
 		}(acc)
@@ -95,16 +96,65 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
 	proxyHandler := NewProxyHandler(pool, wire, cfg)
+
+	metricCtx, metricCancel := context.WithCancel(context.Background())
+
+	// Rate limiter: 60 req/s per IP with burst of 100
+	rl := newRateLimiter(60, 100)
+	rl.startCleanupLoop(metricCtx)
+
+	// Periodically update pool metrics
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-metricCtx.Done():
+				return
+			case <-ticker.C:
+				all := pool.AllAccounts()
+				healthy, exhausted := 0, 0
+				for _, a := range all {
+					if a.IsHealthy() {
+						healthy++
+					} else {
+						exhausted++
+					}
+				}
+				updatePoolMetrics(healthy, exhausted)
+			}
+		}
+	}()
+
 	srv := &http.Server{
 		Addr: cfg.Listen,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		Handler: rateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/metrics" {
+				token := os.Getenv("METRICS_TOKEN")
+				if token != "" {
+					if r.Header.Get("Authorization") != "Bearer "+token {
+						host, _, err := net.SplitHostPort(r.RemoteAddr)
+						if err != nil || (host != "127.0.0.1" && host != "::1") {
+							w.Header().Set("Content-Type", "application/json")
+							w.WriteHeader(http.StatusUnauthorized)
+							json.NewEncoder(w).Encode(map[string]any{
+								"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
+							})
+							return
+						}
+					}
+				}
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				expvar.Handler().ServeHTTP(w, r)
+				return
+			}
 			// Add a 15-minute total timeout for every request to prevent
 			// indefinite hanging. Streaming paths also get this limit,
 			// which is generous enough for typical long-lived connections.
 			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
 			defer cancel()
 			proxyHandler.ServeHTTP(w, r.WithContext(ctx))
-		}),
+		}), rl),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -126,6 +176,10 @@ func main() {
 			}
 			log.Printf("shutting down sig=%v...", sig)
 			close(stop)
+			metricCancel()
+			if mcpCacheCtxCancel != nil {
+				mcpCacheCtxCancel()
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if err := srv.Shutdown(ctx); err != nil {

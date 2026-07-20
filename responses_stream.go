@@ -160,7 +160,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	}
 	tr := newResponsesStreamTranslator(model, searchToolCache)
 	sc := bufio.NewScanner(body)
-	sc.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	var usage map[string]any
 
 	for sc.Scan() {

@@ -61,6 +61,22 @@ systemctl restart prism   # only when you intend downtime / reload
 | `model_tiers` | map | — | Tier → upstream model |
 | `model_remap` | map | — | Virtual model → tier |
 | `default_tier` | string | — | Fallback tier |
+
+### Model remapping behavior
+
+`model_remap` maps virtual model names to tiers. `model_tiers` maps each tier to an
+upstream model name. The resolution logic is:
+
+1. If the requested model is **in `model_remap`**:
+   - Look up its tier, then look up that tier in `model_tiers`.
+   - If both mappings exist → use the upstream model.
+   - If the tier has no upstream mapping → fall back to `default_tier` (if set).
+2. If the requested model is **not in `model_remap`**: pass through unchanged.
+   (Real upstream model names are sent directly to the provider.)
+
+> **Note:** Previously, all unknown models went through `default_tier`. The current
+> behavior only applies `default_tier` to models that exist in `model_remap` but
+> whose target tier has no upstream mapping.
 | `mcp_tools_json` | string | — | Optional path to tool-definitions JSON |
 | `probe_model` | string | `deepseek-chat` | Startup/probe model id |
 

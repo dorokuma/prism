@@ -169,22 +169,6 @@ func TestPoolMarkHealthyWakeup(t *testing.T) {
 	}
 }
 
-func TestWindowedFailureReset(t *testing.T) {
-	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
-
-	// Simulate 4 failures with old timestamps (outside 30min window)
-	acc.mu.Lock()
-	acc.consecutiveFailures = 4
-	acc.lastFailureTime = time.Now().Add(-31 * time.Minute)
-	acc.mu.Unlock()
-
-	// Next failure should reset counter because outside window
-	got := acc.IncrementFailures()
-	if got != 1 {
-		t.Fatalf("expected 1 (windowed reset), got %d", got)
-	}
-}
-
 func TestQuotaCooldownNotExhaustion(t *testing.T) {
 	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
 

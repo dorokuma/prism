@@ -198,6 +198,9 @@ func flattenResponseContentParts(parts []map[string]any) any {
 				out = append(out, map[string]any{"type": "image_url", "image_url": urlVal})
 				continue
 		default:
+			if debugMode {
+				log.Printf("[debug] unknown content part type: %s", p["type"])
+			}
 			out = append(out, p)
 		}
 	}

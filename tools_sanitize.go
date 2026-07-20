@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"strings"
@@ -25,11 +26,38 @@ type tenantCache struct {
 	lastAccess time.Time
 }
 
+const mcpCacheTTL = 30 * time.Minute
+
 var (
 	mcpCache   = make(map[string]*tenantCache)
 	mcpCacheMu sync.Mutex
 )
 
+var mcpCacheCtxCancel context.CancelFunc
+
+func init() {
+	var ctx context.Context
+	ctx, mcpCacheCtxCancel = context.WithCancel(context.Background())
+	go mcpCacheEvictLoop(ctx)
+}
+
+func mcpCacheEvictLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Minute):
+		}
+		mcpCacheMu.Lock()
+		now := time.Now()
+		for tenantID, tc := range mcpCache {
+			if now.Sub(tc.lastAccess) > mcpCacheTTL {
+				delete(mcpCache, tenantID)
+			}
+		}
+		mcpCacheMu.Unlock()
+	}
+}
 
 func cacheMCPTool(tenantID string, tool map[string]any) {
 	if tenantID == "" {

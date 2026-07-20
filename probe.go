@@ -75,11 +75,11 @@ func probeExhausted(pool *Pool, probeModel string) {
 				req.Header.Set("Content-Type", "application/json")
 
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
 				req = req.WithContext(ctx)
 				resp, err := acc.Client().Do(req)
 
 				if err != nil {
+					cancel()
 					log.Printf("probe %s: request failed (attempt %d/%d): %v", acc.Name(), attempt, maxAttempts, err)
 					if attempt < maxAttempts {
 						time.Sleep(retryDelay)
@@ -90,6 +90,7 @@ func probeExhausted(pool *Pool, probeModel string) {
 
 				respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 				resp.Body.Close()
+				cancel()
 
 				if resp.StatusCode == 200 {
 					pool.MarkHealthy(acc)
@@ -102,7 +103,7 @@ func probeExhausted(pool *Pool, probeModel string) {
 					return
 				}
 
-				log.Printf("probe %s: still exhausted (status=%d, attempt %d/%d) body=%s", acc.Name(), resp.StatusCode, attempt, maxAttempts, string(respBody))
+				log.Printf("probe %s: still exhausted (status=%d, attempt %d/%d) body=%s", acc.Name(), resp.StatusCode, attempt, maxAttempts, redactBody(respBody))
 
 				if attempt < maxAttempts {
 					time.Sleep(retryDelay)

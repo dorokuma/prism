@@ -400,6 +400,54 @@ func TestTranslateStream_EmptyInput(t *testing.T) {
 	}
 }
 
+func TestStreamUsageConversion(t *testing.T) {
+	// Stream with detailed usage including cache and reasoning fields.
+	input := `data: {"choices":[{"delta":{"content":"hi"}}]}
+
+data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":200,"completion_tokens":50,"total_tokens":250,"prompt_cache_hit_tokens":100,"prompt_cache_miss_tokens":50,"prompt_tokens_details":{"cached_tokens":100},"completion_tokens_details":{"reasoning_tokens":30}}}
+
+data: [DONE]
+`
+	rec := httptest.NewRecorder()
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	events := parseSSE(t, rec.Body.String())
+
+	// Verify usage in completed event
+	for _, ev := range events {
+		if ev.Type == "response.completed" {
+			// Check prompt_cache_hit_tokens
+			hit := getIntField(t, ev.Raw, "response", "usage", "prompt_cache_hit_tokens")
+			if hit != 100 {
+				t.Fatalf("prompt_cache_hit_tokens = %d, want 100", hit)
+			}
+			// Check prompt_cache_miss_tokens
+			miss := getIntField(t, ev.Raw, "response", "usage", "prompt_cache_miss_tokens")
+			if miss != 50 {
+				t.Fatalf("prompt_cache_miss_tokens = %d, want 50", miss)
+			}
+			// Check completion_tokens_details.reasoning_tokens
+			rt := getIntField(t, ev.Raw, "response", "usage", "completion_tokens_details", "reasoning_tokens")
+			if rt != 30 {
+				t.Fatalf("reasoning_tokens = %d, want 30", rt)
+			}
+			// Check prompt_tokens
+			pt := getIntField(t, ev.Raw, "response", "usage", "prompt_tokens")
+			if pt != 200 {
+				t.Fatalf("prompt_tokens = %d, want 200", pt)
+			}
+			// Check input_tokens
+			inputTok := getIntField(t, ev.Raw, "response", "usage", "input_tokens")
+			if inputTok != 200 {
+				t.Fatalf("input_tokens = %d, want 200", inputTok)
+			}
+		}
+	}
+}
+
 func TestTranslateStream_UsagePassThrough(t *testing.T) {
 	input := `data: {"choices":[{"delta":{"content":"hi"}}]}
 

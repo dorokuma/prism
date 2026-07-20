@@ -20,18 +20,15 @@ const (
 
 const (
 	upstreamTimeout = 10 * time.Minute
-	failureWindow   = 30 * time.Minute
 )
 
 type Account struct {
-	cfg                 AccountConfig
-	status              AccountStatus
-	client              *http.Client
-	mu                  sync.Mutex
-	borrowed            atomic.Bool
-	cooldownUntil       time.Time
-	consecutiveFailures int
-	lastFailureTime     time.Time
+	cfg           AccountConfig
+	status        AccountStatus
+	client        *http.Client
+	mu            sync.Mutex
+	borrowed      atomic.Bool
+	cooldownUntil time.Time
 }
 
 func (a *Account) Name() string         { return a.cfg.Name }
@@ -70,8 +67,6 @@ func (a *Account) MarkHealthy() {
 	if a.status == StatusExhausted {
 		a.status = StatusHealthy
 		a.cooldownUntil = time.Time{}
-		a.consecutiveFailures = 0
-		a.lastFailureTime = time.Time{}
 		log.Printf("account %s: marked healthy (returned to pool)", a.Name())
 	}
 }
@@ -87,36 +82,12 @@ func (a *Account) TryBorrow() bool {
 }
 
 func (a *Account) Release() {
-	a.borrowed.Store(false)
-}
-
-func (a *Account) ResetFailures() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.consecutiveFailures = 0
-	a.lastFailureTime = time.Time{}
-}
-
-// windowedFailuresLocked returns 0 if last failure was outside the window.
-func (a *Account) windowedFailuresLocked() int {
-	if !a.lastFailureTime.IsZero() && time.Since(a.lastFailureTime) > failureWindow {
-		a.consecutiveFailures = 0
+	if !a.borrowed.CompareAndSwap(true, false) {
+		log.Printf("account %s: Release called on already-released account", a.Name())
 	}
-	return a.consecutiveFailures
 }
 
-// IncrementFailures increments and returns the windowed failure count.
-func (a *Account) IncrementFailures() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	// Reset if outside window before incrementing
-	if !a.lastFailureTime.IsZero() && time.Since(a.lastFailureTime) > failureWindow {
-		a.consecutiveFailures = 0
-	}
-	a.consecutiveFailures++
-	a.lastFailureTime = time.Now()
-	return a.consecutiveFailures
-}
+
 
 func (a *Account) SetCooldown(d time.Duration) {
 	a.mu.Lock()
