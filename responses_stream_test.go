@@ -180,8 +180,29 @@ data: [DONE]
 	events := parseSSE(t, rec.Body.String())
 
 	// reasoning_summary_text.delta (Codex 0.142.5); no reasoning_summary.done
-	if len(events) < 9 {
-		t.Fatalf("expected >= 9 events, got %d", len(events))
+	if len(events) != 12 {
+		t.Fatalf("expected 12 events, got %d", len(events))
+	}
+
+	// Verify exact event type sequence (see B8 state-machine refactor).
+	wantTypes := []string{
+		"response.created",
+		"response.output_item.added",
+		"response.reasoning_summary_part.added",
+		"response.reasoning_summary_text.delta",
+		"response.reasoning_summary_text.delta",
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+		"response.output_item.done",
+		"response.output_text.done",
+		"response.output_item.done",
+		"response.completed",
+	}
+	for i, want := range wantTypes {
+		if events[i].Type != want {
+			t.Fatalf("event[%d].type = %q, want %q", i, events[i].Type, want)
+		}
 	}
 
 	foundReasoningDeltas := 0
@@ -230,8 +251,21 @@ data: [DONE]
 
 	// Expect: created → output_item.added (function_call) → output_item.done → completed
 	// (no function_call_arguments.delta — Codex does not handle it)
-	if len(events) < 4 {
-		t.Fatalf("expected >= 4 events, got %d", len(events))
+	if len(events) != 4 {
+		t.Fatalf("expected 4 events, got %d", len(events))
+	}
+
+	// Verify exact event type sequence (see B8 state-machine refactor).
+	wantTypes := []string{
+		"response.created",
+		"response.output_item.added",
+		"response.output_item.done",
+		"response.completed",
+	}
+	for i, want := range wantTypes {
+		if events[i].Type != want {
+			t.Fatalf("event[%d].type = %q, want %q", i, events[i].Type, want)
+		}
 	}
 
 	// Find the output_item.added event for function_call
@@ -291,8 +325,22 @@ data: [DONE]
 	// Expected: created → function_call output_item.added →
 	//           tool_search_output output_item.added → tool_search_output output_item.done →
 	//           completed
-	if len(events) < 5 {
-		t.Fatalf("expected >= 5 events, got %d", len(events))
+	if len(events) != 5 {
+		t.Fatalf("expected 5 events, got %d", len(events))
+	}
+
+	// Verify exact event type sequence (see B8 state-machine refactor).
+	wantTypes := []string{
+		"response.created",
+		"response.output_item.added",
+		"response.output_item.added",
+		"response.output_item.done",
+		"response.completed",
+	}
+	for i, want := range wantTypes {
+		if events[i].Type != want {
+			t.Fatalf("event[%d].type = %q, want %q", i, events[i].Type, want)
+		}
 	}
 
 	// Check that tool_search_output was emitted with cached tools
@@ -361,6 +409,32 @@ data: [DONE]
 	}
 
 	events := parseSSE(t, rec.Body.String())
+
+	if len(events) != 13 {
+		t.Fatalf("expected 13 events, got %d", len(events))
+	}
+
+	// Verify exact event type sequence (see B8 state-machine refactor).
+	wantTypes := []string{
+		"response.created",
+		"response.output_item.added",
+		"response.reasoning_summary_part.added",
+		"response.reasoning_summary_text.delta",
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+		"response.output_item.added",
+		"response.output_item.done",
+		"response.output_item.done",
+		"response.output_text.done",
+		"response.output_item.done",
+		"response.completed",
+	}
+	for i, want := range wantTypes {
+		if events[i].Type != want {
+			t.Fatalf("event[%d].type = %q, want %q", i, events[i].Type, want)
+		}
+	}
 
 	// Must have: reasoning events + content events + tool_call events
 	var hasReasoning, hasContent, hasToolCallDone bool
@@ -562,6 +636,23 @@ data: [DONE]
 	}
 
 	events := parseSSE(t, rec.Body.String())
+
+	if len(events) != 4 {
+		t.Fatalf("expected 4 events, got %d", len(events))
+	}
+
+	// Verify exact event type sequence (see B8 state-machine refactor).
+	wantTypes := []string{
+		"response.created",
+		"response.output_item.added",
+		"response.output_item.done",
+		"response.completed",
+	}
+	for i, want := range wantTypes {
+		if events[i].Type != want {
+			t.Fatalf("event[%d].type = %q, want %q", i, events[i].Type, want)
+		}
+	}
 
 	for _, ev := range events {
 		if ev.Type == "response.output_item.added" {
