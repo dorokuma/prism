@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -142,6 +145,119 @@ func TestConfigRemapModelFallback(t *testing.T) {
 	if got != "gpt-3.5-turbo" {
 		t.Errorf("RemapModel(gpt-4) = %q, want gpt-3.5-turbo (fallback)", got)
 	}
+}
+
+func TestLoadConfigGLMWarning(t *testing.T) {
+	t.Run("glm tier without strip_fields triggers warning", func(t *testing.T) {
+		content := `
+model_tiers:
+  glm-test: glm-5.2
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		f, err := os.CreateTemp("", "config-*.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+
+		var buf bytes.Buffer
+		oldWriter := log.Writer()
+		log.SetOutput(&buf)
+		defer log.SetOutput(oldWriter)
+
+		cfg, err := LoadConfig(f.Name())
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if !strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("expected WARNING for GLM tier without strip_fields, got: %s", buf.String())
+		}
+		if cfg.ModelTiers["glm-test"] != "glm-5.2" {
+			t.Errorf("expected glm-test tier, got %v", cfg.ModelTiers)
+		}
+	})
+
+	t.Run("glm tier with prompt_cache_retention does not warn", func(t *testing.T) {
+		content := `
+model_tiers:
+  glm-test: glm-5.2
+strip_fields:
+  glm-test:
+    - prompt_cache_retention
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		f, err := os.CreateTemp("", "config-*.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+
+		var buf bytes.Buffer
+		oldWriter := log.Writer()
+		log.SetOutput(&buf)
+		defer log.SetOutput(oldWriter)
+
+		cfg, err := LoadConfig(f.Name())
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("unexpected WARNING for GLM tier WITH prompt_cache_retention, got: %s", buf.String())
+		}
+		if cfg.StripFields["glm-test"] == nil || len(cfg.StripFields["glm-test"]) == 0 {
+			t.Errorf("expected strip_fields for glm-test, got %v", cfg.StripFields)
+		}
+	})
+
+	t.Run("non-glm tier does not warn", func(t *testing.T) {
+		content := `
+model_tiers:
+  standard: deepseek-v4-flash
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		f, err := os.CreateTemp("", "config-*.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+
+		var buf bytes.Buffer
+		oldWriter := log.Writer()
+		log.SetOutput(&buf)
+		defer log.SetOutput(oldWriter)
+
+		cfg, err := LoadConfig(f.Name())
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("unexpected WARNING for non-GLM tier, got: %s", buf.String())
+		}
+		if cfg.ModelTiers["standard"] != "deepseek-v4-flash" {
+			t.Errorf("expected standard tier, got %v", cfg.ModelTiers)
+		}
+	})
 }
 
 func TestConfigAllModels(t *testing.T) {

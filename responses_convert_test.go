@@ -106,6 +106,8 @@ func TestMapThoughtLevel(t *testing.T) {
 		{"high to high", "high", "high"},
 		{"xhigh to max", "xhigh", "max"},
 		{"LOW uppercase to high", "LOW", "high"},
+		{"HIGH uppercase to high", "HIGH", "high"},
+		{"XHIGH uppercase to max", "XHIGH", "max"},
 		{"unknown passes through", "unknown", "unknown"},
 		{"empty string passes through", "", ""},
 	}

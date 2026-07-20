@@ -604,6 +604,7 @@ func transformRequestBody(body []byte, cfg *Config) []byte {
 			}
 		}
 		if len(mergedFields) > 0 {
+			sort.Strings(matchedTiers)
 			for _, field := range mergedFields {
 				if _, exists := raw[field]; exists {
 					delete(raw, field)

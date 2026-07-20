@@ -71,12 +71,20 @@ func LoadConfig(path string) (*Config, error) {
 			}
 		}
 	}
-	// Startup validation: warn if GLM/z-ai upstreams lack strip_fields entries
+	// Startup validation: warn if GLM/z-ai upstreams lack prompt_cache_retention in strip_fields
 	for tier, upstream := range cfg.ModelTiers {
 		upstreamLower := strings.ToLower(upstream)
 		if strings.Contains(upstreamLower, "glm") || strings.Contains(upstreamLower, "z-ai") {
-			if _, ok := cfg.StripFields[tier]; !ok || len(cfg.StripFields[tier]) == 0 {
-				log.Printf("WARNING: tier %q upstream %q looks like GLM/z-ai but has no strip_fields entry; add prompt_cache_retention to avoid 400 errors", tier, upstream)
+			fields := cfg.StripFields[tier]
+			hasPromptCacheRetention := false
+			for _, f := range fields {
+				if f == "prompt_cache_retention" {
+					hasPromptCacheRetention = true
+					break
+				}
+			}
+			if !hasPromptCacheRetention {
+				log.Printf("WARNING: tier %q upstream %q looks like GLM/z-ai but strip_fields for this tier is missing prompt_cache_retention; add it to avoid 400 errors", tier, upstream)
 			}
 		}
 	}

@@ -24,10 +24,9 @@ wire_api: both
 model_tiers:
   frontier: deepseek-v4-pro
   standard: deepseek-v4-flash
+  glm-standard: glm-5.2
 default_tier: standard
 
-# 按 tier 声明上游不支持、需要在转发前剥离的请求字段。
-# 匹配发生在 model remap 之后，按上游真实模型名所属的 tier 命中。
 # 按 tier 声明上游不支持、需要在转发前剥离的请求字段。
 # 匹配发生在 model remap 之后，按上游真实模型名所属的 tier 命中。
 # 新增 GLM/z-ai 系上游时记得同步加条目，否则可能 400。
@@ -41,6 +40,7 @@ model_remap:
   gpt-5.4: standard
   gpt-5.4-mini: standard
   gpt-5.3-codex: standard
+  glm-5.2: glm-standard
 
 accounts:
   # name "account-1" → credential/env LB_KEY_ACCOUNT_1

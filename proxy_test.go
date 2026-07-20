@@ -16,7 +16,7 @@ func TestRedactBody(t *testing.T) {
 		expected string
 	}{
 		{
-			input:    `{"error":"invalid api key FAKE_KEY_FOR_TESTING_1234567890","message":"bad key"}`,
+			input:    `{"error":"invalid api key sk-FAKE_KEY_FOR_TESTING_1234567890","message":"bad key"}`,
 			expected: `{"error":"invalid api key sk-***","message":"bad key"}`,
 		},
 		{
@@ -24,11 +24,11 @@ func TestRedactBody(t *testing.T) {
 			expected: `{"error":"Bearer *** token invalid"}`,
 		},
 		{
-			input:    `{"error":"api key FAKE_KEY_WITH_DASHES_FOR_TESTING with dashes"}`,
+			input:    `{"error":"api key sk-FAKE-KEY-WITH-DASHES-FOR-TESTING with dashes"}`,
 			expected: `{"error":"api key sk-*** with dashes"}`,
 		},
 		{
-			input:    `{"error":"api key FAKE_KEY_WITH_UNDERSCORES_FOR_TESTING"}`,
+			input:    `{"error":"api key sk-FAKE_KEY_WITH_UNDERSCORES_FOR_TESTING"}`,
 			expected: `{"error":"api key sk-***"}`,
 		},
 		{
