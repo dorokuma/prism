@@ -109,6 +109,7 @@ func (t *responsesStreamTranslator) ensureReasoningStream(w io.Writer) error {
 	}
 	if !t.reasoningAdded {
 		t.reasoningAdded = true
+		t.reasoningPhase = reasoningItemOpen
 		t.reasoningOutputIdx = t.nextOutputIdx
 		t.nextOutputIdx++
 		if err := t.emit(w, map[string]any{
@@ -123,6 +124,7 @@ func (t *responsesStreamTranslator) ensureReasoningStream(w io.Writer) error {
 	}
 	if !t.reasoningPartAdded {
 		t.reasoningPartAdded = true
+		t.reasoningPhase = reasoningPartOpen
 		return t.emit(w, map[string]any{
 			"type":          "response.reasoning_summary_part.added",
 			"item_id":       t.reasoningItemID,
@@ -140,6 +142,7 @@ func (t *responsesStreamTranslator) ensureMessageStream(w io.Writer) error {
 	}
 	if !t.msgAdded {
 		t.msgAdded = true
+		t.messagePhase = messageItemOpen
 		t.msgOutputIdx = t.nextOutputIdx
 		t.nextOutputIdx++
 		return t.emit(w, map[string]any{
@@ -160,6 +163,7 @@ func (t *responsesStreamTranslator) ensureContentPart(w io.Writer) error {
 	}
 	if !t.contentPartAdded {
 		t.contentPartAdded = true
+		t.messagePhase = messagePartOpen
 		return t.emit(w, map[string]any{
 			"type":          "response.content_part.added",
 			"item_id":       t.msgItemID,
