@@ -53,10 +53,6 @@ type responsesStreamTranslator struct {
 	contentIdx         int
 	tools              map[int]*streamToolState
 	created            bool
-	msgAdded           bool
-	reasoningAdded     bool
-	reasoningPartAdded bool
-	contentPartAdded   bool
 	hadMessageContent  bool
 	reasoningPhase     reasoningPhase
 	messagePhase       messagePhase
@@ -107,8 +103,7 @@ func (t *responsesStreamTranslator) ensureReasoningStream(w io.Writer) error {
 	if err := t.ensureCreated(w); err != nil {
 		return err
 	}
-	if !t.reasoningAdded {
-		t.reasoningAdded = true
+	if t.reasoningPhase == reasoningIdle {
 		t.reasoningPhase = reasoningItemOpen
 		t.reasoningOutputIdx = t.nextOutputIdx
 		t.nextOutputIdx++
@@ -122,8 +117,7 @@ func (t *responsesStreamTranslator) ensureReasoningStream(w io.Writer) error {
 			return err
 		}
 	}
-	if !t.reasoningPartAdded {
-		t.reasoningPartAdded = true
+	if t.reasoningPhase == reasoningItemOpen {
 		t.reasoningPhase = reasoningPartOpen
 		return t.emit(w, map[string]any{
 			"type":          "response.reasoning_summary_part.added",
@@ -140,8 +134,7 @@ func (t *responsesStreamTranslator) ensureMessageStream(w io.Writer) error {
 	if err := t.ensureCreated(w); err != nil {
 		return err
 	}
-	if !t.msgAdded {
-		t.msgAdded = true
+	if t.messagePhase == messageIdle {
 		t.messagePhase = messageItemOpen
 		t.msgOutputIdx = t.nextOutputIdx
 		t.nextOutputIdx++
@@ -161,8 +154,7 @@ func (t *responsesStreamTranslator) ensureContentPart(w io.Writer) error {
 	if err := t.ensureMessageStream(w); err != nil {
 		return err
 	}
-	if !t.contentPartAdded {
-		t.contentPartAdded = true
+	if t.messagePhase == messageItemOpen {
 		t.messagePhase = messagePartOpen
 		return t.emit(w, map[string]any{
 			"type":          "response.content_part.added",
@@ -541,7 +533,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	}
 
 	// Complete reasoning output item if it was started (no reasoning_summary.done — Codex ignores it)
-	if tr.reasoningAdded {
+	if tr.reasoningPhase != reasoningIdle {
 		if err := tr.emit(dst, map[string]any{
 			"type": "response.output_item.done", "output_index": tr.reasoningOutputIdx,
 			"item": map[string]any{
@@ -552,13 +544,13 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 	}
 
-	if tr.msgAdded || tr.hadMessageContent {
-		if !tr.msgAdded {
+	if tr.messagePhase != messageIdle || tr.hadMessageContent {
+		if tr.messagePhase == messageIdle {
 			if err := tr.ensureMessageStream(dst); err != nil {
 				return err
 			}
 		}
-		if tr.contentPartAdded {
+		if tr.messagePhase == messagePartOpen {
 			if err := tr.emit(dst, map[string]any{
 				"type":          "response.output_text.done",
 				"item_id":       tr.msgItemID,
