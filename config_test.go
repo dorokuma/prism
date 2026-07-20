@@ -30,8 +30,8 @@ accounts:
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Listen != ":18790" {
-		t.Errorf("default listen = %q, want :18790", cfg.Listen)
+	if cfg.Listen != "127.0.0.1:18790" {
+		t.Errorf("default listen = %q, want 127.0.0.1:18790", cfg.Listen)
 	}
 	if cfg.ProbeInterval != 10*time.Minute {
 		t.Errorf("default probe interval = %v, want 10m", cfg.ProbeInterval)
@@ -297,6 +297,75 @@ accounts:
 			t.Errorf("expected standard tier, got %v", cfg.ModelTiers)
 		}
 	})
+}
+
+func TestLoadConfigEmptyAccounts(t *testing.T) {
+	content := `
+accounts:
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	_, err = LoadConfig(f.Name())
+	if err == nil {
+		t.Fatal("expected error for empty accounts, got nil")
+	}
+	if !strings.Contains(err.Error(), "no accounts") {
+		t.Errorf("error = %q, want containing \"no accounts\"", err.Error())
+	}
+}
+
+func TestParseTrustedProxies(t *testing.T) {
+	_, err := ParseTrustedProxies([]string{"10.0.0.0/8"})
+	if err != nil {
+		t.Errorf("unexpected error for valid CIDR: %v", err)
+	}
+	_, err = ParseTrustedProxies([]string{"invalid"})
+	if err == nil {
+		t.Fatal("expected error for invalid CIDR, got nil")
+	}
+}
+
+func TestLoadConfigProbeIntervalTooSmall(t *testing.T) {
+	content := `
+probe_interval: 500ms
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	var buf bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(oldWriter)
+
+	cfg, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.ProbeInterval != 10*time.Minute {
+		t.Errorf("probe_interval = %v, want fallback to 10m", cfg.ProbeInterval)
+	}
+	if !strings.Contains(buf.String(), "WARNING") {
+		t.Errorf("expected WARNING for too-small probe_interval, got: %s", buf.String())
+	}
 }
 
 func TestConfigAllModels(t *testing.T) {

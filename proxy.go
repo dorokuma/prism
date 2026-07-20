@@ -25,10 +25,30 @@ var hopByHopHeaders = map[string]bool{
 	"Upgrade":             true,
 }
 
+var sensitiveClientHeaders = map[string]bool{
+	http.CanonicalHeaderKey("Cookie"):       true,
+	http.CanonicalHeaderKey("X-Api-Key"):    true,
+	http.CanonicalHeaderKey("X-Auth-Token"): true,
+}
+
 var (
 	reAPIKey = regexp.MustCompile(`sk-[A-Za-z0-9_-]{10,}`)
 	reBearer = regexp.MustCompile(`Bearer [A-Za-z0-9_-]{10,}`)
 )
+
+// sensitiveJSONKeys names JSON object keys whose values should be redacted
+// in debug logs and error responses. Compared after strings.ToLower.
+var sensitiveJSONKeys = map[string]bool{
+	"api_key":        true,
+	"apikey":         true,
+	"token":          true,
+	"access_token":   true,
+	"refresh_token":  true,
+	"password":       true,
+	"passwd":         true,
+	"secret":         true,
+	"authorization":  true,
+}
 
 func isHopByHop(key string) bool {
 	return hopByHopHeaders[http.CanonicalHeaderKey(key)]
@@ -106,10 +126,10 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 		return
 	}
 	limitReader := io.LimitReader(resp.Body, 4096)
-	bodyBytes, _ := io.ReadAll(limitReader)
-	defer func() {
-		resp.Body.Close()
-	}()
+	bodyBytes, err := io.ReadAll(limitReader)
+	if err != nil {
+		log.Printf("proxy: handleUpstreamError read body: %v", err)
+	}
 
 	if resp.StatusCode == 401 || resp.StatusCode == 402 {
 		acc.MarkExhausted()
@@ -157,7 +177,15 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 		acc.Name(), resp.StatusCode, redactBody(bodyBytes))
 }
 
-func upstreamContext(r *http.Request) (context.Context, context.CancelFunc) {
+// upstreamContext creates a context for upstream requests.
+// For streaming requests, it applies a wide streamMaxDuration timeout on top of
+// r.Context() so that long-lived inference connections propagate client
+// disconnection but are guarded against hanging indefinitely.
+// For non-streaming requests, it applies upstreamTimeout.
+func upstreamContext(r *http.Request, stream bool) (context.Context, context.CancelFunc) {
+	if stream {
+		return context.WithTimeout(r.Context(), streamMaxDuration)
+	}
 	return context.WithTimeout(r.Context(), upstreamTimeout)
 }
 
@@ -166,7 +194,11 @@ func copyClientHeaders(dst http.Header, src http.Header) {
 		if isHopByHop(k) {
 			continue
 		}
-		if http.CanonicalHeaderKey(k) == "Authorization" {
+		ck := http.CanonicalHeaderKey(k)
+		if ck == "Authorization" {
+			continue
+		}
+		if sensitiveClientHeaders[ck] {
 			continue
 		}
 		for _, v := range vs {
@@ -195,9 +227,7 @@ func NewProxyHandler(pool *Pool, wire WireAPIMode, cfg *Config) http.Handler {
 		}
 		if r.URL.Path == "/v1/models" {
 			if r.Method != http.MethodGet {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusMethodNotAllowed)
-				json.NewEncoder(w).Encode(map[string]any{
+				writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
 					"error": map[string]any{"message": "method not allowed", "code": "method_not_allowed"},
 				})
 				return
@@ -207,9 +237,7 @@ func NewProxyHandler(pool *Pool, wire WireAPIMode, cfg *Config) http.Handler {
 		}
 		if r.URL.Path == "/v1/chat/completions" {
 			if !wire.allowsLegacy() {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusNotFound)
-				json.NewEncoder(w).Encode(map[string]any{
+				writeJSON(w, http.StatusNotFound, map[string]any{
 					"error": map[string]any{"message": "wire_api=responses: /v1/chat/completions disabled", "code": "disabled"},
 				})
 				return
@@ -219,9 +247,7 @@ func NewProxyHandler(pool *Pool, wire WireAPIMode, cfg *Config) http.Handler {
 		}
 		if r.URL.Path == "/v1/responses" {
 			if !wire.allowsResponses() {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusNotFound)
-				json.NewEncoder(w).Encode(map[string]any{
+				writeJSON(w, http.StatusNotFound, map[string]any{
 					"error": map[string]any{"message": "wire_api=legacy: /v1/responses disabled", "code": "disabled"},
 				})
 				return
@@ -229,9 +255,7 @@ func NewProxyHandler(pool *Pool, wire WireAPIMode, cfg *Config) http.Handler {
 			proxyResponses(pool, w, r, cfg)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, http.StatusNotFound, map[string]any{
 			"error": map[string]any{"message": "not found", "code": "not_found"},
 		})
 	})
@@ -300,7 +324,11 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) 
 		return
 	}
 	tenantID := getTenantID(r)
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(bodyBytes, &raw)
+	stream := rawBoolField(raw, "stream")
 	proxyChatWithBody(pool, w, r, bodyBytes, start, chatForwardOpts{
+		stream:   stream,
 		tenantID: tenantID,
 	}, cfg)
 }
@@ -308,9 +336,7 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) 
 func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyBytes []byte, start time.Time, opts chatForwardOpts, cfg *Config) {
 	bodyBytes = transformRequestBody(bodyBytes, cfg)
 	if len(pool.accounts) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(503)
-		json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, 503, map[string]any{
 			"error": map[string]any{"message": "No accounts configured", "code": "no_accounts"},
 		})
 		return
@@ -321,10 +347,10 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
 		if attempts > 0 {
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(upstreamRetryDelay)
 		}
 
-		selectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		selectCtx, cancel := context.WithTimeout(context.Background(), accountSelectTimeout)
 		selectStart := time.Now()
 		acc, err := pool.Select(selectCtx)
 		selectDuration := time.Since(selectStart).Milliseconds()
@@ -337,9 +363,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		if err != nil {
 			log.Printf("proxy: select account failed: %v", err)
 			recordError()
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(503)
-			json.NewEncoder(w).Encode(map[string]any{
+			writeJSON(w, 503, map[string]any{
 				"error": map[string]any{"message": "No healthy accounts available", "code": "no_accounts"},
 			})
 			return
@@ -348,7 +372,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		done, streamErr := func() (bool, error) {
 			defer pool.Release(acc)
 
-			ctx, cancel := upstreamContext(r)
+			ctx, cancel := upstreamContext(r, opts.stream)
 			defer cancel()
 
 			targetURL := acc.BaseURL() + "/chat/completions"
@@ -381,7 +405,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 			}
 			defer resp.Body.Close()
 
-			if resp.StatusCode == 429 || resp.StatusCode == 402 || resp.StatusCode == 401 || resp.StatusCode == 403 {
+			if resp.StatusCode == 429 || resp.StatusCode == 402 || resp.StatusCode == 401 {
 				handleUpstreamError(acc, resp)
 				recordUpstreamRetry()
 				return false, nil
@@ -389,18 +413,37 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				recordRequest(time.Since(start))
-			} else {
+			} else if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				// 4xx client error (other than 401/402/429 handled above, plus
+				// 403 which is a permission error not helped by retry).
+				// Pass through with redacted body, no cooldown, no retry.
+				errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+				if readErr != nil {
+					log.Printf("proxy: failed to read upstream 4xx body: %v", readErr)
+				}
+				log.Printf("proxy: %s upstream 4xx status=%d body=%s", acc.Name(), resp.StatusCode, redactBody(errBody))
 				recordError()
-				acc.SetCooldown(30 * time.Second)
-				log.Printf("proxy: %s non-2xx error (status=%d), cooling down 30s", acc.Name(), resp.StatusCode)
-				// Still forward the error to client this time
-				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				log.Printf("proxy: chat upstream error via %s, status=%d, body=%s", acc.Name(), resp.StatusCode, redactBody(errBody))
+				// Copy upstream headers for transparency, then remove
+				// headers that become invalid after body redaction.
 				copyUpstreamHeaders(w, resp.Header)
+				w.Header().Del("Content-Length")
+				w.Header().Del("Content-Encoding")
+				if w.Header().Get("Content-Type") == "" {
+					w.Header().Set("Content-Type", "application/json")
+				}
 				w.WriteHeader(resp.StatusCode)
-				n, _ := w.Write(errBody)
-				log.Printf("proxy: chat upstream error via %s, written=%d", acc.Name(), n)
+				w.Write(redactBodyBytes(errBody))
 				return true, nil
+			} else {
+				// 5xx server error or other non-2xx: cooldown and retry.
+				errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				if readErr != nil {
+					log.Printf("proxy: failed to read upstream 5xx body: %v", readErr)
+				}
+				acc.SetCooldown(30 * time.Second)
+				log.Printf("proxy: %s 5xx error (status=%d), cooling down 30s. body: %s", acc.Name(), resp.StatusCode, redactBody(errBody))
+				recordUpstreamRetry()
+				return false, nil
 			}
 
 			if opts.responsesOut && opts.stream {
@@ -410,7 +453,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				w.WriteHeader(http.StatusOK)
 				translateStart := time.Now()
 				log.Printf("proxy: req=%s account=%s mode=responses_stream translate.start=%s", requestID, acc.Name(), translateStart.Format(time.RFC3339Nano))
-				err = translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools, getSearchToolCache(opts.tenantID))
+				err = translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools, getSearchToolCache(opts.tenantID), ctx)
 				translateElapsed := time.Since(translateStart).Milliseconds()
 				if err != nil {
 					log.Printf("proxy: req=%s account=%s mode=responses_stream translate.error=%v translate_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, time.Since(start))
@@ -435,12 +478,11 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 				out, err := chatCompletionToResponse(rawBody, opts.model, opts.reqTools)
 				translateElapsed := time.Since(translateStart).Milliseconds()
 				if err != nil {
-					log.Printf("proxy: req=%s account=%s mode=responses_json translate.error translate_ms=%d body_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, bodyReadElapsed, time.Since(start))
+					log.Printf("proxy: req=%s account=%s mode=responses_json translate.error=%v translate_ms=%d body_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, bodyReadElapsed, time.Since(start))
 					recordError()
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write(rawBody)
-					recordRequest(time.Since(start))
+					writeJSON(w, http.StatusBadGateway, map[string]any{
+						"error": map[string]any{"message": "upstream response translation failed", "code": "upstream_error"},
+					})
 					return true, nil
 				}
 				w.Header().Set("Content-Type", "application/json")
@@ -478,9 +520,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 	}
 	log.Printf("proxy: req=%s channel=all_exhausted attempts=%d elapsed=%v", requestID, maxAttempts, time.Since(start))
 	recordError()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(503)
-	json.NewEncoder(w).Encode(map[string]any{
+	writeJSON(w, 503, map[string]any{
 		"error": map[string]any{"message": "All accounts exhausted after retries", "code": "all_exhausted"},
 	})
 }
@@ -490,9 +530,7 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config
 
 	modelIDs := cfg.AllModels()
 	if len(modelIDs) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(503)
-		json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, 503, map[string]any{
 			"error": map[string]any{"message": "No models configured", "code": "no_models"},
 		})
 		return
@@ -512,17 +550,76 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config
 		"object": "list",
 		"data":   data,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 	log.Printf("proxy: models returning %d models", len(modelIDs))
 }
 
-// redactBody masks common sensitive patterns in error response bodies for safe logging.
+// redactBody masks common sensitive patterns in error/response bodies for safe
+// logging. It first tries JSON-aware redaction (walk the object tree and replace
+// sensitive-key values with "***"); if the body is not valid JSON it falls back
+// to regex-based redaction of sk-* and Bearer tokens.
 func redactBody(body []byte) string {
-	s := string(body)
+	return string(redactBodyBytes(body))
+}
+
+// redactBodyBytes is the []byte version of redactBody, for direct use in
+// response writing without an extra string allocation.
+func redactBodyBytes(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	// Try JSON-aware redaction first.
+	var parsed any
+	if err := json.Unmarshal(body, &parsed); err == nil && parsed != nil {
+		parsed = redactJSON(parsed, 0)
+		if out, err := json.Marshal(parsed); err == nil {
+			return out
+		}
+	}
+	// Fall back to regex-based redaction.
+	return []byte(redactBodyRegex(string(body)))
+}
+
+// redactBodyRegex applies regex-based redaction: sk-* keys and Bearer tokens.
+func redactBodyRegex(s string) string {
 	result := reAPIKey.ReplaceAllString(s, "sk-***")
 	result = reBearer.ReplaceAllString(result, "Bearer ***")
 	return result
+}
+
+// redactJSON recursively walks a JSON value and replaces sensitive string
+// values with "***". Arrays and nested objects are recursed into.  String
+// leaf values also get regex redaction for embedded sk-*/Bearer patterns.
+// depth is capped at 20 to prevent stack overflow from malicious nesting.
+// Returns the redacted value; when depth exceeds 20 the subtree is replaced
+// with "<redacted:too deep>" instead of being silently passed through.
+func redactJSON(v any, depth int) any {
+	if depth > redactJSONMaxDepth {
+		return "<redacted:too deep>"
+	}
+	switch val := v.(type) {
+	case map[string]any:
+		for k, vv := range val {
+			if sensitiveJSONKeys[strings.ToLower(k)] {
+				val[k] = "***"
+			} else if s, ok := vv.(string); ok {
+				val[k] = redactBodyRegex(s)
+			} else {
+				val[k] = redactJSON(vv, depth+1)
+			}
+		}
+		return val
+	case []any:
+		for i, item := range val {
+			if s, ok := item.(string); ok {
+				val[i] = redactBodyRegex(s)
+			} else {
+				val[i] = redactJSON(item, depth+1)
+			}
+		}
+		return val
+	}
+	return v
 }
 
 // transformRequestBody applies model remap, thinking field remap (for DeepSeek),

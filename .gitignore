@@ -4,3 +4,4 @@ config.yaml
 .audit*.md
 scripts/__pycache__/
 mcp_tools.json
+.codegraph/

@@ -34,7 +34,7 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 	go func() {
 		log.Printf("TEST: Goroutine 1 calling Select")
 		acc, err := p.Select(ctx)
-		log.Printf("TEST: Goroutine 1 Select returned: acc=%v, err=%v", acc, err)
+		log.Printf("TEST: Goroutine 1 Select returned: acc=%s, err=%v", acc.Name(), err)
 		ch1 <- acc
 		log.Printf("TEST: Goroutine 1 sent to ch1")
 	}()
@@ -42,7 +42,7 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 	go func() {
 		log.Printf("TEST: Goroutine 2 calling Select")
 		acc, err := p.Select(ctx)
-		log.Printf("TEST: Goroutine 2 Select returned: acc=%v, err=%v", acc, err)
+		log.Printf("TEST: Goroutine 2 Select returned: acc=%s, err=%v", acc.Name(), err)
 		ch2 <- acc
 		log.Printf("TEST: Goroutine 2 sent to ch2")
 	}()
@@ -57,10 +57,10 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case acc := <-ch1:
-			log.Printf("TEST: Main read from ch1: acc=%v", acc)
+			log.Printf("TEST: Main read from ch1: acc=%s", acc.Name())
 			results = append(results, acc)
 		case acc := <-ch2:
-			log.Printf("TEST: Main read from ch2: acc=%v", acc)
+			log.Printf("TEST: Main read from ch2: acc=%s", acc.Name())
 			results = append(results, acc)
 		case <-time.After(2 * time.Second):
 			t.Fatal("timeout waiting for workers to be woken up")
@@ -76,11 +76,17 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 		names[acc.Name()] = true
 	}
 	if !names["acc-1"] || !names["acc-2"] {
-		t.Errorf("expected to get acc-1 and acc-2, got: %v", results)
+		gotNames := make([]string, len(results))
+		for i, a := range results {
+			gotNames[i] = a.Name()
+		}
+		t.Errorf("expected to get acc-1 and acc-2, got: %v", gotNames)
 	}
 }
 
 func TestPoolCancelAndSignalTransfer(t *testing.T) {
+	// A is started with an already-cancelled context (returns immediately).
+	// B waits for the single account. Release wakes B without race.
 	log.Printf("TEST: TestPoolCancelAndSignalTransfer started")
 	cfgs := []AccountConfig{
 		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
@@ -88,14 +94,7 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 	p := NewPool(cfgs)
 
 	ctx := context.Background()
-	acc1, _ := p.Select(ctx) // 占满唯一账号
-
-	ctxCancel, cancel := context.WithCancel(ctx)
-	errChA := make(chan error, 1)
-	go func() {
-		_, err := p.Select(ctxCancel)
-		errChA <- err
-	}()
+	acc1, _ := p.Select(ctx) // occupies the only account
 
 	accChB := make(chan *Account, 1)
 	go func() {
@@ -105,9 +104,16 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	cancel()
-	p.Release(acc1)
+	ctxCancel, cancel := context.WithCancel(ctx)
+	cancel() // cancel before entering Select
 
+	errChA := make(chan error, 1)
+	go func() {
+		_, err := p.Select(ctxCancel)
+		errChA <- err
+	}()
+
+	// A should return immediately with Canceled
 	select {
 	case err := <-errChA:
 		if !errors.Is(err, context.Canceled) {
@@ -117,10 +123,15 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 		t.Fatal("timeout waiting for A to exit")
 	}
 
+	// Now release to wake B
+	p.Release(acc1)
+
 	select {
 	case acc := <-accChB:
-		if acc == nil || acc.Name() != "acc-1" {
-			t.Errorf("expected B to be woken up and get acc-1, got %v", acc)
+		if acc == nil {
+			t.Error("expected B to be woken up, got nil")
+		} else if acc.Name() != "acc-1" {
+			t.Errorf("expected B to get acc-1, got %s", acc.Name())
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for B to get the transferred signal")
@@ -162,10 +173,35 @@ func TestPoolMarkHealthyWakeup(t *testing.T) {
 	select {
 	case acc := <-accCh:
 		if acc == nil || acc.Name() != "acc-1" {
-			t.Errorf("expected to get acc-1 immediately, got %v", acc)
+			if acc == nil {
+				t.Error("expected to get acc-1 immediately, got nil")
+			} else {
+				t.Errorf("expected to get acc-1 immediately, got %s", acc.Name())
+			}
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout: waiting worker was not woken up by MarkHealthy")
+	}
+}
+
+func TestSetCooldownDoesNotShorten(t *testing.T) {
+	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
+
+	// Set a long cooldown first
+	acc.SetCooldown(5 * time.Minute)
+	if !acc.IsInCooldown() {
+		t.Fatal("expected account to be in cooldown after 5m set")
+	}
+
+	// Try to shorten with a shorter cooldown — should NOT shorten
+	acc.SetCooldown(30 * time.Second)
+	if !acc.IsInCooldown() {
+		t.Fatal("expected account to still be in cooldown after short set")
+	}
+	// Should have at least 4 minutes remaining (5m - 30s overhead)
+	remaining := time.Until(acc.cooldownUntil)
+	if remaining < 4*time.Minute {
+		t.Errorf("cooldown was shortened: remaining = %v, want >= 4m", remaining)
 	}
 }
 

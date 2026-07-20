@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"net"
 	"net/http"
 	"strings"
@@ -22,8 +21,6 @@ type tokenBucket struct {
 	tokens    float64
 	lastCheck time.Time
 }
-
-const rateLimitIdleTTL = 10 * time.Minute
 
 func newRateLimiter(rate, burst int) *rateLimiter {
 	return &rateLimiter{
@@ -85,16 +82,44 @@ func (rl *rateLimiter) startCleanupLoop(ctx context.Context) {
 	}()
 }
 
-// getClientIP extracts the client IP from the request.
-// It checks X-Forwarded-For (first non-private IP), then X-Real-IP, then RemoteAddr.
-// WARNING: If X-Forwarded-For can be spoofed by clients, consider only trusting
-// the rightmost IP added by your trusted reverse proxy instead of the leftmost.
-func getClientIP(r *http.Request) string {
+// getClientIP extracts the client IP from the request using trusted proxy awareness.
+// If trustedProxies is empty, X-Forwarded-For and X-Real-IP are ignored entirely
+// (only RemoteAddr is used) to prevent IP spoofing.
+// If trustedProxies is non-empty and RemoteAddr is within a trusted CIDR,
+// the rightmost IP from X-Forwarded-For is trusted (or X-Real-IP as fallback).
+// If RemoteAddr is not trusted, XFF/X-Real-IP are ignored.
+func getClientIP(r *http.Request, trustedProxies []*net.IPNet) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+
+	if len(trustedProxies) == 0 {
+		return host
+	}
+
+	// Check if RemoteAddr is from a trusted proxy
+	remoteIP := net.ParseIP(host)
+	trusted := false
+	if remoteIP != nil {
+		for _, cidr := range trustedProxies {
+			if cidr.Contains(remoteIP) {
+				trusted = true
+				break
+			}
+		}
+	}
+
+	if !trusted {
+		return host
+	}
+
+	// RemoteAddr is trusted — use X-Forwarded-For (rightmost) or X-Real-IP
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
-		for _, part := range parts {
-			ip := net.ParseIP(strings.TrimSpace(part))
-			if ip != nil && !ip.IsPrivate() {
+		for i := len(parts) - 1; i >= 0; i-- {
+			ip := net.ParseIP(strings.TrimSpace(parts[i]))
+			if ip != nil {
 				return ip.String()
 			}
 		}
@@ -104,23 +129,17 @@ func getClientIP(r *http.Request) string {
 			return ip.String()
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
 	return host
 }
 
 // rateLimitMiddleware returns an HTTP middleware that rate-limits per client IP.
-func rateLimitMiddleware(next http.Handler, rl *rateLimiter) http.Handler {
+func rateLimitMiddleware(next http.Handler, rl *rateLimiter, trustedProxies []*net.IPNet) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if rl != nil {
-			ip := getClientIP(r)
+			ip := getClientIP(r, trustedProxies)
 			if !rl.Allow(ip) {
 				recordRateLimited()
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(429)
-				json.NewEncoder(w).Encode(map[string]any{
+				writeJSON(w, http.StatusTooManyRequests, map[string]any{
 					"error": map[string]any{"message": "Rate limit exceeded", "code": "rate_limited"},
 				})
 				return

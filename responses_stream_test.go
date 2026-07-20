@@ -1,10 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // sseEvent represents a single SSE event from the Responses API stream.
@@ -82,7 +90,7 @@ data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":5,"completion_tokens":7
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -164,7 +172,7 @@ data: {"choices":[{"delta":{"content":"Final answer"}}]}
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "deepseek", nil, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "deepseek", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -213,7 +221,7 @@ data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ls
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -273,7 +281,7 @@ func TestTranslateStream_ToolSearchInterception(t *testing.T) {
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, cachedTools)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, cachedTools, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -318,7 +326,7 @@ func TestTranslateStream_ToolSearchInterception_NoCache(t *testing.T) {
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -347,7 +355,7 @@ data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"funct
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -383,7 +391,7 @@ data: [DONE]
 
 func TestTranslateStream_EmptyInput(t *testing.T) {
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(""), "gpt-5.5", nil, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(""), "gpt-5.5", nil, nil, context.Background())
 	if err != ErrEmptyUpstreamStream {
 		t.Fatalf("expected ErrEmptyUpstreamStream, got %v", err)
 	}
@@ -409,7 +417,7 @@ data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":200,"completion_tokens"
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -456,7 +464,7 @@ data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -489,7 +497,7 @@ func TestTranslateStream_ReqToolsPropagated(t *testing.T) {
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", reqTools, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", reqTools, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -530,7 +538,7 @@ data: {"choices":[{"delta":{"content":"hi"}}]}
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -548,7 +556,7 @@ func TestTranslateStream_NamespacePrefixedToolName(t *testing.T) {
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil)
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -569,5 +577,195 @@ data: [DONE]
 				}
 			}
 		}
+	}
+}
+
+func TestTranslateStreamCancelBlockedReader(t *testing.T) {
+	// A pipe with no writer blocks forever – this simulates an upstream
+	// that is silent (e.g. long reasoning pause). After ctx cancel the
+	// ctxReader wrapper must unblock and return context.Canceled promptly.
+	pr, pw := io.Pipe()
+	// Don't write anything; just close pw when the test ends so the
+	// background io.Copy goroutine in ctxReader can exit.
+	defer pw.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := httptest.NewRecorder()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- translateChatStreamToResponses(rec, pr, "gpt-5.5", nil, nil, ctx)
+	}()
+
+	// Let translate start reading; it should block on the pipe.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout: translate did not return after cancel on blocked reader")
+	}
+}
+
+// Test TranslateStream with partial input (no [DONE]) to exercise scanner
+// EOF handling through the ctxReader wrapper.
+func TestTranslateStreamCancel(t *testing.T) {
+	// Pipe that continuously produces SSE data lines.
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			_, err := pw.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"))
+			if err != nil {
+				return
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// started signals that the translate goroutine has begun reading the pipe.
+	started := make(chan struct{})
+	sr := &signalReader{r: pr, started: started}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := httptest.NewRecorder()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- translateChatStreamToResponses(rec, sr, "gpt-5.5", nil, nil, ctx)
+	}()
+
+	// Wait until translate has started reading, then cancel.
+	<-started
+	cancel()
+
+	var err error
+	select {
+	case err = <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for translate to return after cancel")
+	}
+
+	if err == nil {
+		t.Fatal("expected error after context cancel, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+
+	pw.Close()
+	<-done
+}
+
+// signalReader wraps an io.Reader and closes the started channel on the first
+// Read call, so tests can synchronize with the reader starting.
+type signalReader struct {
+	r       io.Reader
+	started chan struct{}
+	once    sync.Once
+}
+
+func (s *signalReader) Read(p []byte) (int, error) {
+	s.once.Do(func() { close(s.started) })
+	return s.r.Read(p)
+}
+
+// failWriter is an http.ResponseWriter whose Write always returns an error,
+// simulating a client disconnect mid-stream.
+type failWriter struct {
+	header http.Header
+}
+
+func (w *failWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *failWriter) Write(p []byte) (int, error) {
+	return 0, errors.New("client disconnected")
+}
+
+func (w *failWriter) WriteHeader(statusCode int) {}
+
+// TestTranslateStreamEmitFailureCancelsCtxReader verifies that when translate
+// exits due to a write error (e.g. client disconnected) and the ctxReader's
+// io.Copy goroutine might be stuck on the inner pipe write, cancelling the
+// context causes the watcher goroutine to close the pipe write end, unblocking
+// io.Copy and preventing a goroutine + pipe leak.
+//
+// Without the watcher goroutine in ctxReader, this scenario would leak:
+//  1. translate emits SSE events (w.Write) — client disconnects, Write returns
+//     err, translate returns.
+//  2. At that point sc.Scan is not running, so nobody calls ctxPipeReader.Read.
+//  3. The io.Copy goroutine inside ctxReader may be blocked on pw.Write (inner
+//     pipe full). Cancelling ctx alone won't help because io.Copy does not
+//     watch ctx; the existing cancel path in ctxPipeReader.Read never fires
+//     because nobody is calling Read.
+//  4. The watcher goroutine added to ctxReader closes pw on ctx.Done, forcing
+//     io.Copy's pw.Write to fail, causing io.Copy to exit.
+//
+// This test uses goroutine counting to assert that both ctxReader internal
+// goroutines (io.Copy and watcher) exit after context cancellation. The old
+// writer-goroutine-exit approach did not actually prove ctxReader cleanup.
+func TestTranslateStreamEmitFailureCancelsCtxReader(t *testing.T) {
+	// Take a goroutine baseline before creating any extra goroutines for
+	// this test (producer, ctxReader's io.Copy, watcher). All of these must
+	// exit for the count to return to baseline.
+	baseline := runtime.NumGoroutine()
+
+	// Producer: continuously write SSE data as fast as possible so that
+	// io.Copy's srcPr.Read never blocks. After translate returns (nobody
+	// reads pr), io.Copy will reliably block on pw.Write — exactly the
+	// scenario the watcher goroutine guards against.
+	srcPr, srcPw := io.Pipe()
+	go func() {
+		for i := 0; ; i++ {
+			_, err := fmt.Fprintf(srcPw, "data: {\"choices\":[{\"delta\":{\"content\":\"x%d\"}}]}\n\n", i)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fw := &failWriter{}
+
+	// translate returns on the first emit because failWriter.Write fails.
+	translateErr := translateChatStreamToResponses(fw, srcPr, "gpt-5.5", nil, nil, ctx)
+	if translateErr == nil {
+		cancel()
+		srcPw.Close()
+		t.Fatal("expected translate to fail due to write error")
+	}
+
+	// Cancel the context. The watcher goroutine inside ctxReader closes the
+	// inner pipe write end, unblocking io.Copy. Both ctxReader goroutines
+	// (io.Copy and watcher) should exit.
+	cancel()
+
+	// Close the upstream writer so the producer goroutine exits too.
+	srcPw.Close()
+
+	// Poll until goroutine count returns to baseline.
+	runtime.GC()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= baseline {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > baseline {
+		buf := make([]byte, 1<<16)
+		stackLen := runtime.Stack(buf, true)
+		t.Fatalf("goroutine leak: ctxReader io.Copy/watcher did not exit (count=%d, baseline=%d, delta=%d):\n%s",
+			n, baseline, n-baseline, buf[:stackLen])
 	}
 }

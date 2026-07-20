@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"expvar"
 	"io"
@@ -27,7 +28,7 @@ func main() {
 	loadMCPTools(cfg.MCPToolsJSON)
 	pool := NewPool(cfg.Accounts)
 	wire, _ := ParseWireAPIMode(cfg.WireAPI)
-	log.Printf("loaded %d accounts, wire_api=%s, listening on %s, debug=%v", len(cfg.Accounts), wire, cfg.Listen, debugMode)
+	log.Printf("loaded %d accounts, wire_api=%s, listening on %s, debug=%v, auth=%v, tls=%v", len(cfg.Accounts), wire, cfg.Listen, debugMode, cfg.AuthToken != "", cfg.TLSCertFile != "")
 
 	// Initial health probe: check all accounts on startup, warn but don't block
 	probeExhausted(pool, cfg.ProbeModel)
@@ -70,9 +71,12 @@ func main() {
 				a.SetCooldown(5 * time.Minute)
 				return
 			}
+			defer resp.Body.Close()
 			limitReader := io.LimitReader(resp.Body, 4096)
-			bodyBytes, _ := io.ReadAll(limitReader)
-			resp.Body.Close()
+			bodyBytes, readErr := io.ReadAll(limitReader)
+			if readErr != nil {
+				log.Printf("startup check %s: read body failed: %v", a.Name(), readErr)
+			}
 			if resp.StatusCode == 200 {
 				log.Printf("startup check %s: OK (200)", a.Name())
 			} else if resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 403 || isPermanentCredentialError(bodyBytes) || isQuotaError(bodyBytes) {
@@ -100,8 +104,13 @@ func main() {
 	metricCtx, metricCancel := context.WithCancel(context.Background())
 
 	// Rate limiter: 60 req/s per IP with burst of 100
-	rl := newRateLimiter(60, 100)
+	rl := newRateLimiter(rateLimitPerSecond, rateLimitBurst)
 	rl.startCleanupLoop(metricCtx)
+
+	trustedProxies, err := ParseTrustedProxies(cfg.TrustedProxies)
+	if err != nil {
+		log.Fatalf("trusted_proxies: %v", err)
+	}
 
 	// Periodically update pool metrics
 	go func() {
@@ -131,30 +140,30 @@ func main() {
 		Handler: rateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/metrics" {
 				token := os.Getenv("METRICS_TOKEN")
-				if token != "" {
-					if r.Header.Get("Authorization") != "Bearer "+token {
-						host, _, err := net.SplitHostPort(r.RemoteAddr)
-						if err != nil || (host != "127.0.0.1" && host != "::1") {
-							w.Header().Set("Content-Type", "application/json")
-							w.WriteHeader(http.StatusUnauthorized)
-							json.NewEncoder(w).Encode(map[string]any{
-								"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
-							})
-							return
-						}
-					}
+				allowed := (token != "" && CheckAuth(r, token)) || IsLocalhost(r)
+				if !allowed {
+					writeJSON(w, http.StatusUnauthorized, map[string]any{
+						"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
+					})
+					return
 				}
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				expvar.Handler().ServeHTTP(w, r)
 				return
 			}
-			// Add a 15-minute total timeout for every request to prevent
-			// indefinite hanging. Streaming paths also get this limit,
-			// which is generous enough for typical long-lived connections.
-			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
-			defer cancel()
-			proxyHandler.ServeHTTP(w, r.WithContext(ctx))
-		}), rl),
+			if cfg.AuthToken != "" && r.URL.Path != "/health" {
+				if !CheckAuth(r, cfg.AuthToken) {
+					writeJSON(w, http.StatusUnauthorized, map[string]any{
+						"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
+					})
+					return
+				}
+			}
+			// Timeout decisions are delegated to proxyChatWithBody which
+			// applies per-request timeouts based on the actual stream
+			// setting (parsed from the JSON body, not headers).
+			proxyHandler.ServeHTTP(w, r)
+		}), rl, trustedProxies),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -189,7 +198,38 @@ func main() {
 		}
 	}()
 
-	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-		log.Fatalf("listen: %v", err)
+	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		log.Printf("starting HTTPS server on %s", cfg.Listen)
+		if err := srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != http.ErrServerClosed {
+			log.Fatalf("listen tls: %v", err)
+		}
+	} else {
+		log.Printf("starting HTTP server on %s", cfg.Listen)
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("listen: %v", err)
+		}
 	}
 }
+
+// CheckAuth returns true if the request carries a valid Authorization header for
+// the given token. When token is empty, all requests pass (auth disabled).
+func CheckAuth(r *http.Request, token string) bool {
+	if token == "" {
+		return true
+	}
+	provided := r.Header.Get("Authorization")
+	expected := "Bearer " + token
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+// IsLocalhost returns true if the request's RemoteAddr is a loopback address.
+func IsLocalhost(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+

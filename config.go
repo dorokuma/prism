@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,7 +29,11 @@ type Config struct {
 	StripFields   map[string][]string `yaml:"strip_fields"`
 	Debug         bool                `yaml:"debug"`
 	MCPToolsJSON  string              `yaml:"mcp_tools_json"`
-	ProbeModel    string              `yaml:"probe_model"`
+	ProbeModel     string              `yaml:"probe_model"`
+	AuthToken      string              `yaml:"auth_token,omitempty"`
+	TLSCertFile    string              `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile     string              `yaml:"tls_key_file,omitempty"`
+	TrustedProxies []string            `yaml:"trusted_proxies,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -41,9 +46,13 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	if cfg.Listen == "" {
-		cfg.Listen = ":18790"
+		cfg.Listen = "127.0.0.1:18790"
 	}
 	if cfg.ProbeInterval == 0 {
+		cfg.ProbeInterval = 10 * time.Minute
+	}
+	if cfg.ProbeInterval > 0 && cfg.ProbeInterval < time.Second {
+		log.Printf("WARNING: probe_interval %v is too small (< 1s), falling back to 10m", cfg.ProbeInterval)
 		cfg.ProbeInterval = 10 * time.Minute
 	}
 	if cfg.WireAPI == "" {
@@ -54,6 +63,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if _, err := ParseWireAPIMode(cfg.WireAPI); err != nil {
 		return nil, err
+	}
+	if len(cfg.Accounts) == 0 {
+		return nil, fmt.Errorf("no accounts configured")
 	}
 	if cfg.ModelTiers == nil {
 		cfg.ModelTiers = map[string]string{}
@@ -70,6 +82,23 @@ func LoadConfig(path string) (*Config, error) {
 			if cfg.Accounts[i].Key == "" {
 				return nil, fmt.Errorf("account %s: key not set in config and credential/env var %s is empty", cfg.Accounts[i].Name, envVar)
 			}
+		}
+	}
+	// AuthToken fallback to env var
+	if cfg.AuthToken == "" {
+		cfg.AuthToken = os.Getenv("PRISM_AUTH_TOKEN")
+	}
+	// TLS cert/key fallback to env vars
+	if cfg.TLSCertFile == "" {
+		cfg.TLSCertFile = os.Getenv("PRISM_TLS_CERT")
+	}
+	if cfg.TLSKeyFile == "" {
+		cfg.TLSKeyFile = os.Getenv("PRISM_TLS_KEY")
+	}
+	// Validate trusted proxies CIDRs
+	for _, s := range cfg.TrustedProxies {
+		if _, _, err := net.ParseCIDR(s); err != nil {
+			return nil, fmt.Errorf("trusted_proxies: invalid CIDR %q: %v", s, err)
 		}
 	}
 	// Startup validation: warn if GLM/z-ai upstreams lack prompt_cache_retention in strip_fields
@@ -155,4 +184,21 @@ func getCredential(name string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+// ParseTrustedProxies parses a list of CIDR strings into *net.IPNet values.
+// This is a helper for main.go to use after loading config.
+func ParseTrustedProxies(proxies []string) ([]*net.IPNet, error) {
+	if len(proxies) == 0 {
+		return nil, nil
+	}
+	parsed := make([]*net.IPNet, 0, len(proxies))
+	for _, s := range proxies {
+		_, cidr, err := net.ParseCIDR(s)
+		if err != nil {
+			return nil, err
+		}
+		parsed = append(parsed, cidr)
+	}
+	return parsed, nil
 }

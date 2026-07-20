@@ -50,9 +50,6 @@ func probeExhausted(pool *Pool, probeModel string) {
 		"max_tokens":  1,
 	})
 
-	const maxAttempts = 3
-	const retryDelay = 2 * time.Second
-
 	var wg sync.WaitGroup
 	for _, acc := range exhausted {
 		wg.Add(1)
@@ -64,49 +61,53 @@ func probeExhausted(pool *Pool, probeModel string) {
 				}
 			}()
 
-			for attempt := 1; attempt <= maxAttempts; attempt++ {
-				url := acc.BaseURL() + "/chat/completions"
-				req, err := http.NewRequest("POST", url, bytes.NewReader(probeBody))
-				if err != nil {
-					log.Printf("probe %s: failed to create request: %v", acc.Name(), err)
-					return
-				}
-				req.Header.Set("Authorization", "Bearer "+acc.Key())
-				req.Header.Set("Content-Type", "application/json")
-
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				req = req.WithContext(ctx)
-				resp, err := acc.Client().Do(req)
-
-				if err != nil {
-					cancel()
-					log.Printf("probe %s: request failed (attempt %d/%d): %v", acc.Name(), attempt, maxAttempts, err)
-					if attempt < maxAttempts {
-						time.Sleep(retryDelay)
-						continue
+			for attempt := 1; attempt <= maxProbeAttempts; attempt++ {
+				stop := func() bool {
+					url := acc.BaseURL() + "/chat/completions"
+					req, err := http.NewRequest("POST", url, bytes.NewReader(probeBody))
+					if err != nil {
+						log.Printf("probe %s: failed to create request: %v", acc.Name(), err)
+						return true
 					}
+					req.Header.Set("Authorization", "Bearer "+acc.Key())
+					req.Header.Set("Content-Type", "application/json")
+
+					ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+					defer cancel()
+					req = req.WithContext(ctx)
+					resp, err := acc.Client().Do(req)
+
+					if err != nil {
+						log.Printf("probe %s: request failed (attempt %d/%d): %v", acc.Name(), attempt, maxProbeAttempts, err)
+						return false
+					}
+					defer resp.Body.Close()
+
+					respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+					if readErr != nil {
+						log.Printf("probe %s: read body failed: %v", acc.Name(), readErr)
+					}
+
+					if resp.StatusCode == 200 {
+						pool.MarkHealthy(acc)
+						log.Printf("probe %s: recovered (200), returned to pool", acc.Name())
+						return true
+					}
+
+					if resp.StatusCode == 429 {
+						log.Printf("probe %s: still exhausted (429 quota, attempt %d/%d)", acc.Name(), attempt, maxProbeAttempts)
+						return true
+					}
+
+					log.Printf("probe %s: still exhausted (status=%d, attempt %d/%d) body=%s", acc.Name(), resp.StatusCode, attempt, maxProbeAttempts, redactBody(respBody))
+					return false
+				}()
+
+				if stop {
 					return
 				}
-
-				respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				resp.Body.Close()
-				cancel()
-
-				if resp.StatusCode == 200 {
-					pool.MarkHealthy(acc)
-					log.Printf("probe %s: recovered (200), returned to pool", acc.Name())
-					return
-				}
-
-				if resp.StatusCode == 429 {
-					log.Printf("probe %s: still exhausted (429 quota, attempt %d/%d)", acc.Name(), attempt, maxAttempts)
-					return
-				}
-
-				log.Printf("probe %s: still exhausted (status=%d, attempt %d/%d) body=%s", acc.Name(), resp.StatusCode, attempt, maxAttempts, redactBody(respBody))
-
-				if attempt < maxAttempts {
-					time.Sleep(retryDelay)
+				if attempt < maxProbeAttempts {
+					time.Sleep(probeRetryDelay)
 				}
 			}
 		}(acc)

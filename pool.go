@@ -18,9 +18,6 @@ const (
 	StatusExhausted
 )
 
-const (
-	upstreamTimeout = 10 * time.Minute
-)
 
 type Account struct {
 	cfg           AccountConfig
@@ -92,7 +89,10 @@ func (a *Account) Release() {
 func (a *Account) SetCooldown(d time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.cooldownUntil = time.Now().Add(d)
+	newUntil := time.Now().Add(d)
+	if newUntil.After(a.cooldownUntil) {
+		a.cooldownUntil = newUntil
+	}
 }
 
 func (a *Account) IsInCooldown() bool {

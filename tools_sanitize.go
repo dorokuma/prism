@@ -26,8 +26,6 @@ type tenantCache struct {
 	lastAccess time.Time
 }
 
-const mcpCacheTTL = 30 * time.Minute
-
 var (
 	mcpCache   = make(map[string]*tenantCache)
 	mcpCacheMu sync.Mutex

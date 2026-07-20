@@ -21,11 +21,10 @@ func stripCodexUpstreamBloat(system string) string {
 	if s == "" {
 		return "You are a helpful coding assistant."
 	}
-	const maxSystemRunes = 12000
-	if utf8.RuneCountInString(s) > maxSystemRunes {
-		// Truncate to maxSystemRunes runes, preserving complete UTF-8 characters
+	if utf8.RuneCountInString(s) > systemPromptMaxRunes {
+		// Truncate to systemPromptMaxRunes runes, preserving complete UTF-8 characters
 		runes := []rune(s)
-		return string(runes[:maxSystemRunes]) + "\n\n[... truncated for upstream compatibility]"
+		return string(runes[:systemPromptMaxRunes]) + "\n\n[... truncated for upstream compatibility]"
 	}
 	return s
 }

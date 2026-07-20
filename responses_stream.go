@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -152,18 +153,137 @@ func (t *responsesStreamTranslator) ensureContentPart(w io.Writer) error {
 	return nil
 }
 
-func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model string, reqTools json.RawMessage, searchToolCache []map[string]any) error {
+// ctxReader wraps an io.Reader so that Read calls return promptly when ctx
+// is cancelled. Data is copied from r into an io.Pipe in a background goroutine.
+// When ctx is done, the pipe's read end is closed, unblocking any pending Read.
+//
+// A persistent goroutine (readLoop) reads from the pipe into an internal buffer
+// and delivers results via a channel. This avoids creating a new goroutine per
+// Read call and decouples pr.Read from the caller's p slice: when ctx is
+// cancelled, p is guaranteed untouched (io.Reader contract safety).
+//
+// A ctx watcher goroutine closes the pipe write end on cancellation as a
+// backstop: if nobody is calling Read (e.g. translate exited due to a write
+// error), the watcher unblocks io.Copy, which would otherwise be stuck on
+// pw.Write with a full pipe buffer.
+func ctxReader(ctx context.Context, r io.Reader) io.Reader {
+	pr, pw := io.Pipe()
+	// Watcher: ctx cancel forces the write end closed, unblocking io.Copy
+	// even when nobody is reading from pr. CloseWithError is idempotent.
+	go func() {
+		<-ctx.Done()
+		pw.CloseWithError(ctx.Err())
+	}()
+	go func() {
+		defer pw.Close()
+		_, err := io.Copy(pw, r)
+		if err != nil {
+			pw.CloseWithError(err)
+		}
+	}()
+	cpr := &ctxPipeReader{
+		ctx: ctx,
+		pr:  pr,
+		ch:  make(chan prResult, 1),
+	}
+	go cpr.readLoop()
+	return cpr
+}
+
+// prResult carries the outcome of a single pipe read performed by the
+// persistent readLoop goroutine.
+type prResult struct {
+	n   int
+	err error
+	buf []byte // copy of the data read (owned by the receiver)
+}
+
+type ctxPipeReader struct {
+	ctx      context.Context
+	pr       *io.PipeReader
+	ch       chan prResult // results from the persistent readLoop goroutine
+	leftover []byte        // unconsumed data from the previous prResult
+	lerr     error         // error attached to leftover (delivered once leftover is drained)
+}
+
+// readLoop is the persistent goroutine that reads from the pipe into an
+// internal buffer and delivers results to Read via ch. It exits when the
+// pipe returns an error or ctx is cancelled.
+func (c *ctxPipeReader) readLoop() {
+	defer close(c.ch)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := c.pr.Read(buf)
+		if n > 0 {
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			select {
+			case c.ch <- prResult{n: n, err: err, buf: data}:
+			case <-c.ctx.Done():
+				return
+			}
+		}
+		if err != nil {
+			if n == 0 {
+				select {
+				case c.ch <- prResult{err: err}:
+				case <-c.ctx.Done():
+				}
+			}
+			return
+		}
+	}
+}
+
+func (c *ctxPipeReader) Read(p []byte) (int, error) {
+	// Serve leftover data from the previous internal read first.
+	if len(c.leftover) > 0 {
+		n := copy(p, c.leftover)
+		c.leftover = c.leftover[n:]
+		if len(c.leftover) == 0 && c.lerr != nil {
+			err := c.lerr
+			c.lerr = nil
+			return n, err
+		}
+		return n, nil
+	}
+
+	select {
+	case <-c.ctx.Done():
+		c.pr.CloseWithError(c.ctx.Err())
+		return 0, c.ctx.Err()
+	case res, ok := <-c.ch:
+		if !ok {
+			return 0, io.EOF
+		}
+		n := copy(p, res.buf)
+		if n < len(res.buf) {
+			c.leftover = res.buf[n:]
+			c.lerr = res.err
+			return n, nil
+		}
+		return n, res.err
+	}
+}
+
+func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model string, reqTools json.RawMessage, searchToolCache []map[string]any, ctx context.Context) error {
 	flusher, _ := w.(http.Flusher)
 	dst := io.Writer(w)
 	if flusher != nil {
 		dst = &flushWriter{w: w, f: flusher}
 	}
 	tr := newResponsesStreamTranslator(model, searchToolCache)
-	sc := bufio.NewScanner(body)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	// Wrap body with a ctx-aware reader so that a blocked Read (e.g.
+	// upstream silent during long reasoning) returns promptly when the
+	// context is cancelled.
+	sc := bufio.NewScanner(ctxReader(ctx, body))
+	sc.Buffer(make([]byte, 0, streamScannerInitialBuf), streamScannerMaxBuf)
 	var usage map[string]any
 
 	for sc.Scan() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		line := sc.Bytes()
 		if !bytes.HasPrefix(line, []byte("data: ")) {
 			continue

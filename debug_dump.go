@@ -20,11 +20,12 @@ func dumpDebugChatBody(chatBody []byte) {
 	}
 	dir := initDebugDumpDir()
 	path := filepath.Join(dir, "last-chat-request.json")
-	if err := os.WriteFile(path, chatBody, 0o600); err != nil {
+	sanitized := []byte(redactBody(chatBody))
+	if err := os.WriteFile(path, sanitized, 0o600); err != nil {
 		log.Printf("debug: dump failed: %v", err)
 		return
 	}
-	log.Printf("debug: wrote %s (%d bytes)", path, len(chatBody))
+	log.Printf("debug: wrote %s (%d bytes)", path, len(sanitized))
 }
 
 func dumpDebugResponsesBody(originalBody []byte) {
@@ -33,7 +34,8 @@ func dumpDebugResponsesBody(originalBody []byte) {
 	}
 	dir := initDebugDumpDir()
 	path := filepath.Join(dir, "last-responses-request.json")
-	if err := os.WriteFile(path, originalBody, 0o600); err != nil {
+	sanitized := []byte(redactBody(originalBody))
+	if err := os.WriteFile(path, sanitized, 0o600); err != nil {
 		log.Printf("debug: dump failed: %v", err)
 	}
 }
@@ -44,7 +46,8 @@ func dumpDebugUpstreamResponse(rawBody []byte) {
 	}
 	dir := initDebugDumpDir()
 	path := filepath.Join(dir, "last-upstream-response.json")
-	if err := os.WriteFile(path, rawBody, 0o600); err != nil {
+	sanitized := []byte(redactBody(rawBody))
+	if err := os.WriteFile(path, sanitized, 0o600); err != nil {
 		log.Printf("debug: dump failed: %v", err)
 	}
 }

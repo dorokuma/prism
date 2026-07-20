@@ -16,6 +16,22 @@
 
 debug: false
 listen: "127.0.0.1:18790"
+
+# Optional authentication token for /v1/* endpoints. When set, clients must
+# send "Authorization: Bearer <token>". Env var: PRISM_AUTH_TOKEN.
+# auth_token: "your-secret-token"
+
+# Optional TLS. When both set, server listens with HTTPS. Env vars: PRISM_TLS_CERT, PRISM_TLS_KEY.
+# tls_cert_file: "/path/to/cert.pem"
+# tls_key_file: "/path/to/key.pem"
+
+# Optional trusted reverse proxy CIDRs. When set, X-Forwarded-For is only
+# trusted for requests coming from these CIDRs (rightmost XFF entry used).
+# When empty, only RemoteAddr is used for rate limiting (safest default).
+# trusted_proxies:
+#   - "10.0.0.0/8"
+#   - "127.0.0.0/8"
+
 probe_interval: 10m
 probe_model: "deepseek-chat"
 # wire_api: legacy | responses | both
