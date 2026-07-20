@@ -126,7 +126,6 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
 	}
-	defer resp.Body.Close()
 	limitReader := io.LimitReader(resp.Body, 4096)
 	bodyBytes, err := io.ReadAll(limitReader)
 	if err != nil {
@@ -341,6 +340,176 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) 
 	}, cfg)
 }
 
+// doUpstreamResult bundles the result of an upstream request attempt.
+// resp is non-nil when the upstream returned an HTTP response (success or not).
+// ctx/cancel are valid only when resp is non-nil and are passed to
+// handleUpstreamResponse which owns their lifecycle.
+// When resp is nil, retry indicates whether the caller should retry
+// (retry=true) or treat this as a fatal error (retry=false with fatalErr).
+type doUpstreamResult struct {
+	resp     *http.Response
+	ctx      context.Context
+	cancel   context.CancelFunc
+	retry    bool
+	fatalErr error
+}
+
+// doUpstreamRequest builds and sends the upstream HTTP request.
+// On success it returns the response plus ctx/cancel for the caller (segment 3)
+// to manage. On any error it explicitly cancels the upstream context and returns
+// a result describing whether the caller should retry.
+func doUpstreamRequest(acc *Account, r *http.Request, bodyBytes []byte, opts chatForwardOpts, requestID string) doUpstreamResult {
+	ctx, cancel := upstreamContext(r, opts.stream)
+
+	targetURL := acc.BaseURL() + "/chat/completions"
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		cancel()
+		log.Printf("proxy: failed to create request for %s: %v", acc.Name(), err)
+		recordUpstreamRetry()
+		return doUpstreamResult{retry: true}
+	}
+	copyClientHeaders(req.Header, r.Header)
+	req.Header.Set("Authorization", "Bearer "+acc.Key())
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := acc.Client().Do(req)
+	if err != nil {
+		cancel()
+		// If client disconnected, don't retry
+		if r.Context().Err() != nil {
+			log.Printf("proxy: req=%s client disconnected, aborting retry", requestID)
+			recordError()
+			return doUpstreamResult{retry: false, fatalErr: fmt.Errorf("client disconnected: %w", r.Context().Err())}
+		}
+		acc.SetCooldown(30 * time.Second)
+		log.Printf("proxy: chat retry via %s (upstream connection error), cooling down 30s: %v", acc.Name(), err)
+		recordUpstreamRetry()
+		return doUpstreamResult{retry: true}
+	}
+
+	return doUpstreamResult{resp: resp, ctx: ctx, cancel: cancel}
+}
+
+// handleUpstreamResponse processes the upstream HTTP response and writes the
+// result to the client. It owns the lifecycle of ctx (via the provided cancel)
+// and resp.Body.
+func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request, resp *http.Response, bodyBytes []byte, start time.Time, opts chatForwardOpts, requestID string, ctx context.Context, cancel context.CancelFunc) (done bool, fatalErr error) {
+	defer cancel()
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 429 || resp.StatusCode == 402 || resp.StatusCode == 401 {
+		handleUpstreamError(acc, resp)
+		recordUpstreamRetry()
+		return false, nil
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		recordRequest(time.Since(start))
+	} else if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		// 4xx client error (other than 401/402/429 handled above, plus
+		// 403 which is a permission error not helped by retry).
+		// Pass through with redacted body, no cooldown, no retry.
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		if readErr != nil {
+			log.Printf("proxy: failed to read upstream 4xx body: %v", readErr)
+		}
+		log.Printf("proxy: %s upstream 4xx status=%d body=%s", acc.Name(), resp.StatusCode, redactBody(errBody))
+		recordError()
+		// Transparent proxy: forward all non-hop-by-hop upstream headers
+		// (see copyUpstreamHeaders godoc for design rationale), then remove
+		// headers that become invalid after body redaction.
+		copyUpstreamHeaders(w, resp.Header)
+		w.Header().Del("Content-Length")
+		w.Header().Del("Content-Encoding")
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/json")
+		}
+		w.WriteHeader(resp.StatusCode)
+		w.Write(redactBodyBytes(errBody))
+		return true, nil
+	} else {
+		// 5xx server error or other non-2xx: cooldown and retry.
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if readErr != nil {
+			log.Printf("proxy: failed to read upstream 5xx body: %v", readErr)
+		}
+		acc.SetCooldown(30 * time.Second)
+		log.Printf("proxy: %s 5xx error (status=%d), cooling down 30s. body: %s", acc.Name(), resp.StatusCode, redactBody(errBody))
+		recordUpstreamRetry()
+		return false, nil
+	}
+
+	if opts.responsesOut && opts.stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		translateStart := time.Now()
+		log.Printf("proxy: req=%s account=%s mode=responses_stream translate.start=%s", requestID, acc.Name(), translateStart.Format(time.RFC3339Nano))
+		err := translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools, getSearchToolCache(opts.tenantID), ctx)
+		translateElapsed := time.Since(translateStart).Milliseconds()
+		if err != nil {
+			log.Printf("proxy: req=%s account=%s mode=responses_stream translate.error=%v translate_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, time.Since(start))
+			recordError()
+			return true, err
+		}
+		log.Printf("proxy: req=%s account=%s mode=responses_stream translate.done translate_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, time.Since(start))
+		recordRequest(time.Since(start))
+		return true, nil
+	}
+
+	if opts.responsesOut && !opts.stream {
+		bodyReadStart := time.Now()
+		rawBody, err := io.ReadAll(resp.Body)
+		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
+		if err != nil {
+			log.Printf("proxy: req=%s account=%s mode=responses_json body_read_error body_ms=%d elapsed=%v", requestID, acc.Name(), bodyReadElapsed, time.Since(start))
+			return true, err
+		}
+		dumpDebugUpstreamResponse(rawBody)
+		translateStart := time.Now()
+		out, err := chatCompletionToResponse(rawBody, opts.model, opts.reqTools)
+		translateElapsed := time.Since(translateStart).Milliseconds()
+		if err != nil {
+			log.Printf("proxy: req=%s account=%s mode=responses_json translate.error=%v translate_ms=%d body_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, bodyReadElapsed, time.Since(start))
+			recordError()
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error": map[string]any{"message": "upstream response translation failed", "code": "upstream_error"},
+			})
+			return true, nil
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		n, _ := w.Write(out)
+		log.Printf("proxy: req=%s account=%s mode=responses_json done written=%d body_ms=%d translate_ms=%d elapsed=%v", requestID, acc.Name(), n, bodyReadElapsed, translateElapsed, time.Since(start))
+		recordRequest(time.Since(start))
+		return true, nil
+	}
+
+	copyUpstreamHeaders(w, resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	bodyReadStart := time.Now()
+	n, err := streamResponseBody(w, resp.Body, r, acc.Name())
+	bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
+	if err != nil {
+		log.Printf("proxy: req=%s account=%s mode=legacy_stream body_read_error body_ms=%d elapsed=%v", requestID, acc.Name(), bodyReadElapsed, time.Since(start))
+		recordError()
+		return true, err
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		log.Printf("proxy: req=%s account=%s mode=legacy_stream done status=%d written=%d content-length=%s body_read_ms=%d elapsed=%v", requestID, acc.Name(), resp.StatusCode, n, cl, bodyReadElapsed, time.Since(start))
+	} else {
+		log.Printf("proxy: req=%s account=%s mode=legacy_stream done status=%d written=%d body_read_ms=%d elapsed=%v", requestID, acc.Name(), resp.StatusCode, n, bodyReadElapsed, time.Since(start))
+	}
+	recordRequest(time.Since(start))
+	return true, nil
+}
+
 func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyBytes []byte, start time.Time, opts chatForwardOpts, cfg *Config) {
 	bodyBytes = transformRequestBody(bodyBytes, cfg)
 	if len(pool.accounts) == 0 {
@@ -377,151 +546,30 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 			return
 		}
 
-		done, streamErr := func() (bool, error) {
+		var terminalDone bool
+		var terminalFatalErr error
+
+		func() {
 			defer pool.Release(acc)
-
-			ctx, cancel := upstreamContext(r, opts.stream)
-			defer cancel()
-
-			targetURL := acc.BaseURL() + "/chat/completions"
-			if r.URL.RawQuery != "" {
-				targetURL += "?" + r.URL.RawQuery
-			}
-
-			req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(bodyBytes))
-			if err != nil {
-				log.Printf("proxy: failed to create request for %s: %v", acc.Name(), err)
-				recordUpstreamRetry()
-				return false, nil
-			}
-			copyClientHeaders(req.Header, r.Header)
-			req.Header.Set("Authorization", "Bearer "+acc.Key())
-			req.Header.Set("Content-Type", "application/json")
-
-			resp, err := acc.Client().Do(req)
-			if err != nil {
-				// If client disconnected, don't retry
-				if r.Context().Err() != nil {
-					log.Printf("proxy: req=%s client disconnected, aborting retry", requestID)
-					recordError()
-					return true, fmt.Errorf("client disconnected: %w", r.Context().Err())
+			res := doUpstreamRequest(acc, r, bodyBytes, opts, requestID)
+			if res.resp != nil {
+				done, fatalErr := handleUpstreamResponse(acc, w, r, res.resp, bodyBytes, start, opts, requestID, res.ctx, res.cancel)
+				if done {
+					terminalDone = true
+					terminalFatalErr = fatalErr
+					return
 				}
-				acc.SetCooldown(30 * time.Second)
-				log.Printf("proxy: chat retry via %s (upstream connection error), cooling down 30s: %v", acc.Name(), err)
-				recordUpstreamRetry()
-				return false, nil
+				return
 			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == 429 || resp.StatusCode == 402 || resp.StatusCode == 401 {
-				handleUpstreamError(acc, resp)
-				recordUpstreamRetry()
-				return false, nil
+			if res.retry {
+				return
 			}
-
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				recordRequest(time.Since(start))
-			} else if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				// 4xx client error (other than 401/402/429 handled above, plus
-				// 403 which is a permission error not helped by retry).
-				// Pass through with redacted body, no cooldown, no retry.
-				errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-				if readErr != nil {
-					log.Printf("proxy: failed to read upstream 4xx body: %v", readErr)
-				}
-				log.Printf("proxy: %s upstream 4xx status=%d body=%s", acc.Name(), resp.StatusCode, redactBody(errBody))
-				recordError()
-				// Transparent proxy: forward all non-hop-by-hop upstream headers
-				// (see copyUpstreamHeaders godoc for design rationale), then remove
-				// headers that become invalid after body redaction.
-				copyUpstreamHeaders(w, resp.Header)
-				w.Header().Del("Content-Length")
-				w.Header().Del("Content-Encoding")
-				if w.Header().Get("Content-Type") == "" {
-					w.Header().Set("Content-Type", "application/json")
-				}
-				w.WriteHeader(resp.StatusCode)
-				w.Write(redactBodyBytes(errBody))
-				return true, nil
-			} else {
-				// 5xx server error or other non-2xx: cooldown and retry.
-				errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				if readErr != nil {
-					log.Printf("proxy: failed to read upstream 5xx body: %v", readErr)
-				}
-				acc.SetCooldown(30 * time.Second)
-				log.Printf("proxy: %s 5xx error (status=%d), cooling down 30s. body: %s", acc.Name(), resp.StatusCode, redactBody(errBody))
-				recordUpstreamRetry()
-				return false, nil
-			}
-
-			if opts.responsesOut && opts.stream {
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.Header().Set("Cache-Control", "no-cache")
-				w.Header().Set("Connection", "keep-alive")
-				w.WriteHeader(http.StatusOK)
-				translateStart := time.Now()
-				log.Printf("proxy: req=%s account=%s mode=responses_stream translate.start=%s", requestID, acc.Name(), translateStart.Format(time.RFC3339Nano))
-				err = translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools, getSearchToolCache(opts.tenantID), ctx)
-				translateElapsed := time.Since(translateStart).Milliseconds()
-				if err != nil {
-					log.Printf("proxy: req=%s account=%s mode=responses_stream translate.error=%v translate_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, time.Since(start))
-					recordError()
-					return true, err
-				}
-				log.Printf("proxy: req=%s account=%s mode=responses_stream translate.done translate_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, time.Since(start))
-				recordRequest(time.Since(start))
-				return true, nil
-			}
-
-			if opts.responsesOut && !opts.stream {
-				bodyReadStart := time.Now()
-				rawBody, err := io.ReadAll(resp.Body)
-				bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
-				if err != nil {
-					log.Printf("proxy: req=%s account=%s mode=responses_json body_read_error body_ms=%d elapsed=%v", requestID, acc.Name(), bodyReadElapsed, time.Since(start))
-					return true, err
-				}
-				dumpDebugUpstreamResponse(rawBody)
-				translateStart := time.Now()
-				out, err := chatCompletionToResponse(rawBody, opts.model, opts.reqTools)
-				translateElapsed := time.Since(translateStart).Milliseconds()
-				if err != nil {
-					log.Printf("proxy: req=%s account=%s mode=responses_json translate.error=%v translate_ms=%d body_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, bodyReadElapsed, time.Since(start))
-					recordError()
-					writeJSON(w, http.StatusBadGateway, map[string]any{
-						"error": map[string]any{"message": "upstream response translation failed", "code": "upstream_error"},
-					})
-					return true, nil
-				}
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusOK)
-				n, _ := w.Write(out)
-				log.Printf("proxy: req=%s account=%s mode=responses_json done written=%d body_ms=%d translate_ms=%d elapsed=%v", requestID, acc.Name(), n, bodyReadElapsed, translateElapsed, time.Since(start))
-				recordRequest(time.Since(start))
-				return true, nil
-			}
-
-			copyUpstreamHeaders(w, resp.Header)
-			w.WriteHeader(resp.StatusCode)
-			bodyReadStart := time.Now()
-			n, err := streamResponseBody(w, resp.Body, r, acc.Name())
-			bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
-			if err != nil {
-				log.Printf("proxy: req=%s account=%s mode=legacy_stream body_read_error body_ms=%d elapsed=%v", requestID, acc.Name(), bodyReadElapsed, time.Since(start))
-				recordError()
-				return true, err
-			}
-			if cl := resp.Header.Get("Content-Length"); cl != "" {
-				log.Printf("proxy: req=%s account=%s mode=legacy_stream done status=%d written=%d content-length=%s body_read_ms=%d elapsed=%v", requestID, acc.Name(), resp.StatusCode, n, cl, bodyReadElapsed, time.Since(start))
-			} else {
-				log.Printf("proxy: req=%s account=%s mode=legacy_stream done status=%d written=%d body_read_ms=%d elapsed=%v", requestID, acc.Name(), resp.StatusCode, n, bodyReadElapsed, time.Since(start))
-			}
-			recordRequest(time.Since(start))
-			return true, nil
+			terminalDone = true
+			terminalFatalErr = res.fatalErr
 		}()
-		if done {
-			if streamErr != nil {
+
+		if terminalDone {
+			if terminalFatalErr != nil {
 				return
 			}
 			return

@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -578,5 +580,144 @@ func TestUpstream5xxCooldown(t *testing.T) {
 	accs := pool.AllAccounts()
 	if !accs[0].IsInCooldown() {
 		t.Error("account should be in cooldown after 5xx")
+	}
+}
+
+func TestClientDisconnectedNoRetry(t *testing.T) {
+	var upstreamCalls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"delta":{"content":"hello"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &Config{Accounts: []AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	pool := NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	ctx, cancel := context.WithCancel(context.Background())
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r = r.WithContext(ctx)
+	r.Header.Set("Content-Type", "application/json")
+	cancel()
+
+	proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{}, cfg)
+
+	if strings.Contains(rec.Body.String(), "all_exhausted") {
+		t.Error("should not have reached 'all accounts exhausted' for disconnected client")
+	}
+	accs := pool.AllAccounts()
+	if accs[0].IsInCooldown() {
+		t.Error("account should NOT be in cooldown after client disconnect")
+	}
+	if atomic.LoadInt32(&upstreamCalls) > 1 {
+		t.Errorf("upstream calls = %d, want <= 1", upstreamCalls)
+	}
+}
+
+func TestUpstreamConnectionErrorRetry(t *testing.T) {
+	cfg := &Config{Accounts: []AccountConfig{{Name: "test", Key: "k", BaseURL: "http://127.0.0.1:1"}}}
+	pool := NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{}, cfg)
+
+	if rec.Code != 503 {
+		t.Errorf("expected status 503, got %d", rec.Code)
+	}
+	accs := pool.AllAccounts()
+	if !accs[0].IsInCooldown() {
+		t.Error("account should be in cooldown after connection error")
+	}
+}
+
+func TestUpstream401Retry(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(401)
+		w.Write([]byte(`{"error":{"message":"invalid api key"}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &Config{Accounts: []AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	pool := NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{}, cfg)
+
+	if rec.Code != 503 {
+		t.Errorf("expected status 503, got %d", rec.Code)
+	}
+	accs := pool.AllAccounts()
+	if accs[0].Status() != StatusExhausted {
+		t.Errorf("account status = %d, want StatusExhausted", accs[0].Status())
+	}
+}
+
+func TestUpstream429CooldownRetry(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &Config{Accounts: []AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	pool := NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{}, cfg)
+
+	if rec.Code != 503 {
+		t.Errorf("expected status 503, got %d", rec.Code)
+	}
+	accs := pool.AllAccounts()
+	if !accs[0].IsInCooldown() {
+		t.Error("account should be in cooldown after 429")
+	}
+}
+
+func TestChatPassthrough2xx(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Request-ID", "req-12345")
+		w.WriteHeader(200)
+		w.Write([]byte(`data: {"choices":[{"delta":{"content":"hello"}}]}
+
+data: {"choices":[{"delta":{"content":" world"}}]}
+
+data: [DONE]
+
+`))
+	}))
+	defer upstream.Close()
+
+	cfg := &Config{Accounts: []AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	pool := NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{responsesOut: false, stream: false}, cfg)
+
+	if rec.Code != 200 {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+	if rec.Header().Get("X-Request-ID") != "req-12345" {
+		t.Errorf("X-Request-ID = %q, want req-12345", rec.Header().Get("X-Request-ID"))
+	}
+	if !strings.Contains(rec.Body.String(), "hello") {
+		t.Error("body should contain SSE content 'hello'")
 	}
 }
