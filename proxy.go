@@ -309,6 +309,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 	// Remap model name if configured
 	bodyBytes = remapModelInBody(bodyBytes, cfg)
 	bodyBytes = remapThinkingForDeepSeek(bodyBytes)
+	bodyBytes = stripUnsupportedFields(bodyBytes)
 	if len(pool.accounts) == 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(503)
@@ -554,6 +555,34 @@ func remapModelInBody(body []byte, cfg *Config) []byte {
 		return body
 	}
 	log.Printf("proxy: model remap %s -> %s", model, remapped)
+	return out
+}
+
+// stripUnsupportedFields removes fields from the request body that are not
+// supported by certain upstream providers. Currently handles:
+//   - prompt_cache_retention: not supported by GLM/z-ai upstream ("Error from
+//     provider: Extra inputs are not permitted, field: 'prompt_cache_retention'")
+func stripUnsupportedFields(body []byte) []byte {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return body
+	}
+
+	model, _ := rawStringField(raw, "model")
+	modelLower := strings.ToLower(model)
+
+	// GLM/z-ai upstream doesn't support prompt_cache_retention
+	if strings.Contains(modelLower, "glm") || strings.Contains(modelLower, "z-ai") {
+		if _, ok := raw["prompt_cache_retention"]; ok {
+			delete(raw, "prompt_cache_retention")
+			log.Printf("proxy: stripped prompt_cache_retention for model %s", model)
+		}
+	}
+
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return body
+	}
 	return out
 }
 
