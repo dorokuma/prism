@@ -196,11 +196,12 @@ func (p *Pool) trySelectLocked() *Account {
 // ErrNoHealthyAccounts is returned when no healthy upstream accounts are available in the pool.
 var ErrNoHealthyAccounts = errors.New("no healthy accounts available")
 
-// ErrSelectTimeout is returned when waiting for an available account exceeds the configured timeout.
+// ErrSelectTimeout is returned as a safety net when waiting for an available account exceeds 2×accountSelectTimeout.
+// Under normal operation the caller's context (accountSelectTimeout) expires first, so this acts as a fallback.
 var ErrSelectTimeout = errors.New("select account timeout")
 
 func (p *Pool) Select(ctx context.Context) (*Account, error) {
-	timer := time.NewTimer(45 * time.Second)
+	timer := time.NewTimer(2 * accountSelectTimeout)
 	defer timer.Stop()
 
 	for {

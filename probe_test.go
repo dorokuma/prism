@@ -122,25 +122,23 @@ func TestProbeExhausted_503Retries(t *testing.T) {
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
+	probeRetryDelay = time.Millisecond
 
 	start := time.Now()
 	probeExhausted(pool, "test-model")
-	elapsed := time.Since(start)
 
 	// Should have retried maxProbeAttempts times (3)
 	if callCount != maxProbeAttempts {
 		t.Errorf("expected %d attempts for 503, got %d", maxProbeAttempts, callCount)
 	}
+	// Guard that retry delay is actually applied (2 sleeps between 3 attempts)
+	if since := time.Since(start); since < 2*probeRetryDelay-time.Millisecond {
+		t.Errorf("retry delay not applied: elapsed %v, expected at least ~%v", since, 2*probeRetryDelay)
+	}
 
 	// Should still be exhausted (503 doesn't trigger recovery)
 	if accs[0].IsHealthy() {
 		t.Error("account should NOT be marked healthy after 503")
-	}
-
-	// Should have waited between retries (at least 2 * probeRetryDelay)
-	minWait := 2 * probeRetryDelay
-	if elapsed < minWait {
-		t.Errorf("expected at least %v elapsed for retries, got %v", minWait, elapsed)
 	}
 }
 
@@ -162,6 +160,7 @@ func TestProbeExhausted_401Retries(t *testing.T) {
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
+	probeRetryDelay = time.Millisecond
 
 	probeExhausted(pool, "test-model")
 
@@ -194,6 +193,7 @@ func TestProbeExhausted_403Retries(t *testing.T) {
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
+	probeRetryDelay = time.Millisecond
 
 	probeExhausted(pool, "test-model")
 
@@ -237,6 +237,7 @@ func TestProbeExhausted_MultipleAccounts(t *testing.T) {
 	for _, a := range accs {
 		a.MarkExhausted()
 	}
+	probeRetryDelay = time.Millisecond
 
 	probeExhausted(pool, "test-model")
 
@@ -271,6 +272,7 @@ func TestProbeExhausted_ConnectionRefused(t *testing.T) {
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
+	probeRetryDelay = time.Millisecond
 
 	// Should not panic; will retry and fail
 	probeExhausted(pool, "test-model")
@@ -303,22 +305,21 @@ func TestProbeExhausted_RecoveryAfterRetry(t *testing.T) {
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
+	probeRetryDelay = time.Millisecond
 
 	start := time.Now()
 	probeExhausted(pool, "test-model")
-	elapsed := time.Since(start)
 
 	if callCount != 3 {
 		t.Errorf("expected 3 attempts, got %d", callCount)
+	}
+	// Guard that retry delay is actually applied (2 sleeps between 3 attempts)
+	if since := time.Since(start); since < 2*probeRetryDelay-time.Millisecond {
+		t.Errorf("retry delay not applied: elapsed %v, expected at least ~%v", since, 2*probeRetryDelay)
 	}
 
 	// Should be healed after 200 on third attempt
 	if !accs[0].IsHealthy() {
 		t.Error("account should be marked healthy after 200 on retry")
-	}
-
-	// Should have waited at least 2 * probeRetryDelay (two retry delays)
-	if elapsed < 2*probeRetryDelay {
-		t.Errorf("expected at least %v elapsed, got %v", 2*probeRetryDelay, elapsed)
 	}
 }

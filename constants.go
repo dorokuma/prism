@@ -2,10 +2,13 @@ package main
 
 import "time"
 
-const (
+var (
 	// Probe
 	maxProbeAttempts = 3
 	probeRetryDelay  = 2 * time.Second
+)
+
+const (
 	probeTimeout     = 30 * time.Second
 
 	// Rate limiting
