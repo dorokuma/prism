@@ -223,6 +223,45 @@ accounts:
 		}
 	})
 
+	t.Run("glm tier with other fields but missing prompt_cache_retention warns", func(t *testing.T) {
+		content := `
+model_tiers:
+  glm-test: glm-5.2
+strip_fields:
+  glm-test:
+    - some_other_field
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		f, err := os.CreateTemp("", "config-*.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+
+		var buf bytes.Buffer
+		oldWriter := log.Writer()
+		log.SetOutput(&buf)
+		defer log.SetOutput(oldWriter)
+
+		cfg, err := LoadConfig(f.Name())
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if !strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("expected WARNING for GLM tier with other fields but no prompt_cache_retention, got: %s", buf.String())
+		}
+		if len(cfg.StripFields["glm-test"]) != 1 || cfg.StripFields["glm-test"][0] != "some_other_field" {
+			t.Errorf("expected strip_fields for glm-test with some_other_field, got %v", cfg.StripFields)
+		}
+	})
+
 	t.Run("non-glm tier does not warn", func(t *testing.T) {
 		content := `
 model_tiers:
