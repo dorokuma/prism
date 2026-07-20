@@ -103,8 +103,8 @@ accounts:
 func TestConfigRemapModel(t *testing.T) {
 	cfg := &Config{
 		ModelRemap: map[string]string{
-			"gpt-4":    "premium",
-			"gpt-3.5":  "standard",
+			"gpt-4":   "premium",
+			"gpt-3.5": "standard",
 		},
 		ModelTiers: map[string]string{
 			"premium":  "gpt-4-turbo",
@@ -133,7 +133,7 @@ func TestConfigRemapModel(t *testing.T) {
 func TestConfigRemapModelFallback(t *testing.T) {
 	cfg := &Config{
 		ModelRemap: map[string]string{
-			"gpt-4":   "premium",
+			"gpt-4": "premium",
 		},
 		ModelTiers: map[string]string{
 			"standard": "gpt-3.5-turbo",
