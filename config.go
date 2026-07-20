@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"gopkg.in/yaml.v3"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,6 +68,15 @@ func LoadConfig(path string) (*Config, error) {
 			cfg.Accounts[i].Key = key
 			if cfg.Accounts[i].Key == "" {
 				return nil, fmt.Errorf("account %s: key not set in config and credential/env var %s is empty", cfg.Accounts[i].Name, envVar)
+			}
+		}
+	}
+	// Startup validation: warn if GLM/z-ai upstreams lack strip_fields entries
+	for tier, upstream := range cfg.ModelTiers {
+		upstreamLower := strings.ToLower(upstream)
+		if strings.Contains(upstreamLower, "glm") || strings.Contains(upstreamLower, "z-ai") {
+			if _, ok := cfg.StripFields[tier]; !ok || len(cfg.StripFields[tier]) == 0 {
+				log.Printf("WARNING: tier %q upstream %q looks like GLM/z-ai but has no strip_fields entry; add prompt_cache_retention to avoid 400 errors", tier, upstream)
 			}
 		}
 	}

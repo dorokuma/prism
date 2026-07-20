@@ -585,22 +585,30 @@ func transformRequestBody(body []byte, cfg *Config) []byte {
 	}
 
 	// Step 3: Strip unsupported fields per tier config
+	// Aggregate StripFields across all tiers whose upstream matches the model.
 	if len(cfg.StripFields) > 0 && model != "" {
-		var tier string
+		var matchedTiers []string
+		seenFields := make(map[string]bool)
+		var mergedFields []string
 		for t, upstream := range cfg.ModelTiers {
 			if upstream == model {
-				tier = t
-				break
+				matchedTiers = append(matchedTiers, t)
+				if fields, ok := cfg.StripFields[t]; ok {
+					for _, f := range fields {
+						if !seenFields[f] {
+							seenFields[f] = true
+							mergedFields = append(mergedFields, f)
+						}
+					}
+				}
 			}
 		}
-		if tier != "" {
-			if fields, ok := cfg.StripFields[tier]; ok && len(fields) > 0 {
-				for _, field := range fields {
-					if _, exists := raw[field]; exists {
-						delete(raw, field)
-						changed = true
-						log.Printf("proxy: stripped field %q for model %s (tier %s)", field, model, tier)
-					}
+		if len(mergedFields) > 0 {
+			for _, field := range mergedFields {
+				if _, exists := raw[field]; exists {
+					delete(raw, field)
+					changed = true
+					log.Printf("proxy: stripped field %q for model %s (tiers %v)", field, model, matchedTiers)
 				}
 			}
 		}

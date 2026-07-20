@@ -5,12 +5,20 @@ import (
 	"testing"
 )
 
+func assertBodyUnchanged(t *testing.T, got, body []byte) {
+	t.Helper()
+	if string(got) != string(body) {
+		t.Errorf("body changed: got %s, want %s", got, body)
+	}
+	if len(got) > 0 && len(body) > 0 && &got[0] != &body[0] {
+		t.Errorf("body slice identity changed: expected same underlying array")
+	}
+}
+
 func TestTransformRequestBody_NilCfg(t *testing.T) {
 	body := []byte(`{"model":"glm-5.2","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}]}`)
 	got := transformRequestBody(body, nil)
-	if string(got) != string(body) {
-		t.Errorf("transformRequestBody(nil) changed body: got %s, want %s", got, body)
-	}
+	assertBodyUnchanged(t, got, body)
 }
 
 func TestTransformRequestBody_StripGLM(t *testing.T) {
@@ -58,7 +66,7 @@ func TestTransformRequestBody_StripGLM(t *testing.T) {
 	}
 }
 
-func TestTransformRequestBody_NonGLMNoStrip(t *testing.T) {
+func TestTransformRequestBody_DeepSeekNoThinkingNoStrip(t *testing.T) {
 	cfg := &Config{
 		ModelRemap: map[string]string{"deepseek-v4-pro": "frontier"},
 		ModelTiers: map[string]string{"frontier": "deepseek-v4-pro"},
@@ -70,11 +78,9 @@ func TestTransformRequestBody_NonGLMNoStrip(t *testing.T) {
 	body := []byte(`{"model":"deepseek-v4-pro","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}]}`)
 	got := transformRequestBody(body, cfg)
 
-	// Since this model doesn't belong to a tier that has strip fields,
-	// the body should be returned as-is (no change)
-	if string(got) != string(body) {
-		t.Errorf("transformRequestBody changed non-GLM body: got %s, want %s", got, body)
-	}
+	// This is a DeepSeek model but has no thinking/reasoning_effort fields and
+	// no matching tier with strip_fields, so the body should be returned as-is.
+	assertBodyUnchanged(t, got, body)
 }
 
 func TestTransformRequestBody_GLMNoStripField(t *testing.T) {
@@ -200,9 +206,7 @@ func TestTransformRequestBody_InvalidJSON(t *testing.T) {
 	}
 	body := []byte(`{invalid json}`)
 	got := transformRequestBody(body, cfg)
-	if string(got) != string(body) {
-		t.Errorf("transformRequestBody changed invalid JSON body: got %s, want %s", got, body)
-	}
+	assertBodyUnchanged(t, got, body)
 }
 
 func TestTransformRequestBody_DeepSeekThinkingRemap(t *testing.T) {
@@ -248,9 +252,7 @@ func TestTransformRequestBody_EmptyModel(t *testing.T) {
 	// Empty model → no remap, no strip
 	body := []byte(`{"model":"","messages":[{"role":"user","content":"hi"}]}`)
 	got := transformRequestBody(body, cfg)
-	if string(got) != string(body) {
-		t.Errorf("transformRequestBody changed body with empty model: got %s, want %s", got, body)
-	}
+	assertBodyUnchanged(t, got, body)
 }
 
 func TestTransformRequestBody_NoModelKey(t *testing.T) {
@@ -260,7 +262,66 @@ func TestTransformRequestBody_NoModelKey(t *testing.T) {
 	}
 	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
 	got := transformRequestBody(body, cfg)
-	if string(got) != string(body) {
-		t.Errorf("transformRequestBody changed body without model key: got %s, want %s", got, body)
+	assertBodyUnchanged(t, got, body)
+}
+
+func TestTransformRequestBody_DeepSeekReasoningEffortRemap(t *testing.T) {
+	cfg := &Config{
+		ModelRemap: map[string]string{"gpt-5.5": "frontier"},
+		ModelTiers: map[string]string{"frontier": "deepseek-v4-pro"},
+	}
+
+	tests := []struct {
+		name       string
+		inputLevel string
+		wantLevel  string
+	}{
+		{"low to high", "low", "high"},
+		{"xhigh to max", "xhigh", "max"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-5.5","reasoning_effort":"` + tt.inputLevel + `","messages":[{"role":"user","content":"hi"}]}`)
+			got := transformRequestBody(body, cfg)
+
+			if string(got) == string(body) {
+				t.Fatal("transformRequestBody should have remapped reasoning_effort, but returned same body")
+			}
+
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(got, &raw); err != nil {
+				t.Fatalf("unmarshal result: %v", err)
+			}
+
+			model, _ := rawStringField(raw, "model")
+			if model != "deepseek-v4-pro" {
+				t.Errorf("model = %q, want deepseek-v4-pro", model)
+			}
+
+			var effort string
+			if err := json.Unmarshal(raw["reasoning_effort"], &effort); err != nil {
+				t.Fatalf("unmarshal reasoning_effort: %v", err)
+			}
+			if effort != tt.wantLevel {
+				t.Errorf("reasoning_effort = %q, want %q", effort, tt.wantLevel)
+			}
+		})
 	}
 }
+
+func TestTransformRequestBody_NonDeepSeekNonGLMNoStrip(t *testing.T) {
+	cfg := &Config{
+		ModelRemap: map[string]string{"mimo-v2.5": "standard"},
+		ModelTiers: map[string]string{"standard": "mimo-v2.5"},
+		// No strip_fields for this tier — should not strip anything
+	}
+
+	body := []byte(`{"model":"mimo-v2.5","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}]}`)
+	got := transformRequestBody(body, cfg)
+
+	// mimo-v2.5 is neither deepseek nor glm, has no matching strip_fields;
+	// model remap mimo-v2.5 → standard → mimo-v2.5 (no-op). Body unchanged.
+	assertBodyUnchanged(t, got, body)
+}
+

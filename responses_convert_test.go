@@ -94,3 +94,27 @@ func TestConvertResponsesUsage(t *testing.T) {
 		t.Fatalf("prompt_tokens = %v, want 200", pt)
 	}
 }
+
+func TestMapThoughtLevel(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"low to high", "low", "high"},
+		{"medium to high", "medium", "high"},
+		{"high to high", "high", "high"},
+		{"xhigh to max", "xhigh", "max"},
+		{"LOW uppercase to high", "LOW", "high"},
+		{"unknown passes through", "unknown", "unknown"},
+		{"empty string passes through", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mapThoughtLevel(tt.input)
+			if got != tt.want {
+				t.Errorf("mapThoughtLevel(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
