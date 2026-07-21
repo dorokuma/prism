@@ -721,3 +721,28 @@ data: [DONE]
 		t.Error("body should contain SSE content 'hello'")
 	}
 }
+
+func TestHandleUpstreamResponse_NoDoubleCount(t *testing.T) {
+	// Reset metrics
+	metricsRequestsTotal.Set(0)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &Config{Accounts: []AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	pool := NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{}, cfg)
+
+	if metricsRequestsTotal.Value() != 1 {
+		t.Errorf("requests_total = %d, want 1 (double counting detected)", metricsRequestsTotal.Value())
+	}
+}

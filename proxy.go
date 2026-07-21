@@ -408,9 +408,7 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		return false, nil
 	}
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		recordRequest(time.Since(start))
-	} else if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		// 4xx client error (other than 401/402/429 handled above, plus
 		// 403 which is a permission error not helped by retry).
 		// Pass through with redacted body, no cooldown, no retry.
@@ -432,7 +430,8 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		w.WriteHeader(resp.StatusCode)
 		w.Write(redactBodyBytes(errBody))
 		return true, nil
-	} else {
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// 5xx server error or other non-2xx: cooldown and retry.
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if readErr != nil {
