@@ -1,5 +1,6 @@
 prism
 config.yaml
+bin/
 .env
 .audit*.md
 scripts/__pycache__/
