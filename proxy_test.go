@@ -197,7 +197,7 @@ func TestIsQuotaError(t *testing.T) {
 
 func TestHandleUpstreamErrorNilResp(t *testing.T) {
 	// Should not panic
-	handleUpstreamError(nil, nil)
+	handleUpstreamError(nil, nil, "test-req", "test-model")
 }
 
 func TestHandleUpstreamErrorNoBody(t *testing.T) {
@@ -206,7 +206,7 @@ func TestHandleUpstreamErrorNoBody(t *testing.T) {
 		StatusCode: 500,
 		Body:       io.NopCloser(bytes.NewReader(nil)),
 	}
-	handleUpstreamError(&Account{cfg: AccountConfig{Name: "test"}}, resp)
+	handleUpstreamError(&Account{cfg: AccountConfig{Name: "test"}}, resp, "test-req", "test-model")
 }
 
 func TestParseRetryAfter(t *testing.T) {

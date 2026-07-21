@@ -97,6 +97,7 @@ func (a *Account) SetCooldown(d time.Duration) {
 	if newUntil.After(a.cooldownUntil) {
 		a.cooldownUntil = newUntil
 	}
+	slog.Warn("account cooldown", "account", a.Name(), "duration", d.String(), "until", a.cooldownUntil.Format(time.RFC3339))
 }
 
 func (a *Account) IsInCooldown() bool {

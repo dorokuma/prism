@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -104,5 +106,58 @@ func TestDefaultLogger_Init(t *testing.T) {
 	// init() sets a default LevelInfo logger. Verify it exists.
 	if logger == nil {
 		t.Fatal("expected init() to create a default logger, got nil")
+	}
+}
+
+func TestRequestIDMiddleware_GeneratesAndPropagates(t *testing.T) {
+	var capturedID string
+	handler := requestIDMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedID = requestIDFromCtx(r.Context())
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	// No X-Request-ID header set — middleware should generate one.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if capturedID == "" {
+		t.Fatal("expected non-empty request ID from context after middleware")
+	}
+	respID := rec.Header().Get("X-Request-ID")
+	if respID == "" {
+		t.Fatal("expected X-Request-ID response header to be set")
+	}
+	if capturedID != respID {
+		t.Fatalf("context request ID %q != response header %q", capturedID, respID)
+	}
+}
+
+func TestRequestIDMiddleware_PreservesClientHeader(t *testing.T) {
+	var capturedID string
+	handler := requestIDMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedID = requestIDFromCtx(r.Context())
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	clientID := "my-client-id-123"
+	req.Header.Set("X-Request-ID", clientID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if capturedID != clientID {
+		t.Fatalf("context request ID %q != client ID %q", capturedID, clientID)
+	}
+	respID := rec.Header().Get("X-Request-ID")
+	if respID != clientID {
+		t.Fatalf("response header X-Request-ID %q != client ID %q", respID, clientID)
+	}
+}
+
+func TestRequestIDFromCtx_EmptyWithoutMiddleware(t *testing.T) {
+	ctx := context.Background()
+	if id := requestIDFromCtx(ctx); id != "" {
+		t.Fatalf("expected empty string from bare context, got %q", id)
 	}
 }

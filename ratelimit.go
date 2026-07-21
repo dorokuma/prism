@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -139,6 +140,7 @@ func rateLimitMiddleware(next http.Handler, rl *rateLimiter, trustedProxies []*n
 			ip := getClientIP(r, trustedProxies)
 			if !rl.Allow(ip) {
 				recordRateLimited()
+				slog.Warn("rate_limit.hit", "ip", ip, "path", r.URL.Path, "req", requestIDFromCtx(r.Context()))
 				writeJSON(w, http.StatusTooManyRequests, map[string]any{
 					"error": map[string]any{"message": "Rate limit exceeded", "code": "rate_limited"},
 				})

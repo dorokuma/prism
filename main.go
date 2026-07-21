@@ -142,7 +142,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr: cfg.Listen,
-		Handler: rateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		Handler: requestIDMiddleware(rateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/metrics" {
 				token := os.Getenv("METRICS_TOKEN")
 				allowed := (token != "" && CheckAuth(r, token)) || IsLocalhost(r)
@@ -159,6 +159,7 @@ func main() {
 			curCfg := holder.Load()
 			if curCfg.AuthToken != "" && r.URL.Path != "/health" {
 				if !CheckAuth(r, curCfg.AuthToken) {
+					slog.Warn("auth_failed", "req", requestIDFromCtx(r.Context()), "path", r.URL.Path, "remote_addr", r.RemoteAddr)
 					writeJSON(w, http.StatusUnauthorized, map[string]any{
 						"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
 					})
@@ -169,7 +170,7 @@ func main() {
 			// applies per-request timeouts based on the actual stream
 			// setting (parsed from the JSON body, not headers).
 			proxyHandler.ServeHTTP(w, r)
-		}), rl, trustedProxies),
+		}), rl, trustedProxies)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,

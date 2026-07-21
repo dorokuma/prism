@@ -132,32 +132,34 @@ func parseRetryAfter(resp *http.Response) time.Duration {
 	return 0
 }
 
-func handleUpstreamError(acc *Account, resp *http.Response) {
+func handleUpstreamError(acc *Account, resp *http.Response, requestID string, model string) {
 	if resp == nil || resp.Body == nil {
 		return
 	}
 	limitReader := io.LimitReader(resp.Body, 4096)
 	bodyBytes, err := io.ReadAll(limitReader)
 	if err != nil {
-		slog.Error("handleUpstreamError read body", "error", err)
+		slog.Error("handleUpstreamError read body", "req", requestID, "error", err)
 	}
+
+	baseAttrs := []any{"req", requestID, "model", model, "account", acc.Name(), "status", resp.StatusCode}
 
 	if resp.StatusCode == 401 || resp.StatusCode == 402 {
 		acc.MarkExhausted()
-		slog.Error("upstream permanent error, marking exhausted", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(bodyBytes))
+		slog.Error("upstream permanent error, marking exhausted", append(baseAttrs, "body", redactBody(bodyBytes), "error_type", "auth_failed")...)
 		return
 	}
 
 	if isPermanentCredentialError(bodyBytes) {
 		acc.MarkExhausted()
-		slog.Error("upstream permanent credential error, marking exhausted", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(bodyBytes))
+		slog.Error("upstream permanent credential error, marking exhausted", append(baseAttrs, "body", redactBody(bodyBytes), "error_type", "auth_failed")...)
 		return
 	}
 
 	if resp.StatusCode == 429 {
 		if isQuotaError(bodyBytes) {
 			acc.MarkExhausted()
-			slog.Error("upstream 429+quota exhaustion, marking exhausted", "account", acc.Name(), "body", redactBody(bodyBytes))
+			slog.Error("upstream 429+quota exhaustion, marking exhausted", append(baseAttrs, "body", redactBody(bodyBytes), "error_type", "upstream_ratelimited")...)
 			return
 		}
 		cd := parseRetryAfter(resp)
@@ -168,18 +170,40 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 			cd = 5 * time.Minute
 		}
 		acc.SetCooldown(cd)
-		slog.Warn("upstream rate-limited 429", "account", acc.Name(), "cooldown", cd, "body", redactBody(bodyBytes))
+		slog.Warn("upstream rate-limited 429", append(baseAttrs, "cooldown", cd.String(), "body", redactBody(bodyBytes), "error_type", "upstream_ratelimited")...)
 		return
 	}
 
 	if isQuotaError(bodyBytes) {
 		acc.MarkExhausted()
-		slog.Error("upstream insufficient_quota, marking exhausted", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(bodyBytes))
+		slog.Error("upstream insufficient_quota, marking exhausted", append(baseAttrs, "body", redactBody(bodyBytes), "error_type", "upstream_ratelimited")...)
 		return
 	}
 
 	acc.SetCooldown(30 * time.Second)
-	slog.Warn("upstream temporary error, cooling down", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(bodyBytes))
+	slog.Warn("upstream temporary error, cooling down", append(baseAttrs, "body", redactBody(bodyBytes), "error_type", "upstream_5xx")...)
+}
+
+// upstreamErrorType classifies an upstream connection error into a short category
+// string for structured logging and future metrics/audit.
+func upstreamErrorType(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if strings.Contains(s, "context deadline exceeded") {
+		return "upstream_timeout"
+	}
+	if strings.Contains(s, "connection refused") {
+		return "upstream_refused"
+	}
+	if strings.Contains(s, "EOF") {
+		return "upstream_refused"
+	}
+	if strings.Contains(s, "context canceled") {
+		return "client_disconnect"
+	}
+	return "upstream_refused"
 }
 
 // upstreamContext creates a context for upstream requests.
@@ -235,6 +259,7 @@ func NewProxyHandler(pool *Pool, wire WireAPIMode, holder *ConfigHolder) http.Ha
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := holder.Load()
 		if r.URL.Path == "/health" {
+			slog.Debug("health")
 			w.WriteHeader(200)
 			w.Write([]byte("ok"))
 			return
@@ -272,6 +297,7 @@ func NewProxyHandler(pool *Pool, wire WireAPIMode, holder *ConfigHolder) http.Ha
 		writeJSON(w, http.StatusNotFound, map[string]any{
 			"error": map[string]any{"message": "not found", "code": "not_found"},
 		})
+		slog.Debug("not_found", "path", r.URL.Path)
 	})
 }
 
@@ -341,8 +367,10 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) 
 	var raw map[string]json.RawMessage
 	_ = json.Unmarshal(bodyBytes, &raw)
 	stream := rawBoolField(raw, "stream")
+	model, _ := rawStringField(raw, "model")
 	proxyChatWithBody(pool, w, r, bodyBytes, start, chatForwardOpts{
 		stream:   stream,
+		model:    model,
 		tenantID: tenantID,
 	}, cfg)
 }
@@ -376,7 +404,7 @@ func doUpstreamRequest(acc *Account, r *http.Request, bodyBytes []byte, opts cha
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		cancel()
-		slog.Error("failed to create upstream request", "account", acc.Name(), "error", err)
+		slog.Error("failed to create upstream request", "req", requestID, "model", opts.model, "account", acc.Name(), "error", err)
 		recordUpstreamRetry()
 		return doUpstreamResult{retry: true}
 	}
@@ -389,12 +417,12 @@ func doUpstreamRequest(acc *Account, r *http.Request, bodyBytes []byte, opts cha
 		cancel()
 		// If client disconnected, don't retry
 		if r.Context().Err() != nil {
-			slog.Warn("client disconnected, aborting retry", "request_id", requestID)
+			slog.Warn("client disconnected, aborting retry", "req", requestID, "model", opts.model, "error_type", "client_disconnect")
 			recordError()
 			return doUpstreamResult{retry: false, fatalErr: fmt.Errorf("client disconnected: %w", r.Context().Err())}
 		}
 		acc.SetCooldown(30 * time.Second)
-		slog.Warn("chat retry, upstream connection error", "account", acc.Name(), "error", err)
+		slog.Warn("chat retry, upstream connection error", "req", requestID, "model", opts.model, "account", acc.Name(), "error", err, "error_type", upstreamErrorType(err))
 		recordUpstreamRetry()
 		return doUpstreamResult{retry: true}
 	}
@@ -410,7 +438,7 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 429 || resp.StatusCode == 402 || resp.StatusCode == 401 {
-		handleUpstreamError(acc, resp)
+		handleUpstreamError(acc, resp, requestID, opts.model)
 		recordUpstreamRetry()
 		return false, nil
 	}
@@ -421,9 +449,9 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		// Pass through with redacted body, no cooldown, no retry.
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		if readErr != nil {
-			slog.Warn("failed to read upstream 4xx body", "error", readErr)
+			slog.Warn("failed to read upstream 4xx body", "req", requestID, "error", readErr)
 		}
-		slog.Warn("upstream 4xx", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(errBody))
+		slog.Warn("upstream 4xx", "req", requestID, "model", opts.model, "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(errBody), "error_type", "upstream_4xx")
 		recordError()
 		// Transparent proxy: forward all non-hop-by-hop upstream headers
 		// (see copyUpstreamHeaders godoc for design rationale), then remove
@@ -442,10 +470,10 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		// 5xx server error or other non-2xx: cooldown and retry.
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if readErr != nil {
-			slog.Warn("failed to read upstream 5xx body", "error", readErr)
+			slog.Warn("failed to read upstream 5xx body", "req", requestID, "error", readErr)
 		}
 		acc.SetCooldown(30 * time.Second)
-		slog.Warn("upstream 5xx error, cooling down", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(errBody))
+		slog.Warn("upstream 5xx error, cooling down", "req", requestID, "model", opts.model, "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(errBody), "error_type", "upstream_5xx")
 		recordUpstreamRetry()
 		return false, nil
 	}
@@ -460,7 +488,7 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		err := translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools, getSearchToolCache(opts.tenantID), ctx)
 		translateElapsed := time.Since(translateStart).Milliseconds()
 		if err != nil {
-			slog.Error("responses_stream translate error", "request_id", requestID, "account", acc.Name(), "error", err, "translate_ms", translateElapsed, "elapsed", time.Since(start))
+			slog.Error("responses_stream translate error", "req", requestID, "model", opts.model, "account", acc.Name(), "error", err, "translate_ms", translateElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			recordError()
 			return true, err
 		}
@@ -474,7 +502,7 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		rawBody, err := io.ReadAll(resp.Body)
 		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 		if err != nil {
-			slog.Warn("responses_json body read error", "request_id", requestID, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
+			slog.Warn("responses_json body read error", "request_id", requestID, "model", opts.model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			return true, err
 		}
 		dumpDebugUpstreamResponse(rawBody)
@@ -482,7 +510,7 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		out, err := chatCompletionToResponse(rawBody, opts.model, opts.reqTools)
 		translateElapsed := time.Since(translateStart).Milliseconds()
 		if err != nil {
-			slog.Error("responses_json translate error", "request_id", requestID, "account", acc.Name(), "error", err, "translate_ms", translateElapsed, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
+			slog.Error("responses_json translate error", "req", requestID, "model", opts.model, "account", acc.Name(), "error", err, "translate_ms", translateElapsed, "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			recordError()
 			writeJSON(w, http.StatusBadGateway, map[string]any{
 				"error": map[string]any{"message": "upstream response translation failed", "code": "upstream_error"},
@@ -503,7 +531,7 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 	n, err := streamResponseBody(w, resp.Body, r, acc.Name())
 	bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 	if err != nil {
-		slog.Warn("legacy_stream body read error", "request_id", requestID, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
+		slog.Warn("legacy_stream body read error", "request_id", requestID, "model", opts.model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 		recordError()
 		return true, err
 	}
@@ -525,7 +553,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		return
 	}
 	maxAttempts := len(pool.accounts) * 2
-	requestID := randomID()
+	requestID := requestIDFromCtx(r.Context())
 	slog.Debug("proxy request start", "request_id", requestID, "path", r.URL.Path, "stream", opts.stream, "responses_out", opts.responsesOut, "start", start.Format(time.RFC3339Nano))
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
@@ -589,7 +617,8 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 }
 
 func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) {
-	slog.Debug("models request", "remote_addr", r.RemoteAddr)
+	start := time.Now()
+	slog.Debug("models request", "remote_addr", r.RemoteAddr, "req", requestIDFromCtx(r.Context()))
 
 	modelIDs := cfg.AllModels()
 	if len(modelIDs) == 0 {
@@ -614,7 +643,7 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config
 		"data":   data,
 	}
 	writeJSON(w, http.StatusOK, resp)
-	slog.Debug("models returning", "count", len(modelIDs))
+	slog.Debug("models returning", "count", len(modelIDs), "req", requestIDFromCtx(r.Context()), "duration_ms", time.Since(start).Milliseconds())
 }
 
 // redactBody masks common sensitive patterns in error/response bodies for safe
