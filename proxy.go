@@ -313,11 +313,31 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 		return
 	}
 	tenantID := getTenantID(r)
+
+	// Extract model early for logging (before conversion in case it fails).
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(bodyBytes, &raw)
+	virtualModel, _ := rawStringField(raw, "model")
+	requestID := requestIDFromCtx(r.Context())
+
 	chatBody, stream, reqTools, err := responsesToChatCompletions(bodyBytes, tenantID)
 	dumpDebugResponsesBody(bodyBytes)
 	dumpDebugChatBody(chatBody)
 	if err != nil {
 		slog.Error("responses convert error", "error", err)
+		// Rejection logging: classify known rejection reasons.
+		errStr := err.Error()
+		if strings.Contains(errStr, "image") ||
+			strings.Contains(errStr, "previous_response_id") ||
+			strings.Contains(errStr, "not supported") {
+			reason := "unsupported_input"
+			if strings.Contains(errStr, "image") {
+				reason = "multimodal_input"
+			} else if strings.Contains(errStr, "previous_response_id") {
+				reason = "previous_response_id"
+			}
+			slog.Warn("request_rejected", "req", requestID, "reason", reason, "model", virtualModel)
+		}
 		errBody, marshalErr := json.Marshal(map[string]any{
 			"error": map[string]any{"message": err.Error(), "code": "invalid_request"},
 		})
@@ -329,10 +349,6 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 		w.Write(errBody)
 		return
 	}
-	var virtualModel string
-	var raw map[string]json.RawMessage
-	_ = json.Unmarshal(bodyBytes, &raw)
-	virtualModel, _ = rawStringField(raw, "model")
 
 	slog.Debug("responses request", "remote_addr", r.RemoteAddr, "model", virtualModel, "stream", stream, "chat_body_bytes", len(chatBody))
 	proxyChatWithBody(pool, w, r, chatBody, start, chatForwardOpts{
@@ -451,7 +467,8 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		if readErr != nil {
 			slog.Warn("failed to read upstream 4xx body", "req", requestID, "error", readErr)
 		}
-		slog.Warn("upstream 4xx", "req", requestID, "model", opts.model, "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(errBody), "error_type", "upstream_4xx")
+		errStr := string(redactBody(errBody))
+		slog.Warn("upstream 4xx", "req", requestID, "model", opts.model, "account", acc.Name(), "status", resp.StatusCode, "body", errStr, "error_type", "upstream_4xx")
 		recordError()
 		// Transparent proxy: forward all non-hop-by-hop upstream headers
 		// (see copyUpstreamHeaders godoc for design rationale), then remove
@@ -464,6 +481,13 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		}
 		w.WriteHeader(resp.StatusCode)
 		w.Write(redactBodyBytesWithKeys(errBody, []string{acc.Key()}))
+		// Audit: terminal 4xx
+		if a := auditFromCtx(r.Context()); a != nil {
+			a.status = resp.StatusCode
+			a.account = acc.Name()
+			a.errorType = "upstream_4xx"
+			a.error = errStr
+		}
 		return true, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -490,10 +514,20 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		if err != nil {
 			slog.Error("responses_stream translate error", "req", requestID, "model", opts.model, "account", acc.Name(), "error", err, "translate_ms", translateElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			recordError()
+			if a := auditFromCtx(r.Context()); a != nil {
+				a.status = http.StatusOK
+				a.account = acc.Name()
+				a.errorType = upstreamErrorType(err)
+				a.error = err.Error()
+			}
 			return true, err
 		}
 		slog.Debug("responses_stream translate done", "request_id", requestID, "account", acc.Name(), "translate_ms", translateElapsed, "elapsed", time.Since(start))
 		recordRequest(time.Since(start))
+		if a := auditFromCtx(r.Context()); a != nil {
+			a.status = http.StatusOK
+			a.account = acc.Name()
+		}
 		return true, nil
 	}
 
@@ -503,6 +537,11 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 		if err != nil {
 			slog.Warn("responses_json body read error", "request_id", requestID, "model", opts.model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
+			if a := auditFromCtx(r.Context()); a != nil {
+				a.account = acc.Name()
+				a.errorType = upstreamErrorType(err)
+				a.error = err.Error()
+			}
 			return true, err
 		}
 		dumpDebugUpstreamResponse(rawBody)
@@ -515,13 +554,30 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 			writeJSON(w, http.StatusBadGateway, map[string]any{
 				"error": map[string]any{"message": "upstream response translation failed", "code": "upstream_error"},
 			})
+			if a := auditFromCtx(r.Context()); a != nil {
+				a.status = http.StatusBadGateway
+				a.account = acc.Name()
+				a.errorType = "upstream_5xx"
+				a.error = err.Error()
+			}
 			return true, nil
+		}
+		// Capture token usage from the response body for non-streaming audit.
+		if a := auditFromCtx(r.Context()); a != nil {
+			if tokensIn, tokensOut := parseUsageFromChatCompletion(rawBody); tokensIn > 0 || tokensOut > 0 {
+				a.tokensIn = tokensIn
+				a.tokensOut = tokensOut
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		n, _ := w.Write(out)
 		slog.Debug("responses_json done", "request_id", requestID, "account", acc.Name(), "written", n, "body_ms", bodyReadElapsed, "translate_ms", translateElapsed, "elapsed", time.Since(start))
 		recordRequest(time.Since(start))
+		if a := auditFromCtx(r.Context()); a != nil {
+			a.status = http.StatusOK
+			a.account = acc.Name()
+		}
 		return true, nil
 	}
 
@@ -533,6 +589,12 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 	if err != nil {
 		slog.Warn("legacy_stream body read error", "request_id", requestID, "model", opts.model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 		recordError()
+		if a := auditFromCtx(r.Context()); a != nil {
+			a.status = resp.StatusCode
+			a.account = acc.Name()
+			a.errorType = upstreamErrorType(err)
+			a.error = err.Error()
+		}
 		return true, err
 	}
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
@@ -541,19 +603,38 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
 	}
 	recordRequest(time.Since(start))
+	if a := auditFromCtx(r.Context()); a != nil {
+		a.status = resp.StatusCode
+		a.account = acc.Name()
+	}
 	return true, nil
 }
 
 func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyBytes []byte, start time.Time, opts chatForwardOpts, cfg *Config) {
+	requestID := requestIDFromCtx(r.Context())
+	aud := &requestAudit{
+		req:    requestID,
+		method: r.Method,
+		path:   r.URL.Path,
+		model:  opts.model,
+	}
+	r = r.WithContext(context.WithValue(r.Context(), auditKey{}, aud))
+	sc := &statusCapture{ResponseWriter: w}
+
+	defer func() {
+		aud.durationMs = float64(time.Since(start).Milliseconds())
+		aud.status = sc.code
+		emitAudit(aud)
+	}()
+
 	bodyBytes = transformRequestBody(bodyBytes, cfg)
 	if len(pool.accounts) == 0 {
-		writeJSON(w, 503, map[string]any{
+		writeJSON(sc, 503, map[string]any{
 			"error": map[string]any{"message": "No accounts configured", "code": "no_accounts"},
 		})
 		return
 	}
 	maxAttempts := len(pool.accounts) * 2
-	requestID := requestIDFromCtx(r.Context())
 	slog.Debug("proxy request start", "request_id", requestID, "path", r.URL.Path, "stream", opts.stream, "responses_out", opts.responsesOut, "start", start.Format(time.RFC3339Nano))
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
@@ -574,11 +655,15 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		if err != nil {
 			slog.Error("select account failed", "error", err)
 			recordError()
-			writeJSON(w, 503, map[string]any{
+			writeJSON(sc, 503, map[string]any{
 				"error": map[string]any{"message": "No healthy accounts available", "code": "no_accounts"},
 			})
 			return
 		}
+
+		// Record the last attempted account for audit, even if the upstream
+		// request later fails.
+		aud.account = acc.Name()
 
 		var terminalDone bool
 		var terminalFatalErr error
@@ -587,7 +672,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 			defer pool.Release(acc)
 			res := doUpstreamRequest(acc, r, bodyBytes, opts, requestID)
 			if res.resp != nil {
-				done, fatalErr := handleUpstreamResponse(acc, w, r, res.resp, bodyBytes, start, opts, requestID, res.ctx, res.cancel)
+				done, fatalErr := handleUpstreamResponse(acc, sc, r, res.resp, bodyBytes, start, opts, requestID, res.ctx, res.cancel)
 				if done {
 					terminalDone = true
 					terminalFatalErr = fatalErr
@@ -611,7 +696,9 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 	}
 	slog.Error("all accounts exhausted after retries", "request_id", requestID, "attempts", maxAttempts, "elapsed", time.Since(start))
 	recordError()
-	writeJSON(w, 503, map[string]any{
+	aud.error = "all accounts exhausted after retries"
+	aud.errorType = "all_exhausted"
+	writeJSON(sc, 503, map[string]any{
 		"error": map[string]any{"message": "All accounts exhausted after retries", "code": "all_exhausted"},
 	})
 }
@@ -784,6 +871,17 @@ func redactStringWithKeys(s string, extraKeys []string) string {
 		s = strings.ReplaceAll(s, k, "***")
 	}
 	return s
+}
+
+// parseUsageFromChatCompletion extracts input/output token counts from a raw
+// chat completion response body (non-streaming).  Returns 0, 0 when the body
+// cannot be parsed or the usage field is absent.
+func parseUsageFromChatCompletion(body []byte) (tokensIn, tokensOut int) {
+	var comp chatCompletionResponse
+	if err := json.Unmarshal(body, &comp); err != nil || comp.Usage == nil {
+		return 0, 0
+	}
+	return comp.Usage.PromptTokens, comp.Usage.CompletionTokens
 }
 
 // transformRequestBody applies model remap, thinking field remap (for DeepSeek),
