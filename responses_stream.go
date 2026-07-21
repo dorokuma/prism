@@ -437,6 +437,24 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		if debugMode {
 			log.Printf("stream: scanner done, err=%v", err)
 		}
+		// If the context is already cancelled, the client closed the
+		// connection — don't try to write to a dead connection.
+		if ctx.Err() != nil {
+			return err
+		}
+		// Real upstream stream error: emit a response.failed frame so the
+		// client sees an explicit error instead of a silent connection drop.
+		_ = tr.ensureCreated(dst)
+		_ = tr.emit(dst, map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"id": tr.respID, "object": "response", "status": "failed", "model": tr.model,
+				"error": map[string]any{
+					"code":    "upstream_stream_error",
+					"message": "upstream stream ended unexpectedly",
+				},
+			},
+		})
 		return err
 	}
 

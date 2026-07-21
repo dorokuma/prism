@@ -860,3 +860,81 @@ func TestTranslateStreamEmitFailureCancelsCtxReader(t *testing.T) {
 			n, baseline, n-baseline, buf[:stackLen])
 	}
 }
+
+// errorReader returns data then an error after all data has been read.
+type errorReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errorReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		if len(r.data) == 0 && r.err != nil {
+			return n, r.err
+		}
+		return n, nil
+	}
+	if r.err != nil {
+		return 0, r.err
+	}
+	return 0, io.EOF
+}
+
+func TestTranslateStream_UpstreamErrorEmitsFailedFrame(t *testing.T) {
+	// Simulate upstream SSE that sends partial content then breaks.
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n"
+	err := &errorReader{
+		data: []byte(input),
+		err:  errors.New("broken pipe"),
+	}
+
+	rec := httptest.NewRecorder()
+	translateErr := translateChatStreamToResponses(rec, err, "gpt-5.5", nil, nil, context.Background())
+	if translateErr == nil {
+		t.Fatal("expected translate to return an error when upstream stream breaks")
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("expected at least response.failed event")
+	}
+
+	// The last event should be response.failed with upstream_stream_error.
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.failed" {
+		t.Fatalf("expected last event to be response.failed, got %q", lastEv.Type)
+	}
+	code := getStringField(t, lastEv.Raw, "response", "error", "code")
+	if code != "upstream_stream_error" {
+		t.Errorf("expected error code upstream_stream_error, got %q", code)
+	}
+}
+
+func TestTranslateStream_CtxCancelledNoFailedFrame(t *testing.T) {
+	// When ctx is cancelled (client disconnected), no response.failed should be emitted.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Use a pipe so we can cancel ctx before the stream ends.
+	pr, pw := io.Pipe()
+	go func() {
+		fmt.Fprintf(pw, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n")
+		// Cancel the context to simulate client disconnect before closing.
+		cancel()
+		// Close the pipe to trigger an error on the read side (the error will
+		// be io.ErrClosedPipe, but ctx is already cancelled so no frame emitted).
+		pw.Close()
+	}()
+
+	rec := httptest.NewRecorder()
+	translateChatStreamToResponses(rec, pr, "gpt-5.5", nil, nil, ctx)
+	// We don't check the error — it could be context.Canceled or io.ErrClosedPipe.
+
+	events := parseSSE(t, rec.Body.String())
+	for _, ev := range events {
+		if ev.Type == "response.failed" {
+			t.Fatal("response.failed should not be emitted when ctx is cancelled")
+		}
+	}
+}
