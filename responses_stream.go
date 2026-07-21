@@ -294,6 +294,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	sc.Buffer(make([]byte, 0, streamScannerInitialBuf), streamScannerMaxBuf)
 	var usage map[string]any
 	completed := false
+	lastFinishReason := ""
 
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -340,6 +341,9 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			continue
 		}
 		d := chunk.Choices[0].Delta
+		if chunk.Choices[0].FinishReason != "" {
+			lastFinishReason = chunk.Choices[0].FinishReason
+		}
 		// Upstream may stream reasoning_content (e.g. DeepSeek). Codex 0.142.5 expects
 		// response.reasoning_summary_text.delta (not reasoning_summary.delta).
 		if d.ReasoningContent != "" {
@@ -617,7 +621,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 	}
 
-	resp := map[string]any{"id": tr.respID, "object": "response", "status": "completed", "model": tr.model}
+	resp := map[string]any{"id": tr.respID, "object": "response", "status": finishReasonToStatus(lastFinishReason), "model": tr.model}
 	if len(reqTools) > 0 && string(reqTools) != "null" {
 		resp["tools"] = jsonRawToAny(reqTools)
 	}
@@ -642,6 +646,7 @@ type chatStreamChunk struct {
 				} `json:"function"`
 			} `json:"tool_calls"`
 		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
 		PromptTokens            int `json:"prompt_tokens"`

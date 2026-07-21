@@ -1026,3 +1026,119 @@ func TestTranslateStream_NormalCompletionOK(t *testing.T) {
 		}
 	}
 }
+
+func TestTranslateStream_FinishReasonLength_Incomplete(t *testing.T) {
+	// finish_reason="length" on the last chunk should result in
+	// response.completed with status="incomplete" (aligned with
+	// commit 4 non-streaming path: finishReasonToStatus maps
+	// length→incomplete).
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("expected at least one event")
+	}
+
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.completed" {
+		t.Fatalf("expected last event to be response.completed, got %q", lastEv.Type)
+	}
+
+	status := getStringField(t, lastEv.Raw, "response", "status")
+	if status != "incomplete" {
+		t.Fatalf("expected status=incomplete for finish_reason=length, got %q", status)
+	}
+}
+
+func TestTranslateStream_FinishReasonStop_Completed(t *testing.T) {
+	// finish_reason="stop" should result in status="completed".
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("expected at least one event")
+	}
+
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.completed" {
+		t.Fatalf("expected last event to be response.completed, got %q", lastEv.Type)
+	}
+
+	status := getStringField(t, lastEv.Raw, "response", "status")
+	if status != "completed" {
+		t.Fatalf("expected status=completed for finish_reason=stop, got %q", status)
+	}
+}
+
+func TestTranslateStream_FinishReasonContentFilter_Completed(t *testing.T) {
+	// finish_reason="content_filter" (other→completed in finishReasonToStatus)
+	// should result in status="completed".
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("expected at least one event")
+	}
+
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.completed" {
+		t.Fatalf("expected last event to be response.completed, got %q", lastEv.Type)
+	}
+
+	status := getStringField(t, lastEv.Raw, "response", "status")
+	if status != "completed" {
+		t.Fatalf("expected status=completed for finish_reason=content_filter, got %q", status)
+	}
+}
+
+func TestTranslateStream_NoFinishReason_Completed(t *testing.T) {
+	// No finish_reason on any chunk: default behaviour status="completed".
+	// This is the typical streaming path that never set finish_reason.
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("expected at least one event")
+	}
+
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.completed" {
+		t.Fatalf("expected last event to be response.completed, got %q", lastEv.Type)
+	}
+
+	status := getStringField(t, lastEv.Raw, "response", "status")
+	if status != "completed" {
+		t.Fatalf("expected status=completed (default), got %q", status)
+	}
+}
