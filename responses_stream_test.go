@@ -882,6 +882,26 @@ func (r *errorReader) Read(p []byte) (int, error) {
 	return 0, io.EOF
 }
 
+// cleanEOFReader returns data on the first Read, then io.EOF on subsequent calls.
+// It simulates a clean TCP disconnect (no error, just EOF) after partial data.
+type cleanEOFReader struct {
+	data []byte
+	done bool
+}
+
+func (r *cleanEOFReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	if !r.done {
+		r.done = true
+		return 0, io.EOF
+	}
+	return 0, io.EOF
+}
+
 func TestTranslateStream_UpstreamErrorEmitsFailedFrame(t *testing.T) {
 	// Simulate upstream SSE that sends partial content then breaks.
 	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n"
@@ -935,6 +955,74 @@ func TestTranslateStream_CtxCancelledNoFailedFrame(t *testing.T) {
 	for _, ev := range events {
 		if ev.Type == "response.failed" {
 			t.Fatal("response.failed should not be emitted when ctx is cancelled")
+		}
+	}
+}
+
+func TestTranslateStream_CleanEOFWithoutCompletion(t *testing.T) {
+	// Simulate upstream sending partial content then clean TCP disconnect
+	// (io.EOF, not an error). Should emit response.failed with
+	// upstream_stream_incomplete, not response.completed.
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n"
+	body := &cleanEOFReader{data: []byte(input)}
+
+	rec := httptest.NewRecorder()
+	err := translateChatStreamToResponses(rec, body, "gpt-5.5", nil, nil, context.Background())
+	if err == nil {
+		t.Fatal("expected error when upstream stream ends without completion event")
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("expected at least one event")
+	}
+
+	// The last event should be response.failed.
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.failed" {
+		t.Fatalf("expected last event to be response.failed, got %q", lastEv.Type)
+	}
+
+	code := getStringField(t, lastEv.Raw, "response", "error", "code")
+	if code != "upstream_stream_incomplete" {
+		t.Errorf("expected error code upstream_stream_incomplete, got %q", code)
+	}
+
+	// Must NOT contain response.completed.
+	for _, ev := range events {
+		if ev.Type == "response.completed" {
+			t.Fatal("response.completed should not be emitted on incomplete stream")
+		}
+	}
+}
+
+func TestTranslateStream_NormalCompletionOK(t *testing.T) {
+	// Normal stream with [DONE] should emit response.completed, not response.failed.
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("expected at least one event")
+	}
+
+	// The last event should be response.completed.
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.completed" {
+		t.Fatalf("expected last event to be response.completed, got %q", lastEv.Type)
+	}
+
+	// Must NOT contain response.failed.
+	for _, ev := range events {
+		if ev.Type == "response.failed" {
+			t.Fatal("response.failed should not be emitted on normal completion")
 		}
 	}
 }

@@ -293,6 +293,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	sc := bufio.NewScanner(ctxReader(ctx, body))
 	sc.Buffer(make([]byte, 0, streamScannerInitialBuf), streamScannerMaxBuf)
 	var usage map[string]any
+	completed := false
 
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -304,6 +305,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 		payload := bytes.TrimSpace(line[6:])
 		if bytes.Equal(payload, []byte("[DONE]")) {
+			completed = true
 			break
 		}
 		var chunk chatStreamChunk
@@ -471,6 +473,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			}
 		}
 	}
+
 	if !hasSubstantive {
 		if debugMode {
 			log.Printf("stream: empty upstream, emitting response.failed")
@@ -488,6 +491,25 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			return err
 		}
 		return ErrEmptyUpstreamStream
+	}
+
+	// Clean EOF (sc.Err() == nil) with content but without a [DONE]
+	// completion event: upstream disconnected before finishing the stream.
+	if !completed {
+		if debugMode {
+			log.Printf("stream: clean EOF without completion event")
+		}
+		_ = tr.emit(dst, map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"id": tr.respID, "object": "response", "status": "failed", "model": tr.model,
+				"error": map[string]any{
+					"code":    "upstream_stream_incomplete",
+					"message": "upstream stream ended without completion event",
+				},
+			},
+		})
+		return fmt.Errorf("upstream stream ended without completion event")
 	}
 
 	if debugMode {
