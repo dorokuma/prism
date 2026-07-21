@@ -746,3 +746,70 @@ func TestHandleUpstreamResponse_NoDoubleCount(t *testing.T) {
 		t.Errorf("requests_total = %d, want 1 (double counting detected)", metricsRequestsTotal.Value())
 	}
 }
+
+func TestCopyClientHeaders_StripsAcceptEncoding(t *testing.T) {
+	src := http.Header{
+		"Content-Type":    {"application/json"},
+		"Accept-Encoding": {"gzip"},
+		"Accept-encoding": {"br"},
+		"Authorization":   {"Bearer sk-test"},
+	}
+	dst := http.Header{}
+	copyClientHeaders(dst, src)
+
+	// Authorization and Accept-Encoding must be stripped.
+	if dst.Get("Authorization") != "" {
+		t.Errorf("Authorization should be stripped, got %q", dst.Get("Authorization"))
+	}
+	for k := range dst {
+		if http.CanonicalHeaderKey(k) == "Accept-Encoding" {
+			t.Errorf("Accept-Encoding should be stripped, found %q", k)
+		}
+	}
+	// Content-Type must pass through.
+	if dst.Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type should pass through, got %q", dst.Get("Content-Type"))
+	}
+}
+
+func TestUpstream4xx_NoGzipRedactOK(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Assert upstream received no Accept-Encoding.
+		if r.Header.Get("Accept-Encoding") != "" {
+			t.Errorf("upstream received Accept-Encoding: %s", r.Header.Get("Accept-Encoding"))
+		}
+		body := `{"error":{"message":"bad request, api_key=sk-exposed123","code":"invalid_request"}}`
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		w.Write([]byte(body))
+	}))
+	defer upstream.Close()
+
+	cfg := &Config{Accounts: []AccountConfig{{Name: "test", Key: "sk-test-key", BaseURL: upstream.URL}}}
+	pool := NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`)))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept-Encoding", "gzip")
+
+	proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`), time.Now(), chatForwardOpts{}, cfg)
+
+	if rec.Code != 400 {
+		t.Fatalf("expected status 400, got %d", rec.Code)
+	}
+	// Body must be valid JSON after redaction.
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+	// api_key value should be redacted to **.
+	errObj, ok := resp["error"].(map[string]any)
+	if !ok {
+		t.Fatal("response missing error object")
+	}
+	msg, _ := errObj["message"].(string)
+	if strings.Contains(msg, "sk-exposed123") {
+		t.Error("sensitive value not redacted in 4xx body")
+	}
+}

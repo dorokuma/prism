@@ -54,6 +54,7 @@ func newHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: 0,
 		Transport: &http.Transport{
+			DisableCompression:  true,
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     90 * time.Second,
 		},

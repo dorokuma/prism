@@ -199,6 +199,9 @@ func copyClientHeaders(dst http.Header, src http.Header) {
 		if ck == "Authorization" {
 			continue
 		}
+		if ck == "Accept-Encoding" {
+			continue
+		}
 		if sensitiveClientHeaders[ck] {
 			continue
 		}
