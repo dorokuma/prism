@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"log"
+	"os"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -164,6 +167,52 @@ func TestStripCodexUpstreamBloat_MultiByteUTF8(t *testing.T) {
 	// The content should be valid UTF-8 - no split multi-byte chars
 	if !strings.HasSuffix(got, truncationSuffix) {
 		t.Fatal("multi-byte truncation should end with suffix")
+	}
+}
+
+func TestStripCodexUpstreamBloat_DebugLogging(t *testing.T) {
+	// Capture log output when debugMode is enabled.
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	oldDebug := debugMode
+	debugMode = true
+	defer func() { debugMode = oldDebug }()
+
+	_ = stripCodexUpstreamBloat("Some system prompt.")
+
+	output := buf.String()
+	// No bloat blocks, no empty, no truncation → no debug logs expected.
+	if output != "" {
+		t.Logf("debug output for normal prompt: %s", output)
+	}
+
+	buf.Reset()
+	_ = stripCodexUpstreamBloat("")
+	output = buf.String()
+	if !strings.Contains(output, "replacing with default") {
+		t.Errorf("expected debug log about empty prompt replacement, got: %s", output)
+	}
+
+	buf.Reset()
+	_ = stripCodexUpstreamBloat("<skills_instructions>\nstuff\n</skills_instructions>")
+	output = buf.String()
+	// After bloat removal, string becomes empty → should trigger the empty replacement log.
+	if !strings.Contains(output, "replacing with default") {
+		t.Errorf("expected empty-replacement debug log after bloat removal, got: %s", output)
+	}
+
+	buf.Reset()
+	// Build a string that triggers truncation.
+	var sb strings.Builder
+	for i := 0; i < systemPromptMaxRunes+100; i++ {
+		sb.WriteRune('a')
+	}
+	_ = stripCodexUpstreamBloat(sb.String())
+	output = buf.String()
+	if !strings.Contains(output, "truncating system prompt") {
+		t.Errorf("expected debug log about truncation, got: %s", output)
 	}
 }
 
