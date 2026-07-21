@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"fmt"
 	"strings"
@@ -26,6 +27,11 @@ func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, 
 	}
 	if len(messages) == 0 {
 		return nil, false, nil, fmt.Errorf("responses body: empty input")
+	}
+	for _, m := range messages {
+		if hasImagePart(m["content"]) {
+			return nil, false, nil, errors.New("image input not supported by prism proxy on /v1/responses; use /v1/chat/completions")
+		}
 	}
 	messages = normalizeMessagesForChatAPI(messages)
 	out := map[string]any{"model": model, "messages": messages, "stream": stream}
@@ -185,18 +191,6 @@ func flattenResponseContentParts(parts []map[string]any) any {
 		switch typ {
 		case "input_text", "output_text":
 			out = append(out, map[string]any{"type": "text", "text": p["text"]})
-		case "input_image":
-				// Handle both string and object {"url": "..."} formats
-				var urlVal any
-				if u, ok := p["image_url"].(string); ok {
-					urlVal = u
-				} else if u, ok := p["image_url"].(map[string]any); ok {
-					urlVal = u
-				} else {
-					urlVal = p["image_url"]
-				}
-				out = append(out, map[string]any{"type": "image_url", "image_url": urlVal})
-				continue
 		default:
 			if debugMode {
 				log.Printf("[debug] unknown content part type: %s", p["type"])
@@ -205,6 +199,35 @@ func flattenResponseContentParts(parts []map[string]any) any {
 		}
 	}
 	return out
+}
+
+// hasImagePart checks whether a message content contains image parts
+// (image_url, input_image, or input_file) that would be silently dropped
+// by flattenMessageContent in the normalize path.
+func hasImagePart(content any) bool {
+	switch v := content.(type) {
+	case string, nil:
+		return false
+	case []any:
+		for _, part := range v {
+			m, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			typ, _ := m["type"].(string)
+			if typ == "image_url" || typ == "input_image" || typ == "input_file" {
+				return true
+			}
+		}
+	case []map[string]any:
+		for _, m := range v {
+			typ, _ := m["type"].(string)
+			if typ == "image_url" || typ == "input_image" || typ == "input_file" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func extractReasoningText(obj map[string]json.RawMessage) string {

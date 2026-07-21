@@ -168,3 +168,108 @@ func TestResponsesToChat_ParallelToolCalls(t *testing.T) {
 		t.Fatalf("parallel_tool_calls not preserved: %v", ptc)
 	}
 }
+
+func TestResponsesToChat_ImageInputRejected(t *testing.T) {
+	// Content with image_url part should be rejected.
+	body := []byte(`{
+		"model": "deepseek-v4-pro",
+		"input": [{"type":"message","role":"user","content":[{"type":"image_url","image_url":"https://example.com/img.png"}]}]
+	}`)
+	_, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err == nil {
+		t.Fatal("expected error for image_url content, got nil")
+	}
+}
+
+func TestResponsesToChat_InputImageRejected(t *testing.T) {
+	// Content with input_image part should be rejected.
+	body := []byte(`{
+		"model": "deepseek-v4-pro",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_image","image_url":"https://example.com/img.png"}]}]
+	}`)
+	_, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err == nil {
+		t.Fatal("expected error for input_image content, got nil")
+	}
+}
+
+func TestResponsesToChat_TextOnlyOK(t *testing.T) {
+	// Pure text content ([]any with text parts) should succeed without error.
+	body := []byte(`{
+		"model": "deepseek-v4-pro",
+		"stream": true,
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"},{"type":"output_text","text":"world"}]}]
+	}`)
+	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err != nil {
+		t.Fatalf("unexpected error for text-only content: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(chat, &m); err != nil {
+		t.Fatal(err)
+	}
+	msgs, ok := m["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages: %v", m["messages"])
+	}
+	msg := msgs[0].(map[string]any)
+	content, ok := msg["content"].(string)
+	if !ok || content != "helloworld" {
+		t.Fatalf("content: %v (expected 'helloworld')", msg["content"])
+	}
+}
+
+func TestResponsesToChat_TextStringOK(t *testing.T) {
+	// Plain string content should succeed without error.
+	body := []byte(`{
+		"model": "deepseek-v4-pro",
+		"input": "hello world"
+	}`)
+	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err != nil {
+		t.Fatalf("unexpected error for string content: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(chat, &m); err != nil {
+		t.Fatal(err)
+	}
+	msgs, ok := m["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages: %v", m["messages"])
+	}
+	msg := msgs[0].(map[string]any)
+	if msg["content"] != "hello world" {
+		t.Fatalf("content: %v", msg["content"])
+	}
+}
+
+func TestFlattenResponseContentParts_TextOnly(t *testing.T) {
+	// Regression: ensure flattenResponseContentParts still handles text parts correctly.
+	parts := []map[string]any{
+		{"type": "input_text", "text": "hello"},
+		{"type": "output_text", "text": "world"},
+	}
+	result := flattenResponseContentParts(parts)
+	arr, ok := result.([]map[string]any)
+	if !ok || len(arr) != 2 {
+		t.Fatalf("expected 2-element array, got %v", result)
+	}
+	if arr[0]["type"] != "text" || arr[0]["text"] != "hello" {
+		t.Fatalf("part[0]: %v", arr[0])
+	}
+	if arr[1]["type"] != "text" || arr[1]["text"] != "world" {
+		t.Fatalf("part[1]: %v", arr[1])
+	}
+}
+
+func TestFlattenResponseContentParts_SingleText(t *testing.T) {
+	// Single text part should collapse to plain string.
+	parts := []map[string]any{
+		{"type": "input_text", "text": "solo"},
+	}
+	result := flattenResponseContentParts(parts)
+	s, ok := result.(string)
+	if !ok || s != "solo" {
+		t.Fatalf("expected 'solo' string, got %v", result)
+	}
+}
