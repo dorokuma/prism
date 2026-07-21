@@ -34,6 +34,8 @@ fi
 echo "=== 替换二进制 ==="
 install -m 755 ./bin/prism "$BINARY"
 echo "DEPLOYED → $BINARY"
+rm -rf ./bin
+echo "cleaned build output ./bin"
 
 echo "=== 启动服务 ==="
 if systemctl list-unit-files prism.service &>/dev/null; then
