@@ -23,6 +23,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	holder := NewConfigHolder(cfg)
 
 	debugMode = cfg.Debug
 	loadMCPTools(cfg.MCPToolsJSON)
@@ -99,7 +100,7 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
-	proxyHandler := NewProxyHandler(pool, wire, cfg)
+	proxyHandler := NewProxyHandler(pool, wire, holder)
 
 	metricCtx, metricCancel := context.WithCancel(context.Background())
 
@@ -151,8 +152,9 @@ func main() {
 				expvar.Handler().ServeHTTP(w, r)
 				return
 			}
-			if cfg.AuthToken != "" && r.URL.Path != "/health" {
-				if !CheckAuth(r, cfg.AuthToken) {
+			curCfg := holder.Load()
+			if curCfg.AuthToken != "" && r.URL.Path != "/health" {
+				if !CheckAuth(r, curCfg.AuthToken) {
 					writeJSON(w, http.StatusUnauthorized, map[string]any{
 						"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
 					})
@@ -177,10 +179,23 @@ func main() {
 		}()
 		for sig := range sigCh {
 			if sig == syscall.SIGHUP {
-				log.Printf("received SIGHUP, reloading mcp_tools.json")
+				log.Printf("received SIGHUP, reloading config and mcp_tools.json")
+				warnings, err := ReloadConfig(holder, "config.yaml")
+				if err != nil {
+					log.Printf("ERROR: reload config failed: %v (keeping old config)", err)
+				} else {
+					log.Printf("config reloaded successfully")
+					for _, w := range warnings {
+						log.Printf("WARNING: %s", w)
+					}
+					newCfg := holder.Load()
+					debugMode = newCfg.Debug
+				}
+				// Always reload MCP tools from current config (new or old).
+				curCfg := holder.Load()
 				clearMCPCache()
-				loadMCPTools(cfg.MCPToolsJSON)
-				log.Printf("mcp_tools.json reloaded")
+				loadMCPTools(curCfg.MCPToolsJSON)
+				log.Printf("mcp_tools.json reloaded from %s", curCfg.MCPToolsJSON)
 				continue
 			}
 			log.Printf("shutting down sig=%v...", sig)

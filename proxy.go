@@ -237,8 +237,9 @@ func copyUpstreamHeaders(dst http.ResponseWriter, src http.Header) {
 	}
 }
 
-func NewProxyHandler(pool *Pool, wire WireAPIMode, cfg *Config) http.Handler {
+func NewProxyHandler(pool *Pool, wire WireAPIMode, holder *ConfigHolder) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := holder.Load()
 		if r.URL.Path == "/health" {
 			w.WriteHeader(200)
 			w.Write([]byte("ok"))

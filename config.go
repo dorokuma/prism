@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -190,6 +191,107 @@ func getCredential(name string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+// ConfigHolder provides atomic access to the current *Config, enabling
+// safe hot-reloading of read-only configuration fields (model remap,
+// model tiers, default tier, strip fields) without disrupting in-flight
+// requests.
+type ConfigHolder struct {
+	ptr atomic.Pointer[Config]
+}
+
+// NewConfigHolder creates a ConfigHolder initialized with cfg.
+func NewConfigHolder(cfg *Config) *ConfigHolder {
+	h := &ConfigHolder{}
+	h.ptr.Store(cfg)
+	return h
+}
+
+// Load returns the current *Config atomically.
+func (h *ConfigHolder) Load() *Config {
+	return h.ptr.Load()
+}
+
+// Store replaces the current *Config atomically.
+func (h *ConfigHolder) Store(cfg *Config) {
+	h.ptr.Store(cfg)
+}
+
+// ReloadConfig loads a new Config from path, validates it, compares
+// unsafe-to-reload fields against the current config, atomically swaps
+// the new config into holder, and returns any warnings about fields that
+// changed but require a process restart to take effect.
+//
+// On error the old config is preserved.
+func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err error) {
+	oldCfg := holder.Load()
+	newCfg, err := LoadConfig(path)
+	if err != nil {
+		return nil, fmt.Errorf("reload config: %w", err)
+	}
+
+	// Compare fields that cannot be hot-reloaded and warn if changed.
+	if oldCfg.Listen != newCfg.Listen {
+		warnings = append(warnings, fmt.Sprintf(
+			"listen changed from %q to %q: restart required to take effect",
+			oldCfg.Listen, newCfg.Listen))
+	}
+	if oldCfg.AuthToken != newCfg.AuthToken {
+		warnings = append(warnings, "auth_token changed: restart required to take effect")
+	}
+	if !accountsEqual(oldCfg.Accounts, newCfg.Accounts) {
+		warnings = append(warnings, "accounts changed: restart required to take effect")
+	}
+	if oldCfg.ProbeInterval != newCfg.ProbeInterval {
+		warnings = append(warnings, "probe_interval changed: restart required to take effect")
+	}
+	if oldCfg.ProbeModel != newCfg.ProbeModel {
+		warnings = append(warnings, "probe_model changed: restart required to take effect")
+	}
+	if oldCfg.WireAPI != newCfg.WireAPI {
+		warnings = append(warnings, "wire_api changed: restart required to take effect")
+	}
+	if oldCfg.TLSCertFile != newCfg.TLSCertFile || oldCfg.TLSKeyFile != newCfg.TLSKeyFile {
+		warnings = append(warnings, "tls_cert_file/tls_key_file changed: restart required to take effect")
+	}
+	if !equalStringSlices(oldCfg.TrustedProxies, newCfg.TrustedProxies) {
+		warnings = append(warnings, "trusted_proxies changed: restart required to take effect")
+	}
+	if oldCfg.Debug != newCfg.Debug {
+		warnings = append(warnings, "debug changed: restart required to take effect")
+	}
+
+	// Atomically swap to the new config.
+	holder.Store(newCfg)
+
+	return warnings, nil
+}
+
+// accountsEqual compares two account slices by name, base_url, and key.
+func accountsEqual(a, b []AccountConfig) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].BaseURL != b[i].BaseURL || a[i].Key != b[i].Key {
+			return false
+		}
+	}
+	return true
+}
+
+// equalStringSlices compares two string slices for equality.
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // isLoopbackListen returns true if addr binds to a loopback interface.

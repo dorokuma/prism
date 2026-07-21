@@ -517,3 +517,279 @@ accounts:
 		}
 	})
 }
+
+func TestReloadConfig_ModelRemapUpdated(t *testing.T) {
+	// Write initial config with model_remap={"a":"tier1"}
+	content1 := `
+model_tiers:
+  tier1: upstream-a
+  tier2: upstream-b
+model_remap:
+  a: tier1
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	// Initial remap: a → tier1 → upstream-a
+	if got := holder.Load().RemapModel("a"); got != "upstream-a" {
+		t.Fatalf("initial RemapModel(a) = %q, want upstream-a", got)
+	}
+
+	// Overwrite config with model_remap={"b":"tier2"}
+	content2 := `
+model_tiers:
+  tier1: upstream-a
+  tier2: upstream-b
+model_remap:
+  b: tier2
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Logf("warnings (expected none): %v", warnings)
+	}
+
+	// After reload: b → tier2 → upstream-b
+	newCfg := holder.Load()
+	if got := newCfg.RemapModel("b"); got != "upstream-b" {
+		t.Errorf("after reload RemapModel(b) = %q, want upstream-b", got)
+	}
+	// Old mapping no longer exists
+	if got := newCfg.RemapModel("a"); got != "a" {
+		t.Errorf("after reload RemapModel(a) = %q, want \"a\" (pass-through)", got)
+	}
+}
+
+func TestReloadConfig_AccountsChangedWarning(t *testing.T) {
+	content1 := `
+accounts:
+  - name: acc1
+    key: key1
+    base_url: https://api1.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	// Change accounts: add a second account
+	content2 := `
+accounts:
+  - name: acc1
+    key: key1
+    base_url: https://api1.example.com
+  - name: acc2
+    key: key2
+    base_url: https://api2.example.com
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "accounts") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning about accounts change, got: %v", warnings)
+	}
+}
+
+func TestReloadConfig_ListenChangedWarning(t *testing.T) {
+	content1 := `
+listen: 127.0.0.1:8080
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	// Change listen address
+	content2 := `
+listen: 127.0.0.1:9090
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "listen") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning about listen change, got: %v", warnings)
+	}
+}
+
+func TestReloadConfig_NonLoopbackNoAuthRejected(t *testing.T) {
+	content1 := `
+listen: 127.0.0.1:8080
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	// Change to non-loopback without auth – should be rejected by LoadConfig
+	content2 := `
+listen: 0.0.0.0:8080
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ReloadConfig(holder, f.Name())
+	if err == nil {
+		t.Fatal("expected error for non-loopback listen without auth token, got nil")
+	}
+
+	// Old config should be preserved
+	curCfg := holder.Load()
+	if curCfg.Listen != "127.0.0.1:8080" {
+		t.Errorf("old config listen = %q, want 127.0.0.1:8080 (should be preserved)", curCfg.Listen)
+	}
+}
+
+func TestReloadConfig_OldConfigPreservedOnError(t *testing.T) {
+	content1 := `
+listen: 127.0.0.1:8080
+model_tiers:
+  tier1: upstream-a
+model_remap:
+  a: tier1
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	// Write an invalid config (missing accounts)
+	content2 := `
+listen: 0.0.0.0:8080
+auth_token: ""
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ReloadConfig(holder, f.Name())
+	if err == nil {
+		t.Fatal("expected error for invalid config, got nil")
+	}
+
+	// Old config model mapping should be preserved
+	curCfg := holder.Load()
+	if got := curCfg.RemapModel("a"); got != "upstream-a" {
+		t.Errorf("after failed reload RemapModel(a) = %q, want upstream-a (old config preserved)", got)
+	}
+	if curCfg.Listen != "127.0.0.1:8080" {
+		t.Errorf("after failed reload listen = %q, want 127.0.0.1:8080 (old config preserved)", curCfg.Listen)
+	}
+}

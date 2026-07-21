@@ -271,7 +271,8 @@ func TestNewProxyHandlerModelsEndpoint(t *testing.T) {
 		ModelTiers: map[string]string{"premium": "gpt-4-turbo"},
 	}
 	pool := NewPool(nil)
-	handler := NewProxyHandler(pool, WireAPIBoth, cfg)
+	holder := NewConfigHolder(cfg)
+	handler := NewProxyHandler(pool, WireAPIBoth, holder)
 
 	// Test GET /v1/models
 	w := httptest.NewRecorder()
