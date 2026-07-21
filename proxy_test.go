@@ -813,3 +813,69 @@ func TestUpstream4xx_NoGzipRedactOK(t *testing.T) {
 		t.Error("sensitive value not redacted in 4xx body")
 	}
 }
+
+func TestRedact_AccountKey(t *testing.T) {
+	// redactBodyBytesWithKeys replaces the account key as a literal substring.
+	body := []byte(`{"error":{"message":"auth failed for key abc123sekret","code":"unauthorized"}}`)
+	got := redactBodyBytesWithKeys(body, []string{"abc123sekret"})
+	if bytes.Contains(got, []byte("abc123sekret")) {
+		t.Errorf("account key not redacted: %s", got)
+	}
+	if !bytes.Contains(got, []byte("***")) {
+		t.Error("expected *** redaction marker not found")
+	}
+
+	// sensitiveJSONKeys with key/client_key/session_key → values replaced with ***.
+	body2 := []byte(`{"key":"my-secret-key","client_key":"ck-secret","session_key":"sk-secret","name":"ok"}`)
+	got2 := redactBodyBytes(body2)
+	var m map[string]any
+	if err := json.Unmarshal(got2, &m); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	for _, k := range []string{"key", "client_key", "session_key"} {
+		if v, ok := m[k]; !ok || v != "***" {
+			t.Errorf("sensitive key %q not redacted: %v", k, v)
+		}
+	}
+	if m["name"] != "ok" {
+		t.Errorf("non-sensitive key 'name' was modified: %v", m["name"])
+	}
+
+	// sk- prefixed tokens still covered by original regex.
+	body3 := []byte(`{"error":"invalid key sk-FAKE1234567890"}`)
+	got3 := redactBodyBytes(body3)
+	if bytes.Contains(got3, []byte("sk-FAKE1234567890")) {
+		t.Errorf("sk- key not redacted by regex: %s", got3)
+	}
+	if !bytes.Contains(got3, []byte("sk-***")) {
+		t.Errorf("expected 'sk-***' redaction marker, got: %s", got3)
+	}
+}
+
+func TestRedact_ExistingBehaviorUnchanged(t *testing.T) {
+	// Ensure redactBodyBytes without extraKeys behaves identically to before.
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{
+			input:    `{"error":"api key sk-FAKE_KEY_FOR_TESTING_1234567890","message":"bad"}`,
+			expected: `{"error":"api key sk-***","message":"bad"}`,
+		},
+		{
+			input:    `{"api_key":"sk-xxx","data":{"token":"t1","name":"ok"}}`,
+			expected: `{"api_key":"***","data":{"name":"ok","token":"***"}}`,
+		},
+	}
+	for _, tc := range tests {
+		got := redactBodyBytes([]byte(tc.input))
+		var gotMap, wantMap map[string]any
+		json.Unmarshal(got, &gotMap)
+		json.Unmarshal([]byte(tc.expected), &wantMap)
+		gotNorm, _ := json.Marshal(gotMap)
+		wantNorm, _ := json.Marshal(wantMap)
+		if string(gotNorm) != string(wantNorm) {
+			t.Errorf("redactBodyBytes(%q) = %s, want %s", tc.input, gotNorm, wantNorm)
+		}
+	}
+}

@@ -48,6 +48,9 @@ var sensitiveJSONKeys = map[string]bool{
 	"passwd":         true,
 	"secret":         true,
 	"authorization":  true,
+	"key":            true,
+	"client_key":     true,
+	"session_key":    true,
 }
 
 func isHopByHop(key string) bool {
@@ -431,7 +434,7 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 			w.Header().Set("Content-Type", "application/json")
 		}
 		w.WriteHeader(resp.StatusCode)
-		w.Write(redactBodyBytes(errBody))
+		w.Write(redactBodyBytesWithKeys(errBody, []string{acc.Key()}))
 		return true, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -679,6 +682,78 @@ func redactJSON(v any, depth int) any {
 		return val
 	}
 	return v
+}
+
+// redactBodyBytesWithKeys is like redactBodyBytes but also scrubs each non-empty
+// key from extraKeys as a literal substring inside string leaf values during
+// JSON redaction.  Keys are NOT replaced in the raw bytes before JSON parsing
+// to avoid corrupting JSON structure with short keys.
+func redactBodyBytesWithKeys(body []byte, extraKeys []string) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	// Try JSON-aware redaction first (with key scrubbing inside string values).
+	var parsed any
+	if err := json.Unmarshal(body, &parsed); err == nil && parsed != nil {
+		parsed = redactJSONWithKeys(parsed, extraKeys, 0)
+		if out, err := json.Marshal(parsed); err == nil {
+			return out
+		}
+	}
+	// Fall back to regex-based redaction + substring scrubbing on raw text.
+	s := redactBodyRegex(string(body))
+	for _, k := range extraKeys {
+		if k == "" {
+			continue
+		}
+		s = strings.ReplaceAll(s, k, "***")
+	}
+	return []byte(s)
+}
+
+// redactJSONWithKeys is like redactJSON but additionally replaces any non-empty
+// key from extraKeys as a literal substring inside string leaf values (on top
+// of the existing regex redaction).
+func redactJSONWithKeys(v any, extraKeys []string, depth int) any {
+	if depth > redactJSONMaxDepth {
+		return "<redacted:too deep>"
+	}
+	switch val := v.(type) {
+	case map[string]any:
+		for k, vv := range val {
+			if sensitiveJSONKeys[strings.ToLower(k)] {
+				val[k] = "***"
+			} else if s, ok := vv.(string); ok {
+				val[k] = redactStringWithKeys(s, extraKeys)
+			} else {
+				val[k] = redactJSONWithKeys(vv, extraKeys, depth+1)
+			}
+		}
+		return val
+	case []any:
+		for i, item := range val {
+			if s, ok := item.(string); ok {
+				val[i] = redactStringWithKeys(s, extraKeys)
+			} else {
+				val[i] = redactJSONWithKeys(item, extraKeys, depth+1)
+			}
+		}
+		return val
+	}
+	return v
+}
+
+// redactStringWithKeys applies regex redaction then replaces each non-empty
+// extra key as a literal substring with "***".
+func redactStringWithKeys(s string, extraKeys []string) string {
+	s = redactBodyRegex(s)
+	for _, k := range extraKeys {
+		if k == "" {
+			continue
+		}
+		s = strings.ReplaceAll(s, k, "***")
+	}
+	return s
 }
 
 // transformRequestBody applies model remap, thinking field remap (for DeepSeek),
