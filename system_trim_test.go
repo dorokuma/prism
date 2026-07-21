@@ -2,8 +2,7 @@ package main
 
 import (
 	"bytes"
-	"log"
-	"os"
+	"log/slog"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -171,10 +170,11 @@ func TestStripCodexUpstreamBloat_MultiByteUTF8(t *testing.T) {
 }
 
 func TestStripCodexUpstreamBloat_DebugLogging(t *testing.T) {
-	// Capture log output when debugMode is enabled.
+	// Capture slog output when debugMode is enabled.
 	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	oldDefault := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(oldDefault)
 
 	oldDebug := debugMode
 	debugMode = true

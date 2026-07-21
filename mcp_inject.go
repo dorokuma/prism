@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"os"
 )
 
@@ -15,7 +15,7 @@ func loadMCPTools(path string) {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Printf("mcp_inject: failed to read %s: %v", path, err)
+		slog.Warn("mcp_inject failed to read file", "path", path, "error", err)
 		return
 	}
 	var namespaces map[string]struct {
@@ -27,7 +27,7 @@ func loadMCPTools(path string) {
 		} `json:"tools"`
 	}
 	if err := json.Unmarshal(data, &namespaces); err != nil {
-		log.Printf("mcp_inject: failed to parse %s: %v", path, err)
+		slog.Warn("mcp_inject failed to parse file", "path", path, "error", err)
 		return
 	}
 	count := 0
@@ -50,5 +50,5 @@ func loadMCPTools(path string) {
 			count++
 		}
 	}
-	log.Printf("mcp_inject: loaded %d tools from %d namespaces into runtime cache", count, len(namespaces))
+	slog.Info("mcp_inject loaded tools", "count", count, "namespaces", len(namespaces))
 }

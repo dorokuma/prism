@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -22,19 +22,19 @@ func stripCodexUpstreamBloat(system string) string {
 	s = strings.TrimSpace(s)
 	if debugMode {
 		if len(s) != origLen {
-			log.Printf("strip: bloat removed, before=%d after=%d", origLen, len(s))
+			slog.Debug("strip bloat removed", "before", origLen, "after", len(s))
 		}
 	}
 	if s == "" {
 		if debugMode {
-			log.Printf("strip: empty system prompt after bloat removal, replacing with default")
+			slog.Debug("strip empty system prompt after bloat removal, replacing with default")
 		}
 		return "You are a helpful coding assistant."
 	}
 	if utf8.RuneCountInString(s) > systemPromptMaxRunes {
 		// Truncate to systemPromptMaxRunes runes, preserving complete UTF-8 characters
 		if debugMode {
-			log.Printf("strip: truncating system prompt from %d runes to %d runes", utf8.RuneCountInString(s), systemPromptMaxRunes)
+			slog.Debug("strip truncating system prompt", "from_runes", utf8.RuneCountInString(s), "to_runes", systemPromptMaxRunes)
 		}
 		runes := []rune(s)
 		return string(runes[:systemPromptMaxRunes]) + truncationSuffix

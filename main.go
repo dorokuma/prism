@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"expvar"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -21,21 +21,24 @@ import (
 func main() {
 	cfg, err := LoadConfig("config.yaml")
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		slog.Error("load config", "error", err)
+		os.Exit(1)
 	}
 	holder := NewConfigHolder(cfg)
+
+	initLogger(cfg.LogLevel)
 
 	debugMode = cfg.Debug
 	loadMCPTools(cfg.MCPToolsJSON)
 	pool := NewPool(cfg.Accounts)
 	wire, _ := ParseWireAPIMode(cfg.WireAPI)
-	log.Printf("loaded %d accounts, wire_api=%s, listening on %s, debug=%v, auth=%v, tls=%v", len(cfg.Accounts), wire, cfg.Listen, debugMode, cfg.AuthToken != "", cfg.TLSCertFile != "")
+	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", debugMode, "auth", cfg.AuthToken != "", "tls", cfg.TLSCertFile != "")
 
 	// Initial health probe: check all accounts on startup, warn but don't block
 	probeExhausted(pool, cfg.ProbeModel)
 
 	// 启动时验证所有账号的连通性
-	log.Println("starting initial health check for all accounts...")
+	slog.Info("starting initial health check for all accounts")
 	probeBody, _ := json.Marshal(map[string]any{
 		"model":      cfg.ProbeModel,
 		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
@@ -51,14 +54,14 @@ func main() {
 			defer func() { <-sem }()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("panic in startup health check for %s: %v\n%s", a.Name(), r, debug.Stack())
+					slog.Error("panic in startup health check", "account", a.Name(), "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 
 			url := a.BaseURL() + "/chat/completions"
 			req, err := http.NewRequest("POST", url, bytes.NewReader(probeBody))
 			if err != nil {
-				log.Printf("startup check %s: failed to create request: %v", a.Name(), err)
+				slog.Warn("startup check failed to create request", "account", a.Name(), "error", err)
 				return
 			}
 			req.Header.Set("Content-Type", "application/json")
@@ -68,7 +71,7 @@ func main() {
 			req = req.WithContext(ctx)
 			resp, err := a.Client().Do(req)
 			if err != nil {
-				log.Printf("startup check %s: request failed: %v, cooling down", a.Name(), err)
+				slog.Warn("startup check request failed", "account", a.Name(), "error", err)
 				a.SetCooldown(5 * time.Minute)
 				return
 			}
@@ -76,18 +79,18 @@ func main() {
 			limitReader := io.LimitReader(resp.Body, 4096)
 			bodyBytes, readErr := io.ReadAll(limitReader)
 			if readErr != nil {
-				log.Printf("startup check %s: read body failed: %v", a.Name(), readErr)
+				slog.Warn("startup check read body failed", "account", a.Name(), "error", readErr)
 			}
 			if resp.StatusCode == 200 {
-				log.Printf("startup check %s: OK (200)", a.Name())
+				slog.Info("startup check OK", "account", a.Name(), "status", 200)
 			} else if resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 403 || isPermanentCredentialError(bodyBytes) || isQuotaError(bodyBytes) {
-				log.Printf("startup check %s: permanent error status=%d, marking exhausted. body: %s", a.Name(), resp.StatusCode, redactBody(bodyBytes))
+				slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", resp.StatusCode, "body", redactBody(bodyBytes))
 				a.MarkExhausted()
 			} else if resp.StatusCode == 429 {
-				log.Printf("startup check %s: temporary quota error status=429, cooling down. body: %s", a.Name(), redactBody(bodyBytes))
+				slog.Warn("startup check temporary quota error, cooling down", "account", a.Name(), "status", 429, "body", redactBody(bodyBytes))
 				a.SetCooldown(2 * time.Minute)
 			} else {
-				log.Printf("startup check %s: temporary error status=%d, cooling down. body: %s", a.Name(), resp.StatusCode, redactBody(bodyBytes))
+				slog.Warn("startup check temporary error, cooling down", "account", a.Name(), "status", resp.StatusCode, "body", redactBody(bodyBytes))
 				a.SetCooldown(5 * time.Minute)
 			}
 		}(acc)
@@ -110,7 +113,8 @@ func main() {
 
 	trustedProxies, err := ParseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
-		log.Fatalf("trusted_proxies: %v", err)
+		slog.Error("trusted_proxies parse error", "error", err)
+		os.Exit(1)
 	}
 
 	// Periodically update pool metrics
@@ -174,19 +178,19 @@ func main() {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("panic in signal handler: %v\n%s", r, debug.Stack())
+				slog.Error("panic in signal handler", "panic", r, "stack", string(debug.Stack()))
 			}
 		}()
 		for sig := range sigCh {
 			if sig == syscall.SIGHUP {
-				log.Printf("received SIGHUP, reloading config and mcp_tools.json")
+				slog.Info("received SIGHUP, reloading config and mcp_tools.json")
 				warnings, err := ReloadConfig(holder, "config.yaml")
 				if err != nil {
-					log.Printf("ERROR: reload config failed: %v (keeping old config)", err)
+					slog.Error("reload config failed, keeping old config", "error", err)
 				} else {
-					log.Printf("config reloaded successfully")
+					slog.Info("config reloaded successfully")
 					for _, w := range warnings {
-						log.Printf("WARNING: %s", w)
+						slog.Warn("config reload warning", "warning", w)
 					}
 					newCfg := holder.Load()
 					debugMode = newCfg.Debug
@@ -195,10 +199,10 @@ func main() {
 				curCfg := holder.Load()
 				clearMCPCache()
 				loadMCPTools(curCfg.MCPToolsJSON)
-				log.Printf("mcp_tools.json reloaded from %s", curCfg.MCPToolsJSON)
+				slog.Info("mcp_tools.json reloaded", "path", curCfg.MCPToolsJSON)
 				continue
 			}
-			log.Printf("shutting down sig=%v...", sig)
+			slog.Info("shutting down", "signal", sig.String())
 			close(stop)
 			metricCancel()
 			if mcpCacheCtxCancel != nil {
@@ -207,21 +211,23 @@ func main() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if err := srv.Shutdown(ctx); err != nil {
-				log.Printf("shutdown: %v", err)
+				slog.Error("shutdown error", "error", err)
 			}
 			return
 		}
 	}()
 
 	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
-		log.Printf("starting HTTPS server on %s", cfg.Listen)
+		slog.Info("starting HTTPS server", "listen", cfg.Listen)
 		if err := srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != http.ErrServerClosed {
-			log.Fatalf("listen tls: %v", err)
+			slog.Error("listen tls", "error", err)
+			os.Exit(1)
 		}
 	} else {
-		log.Printf("starting HTTP server on %s", cfg.Listen)
+		slog.Info("starting HTTP server", "listen", cfg.Listen)
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			log.Fatalf("listen: %v", err)
+			slog.Error("listen", "error", err)
+			os.Exit(1)
 		}
 	}
 }

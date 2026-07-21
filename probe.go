@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"runtime/debug"
 	"sync"
@@ -16,11 +16,11 @@ func StartProbeLoop(pool *Pool, probeModel string, interval time.Duration, stop 
 	if interval <= 0 {
 		interval = 10 * time.Minute
 	}
-	log.Printf("probe loop started (interval=%v, model=%s)", interval, probeModel)
+	slog.Info("probe loop started", "interval", interval, "model", probeModel)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("panic in probe loop: %v\n%s", r, debug.Stack())
+				slog.Error("panic in probe loop", "panic", r, "stack", string(debug.Stack()))
 			}
 		}()
 		probeExhausted(pool, probeModel)
@@ -29,7 +29,7 @@ func StartProbeLoop(pool *Pool, probeModel string, interval time.Duration, stop 
 		for {
 			select {
 			case <-stop:
-				log.Printf("probe loop stopped")
+				slog.Info("probe loop stopped")
 				return
 			case <-ticker.C:
 				probeExhausted(pool, probeModel)
@@ -57,7 +57,7 @@ func probeExhausted(pool *Pool, probeModel string) {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("panic in probe for %s: %v\n%s", acc.Name(), r, debug.Stack())
+					slog.Error("panic in probe", "account", acc.Name(), "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 
@@ -66,7 +66,7 @@ func probeExhausted(pool *Pool, probeModel string) {
 					url := acc.BaseURL() + "/chat/completions"
 					req, err := http.NewRequest("POST", url, bytes.NewReader(probeBody))
 					if err != nil {
-						log.Printf("probe %s: failed to create request: %v", acc.Name(), err)
+						slog.Warn("probe failed to create request", "account", acc.Name(), "error", err)
 						return true
 					}
 					req.Header.Set("Authorization", "Bearer "+acc.Key())
@@ -78,28 +78,28 @@ func probeExhausted(pool *Pool, probeModel string) {
 					resp, err := acc.Client().Do(req)
 
 					if err != nil {
-						log.Printf("probe %s: request failed (attempt %d/%d): %v", acc.Name(), attempt, maxProbeAttempts, err)
+						slog.Warn("probe request failed", "account", acc.Name(), "attempt", attempt, "max_attempts", maxProbeAttempts, "error", err)
 						return false
 					}
 					defer resp.Body.Close()
 
 					respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 					if readErr != nil {
-						log.Printf("probe %s: read body failed: %v", acc.Name(), readErr)
+						slog.Warn("probe read body failed", "account", acc.Name(), "error", readErr)
 					}
 
 					if resp.StatusCode == 200 {
 						pool.MarkHealthy(acc)
-						log.Printf("probe %s: recovered (200), returned to pool", acc.Name())
+						slog.Info("probe recovered account", "account", acc.Name(), "status", 200)
 						return true
 					}
 
 					if resp.StatusCode == 429 {
-						log.Printf("probe %s: still exhausted (429 quota, attempt %d/%d)", acc.Name(), attempt, maxProbeAttempts)
+						slog.Warn("probe account still exhausted", "account", acc.Name(), "status", 429, "attempt", attempt, "max_attempts", maxProbeAttempts)
 						return true
 					}
 
-					log.Printf("probe %s: still exhausted (status=%d, attempt %d/%d) body=%s", acc.Name(), resp.StatusCode, attempt, maxProbeAttempts, redactBody(respBody))
+					slog.Warn("probe account still exhausted", "account", acc.Name(), "status", resp.StatusCode, "attempt", attempt, "max_attempts", maxProbeAttempts, "body", redactBody(respBody))
 					return false
 				}()
 

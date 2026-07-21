@@ -4,7 +4,7 @@ import (
 	"container/list"
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -46,7 +46,7 @@ func (a *Account) MarkExhausted() {
 	defer a.mu.Unlock()
 	if a.status == StatusHealthy {
 		a.status = StatusExhausted
-		log.Printf("account %s: marked exhausted (removed from pool)", a.Name())
+		slog.Warn("account marked exhausted", "account", a.Name())
 	}
 }
 
@@ -68,7 +68,7 @@ func (a *Account) MarkHealthy() {
 	if a.status == StatusExhausted {
 		a.status = StatusHealthy
 		a.cooldownUntil = time.Time{}
-		log.Printf("account %s: marked healthy (returned to pool)", a.Name())
+		slog.Info("account marked healthy", "account", a.Name())
 	}
 }
 
@@ -84,7 +84,7 @@ func (a *Account) TryBorrow() bool {
 
 func (a *Account) Release() {
 	if !a.borrowed.CompareAndSwap(true, false) {
-		log.Printf("account %s: Release called on already-released account", a.Name())
+		slog.Warn("Release called on already-released account", "account", a.Name())
 	}
 }
 

@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"fmt"
 	"strings"
 	"time"
@@ -35,7 +35,7 @@ func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, 
 	if storeRaw, ok := raw["store"]; ok && len(storeRaw) > 0 && string(storeRaw) != "null" {
 		var store bool
 		if err := json.Unmarshal(storeRaw, &store); err == nil && store {
-			log.Printf("responses_convert: store=true not supported by stateless prism proxy, ignoring")
+			slog.Warn("responses_convert: store=true not supported by stateless prism proxy, ignoring")
 		}
 	}
 	if includeRaw, ok := raw["include"]; ok && len(includeRaw) > 0 && string(includeRaw) != "null" {
@@ -46,7 +46,7 @@ func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, 
 					return nil, false, nil, errors.New("include=encrypted_content not supported by prism proxy")
 				}
 				if inc == "annotations" {
-					log.Printf("responses_convert: include=annotations not supported by prism proxy, ignoring")
+					slog.Warn("responses_convert: include=annotations not supported by prism proxy, ignoring")
 				}
 			}
 		}
@@ -232,7 +232,7 @@ func flattenResponseContentParts(parts []map[string]any) any {
 			out = append(out, map[string]any{"type": "text", "text": p["text"]})
 		default:
 			if debugMode {
-				log.Printf("[debug] unknown content part type: %s", p["type"])
+				slog.Debug("unknown content part type", "type", p["type"])
 			}
 			out = append(out, p)
 		}
@@ -299,7 +299,7 @@ func reasoningEffortFromRaw(raw json.RawMessage) string {
 		return ""
 	}
 	if _, ok := obj["summary"]; ok {
-		log.Printf("responses_convert: reasoning.summary not supported by prism proxy, ignoring")
+		slog.Warn("responses_convert: reasoning.summary not supported by prism proxy, ignoring")
 	}
 	if e, ok := obj["effort"].(string); ok {
 		return e

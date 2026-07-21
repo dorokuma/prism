@@ -3,14 +3,14 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"testing"
 	"time"
 )
 
 func TestPoolFIFOAndRelease(t *testing.T) {
-	log.Printf("TEST: TestPoolFIFOAndRelease started")
+	slog.Info("TEST: TestPoolFIFOAndRelease started")
 	cfgs := []AccountConfig{
 		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
 		{Name: "acc-2", Key: "key-2", BaseURL: "http://localhost:8002"},
@@ -18,12 +18,12 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 	p := NewPool(cfgs)
 
 	ctx := context.Background()
-	log.Printf("TEST: Selecting acc1")
+	slog.Info("TEST: Selecting acc1")
 	acc1, err := p.Select(ctx)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	log.Printf("TEST: Selecting acc2")
+	slog.Info("TEST: Selecting acc2")
 	acc2, err := p.Select(ctx)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -33,23 +33,23 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 	ch2 := make(chan *Account, 1)
 
 	go func() {
-		log.Printf("TEST: Goroutine 1 calling Select")
+		slog.Info("TEST: Goroutine 1 calling Select")
 		acc, err := p.Select(ctx)
-		log.Printf("TEST: Goroutine 1 Select returned: acc=%s, err=%v", acc.Name(), err)
+		slog.Info("TEST: Goroutine 1 Select returned", "account", acc.Name(), "error", err)
 		ch1 <- acc
-		log.Printf("TEST: Goroutine 1 sent to ch1")
+		slog.Info("TEST: Goroutine 1 sent to ch1")
 	}()
 
 	go func() {
-		log.Printf("TEST: Goroutine 2 calling Select")
+		slog.Info("TEST: Goroutine 2 calling Select")
 		acc, err := p.Select(ctx)
-		log.Printf("TEST: Goroutine 2 Select returned: acc=%s, err=%v", acc.Name(), err)
+		slog.Info("TEST: Goroutine 2 Select returned", "account", acc.Name(), "error", err)
 		ch2 <- acc
-		log.Printf("TEST: Goroutine 2 sent to ch2")
+		slog.Info("TEST: Goroutine 2 sent to ch2")
 	}()
 
 	time.Sleep(100 * time.Millisecond)
-	log.Printf("TEST: Releasing acc1 and acc2")
+	slog.Info("TEST: Releasing acc1 and acc2")
 	p.Release(acc1)
 	p.Release(acc2)
 
@@ -58,10 +58,10 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case acc := <-ch1:
-			log.Printf("TEST: Main read from ch1: acc=%s", acc.Name())
+			slog.Info("TEST: Main read from ch1", "account", acc.Name())
 			results = append(results, acc)
 		case acc := <-ch2:
-			log.Printf("TEST: Main read from ch2: acc=%s", acc.Name())
+			slog.Info("TEST: Main read from ch2", "account", acc.Name())
 			results = append(results, acc)
 		case <-time.After(2 * time.Second):
 			t.Fatal("timeout waiting for workers to be woken up")
@@ -88,7 +88,7 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 func TestPoolCancelAndSignalTransfer(t *testing.T) {
 	// A is started with an already-cancelled context (returns immediately).
 	// B waits for the single account. Release wakes B without race.
-	log.Printf("TEST: TestPoolCancelAndSignalTransfer started")
+	slog.Info("TEST: TestPoolCancelAndSignalTransfer started")
 	cfgs := []AccountConfig{
 		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
 	}
@@ -140,7 +140,7 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 }
 
 func TestPoolMarkHealthyWakeup(t *testing.T) {
-	log.Printf("TEST: TestPoolMarkHealthyWakeup started")
+	slog.Info("TEST: TestPoolMarkHealthyWakeup started")
 	cfgs := []AccountConfig{
 		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
 		{Name: "acc-2", Key: "key-2", BaseURL: "http://localhost:8002"},

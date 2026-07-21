@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -22,10 +22,10 @@ func dumpDebugChatBody(chatBody []byte) {
 	path := filepath.Join(dir, "last-chat-request.json")
 	sanitized := []byte(redactBody(chatBody))
 	if err := os.WriteFile(path, sanitized, 0o600); err != nil {
-		log.Printf("debug: dump failed: %v", err)
+		slog.Debug("debug dump failed", "error", err)
 		return
 	}
-	log.Printf("debug: wrote %s (%d bytes)", path, len(sanitized))
+	slog.Debug("debug wrote dump", "path", path, "bytes", len(sanitized))
 }
 
 func dumpDebugResponsesBody(originalBody []byte) {
@@ -36,7 +36,7 @@ func dumpDebugResponsesBody(originalBody []byte) {
 	path := filepath.Join(dir, "last-responses-request.json")
 	sanitized := []byte(redactBody(originalBody))
 	if err := os.WriteFile(path, sanitized, 0o600); err != nil {
-		log.Printf("debug: dump failed: %v", err)
+		slog.Debug("debug responses dump failed", "error", err)
 	}
 }
 
@@ -48,6 +48,6 @@ func dumpDebugUpstreamResponse(rawBody []byte) {
 	path := filepath.Join(dir, "last-upstream-response.json")
 	sanitized := []byte(redactBody(rawBody))
 	if err := os.WriteFile(path, sanitized, 0o600); err != nil {
-		log.Printf("debug: dump failed: %v", err)
+		slog.Debug("debug upstream response dump failed", "error", err)
 	}
 }

@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -168,16 +168,16 @@ accounts:
 		f.Close()
 
 		var buf bytes.Buffer
-		oldWriter := log.Writer()
-		log.SetOutput(&buf)
-		defer log.SetOutput(oldWriter)
+		oldDefault := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(oldDefault)
 
 		cfg, err := LoadConfig(f.Name())
 		if err != nil {
 			t.Fatalf("LoadConfig: %v", err)
 		}
-		if !strings.Contains(buf.String(), "WARNING") {
-			t.Errorf("expected WARNING for GLM tier without strip_fields, got: %s", buf.String())
+		if !strings.Contains(buf.String(), "prompt_cache_retention") {
+			t.Errorf("expected warning for GLM tier without strip_fields, got: %s", buf.String())
 		}
 		if cfg.ModelTiers["glm-test"] != "glm-5.2" {
 			t.Errorf("expected glm-test tier, got %v", cfg.ModelTiers)
@@ -207,16 +207,16 @@ accounts:
 		f.Close()
 
 		var buf bytes.Buffer
-		oldWriter := log.Writer()
-		log.SetOutput(&buf)
-		defer log.SetOutput(oldWriter)
+		oldDefault := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(oldDefault)
 
 		cfg, err := LoadConfig(f.Name())
 		if err != nil {
 			t.Fatalf("LoadConfig: %v", err)
 		}
-		if strings.Contains(buf.String(), "WARNING") {
-			t.Errorf("unexpected WARNING for GLM tier WITH prompt_cache_retention, got: %s", buf.String())
+		if strings.Contains(buf.String(), "prompt_cache_retention") {
+			t.Errorf("unexpected warning for GLM tier WITH prompt_cache_retention, got: %s", buf.String())
 		}
 		if cfg.StripFields["glm-test"] == nil || len(cfg.StripFields["glm-test"]) == 0 {
 			t.Errorf("expected strip_fields for glm-test, got %v", cfg.StripFields)
@@ -246,16 +246,16 @@ accounts:
 		f.Close()
 
 		var buf bytes.Buffer
-		oldWriter := log.Writer()
-		log.SetOutput(&buf)
-		defer log.SetOutput(oldWriter)
+		oldDefault := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(oldDefault)
 
 		cfg, err := LoadConfig(f.Name())
 		if err != nil {
 			t.Fatalf("LoadConfig: %v", err)
 		}
-		if !strings.Contains(buf.String(), "WARNING") {
-			t.Errorf("expected WARNING for GLM tier with other fields but no prompt_cache_retention, got: %s", buf.String())
+		if !strings.Contains(buf.String(), "prompt_cache_retention") {
+			t.Errorf("expected warning for GLM tier with other fields but no prompt_cache_retention, got: %s", buf.String())
 		}
 		if len(cfg.StripFields["glm-test"]) != 1 || cfg.StripFields["glm-test"][0] != "some_other_field" {
 			t.Errorf("expected strip_fields for glm-test with some_other_field, got %v", cfg.StripFields)
@@ -282,16 +282,16 @@ accounts:
 		f.Close()
 
 		var buf bytes.Buffer
-		oldWriter := log.Writer()
-		log.SetOutput(&buf)
-		defer log.SetOutput(oldWriter)
+		oldDefault := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(oldDefault)
 
 		cfg, err := LoadConfig(f.Name())
 		if err != nil {
 			t.Fatalf("LoadConfig: %v", err)
 		}
-		if strings.Contains(buf.String(), "WARNING") {
-			t.Errorf("unexpected WARNING for non-GLM tier, got: %s", buf.String())
+		if strings.Contains(buf.String(), "prompt_cache_retention") {
+			t.Errorf("unexpected warning for non-GLM tier, got: %s", buf.String())
 		}
 		if cfg.ModelTiers["standard"] != "deepseek-v4-flash" {
 			t.Errorf("expected standard tier, got %v", cfg.ModelTiers)
@@ -352,9 +352,9 @@ accounts:
 	f.Close()
 
 	var buf bytes.Buffer
-	oldWriter := log.Writer()
-	log.SetOutput(&buf)
-	defer log.SetOutput(oldWriter)
+	oldDefault := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(oldDefault)
 
 	cfg, err := LoadConfig(f.Name())
 	if err != nil {
@@ -363,8 +363,8 @@ accounts:
 	if cfg.ProbeInterval != 10*time.Minute {
 		t.Errorf("probe_interval = %v, want fallback to 10m", cfg.ProbeInterval)
 	}
-	if !strings.Contains(buf.String(), "WARNING") {
-		t.Errorf("expected WARNING for too-small probe_interval, got: %s", buf.String())
+	if !strings.Contains(buf.String(), "too small") {
+		t.Errorf("expected warning for too-small probe_interval, got: %s", buf.String())
 	}
 }
 

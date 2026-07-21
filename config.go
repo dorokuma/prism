@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -37,6 +37,7 @@ type Config struct {
 	TLSCertFile    string              `yaml:"tls_cert_file,omitempty"`
 	TLSKeyFile     string              `yaml:"tls_key_file,omitempty"`
 	TrustedProxies []string            `yaml:"trusted_proxies,omitempty"`
+	LogLevel      string              `yaml:"log_level"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -55,7 +56,7 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.ProbeInterval = 10 * time.Minute
 	}
 	if cfg.ProbeInterval > 0 && cfg.ProbeInterval < time.Second {
-		log.Printf("WARNING: probe_interval %v is too small (< 1s), falling back to 10m", cfg.ProbeInterval)
+		slog.Warn("probe_interval too small, falling back to 10m", "probe_interval", cfg.ProbeInterval)
 		cfg.ProbeInterval = 10 * time.Minute
 	}
 	if cfg.WireAPI == "" {
@@ -63,6 +64,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.ProbeModel == "" {
 		cfg.ProbeModel = "deepseek-chat"
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
 	}
 	if _, err := ParseWireAPIMode(cfg.WireAPI); err != nil {
 		return nil, err
@@ -121,7 +125,7 @@ func LoadConfig(path string) (*Config, error) {
 				}
 			}
 			if !hasPromptCacheRetention {
-				log.Printf("WARNING: tier %q upstream %q looks like GLM/z-ai but strip_fields for this tier is missing prompt_cache_retention; add it to avoid 400 errors", tier, upstream)
+				slog.Warn("tier upstream looks like GLM/z-ai but missing prompt_cache_retention in strip_fields", "tier", tier, "upstream", upstream)
 			}
 		}
 	}
@@ -260,6 +264,9 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	}
 	if oldCfg.Debug != newCfg.Debug {
 		warnings = append(warnings, "debug changed: restart required to take effect")
+	}
+	if oldCfg.LogLevel != newCfg.LogLevel {
+		setLogLevel(newCfg.LogLevel)
 	}
 
 	// Atomically swap to the new config.

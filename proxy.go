@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"sort"
@@ -139,28 +139,25 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 	limitReader := io.LimitReader(resp.Body, 4096)
 	bodyBytes, err := io.ReadAll(limitReader)
 	if err != nil {
-		log.Printf("proxy: handleUpstreamError read body: %v", err)
+		slog.Error("handleUpstreamError read body", "error", err)
 	}
 
 	if resp.StatusCode == 401 || resp.StatusCode == 402 {
 		acc.MarkExhausted()
-		log.Printf("proxy: %s status %d, marking exhausted. body: %s",
-			acc.Name(), resp.StatusCode, redactBody(bodyBytes))
+		slog.Error("upstream permanent error, marking exhausted", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(bodyBytes))
 		return
 	}
 
 	if isPermanentCredentialError(bodyBytes) {
 		acc.MarkExhausted()
-		log.Printf("proxy: %s permanent credential error (status=%d), marking exhausted. body: %s",
-			acc.Name(), resp.StatusCode, redactBody(bodyBytes))
+		slog.Error("upstream permanent credential error, marking exhausted", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(bodyBytes))
 		return
 	}
 
 	if resp.StatusCode == 429 {
 		if isQuotaError(bodyBytes) {
 			acc.MarkExhausted()
-			log.Printf("proxy: %s 429+quota exhaustion, marking exhausted. body: %s",
-				acc.Name(), redactBody(bodyBytes))
+			slog.Error("upstream 429+quota exhaustion, marking exhausted", "account", acc.Name(), "body", redactBody(bodyBytes))
 			return
 		}
 		cd := parseRetryAfter(resp)
@@ -171,21 +168,18 @@ func handleUpstreamError(acc *Account, resp *http.Response) {
 			cd = 5 * time.Minute
 		}
 		acc.SetCooldown(cd)
-		log.Printf("proxy: %s rate-limited 429, cooling down %v. body: %s",
-			acc.Name(), cd, redactBody(bodyBytes))
+		slog.Warn("upstream rate-limited 429", "account", acc.Name(), "cooldown", cd, "body", redactBody(bodyBytes))
 		return
 	}
 
 	if isQuotaError(bodyBytes) {
 		acc.MarkExhausted()
-		log.Printf("proxy: %s insufficient_quota (status=%d), marking exhausted. body: %s",
-			acc.Name(), resp.StatusCode, redactBody(bodyBytes))
+		slog.Error("upstream insufficient_quota, marking exhausted", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(bodyBytes))
 		return
 	}
 
 	acc.SetCooldown(30 * time.Second)
-	log.Printf("proxy: %s temporary error (status=%d), cooling down 30s. body: %s",
-		acc.Name(), resp.StatusCode, redactBody(bodyBytes))
+	slog.Warn("upstream temporary error, cooling down", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(bodyBytes))
 }
 
 // upstreamContext creates a context for upstream requests.
@@ -288,7 +282,7 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("proxy: responses body read error: %v", err)
+		slog.Error("responses body read error", "error", err)
 		http.Error(w, "failed to read body", 500)
 		return
 	}
@@ -297,7 +291,7 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 	dumpDebugResponsesBody(bodyBytes)
 	dumpDebugChatBody(chatBody)
 	if err != nil {
-		log.Printf("proxy: responses convert error: %v", err)
+		slog.Error("responses convert error", "error", err)
 		errBody, marshalErr := json.Marshal(map[string]any{
 			"error": map[string]any{"message": err.Error(), "code": "invalid_request"},
 		})
@@ -314,7 +308,7 @@ func proxyResponses(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Con
 	_ = json.Unmarshal(bodyBytes, &raw)
 	virtualModel, _ = rawStringField(raw, "model")
 
-	log.Printf("proxy: responses request from %s model=%s stream=%v chat_body=%d bytes", r.RemoteAddr, virtualModel, stream, len(chatBody))
+	slog.Debug("responses request", "remote_addr", r.RemoteAddr, "model", virtualModel, "stream", stream, "chat_body_bytes", len(chatBody))
 	proxyChatWithBody(pool, w, r, chatBody, start, chatForwardOpts{
 		responsesOut: true,
 		stream:       stream,
@@ -339,7 +333,7 @@ func proxyChat(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) 
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("proxy: chat body read error: %v", err)
+		slog.Error("chat body read error", "error", err)
 		http.Error(w, "failed to read body", 500)
 		return
 	}
@@ -382,7 +376,7 @@ func doUpstreamRequest(acc *Account, r *http.Request, bodyBytes []byte, opts cha
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		cancel()
-		log.Printf("proxy: failed to create request for %s: %v", acc.Name(), err)
+		slog.Error("failed to create upstream request", "account", acc.Name(), "error", err)
 		recordUpstreamRetry()
 		return doUpstreamResult{retry: true}
 	}
@@ -395,12 +389,12 @@ func doUpstreamRequest(acc *Account, r *http.Request, bodyBytes []byte, opts cha
 		cancel()
 		// If client disconnected, don't retry
 		if r.Context().Err() != nil {
-			log.Printf("proxy: req=%s client disconnected, aborting retry", requestID)
+			slog.Warn("client disconnected, aborting retry", "request_id", requestID)
 			recordError()
 			return doUpstreamResult{retry: false, fatalErr: fmt.Errorf("client disconnected: %w", r.Context().Err())}
 		}
 		acc.SetCooldown(30 * time.Second)
-		log.Printf("proxy: chat retry via %s (upstream connection error), cooling down 30s: %v", acc.Name(), err)
+		slog.Warn("chat retry, upstream connection error", "account", acc.Name(), "error", err)
 		recordUpstreamRetry()
 		return doUpstreamResult{retry: true}
 	}
@@ -427,9 +421,9 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		// Pass through with redacted body, no cooldown, no retry.
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		if readErr != nil {
-			log.Printf("proxy: failed to read upstream 4xx body: %v", readErr)
+			slog.Warn("failed to read upstream 4xx body", "error", readErr)
 		}
-		log.Printf("proxy: %s upstream 4xx status=%d body=%s", acc.Name(), resp.StatusCode, redactBody(errBody))
+		slog.Warn("upstream 4xx", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(errBody))
 		recordError()
 		// Transparent proxy: forward all non-hop-by-hop upstream headers
 		// (see copyUpstreamHeaders godoc for design rationale), then remove
@@ -448,10 +442,10 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		// 5xx server error or other non-2xx: cooldown and retry.
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if readErr != nil {
-			log.Printf("proxy: failed to read upstream 5xx body: %v", readErr)
+			slog.Warn("failed to read upstream 5xx body", "error", readErr)
 		}
 		acc.SetCooldown(30 * time.Second)
-		log.Printf("proxy: %s 5xx error (status=%d), cooling down 30s. body: %s", acc.Name(), resp.StatusCode, redactBody(errBody))
+		slog.Warn("upstream 5xx error, cooling down", "account", acc.Name(), "status", resp.StatusCode, "body", redactBody(errBody))
 		recordUpstreamRetry()
 		return false, nil
 	}
@@ -462,15 +456,15 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
 		translateStart := time.Now()
-		log.Printf("proxy: req=%s account=%s mode=responses_stream translate.start=%s", requestID, acc.Name(), translateStart.Format(time.RFC3339Nano))
+		slog.Debug("responses_stream translate start", "request_id", requestID, "account", acc.Name(), "translate_start", translateStart.Format(time.RFC3339Nano))
 		err := translateChatStreamToResponses(w, resp.Body, opts.model, opts.reqTools, getSearchToolCache(opts.tenantID), ctx)
 		translateElapsed := time.Since(translateStart).Milliseconds()
 		if err != nil {
-			log.Printf("proxy: req=%s account=%s mode=responses_stream translate.error=%v translate_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, time.Since(start))
+			slog.Error("responses_stream translate error", "request_id", requestID, "account", acc.Name(), "error", err, "translate_ms", translateElapsed, "elapsed", time.Since(start))
 			recordError()
 			return true, err
 		}
-		log.Printf("proxy: req=%s account=%s mode=responses_stream translate.done translate_ms=%d elapsed=%v", requestID, acc.Name(), translateElapsed, time.Since(start))
+		slog.Debug("responses_stream translate done", "request_id", requestID, "account", acc.Name(), "translate_ms", translateElapsed, "elapsed", time.Since(start))
 		recordRequest(time.Since(start))
 		return true, nil
 	}
@@ -480,7 +474,7 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		rawBody, err := io.ReadAll(resp.Body)
 		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 		if err != nil {
-			log.Printf("proxy: req=%s account=%s mode=responses_json body_read_error body_ms=%d elapsed=%v", requestID, acc.Name(), bodyReadElapsed, time.Since(start))
+			slog.Warn("responses_json body read error", "request_id", requestID, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
 			return true, err
 		}
 		dumpDebugUpstreamResponse(rawBody)
@@ -488,7 +482,7 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		out, err := chatCompletionToResponse(rawBody, opts.model, opts.reqTools)
 		translateElapsed := time.Since(translateStart).Milliseconds()
 		if err != nil {
-			log.Printf("proxy: req=%s account=%s mode=responses_json translate.error=%v translate_ms=%d body_ms=%d elapsed=%v", requestID, acc.Name(), err, translateElapsed, bodyReadElapsed, time.Since(start))
+			slog.Error("responses_json translate error", "request_id", requestID, "account", acc.Name(), "error", err, "translate_ms", translateElapsed, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
 			recordError()
 			writeJSON(w, http.StatusBadGateway, map[string]any{
 				"error": map[string]any{"message": "upstream response translation failed", "code": "upstream_error"},
@@ -498,7 +492,7 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		n, _ := w.Write(out)
-		log.Printf("proxy: req=%s account=%s mode=responses_json done written=%d body_ms=%d translate_ms=%d elapsed=%v", requestID, acc.Name(), n, bodyReadElapsed, translateElapsed, time.Since(start))
+		slog.Debug("responses_json done", "request_id", requestID, "account", acc.Name(), "written", n, "body_ms", bodyReadElapsed, "translate_ms", translateElapsed, "elapsed", time.Since(start))
 		recordRequest(time.Since(start))
 		return true, nil
 	}
@@ -509,14 +503,14 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 	n, err := streamResponseBody(w, resp.Body, r, acc.Name())
 	bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 	if err != nil {
-		log.Printf("proxy: req=%s account=%s mode=legacy_stream body_read_error body_ms=%d elapsed=%v", requestID, acc.Name(), bodyReadElapsed, time.Since(start))
+		slog.Warn("legacy_stream body read error", "request_id", requestID, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
 		recordError()
 		return true, err
 	}
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
-		log.Printf("proxy: req=%s account=%s mode=legacy_stream done status=%d written=%d content-length=%s body_read_ms=%d elapsed=%v", requestID, acc.Name(), resp.StatusCode, n, cl, bodyReadElapsed, time.Since(start))
+		slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "content_length", cl, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
 	} else {
-		log.Printf("proxy: req=%s account=%s mode=legacy_stream done status=%d written=%d body_read_ms=%d elapsed=%v", requestID, acc.Name(), resp.StatusCode, n, bodyReadElapsed, time.Since(start))
+		slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
 	}
 	recordRequest(time.Since(start))
 	return true, nil
@@ -532,7 +526,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 	}
 	maxAttempts := len(pool.accounts) * 2
 	requestID := randomID()
-	log.Printf("proxy: req=%s path=%s stream=%v responsesOut=%v totalStart=%s", requestID, r.URL.Path, opts.stream, opts.responsesOut, start.Format(time.RFC3339Nano))
+	slog.Debug("proxy request start", "request_id", requestID, "path", r.URL.Path, "stream", opts.stream, "responses_out", opts.responsesOut, "start", start.Format(time.RFC3339Nano))
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
 		if attempts > 0 {
@@ -548,9 +542,9 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		if acc != nil {
 			accName = acc.Name()
 		}
-		log.Printf("proxy: req=%s attempt=%d pool.select_done=%dms account=%s err=%v", requestID, attempts, selectDuration, accName, err)
+		slog.Debug("pool select done", "request_id", requestID, "attempt", attempts, "select_ms", selectDuration, "account", accName, "error", err)
 		if err != nil {
-			log.Printf("proxy: select account failed: %v", err)
+			slog.Error("select account failed", "error", err)
 			recordError()
 			writeJSON(w, 503, map[string]any{
 				"error": map[string]any{"message": "No healthy accounts available", "code": "no_accounts"},
@@ -587,7 +581,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 			return
 		}
 	}
-	log.Printf("proxy: req=%s channel=all_exhausted attempts=%d elapsed=%v", requestID, maxAttempts, time.Since(start))
+	slog.Error("all accounts exhausted after retries", "request_id", requestID, "attempts", maxAttempts, "elapsed", time.Since(start))
 	recordError()
 	writeJSON(w, 503, map[string]any{
 		"error": map[string]any{"message": "All accounts exhausted after retries", "code": "all_exhausted"},
@@ -595,7 +589,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 }
 
 func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config) {
-	log.Printf("proxy: models request from %s", r.RemoteAddr)
+	slog.Debug("models request", "remote_addr", r.RemoteAddr)
 
 	modelIDs := cfg.AllModels()
 	if len(modelIDs) == 0 {
@@ -620,7 +614,7 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config
 		"data":   data,
 	}
 	writeJSON(w, http.StatusOK, resp)
-	log.Printf("proxy: models returning %d models", len(modelIDs))
+	slog.Debug("models returning", "count", len(modelIDs))
 }
 
 // redactBody masks common sensitive patterns in error/response bodies for safe
@@ -784,7 +778,7 @@ func transformRequestBody(body []byte, cfg *Config) []byte {
 			rawBytes, _ := json.Marshal(remapped)
 			raw["model"] = json.RawMessage(rawBytes)
 			changed = true
-			log.Printf("proxy: model remap %s -> %s", model, remapped)
+			slog.Debug("model remap", "from", model, "to", remapped)
 			model = remapped // use remapped name for downstream steps
 		}
 	}
@@ -797,7 +791,7 @@ func transformRequestBody(body []byte, cfg *Config) []byte {
 				if level, ok := thinking["level"].(string); ok {
 					mapped := mapThoughtLevel(level)
 					if mapped != level {
-						log.Printf("proxy: thinking level remap model=%s level=%s -> %s", model, level, mapped)
+						slog.Debug("thinking level remap", "model", model, "from", level, "to", mapped)
 						thinking["level"] = mapped
 						if b, err := json.Marshal(thinking); err == nil {
 							raw["thinking"] = json.RawMessage(b)
@@ -812,7 +806,7 @@ func transformRequestBody(body []byte, cfg *Config) []byte {
 			if err := json.Unmarshal(effortRaw, &effort); err == nil {
 				mapped := mapThoughtLevel(effort)
 				if mapped != effort {
-					log.Printf("proxy: reasoning_effort remap model=%s effort=%s -> %s", model, effort, mapped)
+					slog.Debug("reasoning_effort remap", "model", model, "from", effort, "to", mapped)
 					if b, err := json.Marshal(mapped); err == nil {
 						raw["reasoning_effort"] = json.RawMessage(b)
 						changed = true
@@ -847,7 +841,7 @@ func transformRequestBody(body []byte, cfg *Config) []byte {
 				if _, exists := raw[field]; exists {
 					delete(raw, field)
 					changed = true
-					log.Printf("proxy: stripped field %q for model %s (tiers %v)", field, model, matchedTiers)
+					slog.Debug("stripped field", "field", field, "model", model, "tiers", matchedTiers)
 				}
 			}
 		}

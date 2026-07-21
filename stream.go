@@ -2,7 +2,7 @@ package main
 
 import (
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 )
 
@@ -27,14 +27,14 @@ func streamResponseBody(w http.ResponseWriter, body io.ReadCloser, clientReq *ht
 	n, err := io.Copy(dst, body)
 	if err != nil {
 		if clientReq != nil && clientReq.Context().Err() != nil {
-			log.Printf("proxy: client disconnected during stream for %s (written=%d): %v", account, n, err)
+			slog.Warn("client disconnected during stream", "account", account, "written", n, "error", err)
 		} else {
-			log.Printf("proxy: upstream stream error for %s (written=%d): %v", account, n, err)
+			slog.Error("upstream stream error", "account", account, "written", n, "error", err)
 		}
 		// Drain the upstream body so the account connection is released cleanly
 		// even when the downstream client has already gone away.
 		if _, drainErr := io.Copy(io.Discard, body); drainErr != nil {
-			log.Printf("proxy: drain upstream body for %s after copy error: %v", account, drainErr)
+			slog.Warn("drain upstream body error", "account", account, "error", drainErr)
 		}
 		return n, err
 	}
