@@ -219,7 +219,16 @@ func CheckAuth(r *http.Request, token string) bool {
 	}
 	provided := r.Header.Get("Authorization")
 	expected := "Bearer " + token
-	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+
+	// Pad both to a fixed length before constant-time comparison so that
+	// unequal lengths do not short-circuit the comparison and leak the
+	// length of expected via timing.
+	const authPadLen = 128
+	pb := make([]byte, authPadLen)
+	eb := make([]byte, authPadLen)
+	copy(pb, provided)
+	copy(eb, expected)
+	return subtle.ConstantTimeCompare(pb, eb) == 1
 }
 
 // IsLocalhost returns true if the request's RemoteAddr is a loopback address.

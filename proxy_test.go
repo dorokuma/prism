@@ -478,6 +478,13 @@ func TestCheckAuth(t *testing.T) {
 	if !CheckAuth(r, "secret") {
 		t.Error("CheckAuth with correct token should return true")
 	}
+
+	// Long wrong token must not pass (length difference must not leak expected length).
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.Header.Set("Authorization", "Bearer "+string(make([]byte, 200)))
+	if CheckAuth(r2, "secret") {
+		t.Error("CheckAuth with long wrong token should return false")
+	}
 }
 
 func TestUpstreamError4xxPassthrough(t *testing.T) {
