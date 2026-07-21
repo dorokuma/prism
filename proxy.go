@@ -15,6 +15,13 @@ import (
 	"time"
 )
 
+var upstreamHeaderAllowlist = map[string]bool{
+	"Content-Type":        true,
+	"Content-Disposition": true,
+	"Content-Language":    true,
+	"Retry-After":         true,
+}
+
 var hopByHopHeaders = map[string]bool{
 	"Connection":          true,
 	"Transfer-Encoding":   true,
@@ -214,15 +221,14 @@ func copyClientHeaders(dst http.Header, src http.Header) {
 	}
 }
 
-// copyUpstreamHeaders copies all non-hop-by-hop headers from the upstream
-// response to the client. This is a transparent proxy by design: all upstream
-// headers (including Server, Via, X-RateLimit-* and other upstream fingerprints)
-// are forwarded as-is. This is intentional for full transparency; if hiding
-// upstream implementation details becomes important in the future, switch to
-// an allowlist approach.
+// copyUpstreamHeaders copies only allowed response headers from the upstream
+// to the client. Only headers in upstreamHeaderAllowlist are forwarded;
+// headers that expose upstream identity (Server, Via, X-RateLimit-*,
+// X-Request-ID) are excluded.
 func copyUpstreamHeaders(dst http.ResponseWriter, src http.Header) {
 	for k, vs := range src {
-		if isHopByHop(k) {
+		ck := http.CanonicalHeaderKey(k)
+		if !upstreamHeaderAllowlist[ck] {
 			continue
 		}
 		for _, v := range vs {

@@ -520,9 +520,9 @@ func TestUpstreamError4xxPassthrough(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "sk-secret") {
 		t.Errorf("body should not contain sk-secret, got %s", rec.Body.String())
 	}
-	// Useful upstream headers should be propagated
-	if rid := rec.Header().Get("X-Request-ID"); rid != "req-123" {
-		t.Errorf("X-Request-ID = %q, want req-123", rid)
+	// X-Request-ID must NOT be forwarded (excluded by allowlist).
+	if rid := rec.Header().Get("X-Request-ID"); rid != "" {
+		t.Errorf("X-Request-ID should not be forwarded, got %q", rid)
 	}
 	// Content-Length must not be present (body was redacted, length changed)
 	if rec.Header().Get("Content-Length") != "" {
@@ -721,8 +721,9 @@ data: [DONE]
 	if rec.Code != 200 {
 		t.Errorf("expected status 200, got %d", rec.Code)
 	}
-	if rec.Header().Get("X-Request-ID") != "req-12345" {
-		t.Errorf("X-Request-ID = %q, want req-12345", rec.Header().Get("X-Request-ID"))
+	// X-Request-ID must NOT be forwarded (excluded by allowlist).
+	if rec.Header().Get("X-Request-ID") != "" {
+		t.Errorf("X-Request-ID should not be forwarded, got %q", rec.Header().Get("X-Request-ID"))
 	}
 	if !strings.Contains(rec.Body.String(), "hello") {
 		t.Error("body should contain SSE content 'hello'")
@@ -883,6 +884,39 @@ func TestRedact_ExistingBehaviorUnchanged(t *testing.T) {
 		wantNorm, _ := json.Marshal(wantMap)
 		if string(gotNorm) != string(wantNorm) {
 			t.Errorf("redactBodyBytes(%q) = %s, want %s", tc.input, gotNorm, wantNorm)
+		}
+	}
+}
+
+func TestCopyUpstreamHeaders_Allowlist(t *testing.T) {
+	rec := httptest.NewRecorder()
+
+	src := http.Header{}
+	src.Set("Content-Type", "application/json")
+	src.Set("Content-Disposition", "attachment; filename=out.json")
+	src.Set("Content-Language", "en")
+	src.Set("Retry-After", "120")
+	src.Set("Server", "nginx/1.21")
+	src.Set("Via", "1.1 proxy")
+	src.Set("X-RateLimit-Remaining", "99")
+	src.Set("X-RateLimit-Limit", "100")
+	src.Set("X-Request-ID", "abc123")
+
+	copyUpstreamHeaders(rec, src)
+
+	dst := rec.Header()
+
+	// Allowed headers must be present.
+	for _, allowed := range []string{"Content-Type", "Content-Disposition", "Content-Language", "Retry-After"} {
+		if dst.Get(allowed) == "" {
+			t.Errorf("allowed header %q missing from response", allowed)
+		}
+	}
+
+	// Disallowed headers must be stripped.
+	for _, disallowed := range []string{"Server", "Via", "X-RateLimit-Remaining", "X-RateLimit-Limit", "X-Request-ID"} {
+		if dst.Get(disallowed) != "" {
+			t.Errorf("disallowed header %q leaked through", disallowed)
 		}
 	}
 }
