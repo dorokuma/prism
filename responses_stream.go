@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // ErrEmptyUpstreamStream is returned when the chat completion stream has no model output.
@@ -295,6 +296,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	var usage map[string]any
 	completed := false
 	lastFinishReason := ""
+	var lastLogprobs any
 
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -343,6 +345,9 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		d := chunk.Choices[0].Delta
 		if chunk.Choices[0].FinishReason != "" {
 			lastFinishReason = chunk.Choices[0].FinishReason
+		}
+		if chunk.Choices[0].Logprobs != nil {
+			lastLogprobs = chunk.Choices[0].Logprobs
 		}
 		// Upstream may stream reasoning_content (e.g. DeepSeek). Codex 0.142.5 expects
 		// response.reasoning_summary_text.delta (not reasoning_summary.delta).
@@ -640,12 +645,15 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 	}
 
-	resp := map[string]any{"id": tr.respID, "object": "response", "status": finishReasonToStatus(lastFinishReason), "model": tr.model}
+	resp := map[string]any{"id": tr.respID, "object": "response", "status": finishReasonToStatus(lastFinishReason), "model": tr.model, "created_at": time.Now().Unix()}
 	if len(reqTools) > 0 && string(reqTools) != "null" {
 		resp["tools"] = jsonRawToAny(reqTools)
 	}
 	if usage != nil {
 		resp["usage"] = usage
+	}
+	if lastLogprobs != nil {
+		resp["logprobs"] = lastLogprobs
 	}
 	return tr.emit(dst, map[string]any{"type": "response.completed", "response": resp})
 }
@@ -667,6 +675,7 @@ type chatStreamChunk struct {
 			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
+		Logprobs     any    `json:"logprobs"`
 	} `json:"choices"`
 	Usage *struct {
 		PromptTokens            int `json:"prompt_tokens"`

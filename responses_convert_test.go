@@ -359,3 +359,122 @@ func TestResponsesToChat_TextFormatJsonObject(t *testing.T) {
 		t.Fatalf("response_format.type = %v, want json_object", rfMap["type"])
 	}
 }
+
+func TestResponsesToChat_UserSeedPassthrough(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-4",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"user": "user-123",
+		"seed": 42
+	}`)
+	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(chat, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["user"] != "user-123" {
+		t.Fatalf("user = %v, want user-123", m["user"])
+	}
+	if m["seed"] != float64(42) {
+		t.Fatalf("seed = %v, want 42", m["seed"])
+	}
+}
+
+func TestChatCompletionToResponse_CreatedAt(t *testing.T) {
+	chatBody := `{
+		"model": "gpt-4",
+		"created": 1700000000,
+		"choices": [{
+			"finish_reason": "stop",
+			"message": {"role": "assistant", "content": "Hello"}
+		}]
+	}`
+	out, err := chatCompletionToResponse([]byte(chatBody), "gpt-4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	ca, ok := resp["created_at"]
+	if !ok {
+		t.Fatal("missing created_at")
+	}
+	caFloat, ok := ca.(float64)
+	if !ok {
+		t.Fatalf("created_at not float64: %T", ca)
+	}
+	if int64(caFloat) != 1700000000 {
+		t.Fatalf("created_at = %v, want 1700000000", int64(caFloat))
+	}
+}
+
+func TestChatCompletionToResponse_Logprobs(t *testing.T) {
+	chatBody := []byte(`{
+		"model": "gpt-4",
+		"choices": [{
+			"finish_reason": "stop",
+			"logprobs": {"content": [{"token": "Hello", "logprob": -0.5}]},
+			"message": {"role": "assistant", "content": "Hello"}
+		}]
+	}`)
+	out, err := chatCompletionToResponse(chatBody, "gpt-4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	lp, ok := resp["logprobs"]
+	if !ok {
+		t.Fatal("missing logprobs")
+	}
+	lpMap, ok := lp.(map[string]any)
+	if !ok {
+		t.Fatalf("logprobs not map: %T", lp)
+	}
+	content, ok := lpMap["content"]
+	if !ok {
+		t.Fatal("logprobs.content missing")
+	}
+	contentArr, ok := content.([]any)
+	if !ok {
+		t.Fatalf("logprobs.content not array: %T", content)
+	}
+	if len(contentArr) != 1 {
+		t.Fatalf("logprobs.content len = %d, want 1", len(contentArr))
+	}
+}
+
+func TestResponsesToChat_EncryptedContentRejected(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-4",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"include": ["encrypted_content"]
+	}`)
+	_, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err == nil {
+		t.Fatal("expected error for include=encrypted_content, got nil")
+	}
+}
+
+func TestResponsesToChat_StoreTrueWarns(t *testing.T) {
+	// store=true should not return error, just warn (no panic).
+	body := []byte(`{
+		"model": "gpt-4",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"store": true
+	}`)
+	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err != nil {
+		t.Fatalf("unexpected error for store=true: %v", err)
+	}
+	if chat == nil {
+		t.Fatal("expected non-nil chat body")
+	}
+}

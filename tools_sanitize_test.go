@@ -8,7 +8,11 @@ func TestSanitizeToolsFlattensNamespaceAndConvertsWebSearch(t *testing.T) {
 	  {"type":"web_search"},
 	  {"name":"multi_agent_v1","tools":[{"name":"close_agent","parameters":{"type":"object"}}]}
 	]`)
-	got := sanitizeToolsForChatCompletions(raw, "test-tenant").([]map[string]any)
+	rawResult, err := sanitizeToolsForChatCompletions(raw, "test-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := rawResult.([]map[string]any)
 	// web_search is now converted to a function tool (not dropped)
 	if len(got) != 3 {
 		t.Fatalf("len=%d want 3", len(got))
@@ -24,5 +28,18 @@ func TestSanitizeToolsFlattensNamespaceAndConvertsWebSearch(t *testing.T) {
 	}
 	if fn2["name"] != "multi_agent_v1__close_agent" {
 		t.Fatalf("got[2] name=%v, want multi_agent_v1__close_agent", fn2["name"])
+	}
+}
+
+func TestSanitizeTools_UnsupportedToolReturnsError(t *testing.T) {
+	tests := []string{"code_interpreter", "file_search", "computer_use"}
+	for _, typ := range tests {
+		t.Run(typ, func(t *testing.T) {
+			raw := []byte(`[{"type":"` + typ + `"}]`)
+			_, err := sanitizeToolsForChatCompletions(raw, "test-tenant")
+			if err == nil {
+				t.Fatalf("expected error for tool type %q, got nil", typ)
+			}
+		})
 	}
 }

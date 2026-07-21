@@ -1200,3 +1200,38 @@ func TestTranslateStream_RefusalDelta_EmitsMessage(t *testing.T) {
 		t.Fatalf("expected status=completed, got %q", status)
 	}
 }
+
+func TestTranslateStream_Logprobs(t *testing.T) {
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"logprobs\":{\"content\":[{\"token\":\"Hello\",\"logprob\":-0.5}]}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("expected at least one event")
+	}
+
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.completed" {
+		t.Fatalf("expected last event to be response.completed, got %q", lastEv.Type)
+	}
+
+	// Verify logprobs appears in response.completed
+	var m map[string]any
+	if err := json.Unmarshal(lastEv.Raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	resp := m["response"].(map[string]any)
+	if _, ok := resp["logprobs"]; !ok {
+		t.Fatal("expected logprobs in response.completed")
+	}
+	// created_at should also be present
+	if _, ok := resp["created_at"]; !ok {
+		t.Fatal("expected created_at in response.completed")
+	}
+}

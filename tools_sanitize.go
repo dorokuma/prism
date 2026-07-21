@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -122,31 +122,34 @@ func ResolveNamespaceTool(name string) string {
 }
 
 // sanitizeToolsForChatCompletions converts Responses API tools to Chat Completions format.
-func sanitizeToolsForChatCompletions(raw json.RawMessage, tenantID string) any {
+func sanitizeToolsForChatCompletions(raw json.RawMessage, tenantID string) (any, error) {
 	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
-		return jsonRawToAny(raw)
+		return jsonRawToAny(raw), nil
 	}
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
-		out = append(out, flattenToolEntry(item, tenantID)...)
+		entries, err := flattenToolEntry(item, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, entries...)
 	}
 	if len(out) == 0 {
-		return nil
+		return nil, nil
 	}
-	return out
+	return out, nil
 }
 
-func flattenToolEntry(item json.RawMessage, tenantID string) []map[string]any {
+func flattenToolEntry(item json.RawMessage, tenantID string) ([]map[string]any, error) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(item, &m); err != nil {
-		return nil
+		return nil, nil
 	}
 	typ, _ := rawStringField(m, "type")
 	switch typ {
 	case "code_interpreter", "file_search", "computer_use":
-		log.Printf("tools_sanitize: dropping unsupported tool type %q", typ)
-		return nil
+		return nil, fmt.Errorf("tool type %q not supported by prism proxy", typ)
 	}
 	if typ == "web_search" {
 		params := map[string]any{
@@ -174,14 +177,14 @@ func flattenToolEntry(item json.RawMessage, tenantID string) []map[string]any {
 				"description": "Search the web for current information on any topic.",
 				"parameters":  params,
 			},
-		}}
+		}}, nil
 	}
 	// Namespace / MCP bundle: extract tools and cache for tool_search
 	if nested, ok := m["tools"]; ok && len(nested) > 0 && string(nested) != "null" {
 		bundleName, _ := rawStringField(m, "name")
 		var sub []json.RawMessage
 		if err := json.Unmarshal(nested, &sub); err != nil {
-			return nil
+			return nil, nil
 		}
 		var out []map[string]any
 		for _, s := range sub {
@@ -209,7 +212,7 @@ func flattenToolEntry(item json.RawMessage, tenantID string) []map[string]any {
 				out = append(out, t)
 			}
 		}
-		return out
+		return out, nil
 	}
 	// tool_search: append cached MCP tools so non-GPT models can see them
 	if typ == "tool_search" {
@@ -228,12 +231,12 @@ func flattenToolEntry(item json.RawMessage, tenantID string) []map[string]any {
 			"function": fnObj,
 		}}
 		result = append(result, getTenantMCPTools(tenantID)...)
-		return result
+		return result, nil
 	}
 	if t := asFunctionTool(m); t != nil {
-		return []map[string]any{t}
+		return []map[string]any{t}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 func asFunctionTool(m map[string]json.RawMessage) map[string]any {

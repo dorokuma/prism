@@ -6,6 +6,7 @@ import (
 	"log"
 	"fmt"
 	"strings"
+	"time"
 )
 
 func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, stream bool, reqTools json.RawMessage, err error) {
@@ -31,6 +32,25 @@ func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, 
 	if v, ok := raw["previous_response_id"]; ok && len(v) > 0 && string(v) != "null" {
 		return nil, false, nil, errors.New("previous_response_id not supported by stateless prism proxy")
 	}
+	if storeRaw, ok := raw["store"]; ok && len(storeRaw) > 0 && string(storeRaw) != "null" {
+		var store bool
+		if err := json.Unmarshal(storeRaw, &store); err == nil && store {
+			log.Printf("responses_convert: store=true not supported by stateless prism proxy, ignoring")
+		}
+	}
+	if includeRaw, ok := raw["include"]; ok && len(includeRaw) > 0 && string(includeRaw) != "null" {
+		var includes []string
+		if err := json.Unmarshal(includeRaw, &includes); err == nil {
+			for _, inc := range includes {
+				if inc == "encrypted_content" {
+					return nil, false, nil, errors.New("include=encrypted_content not supported by prism proxy")
+				}
+				if inc == "annotations" {
+					log.Printf("responses_convert: include=annotations not supported by prism proxy, ignoring")
+				}
+			}
+		}
+	}
 	for _, m := range messages {
 		if hasImagePart(m["content"]) {
 			return nil, false, nil, errors.New("image input not supported by prism proxy on /v1/responses; use /v1/chat/completions")
@@ -39,12 +59,16 @@ func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, 
 	messages = normalizeMessagesForChatAPI(messages)
 	out := map[string]any{"model": model, "messages": messages, "stream": stream}
 	if v, ok := raw["tools"]; ok && len(v) > 0 && string(v) != "null" {
-		if tools := sanitizeToolsForChatCompletions(v, tenantID); tools != nil {
+		tools, toolsErr := sanitizeToolsForChatCompletions(v, tenantID)
+		if toolsErr != nil {
+			return nil, false, nil, toolsErr
+		}
+		if tools != nil {
 			out["tools"] = tools
 			copyOptionalRaw(raw, out, "tool_choice")
 		}
 	}
-	copyOptionalRaw(raw, out, "temperature", "top_p", "stream_options", "thinking", "parallel_tool_calls")
+	copyOptionalRaw(raw, out, "temperature", "top_p", "stream_options", "thinking", "parallel_tool_calls", "user", "seed")
 	if textRaw, ok := raw["text"]; ok && len(textRaw) > 0 && string(textRaw) != "null" {
 		var textMap map[string]any
 		if err := json.Unmarshal(textRaw, &textMap); err == nil {
@@ -274,6 +298,9 @@ func reasoningEffortFromRaw(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return ""
 	}
+	if _, ok := obj["summary"]; ok {
+		log.Printf("responses_convert: reasoning.summary not supported by prism proxy, ignoring")
+	}
 	if e, ok := obj["effort"].(string); ok {
 		return e
 	}
@@ -298,15 +325,23 @@ func chatCompletionToResponse(body []byte, model string, reqTools json.RawMessag
 		})
 	}
 	if ch.Message.Refusal != "" {
-		output = append(output, map[string]any{
+		msg := map[string]any{
 			"type": "message", "id": "msg_" + randomID(), "role": "assistant", "status": "completed",
 			"content": []map[string]any{{"type": "output_text", "text": ch.Message.Refusal}},
-		})
+		}
+		if ch.Message.Annotations != nil {
+			msg["annotations"] = ch.Message.Annotations
+		}
+		output = append(output, msg)
 	} else if ch.Message.Content != nil && contentString(ch.Message.Content) != "" {
-		output = append(output, map[string]any{
+		msg := map[string]any{
 			"type": "message", "id": "msg_" + randomID(), "role": "assistant", "status": "completed",
 			"content": []map[string]any{{"type": "output_text", "text": contentString(ch.Message.Content)}},
-		})
+		}
+		if ch.Message.Annotations != nil {
+			msg["annotations"] = ch.Message.Annotations
+		}
+		output = append(output, msg)
 	}
 	for _, tc := range ch.Message.ToolCalls {
 		name := ResolveNamespaceTool(tc.Function.Name)
@@ -344,9 +379,16 @@ func chatCompletionToResponse(body []byte, model string, reqTools json.RawMessag
 			}
 		}
 	}
+	createdAt := int64(comp.Created)
+	if createdAt == 0 {
+		createdAt = time.Now().Unix()
+	}
 	resp := map[string]any{
 		"id": respID, "object": "response", "status": finishReasonToStatus(ch.FinishReason),
-		"model": model, "output": output, "usage": usage,
+		"model": model, "output": output, "usage": usage, "created_at": createdAt,
+	}
+	if ch.Logprobs != nil {
+		resp["logprobs"] = ch.Logprobs
 	}
 	if len(reqTools) > 0 && string(reqTools) != "null" {
 		resp["tools"] = jsonRawToAny(reqTools)
@@ -366,12 +408,15 @@ func finishReasonToStatus(reason string) string {
 
 type chatCompletionResponse struct {
 	Model   string `json:"model"`
+	Created int    `json:"created"`
 	Choices []struct {
 		FinishReason string `json:"finish_reason"`
+		Logprobs     any    `json:"logprobs"`
 		Message      struct {
 			Role             string `json:"role"`
 			Content          any    `json:"content"`
 			Refusal          string `json:"refusal"`
+			Annotations      any    `json:"annotations"`
 			ReasoningContent string `json:"reasoning_content"`
 			ToolCalls        []struct {
 				ID       string `json:"id"`
