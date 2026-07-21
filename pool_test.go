@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -216,5 +217,23 @@ func TestQuotaCooldownNotExhaustion(t *testing.T) {
 	}
 	if !acc.IsHealthy() {
 		t.Fatal("account should still be healthy after quota cooldown")
+	}
+}
+
+func TestNewHTTPClient_ResponseHeaderTimeout(t *testing.T) {
+	c := newHTTPClient()
+
+	// http.Client.Timeout must remain 0 for streaming.
+	if c.Timeout != 0 {
+		t.Errorf("Client.Timeout = %v, want 0 (streaming must not be truncated)", c.Timeout)
+	}
+
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("Transport is not *http.Transport")
+	}
+
+	if tr.ResponseHeaderTimeout == 0 {
+		t.Error("ResponseHeaderTimeout is 0, want non-zero defence for stale upstream connections")
 	}
 }
