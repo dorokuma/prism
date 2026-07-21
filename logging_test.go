@@ -342,8 +342,8 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		}
 	})
 
-	// Streaming: verify audit still emits (tokens may be 0 for streaming via legacy path).
-	t.Run("streaming", func(t *testing.T) {
+	// Legacy streaming: verify that token usage is captured from SSE tail.
+	t.Run("legacy_streaming", func(t *testing.T) {
 		h := &capturingHandler{}
 		restore := stashSlog(h)
 		defer restore()
@@ -381,9 +381,73 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		if !strings.Contains(out, `"msg":"request.complete"`) {
 			t.Fatalf("expected request.complete log line, got: %s", out)
 		}
-		// Streaming tokens via legacy path aren't captured — expect 0.
-		// This is valid (degraded B). The audit line is still emitted.
-		t.Logf("audit output: %s", out)
+		if !strings.Contains(out, `"tokens_in":15`) {
+			t.Errorf("expected tokens_in=15, got: %s", out)
+		}
+		if !strings.Contains(out, `"tokens_out":7`) {
+			t.Errorf("expected tokens_out=7, got: %s", out)
+		}
+		// Assert the client received the full SSE stream (passthrough not broken).
+		body := rec.Body.String()
+		if !strings.Contains(body, "hello") {
+			t.Error("client body missing content chunk 'hello'")
+		}
+		if !strings.Contains(body, "[DONE]") {
+			t.Error("client body missing [DONE]")
+		}
+	})
+
+	// Legacy streaming without usage: tokens stay 0, audit line still emitted,
+	// passthrough intact.
+	t.Run("legacy_streaming_no_usage", func(t *testing.T) {
+		h := &capturingHandler{}
+		restore := stashSlog(h)
+		defer restore()
+
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			// No usage in any chunk.
+			w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"index\":0}]}\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			w.Write([]byte("data: [DONE]\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}))
+		defer upstream.Close()
+
+		cfg := &Config{Accounts: []AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		pool := NewPool(cfg.Accounts)
+
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4","stream":true}`)))
+		r.Header.Set("Content-Type", "application/json")
+
+		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), chatForwardOpts{stream: true}, cfg)
+
+		out := h.output()
+		if !strings.Contains(out, `"msg":"request.complete"`) {
+			t.Fatalf("expected request.complete log line, got: %s", out)
+		}
+		// tokens should be 0 (no usage in SSE stream).
+		if !strings.Contains(out, `"tokens_in":0`) {
+			t.Errorf("expected tokens_in=0, got: %s", out)
+		}
+		if !strings.Contains(out, `"tokens_out":0`) {
+			t.Errorf("expected tokens_out=0, got: %s", out)
+		}
+		// Client still gets complete stream.
+		body := rec.Body.String()
+		if !strings.Contains(body, "world") {
+			t.Error("client body missing content chunk 'world'")
+		}
+		if !strings.Contains(body, "[DONE]") {
+			t.Error("client body missing [DONE]")
+		}
 	})
 }
 
