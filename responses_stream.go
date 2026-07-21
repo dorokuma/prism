@@ -383,6 +383,25 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 				return err
 			}
 		}
+		if d.Refusal != "" {
+			if debugMode {
+				log.Printf("stream: refusal chunk: %q", d.Refusal)
+			}
+			tr.hadMessageContent = true
+			tr.textBuf.WriteString(d.Refusal)
+			if err := tr.ensureContentPart(dst); err != nil {
+				return err
+			}
+			if err := tr.emit(dst, map[string]any{
+				"type":          "response.output_text.delta",
+				"item_id":       tr.msgItemID,
+				"output_index":  tr.msgOutputIdx,
+				"content_index": tr.contentIdx,
+				"delta":         d.Refusal,
+			}); err != nil {
+				return err
+			}
+		}
 		for _, tc := range d.ToolCalls {
 			idx := tc.Index
 			st, ok := tr.tools[idx]
@@ -636,6 +655,7 @@ type chatStreamChunk struct {
 		Delta struct {
 			Content          string `json:"content"`
 			ReasoningContent string `json:"reasoning_content"`
+			Refusal          string `json:"refusal"`
 			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`

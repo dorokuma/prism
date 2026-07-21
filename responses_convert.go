@@ -342,7 +342,7 @@ func chatCompletionToResponse(body []byte, model string, reqTools json.RawMessag
 // finishReasonToStatus maps an OpenAI finish_reason to a Responses API status.
 func finishReasonToStatus(reason string) string {
 	switch reason {
-	case "length":
+	case "length", "content_filter":
 		return "incomplete"
 	default:
 		return "completed"

@@ -129,7 +129,7 @@ func TestChatCompletionToResponse_FinishReason(t *testing.T) {
 		{"length", "incomplete"},
 		{"stop", "completed"},
 		{"tool_calls", "completed"},
-		{"content_filter", "completed"},
+		{"content_filter", "incomplete"},
 		{"", "completed"},
 	}
 	for _, tc := range tests {

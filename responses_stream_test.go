@@ -1086,9 +1086,9 @@ func TestTranslateStream_FinishReasonStop_Completed(t *testing.T) {
 	}
 }
 
-func TestTranslateStream_FinishReasonContentFilter_Completed(t *testing.T) {
-	// finish_reason="content_filter" (other→completed in finishReasonToStatus)
-	// should result in status="completed".
+func TestTranslateStream_FinishReasonContentFilter_Incomplete(t *testing.T) {
+	// finish_reason="content_filter" (maps to incomplete in finishReasonToStatus)
+	// should result in status="incomplete".
 	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n" +
 		"data: [DONE]\n\n"
@@ -1110,8 +1110,8 @@ func TestTranslateStream_FinishReasonContentFilter_Completed(t *testing.T) {
 	}
 
 	status := getStringField(t, lastEv.Raw, "response", "status")
-	if status != "completed" {
-		t.Fatalf("expected status=completed for finish_reason=content_filter, got %q", status)
+	if status != "incomplete" {
+		t.Fatalf("expected status=incomplete for finish_reason=content_filter, got %q", status)
 	}
 }
 
@@ -1140,5 +1140,63 @@ func TestTranslateStream_NoFinishReason_Completed(t *testing.T) {
 	status := getStringField(t, lastEv.Raw, "response", "status")
 	if status != "completed" {
 		t.Fatalf("expected status=completed (default), got %q", status)
+	}
+}
+
+func TestTranslateStream_RefusalDelta_EmitsMessage(t *testing.T) {
+	input := "data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot answer\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"refusal\":\" that question\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	events := parseSSE(t, rec.Body.String())
+
+	// Should have response.created, message item, content_part, 2 deltas, done, item.done, completed
+	if len(events) != 8 {
+		t.Fatalf("expected 8 events, got %d", len(events))
+	}
+
+	// Verify event types
+	wantTypes := []string{
+		"response.created",
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+		"response.output_text.delta",
+		"response.output_text.done",
+		"response.output_item.done",
+		"response.completed",
+	}
+	for i, want := range wantTypes {
+		if events[i].Type != want {
+			t.Fatalf("event[%d].type = %q, want %q", i, events[i].Type, want)
+		}
+	}
+
+	// Verify deltas are refusal text
+	delta3 := getStringField(t, events[3].Raw, "delta")
+	if delta3 != "I cannot answer" {
+		t.Fatalf("delta[3] = %q, want 'I cannot answer'", delta3)
+	}
+	delta4 := getStringField(t, events[4].Raw, "delta")
+	if delta4 != " that question" {
+		t.Fatalf("delta[4] = %q, want ' that question'", delta4)
+	}
+
+	// Verify final message content is the accumulated refusal
+	text5 := getStringField(t, events[5].Raw, "text")
+	if text5 != "I cannot answer that question" {
+		t.Fatalf("output_text.done text = %q, want 'I cannot answer that question'", text5)
+	}
+
+	// Verify status is completed
+	status := getStringField(t, events[7].Raw, "response", "status")
+	if status != "completed" {
+		t.Fatalf("expected status=completed, got %q", status)
 	}
 }
