@@ -35,7 +35,7 @@ func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, 
 			copyOptionalRaw(raw, out, "tool_choice")
 		}
 	}
-	copyOptionalRaw(raw, out, "temperature", "top_p", "stream_options", "thinking")
+	copyOptionalRaw(raw, out, "temperature", "top_p", "stream_options", "thinking", "parallel_tool_calls")
 	if v, ok := raw["max_output_tokens"]; ok {
 		out["max_tokens"] = jsonRawToAny(v)
 	}
@@ -307,7 +307,7 @@ func chatCompletionToResponse(body []byte, model string, reqTools json.RawMessag
 		}
 	}
 	resp := map[string]any{
-		"id": respID, "object": "response", "status": "completed",
+		"id": respID, "object": "response", "status": finishReasonToStatus(ch.FinishReason),
 		"model": model, "output": output, "usage": usage,
 	}
 	if len(reqTools) > 0 && string(reqTools) != "null" {
@@ -316,10 +316,21 @@ func chatCompletionToResponse(body []byte, model string, reqTools json.RawMessag
 	return json.Marshal(resp)
 }
 
+// finishReasonToStatus maps an OpenAI finish_reason to a Responses API status.
+func finishReasonToStatus(reason string) string {
+	switch reason {
+	case "length":
+		return "incomplete"
+	default:
+		return "completed"
+	}
+}
+
 type chatCompletionResponse struct {
 	Model   string `json:"model"`
 	Choices []struct {
-		Message struct {
+		FinishReason string `json:"finish_reason"`
+		Message      struct {
 			Role             string `json:"role"`
 			Content          any    `json:"content"`
 			Refusal          string `json:"refusal"`

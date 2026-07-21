@@ -120,3 +120,51 @@ func TestMapThoughtLevel(t *testing.T) {
 		})
 	}
 }
+
+func TestChatCompletionToResponse_FinishReason(t *testing.T) {
+	tests := []struct {
+		reason string
+		status string
+	}{
+		{"length", "incomplete"},
+		{"stop", "completed"},
+		{"tool_calls", "completed"},
+		{"content_filter", "completed"},
+		{"", "completed"},
+	}
+	for _, tc := range tests {
+		chatBody := `{"model":"gpt-4","choices":[{"finish_reason":"` + tc.reason + `","message":{"role":"assistant","content":"ok"}}]}`
+		out, err := chatCompletionToResponse([]byte(chatBody), "gpt-4", nil)
+		if err != nil {
+			t.Fatalf("chatCompletionToResponse(%q) error: %v", tc.reason, err)
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(out, &resp); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		gotStatus, _ := resp["status"].(string)
+		if gotStatus != tc.status {
+			t.Errorf("finish_reason=%q status=%q, want %q", tc.reason, gotStatus, tc.status)
+		}
+	}
+}
+
+func TestResponsesToChat_ParallelToolCalls(t *testing.T) {
+	body := []byte(`{
+		"model": "deepseek-v4-pro",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"parallel_tool_calls": true
+	}`)
+	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(chat, &m); err != nil {
+		t.Fatal(err)
+	}
+	ptc, ok := m["parallel_tool_calls"]
+	if !ok || ptc != true {
+		t.Fatalf("parallel_tool_calls not preserved: %v", ptc)
+	}
+}
