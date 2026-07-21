@@ -273,3 +273,89 @@ func TestFlattenResponseContentParts_SingleText(t *testing.T) {
 		t.Fatalf("expected 'solo' string, got %v", result)
 	}
 }
+
+func TestResponsesToChat_PreviousResponseIDRejected(t *testing.T) {
+	body := []byte(`{
+		"model": "deepseek-v4-pro",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"previous_response_id": "resp_abc123"
+	}`)
+	_, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err == nil {
+		t.Fatal("expected error for previous_response_id, got nil")
+	}
+}
+
+func TestResponsesToChat_TextFormatJsonSchema(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-4",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"text": {
+			"format": {
+				"type": "json_schema",
+				"name": "response",
+				"schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+				"strict": true
+			}
+		}
+	}`)
+	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(chat, &m); err != nil {
+		t.Fatal(err)
+	}
+	rf, ok := m["response_format"]
+	if !ok {
+		t.Fatal("expected response_format")
+	}
+	rfMap, ok := rf.(map[string]any)
+	if !ok {
+		t.Fatalf("response_format not map: %T", rf)
+	}
+	if rfMap["type"] != "json_schema" {
+		t.Fatalf("response_format.type = %v, want json_schema", rfMap["type"])
+	}
+	if rfMap["name"] != "response" {
+		t.Fatalf("response_format.name = %v, want response", rfMap["name"])
+	}
+	if rfMap["strict"] != true {
+		t.Fatalf("response_format.strict = %v, want true", rfMap["strict"])
+	}
+	if _, ok := rfMap["schema"]; !ok {
+		t.Fatal("response_format missing schema")
+	}
+}
+
+func TestResponsesToChat_TextFormatJsonObject(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-4",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"text": {
+			"format": {
+				"type": "json_object"
+			}
+		}
+	}`)
+	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(chat, &m); err != nil {
+		t.Fatal(err)
+	}
+	rf, ok := m["response_format"]
+	if !ok {
+		t.Fatal("expected response_format")
+	}
+	rfMap, ok := rf.(map[string]any)
+	if !ok {
+		t.Fatalf("response_format not map: %T", rf)
+	}
+	if rfMap["type"] != "json_object" {
+		t.Fatalf("response_format.type = %v, want json_object", rfMap["type"])
+	}
+}

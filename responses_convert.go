@@ -28,6 +28,9 @@ func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, 
 	if len(messages) == 0 {
 		return nil, false, nil, fmt.Errorf("responses body: empty input")
 	}
+	if v, ok := raw["previous_response_id"]; ok && len(v) > 0 && string(v) != "null" {
+		return nil, false, nil, errors.New("previous_response_id not supported by stateless prism proxy")
+	}
 	for _, m := range messages {
 		if hasImagePart(m["content"]) {
 			return nil, false, nil, errors.New("image input not supported by prism proxy on /v1/responses; use /v1/chat/completions")
@@ -42,6 +45,18 @@ func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, 
 		}
 	}
 	copyOptionalRaw(raw, out, "temperature", "top_p", "stream_options", "thinking", "parallel_tool_calls")
+	if textRaw, ok := raw["text"]; ok && len(textRaw) > 0 && string(textRaw) != "null" {
+		var textMap map[string]any
+		if err := json.Unmarshal(textRaw, &textMap); err == nil {
+			if fmtRaw, ok := textMap["format"]; ok {
+				if fmtMap, ok := fmtRaw.(map[string]any); ok {
+					if ft, ok := fmtMap["type"].(string); ok && (ft == "json_schema" || ft == "json_object") {
+						out["response_format"] = fmtMap
+					}
+				}
+			}
+		}
+	}
 	if v, ok := raw["max_output_tokens"]; ok {
 		out["max_tokens"] = jsonRawToAny(v)
 	}
