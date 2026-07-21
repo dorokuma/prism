@@ -581,13 +581,46 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		return true, nil
 	}
 
-	copyUpstreamHeaders(w, resp.Header)
-	w.WriteHeader(resp.StatusCode)
+	// Legacy chat path (no responses translation).
+	if opts.stream {
+		// Streaming: pass through SSE chunks without token capture.
+		// Streaming token interception is complex and risks breaking
+		// the SSE stream; tokens_in/tokens_out remain 0 (acceptable).
+		copyUpstreamHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		bodyReadStart := time.Now()
+		n, err := streamResponseBody(w, resp.Body, r, acc.Name())
+		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
+		if err != nil {
+			slog.Warn("legacy_stream body read error", "request_id", requestID, "model", opts.model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
+			recordError()
+			if a := auditFromCtx(r.Context()); a != nil {
+				a.status = resp.StatusCode
+				a.account = acc.Name()
+				a.errorType = upstreamErrorType(err)
+				a.error = err.Error()
+			}
+			return true, err
+		}
+		if cl := resp.Header.Get("Content-Length"); cl != "" {
+			slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "content_length", cl, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
+		} else {
+			slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
+		}
+		recordRequest(time.Since(start))
+		if a := auditFromCtx(r.Context()); a != nil {
+			a.status = resp.StatusCode
+			a.account = acc.Name()
+		}
+		return true, nil
+	}
+
+	// Non-streaming legacy: read full body, capture token usage, write to client.
 	bodyReadStart := time.Now()
-	n, err := streamResponseBody(w, resp.Body, r, acc.Name())
+	rawBody, err := io.ReadAll(resp.Body)
 	bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 	if err != nil {
-		slog.Warn("legacy_stream body read error", "request_id", requestID, "model", opts.model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
+		slog.Warn("legacy_nonstream body read error", "request_id", requestID, "model", opts.model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 		recordError()
 		if a := auditFromCtx(r.Context()); a != nil {
 			a.status = resp.StatusCode
@@ -597,11 +630,18 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		}
 		return true, err
 	}
-	if cl := resp.Header.Get("Content-Length"); cl != "" {
-		slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "content_length", cl, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
-	} else {
-		slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
+	dumpDebugUpstreamResponse(rawBody)
+	// Capture token usage from the response body for non-streaming audit.
+	if a := auditFromCtx(r.Context()); a != nil {
+		if tokensIn, tokensOut := parseUsageFromChatCompletion(rawBody); tokensIn > 0 || tokensOut > 0 {
+			a.tokensIn = tokensIn
+			a.tokensOut = tokensOut
+		}
 	}
+	copyUpstreamHeaders(w, resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	n, _ := w.Write(rawBody)
+	slog.Debug("legacy_nonstream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
 	recordRequest(time.Since(start))
 	if a := auditFromCtx(r.Context()); a != nil {
 		a.status = resp.StatusCode

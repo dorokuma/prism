@@ -310,7 +310,39 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		}
 	})
 
-	// Streaming: verify audit still emits (tokens may be 0 for streaming via responses path).
+	// Legacy non-streaming: verify token usage is captured on the legacy chat path.
+	t.Run("legacy_non_streaming", func(t *testing.T) {
+		h := &capturingHandler{}
+		restore := stashSlog(h)
+		defer restore()
+
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":3,\"total_tokens\":23}}"))
+		}))
+		defer upstream.Close()
+
+		cfg := &Config{Accounts: []AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		pool := NewPool(cfg.Accounts)
+
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte("{\"model\":\"gpt-4\"}")))
+		r.Header.Set("Content-Type", "application/json")
+
+		// Legacy path: responsesOut=false (default), non-streaming.
+		proxyChatWithBody(pool, rec, r, []byte("{\"model\":\"gpt-4\"}"), time.Now(), chatForwardOpts{}, cfg)
+
+		out := h.output()
+		if !strings.Contains(out, "\"tokens_in\":20") {
+			t.Errorf("expected tokens_in=20, got: %s", out)
+		}
+		if !strings.Contains(out, "\"tokens_out\":3") {
+			t.Errorf("expected tokens_out=3, got: %s", out)
+		}
+	})
+
+	// Streaming: verify audit still emits (tokens may be 0 for streaming via legacy path).
 	t.Run("streaming", func(t *testing.T) {
 		h := &capturingHandler{}
 		restore := stashSlog(h)
