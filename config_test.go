@@ -393,3 +393,127 @@ func TestConfigAllModels(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadConfig_NonLoopbackRequiresAuth(t *testing.T) {
+	t.Run("non-loopback without auth", func(t *testing.T) {
+		content := `
+listen: 0.0.0.0:8080
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		f, err := os.CreateTemp("", "config-.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+
+		_, err = LoadConfig(f.Name())
+		if err == nil {
+			t.Fatal("expected error for non-loopback listen without auth token, got nil")
+		}
+	})
+
+	t.Run("loopback 127.0.0.1 without auth", func(t *testing.T) {
+		content := `
+listen: 127.0.0.1:8080
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		f, err := os.CreateTemp("", "config-.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+
+		_, err = LoadConfig(f.Name())
+		if err != nil {
+			t.Fatalf("LoadConfig with loopback should succeed: %v", err)
+		}
+	})
+
+	t.Run("loopback [::1] without auth", func(t *testing.T) {
+		content := `
+listen: "[::1]:8080"
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		f, err := os.CreateTemp("", "config-.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+
+		_, err = LoadConfig(f.Name())
+		if err != nil {
+			t.Fatalf("LoadConfig with [::1] should succeed: %v", err)
+		}
+	})
+
+	t.Run("non-loopback with auth token", func(t *testing.T) {
+		content := `
+listen: 0.0.0.0:8080
+auth_token: my-secret-token
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		f, err := os.CreateTemp("", "config-.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+
+		_, err = LoadConfig(f.Name())
+		if err != nil {
+			t.Fatalf("LoadConfig with non-loopback and auth token should succeed: %v", err)
+		}
+	})
+
+	t.Run("empty host without auth", func(t *testing.T) {
+		content := `
+listen: ":8080"
+auth_token: 
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		f, err := os.CreateTemp("", "config-.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+
+		_, err = LoadConfig(f.Name())
+		if err == nil {
+			t.Fatal("expected error for empty-host listen without auth token, got nil")
+		}
+	})
+}

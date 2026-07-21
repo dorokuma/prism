@@ -90,6 +90,10 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.AuthToken == "" {
 		cfg.AuthToken = os.Getenv("PRISM_AUTH_TOKEN")
 	}
+	// Reject non-loopback listen without auth token
+	if !isLoopbackListen(cfg.Listen) && cfg.AuthToken == "" {
+		return nil, fmt.Errorf("non-loopback listen address %q requires auth_token or PRISM_AUTH_TOKEN", cfg.Listen)
+	}
 	// TLS cert/key fallback to env vars
 	if cfg.TLSCertFile == "" {
 		cfg.TLSCertFile = os.Getenv("PRISM_TLS_CERT")
@@ -186,6 +190,24 @@ func getCredential(name string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+// isLoopbackListen returns true if addr binds to a loopback interface.
+// Uses fail-safe logic: parse errors, empty host, and non-IP hosts are
+// treated as non-loopback.
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // ParseTrustedProxies parses a list of CIDR strings into *net.IPNet values.
