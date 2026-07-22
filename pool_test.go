@@ -436,3 +436,35 @@ func TestSnapshotStats(t *testing.T) {
 		t.Errorf("InFlightSum = %d, want 0", snap.InFlightSum)
 	}
 }
+
+// TestCooldownExhaustCount verifies that cooldownCount tracks SetCooldown calls
+// and exhaustCount tracks MarkExhausted calls (without double-counting).
+func TestCooldownExhaustCount(t *testing.T) {
+	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
+
+	// SetCooldown 3 times
+	acc.SetCooldown(1 * time.Minute)
+	acc.SetCooldown(2 * time.Minute)
+	acc.SetCooldown(3 * time.Minute)
+	if got := acc.CooldownCount(); got != 3 {
+		t.Errorf("CooldownCount after 3 SetCooldown calls = %d, want 3", got)
+	}
+
+	// MarkExhausted once
+	acc.MarkExhausted()
+	if got := acc.ExhaustCount(); got != 1 {
+		t.Errorf("ExhaustCount after 1 MarkExhausted = %d, want 1", got)
+	}
+
+	// Repeat MarkExhausted — should NOT increment count (only transitions)
+	acc.MarkExhausted()
+	acc.MarkExhausted()
+	if got := acc.ExhaustCount(); got != 1 {
+		t.Errorf("ExhaustCount after 3 MarkExhausted calls = %d, want 1 (no double-count)", got)
+	}
+
+	// CooldownCount should still be 3
+	if got := acc.CooldownCount(); got != 3 {
+		t.Errorf("CooldownCount after exhaust = %d, want 3", got)
+	}
+}

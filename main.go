@@ -126,6 +126,12 @@ func main() {
 		expvar.Publish("pool_account_"+acc.Name()+"_total_requests", expvar.Func(func() any {
 			return acc.TotalRequests()
 		}))
+		expvar.Publish("pool_account_"+acc.Name()+"_cooldown_total", expvar.Func(func() any {
+			return acc.CooldownCount()
+		}))
+		expvar.Publish("pool_account_"+acc.Name()+"_exhaust_total", expvar.Func(func() any {
+			return acc.ExhaustCount()
+		}))
 	}
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)

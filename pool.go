@@ -28,6 +28,8 @@ type Account struct {
 	mu            sync.Mutex
 	inFlight      atomic.Int32
 	totalRequests atomic.Int64
+	cooldownCount atomic.Int64
+	exhaustCount  atomic.Int64
 	cooldownUntil time.Time
 }
 
@@ -47,6 +49,7 @@ func (a *Account) MarkExhausted() {
 	defer a.mu.Unlock()
 	if a.status == StatusHealthy {
 		a.status = StatusExhausted
+		a.exhaustCount.Add(1)
 		slog.Warn("account marked exhausted", "account", a.Name(), "in_flight", a.inFlight.Load())
 	}
 }
@@ -115,6 +118,14 @@ func (a *Account) TotalRequests() int64 {
 	return a.totalRequests.Load()
 }
 
+func (a *Account) CooldownCount() int64 {
+	return a.cooldownCount.Load()
+}
+
+func (a *Account) ExhaustCount() int64 {
+	return a.exhaustCount.Load()
+}
+
 func (a *Account) SetCooldown(d time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -122,6 +133,7 @@ func (a *Account) SetCooldown(d time.Duration) {
 	if newUntil.After(a.cooldownUntil) {
 		a.cooldownUntil = newUntil
 	}
+	a.cooldownCount.Add(1)
 	slog.Warn("account cooldown", "account", a.Name(), "duration", d.String(), "until", a.cooldownUntil.Format(time.RFC3339), "in_flight", a.inFlight.Load())
 }
 
