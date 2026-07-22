@@ -1,4 +1,4 @@
-package main
+package stream
 
 import (
 	"context"
@@ -90,7 +90,7 @@ data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":5,"completion_tokens":7
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -172,7 +172,7 @@ data: {"choices":[{"delta":{"content":"Final answer"}}]}
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "deepseek", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "deepseek", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -242,7 +242,7 @@ data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ls
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestTranslateStream_ToolSearchInterception(t *testing.T) {
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, cachedTools, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, cachedTools, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestTranslateStream_ToolSearchInterception_NoCache(t *testing.T) {
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -403,7 +403,7 @@ data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"funct
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -465,7 +465,7 @@ data: [DONE]
 
 func TestTranslateStream_EmptyInput(t *testing.T) {
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(""), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(""), "gpt-5.5", nil, nil, context.Background())
 	if err != ErrEmptyUpstreamStream {
 		t.Fatalf("expected ErrEmptyUpstreamStream, got %v", err)
 	}
@@ -491,7 +491,7 @@ data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":200,"completion_tokens"
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -538,7 +538,7 @@ data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -571,7 +571,7 @@ func TestTranslateStream_ReqToolsPropagated(t *testing.T) {
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", reqTools, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", reqTools, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -612,7 +612,7 @@ data: {"choices":[{"delta":{"content":"hi"}}]}
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -630,7 +630,7 @@ func TestTranslateStream_NamespacePrefixedToolName(t *testing.T) {
 data: [DONE]
 `
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -685,7 +685,7 @@ func TestTranslateStreamCancelBlockedReader(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- translateChatStreamToResponses(rec, pr, "gpt-5.5", nil, nil, ctx)
+		errCh <- TranslateChatStreamToResponses(rec, pr, "gpt-5.5", nil, nil, ctx)
 	}()
 
 	// Let translate start reading; it should block on the pipe.
@@ -728,7 +728,7 @@ func TestTranslateStreamCancel(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- translateChatStreamToResponses(rec, sr, "gpt-5.5", nil, nil, ctx)
+		errCh <- TranslateChatStreamToResponses(rec, sr, "gpt-5.5", nil, nil, ctx)
 	}()
 
 	// Wait until translate has started reading, then cancel.
@@ -829,7 +829,7 @@ func TestTranslateStreamEmitFailureCancelsCtxReader(t *testing.T) {
 	fw := &failWriter{}
 
 	// translate returns on the first emit because failWriter.Write fails.
-	translateErr := translateChatStreamToResponses(fw, srcPr, "gpt-5.5", nil, nil, ctx)
+	translateErr := TranslateChatStreamToResponses(fw, srcPr, "gpt-5.5", nil, nil, ctx)
 	if translateErr == nil {
 		cancel()
 		srcPw.Close()
@@ -911,7 +911,7 @@ func TestTranslateStream_UpstreamErrorEmitsFailedFrame(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	translateErr := translateChatStreamToResponses(rec, err, "gpt-5.5", nil, nil, context.Background())
+	translateErr := TranslateChatStreamToResponses(rec, err, "gpt-5.5", nil, nil, context.Background())
 	if translateErr == nil {
 		t.Fatal("expected translate to return an error when upstream stream breaks")
 	}
@@ -948,7 +948,7 @@ func TestTranslateStream_CtxCancelledNoFailedFrame(t *testing.T) {
 	}()
 
 	rec := httptest.NewRecorder()
-	translateChatStreamToResponses(rec, pr, "gpt-5.5", nil, nil, ctx)
+	TranslateChatStreamToResponses(rec, pr, "gpt-5.5", nil, nil, ctx)
 	// We don't check the error — it could be context.Canceled or io.ErrClosedPipe.
 
 	events := parseSSE(t, rec.Body.String())
@@ -967,7 +967,7 @@ func TestTranslateStream_CleanEOFWithoutCompletion(t *testing.T) {
 	body := &cleanEOFReader{data: []byte(input)}
 
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, body, "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, body, "gpt-5.5", nil, nil, context.Background())
 	if err == nil {
 		t.Fatal("expected error when upstream stream ends without completion event")
 	}
@@ -1003,7 +1003,7 @@ func TestTranslateStream_NormalCompletionOK(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1037,7 +1037,7 @@ func TestTranslateStream_FinishReasonLength_Incomplete(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1065,7 +1065,7 @@ func TestTranslateStream_FinishReasonStop_Completed(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1094,7 +1094,7 @@ func TestTranslateStream_FinishReasonContentFilter_Incomplete(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1122,7 +1122,7 @@ func TestTranslateStream_NoFinishReason_Completed(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1149,7 +1149,7 @@ func TestTranslateStream_RefusalDelta_EmitsMessage(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1206,7 +1206,7 @@ func TestTranslateStream_Logprobs(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	rec := httptest.NewRecorder()
-	err := translateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
