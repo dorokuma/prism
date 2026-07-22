@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"bytes"
@@ -11,12 +11,15 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/pool"
+	"github.com/dorokuma/prism/internal/util"
 )
 
-
-
 // ---------------------------------------------------------------------------
-// Audit log test helpers
+// Audit log test helpers (duplicated from middleware/logging_test.go to avoid
+// circular imports – the middleware package cannot import proxy).
 // ---------------------------------------------------------------------------
 
 // capturingHandler collects log records into a []byte slice for later
@@ -61,7 +64,7 @@ func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
 }
 func (h *capturingHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
 func (h *capturingHandler) WithGroup(name string) slog.Handler      { return h }
-func (h *capturingHandler) output() string                          { h.mu.Lock(); defer h.mu.Unlock(); return string(h.buf) }
+func (h *capturingHandler) output() string { h.mu.Lock(); defer h.mu.Unlock(); return string(h.buf) }
 
 // stashSlog replaces the default slog.Logger with one that writes into h
 // and returns a restore function.  Callers must defer the restore func.
@@ -89,17 +92,17 @@ func TestAuditLog_RequestComplete(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &Config{Accounts: []AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
-	pool := NewPool(cfg.Accounts)
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
 	// Inject a request ID to get a meaningful audit.req.
-	ctx := context.WithValue(r.Context(), requestIDKey{}, "audit-test-1")
+	ctx := context.WithValue(r.Context(), util.RequestIDKey{}, "audit-test-1")
 	r = r.WithContext(ctx)
 
-	proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{}, cfg)
+	ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
 	if rec.Code != 200 {
 		t.Fatalf("expected status 200, got %d", rec.Code)
@@ -140,8 +143,8 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &Config{Accounts: []AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
-		pool := NewPool(cfg.Accounts)
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
@@ -149,7 +152,7 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 
 		// Use responsesOut=true so handleUpstreamResponse goes through the
 		// responses_json path which calls chatCompletionToResponse and captures usage.
-		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{ResponsesOut: true}, cfg)
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{ResponsesOut: true}, cfg)
 
 		out := h.output()
 		if !strings.Contains(out, `"tokens_in":20`) {
@@ -169,25 +172,25 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":3,\"total_tokens\":23}}"))
+			w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":20,"completion_tokens":3,"total_tokens":23}}`))
 		}))
 		defer upstream.Close()
 
-		cfg := &Config{Accounts: []AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
-		pool := NewPool(cfg.Accounts)
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
-		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte("{\"model\":\"gpt-4\"}")))
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 		r.Header.Set("Content-Type", "application/json")
 
 		// Legacy path: responsesOut=false (default), non-streaming.
-		proxyChatWithBody(pool, rec, r, []byte("{\"model\":\"gpt-4\"}"), time.Now(), chatForwardOpts{}, cfg)
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
 		out := h.output()
-		if !strings.Contains(out, "\"tokens_in\":20") {
+		if !strings.Contains(out, `"tokens_in":20`) {
 			t.Errorf("expected tokens_in=20, got: %s", out)
 		}
-		if !strings.Contains(out, "\"tokens_out\":3") {
+		if !strings.Contains(out, `"tokens_out":3`) {
 			t.Errorf("expected tokens_out=3, got: %s", out)
 		}
 	})
@@ -218,14 +221,14 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &Config{Accounts: []AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
-		pool := NewPool(cfg.Accounts)
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4","stream":true}`)))
 		r.Header.Set("Content-Type", "application/json")
 
-		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), chatForwardOpts{Stream: true}, cfg)
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), ChatForwardOpts{Stream: true}, cfg)
 
 		out := h.output()
 		if !strings.Contains(out, `"msg":"request.complete"`) {
@@ -270,14 +273,14 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &Config{Accounts: []AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
-		pool := NewPool(cfg.Accounts)
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4","stream":true}`)))
 		r.Header.Set("Content-Type", "application/json")
 
-		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), chatForwardOpts{Stream: true}, cfg)
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), ChatForwardOpts{Stream: true}, cfg)
 
 		out := h.output()
 		if !strings.Contains(out, `"msg":"request.complete"`) {
@@ -314,14 +317,14 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &Config{Accounts: []AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
-		pool := NewPool(cfg.Accounts)
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 		r.Header.Set("Content-Type", "application/json")
 
-		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{}, cfg)
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
 		out := h.output()
 		if !strings.Contains(out, `"error_type":"upstream_4xx"`) {
@@ -341,17 +344,17 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &Config{Accounts: []AccountConfig{
+		cfg := &config.Config{Accounts: []config.AccountConfig{
 			{Name: "a1", Key: "k1", BaseURL: upstream.URL},
 			{Name: "a2", Key: "k2", BaseURL: upstream.URL},
 		}}
-		pool := NewPool(cfg.Accounts)
+		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 		r.Header.Set("Content-Type", "application/json")
 
-		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{}, cfg)
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
 		out := h.output()
 		if !strings.Contains(out, `"error_type":"all_exhausted"`) {
@@ -367,12 +370,12 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 		restore := stashSlog(h)
 		defer restore()
 
-		pool := NewPool(nil)
+		p := pool.NewPool(nil)
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 		r.Header.Set("Content-Type", "application/json")
 
-		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{}, &Config{})
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, &config.Config{})
 
 		out := h.output()
 		if !strings.Contains(out, `"msg":"request.complete"`) {
@@ -382,32 +385,4 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 			t.Errorf("expected status=503 for empty pool, got: %s", out)
 		}
 	})
-}
-
-
-func TestRateLimit_HitLogsWarn(t *testing.T) {
-	h := &capturingHandler{}
-	restore := stashSlog(h)
-	defer restore()
-
-	rl := newRateLimiter(1, 1)
-	// First request passes.
-	if !rl.Allow("10.0.0.1") {
-		t.Fatal("first Allow should succeed")
-	}
-	// Second request within the same second should be rate limited.
-	if rl.Allow("10.0.0.1") {
-		t.Fatal("second Allow should fail")
-	}
-
-	// Simulate the middleware log path.
-	slog.Warn("rate_limit.hit", "ip", "10.0.0.1", "path", "/v1/chat/completions", "req", "test-req")
-
-	out := h.output()
-	if !strings.Contains(out, `"msg":"rate_limit.hit"`) {
-		t.Errorf("expected rate_limit.hit log, got: %s", out)
-	}
-	if !strings.Contains(out, `"ip":"10.0.0.1"`) {
-		t.Error("missing ip field")
-	}
 }

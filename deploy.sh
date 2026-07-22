@@ -7,7 +7,7 @@ BINARY="/usr/local/bin/prism"
 
 echo "=== 编译 ==="
 cd "$ROOT"
-go build -o ./bin/prism . 2>&1
+go build -o ./bin/prism ./cmd/prism 2>&1
 echo "BUILD OK ($(du -h ./bin/prism | cut -f1))"
 
 echo "=== 停止旧进程 ==="
