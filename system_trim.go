@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/dorokuma/prism/internal/util"
 )
 
 var (
@@ -20,20 +22,20 @@ func stripCodexUpstreamBloat(system string) string {
 	s = reSkillsBlock.ReplaceAllString(s, "")
 	s = rePermsBlock.ReplaceAllString(s, "")
 	s = strings.TrimSpace(s)
-	if debugMode {
+	if util.DebugMode {
 		if len(s) != origLen {
 			slog.Debug("strip bloat removed", "before", origLen, "after", len(s))
 		}
 	}
 	if s == "" {
-		if debugMode {
+		if util.DebugMode {
 			slog.Debug("strip empty system prompt after bloat removal, replacing with default")
 		}
 		return "You are a helpful coding assistant."
 	}
 	if utf8.RuneCountInString(s) > systemPromptMaxRunes {
 		// Truncate to systemPromptMaxRunes runes, preserving complete UTF-8 characters
-		if debugMode {
+		if util.DebugMode {
 			slog.Debug("strip truncating system prompt", "from_runes", utf8.RuneCountInString(s), "to_runes", systemPromptMaxRunes)
 		}
 		runes := []rune(s)

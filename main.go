@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+
+	"github.com/dorokuma/prism/internal/util"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,11 +30,11 @@ func main() {
 
 	initLogger(cfg.LogLevel)
 
-	debugMode = cfg.Debug
+	util.DebugMode = cfg.Debug
 	loadMCPTools(cfg.MCPToolsJSON)
 	pool := NewPool(cfg.Accounts)
 	wire, _ := ParseWireAPIMode(cfg.WireAPI)
-	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", debugMode, "auth", cfg.AuthToken != "", "tls", cfg.TLSCertFile != "")
+	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", util.DebugMode, "auth", cfg.AuthToken != "", "tls", cfg.TLSCertFile != "")
 
 	// Initial health probe: check all accounts on startup, warn but don't block
 	probeExhausted(pool, cfg.ProbeModel)
@@ -208,7 +210,7 @@ func main() {
 						slog.Warn("config reload warning", "warning", w)
 					}
 					newCfg := holder.Load()
-					debugMode = newCfg.Debug
+					util.DebugMode = newCfg.Debug
 				}
 				// Always reload MCP tools from current config (new or old).
 				curCfg := holder.Load()

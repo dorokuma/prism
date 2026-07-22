@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/dorokuma/prism/internal/util"
 )
 
 func responsesToChatCompletions(body []byte, tenantID string) (chatBody []byte, stream bool, reqTools json.RawMessage, err error) {
@@ -231,7 +233,7 @@ func flattenResponseContentParts(parts []map[string]any) any {
 		case "input_text", "output_text":
 			out = append(out, map[string]any{"type": "text", "text": p["text"]})
 		default:
-			if debugMode {
+			if util.DebugMode {
 				slog.Debug("unknown content part type", "type", p["type"])
 			}
 			out = append(out, p)
@@ -290,22 +292,7 @@ func extractReasoningText(obj map[string]json.RawMessage) string {
 	return ""
 }
 
-func reasoningEffortFromRaw(raw json.RawMessage) string {
-	if len(raw) == 0 || string(raw) == "null" {
-		return ""
-	}
-	var obj map[string]any
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return ""
-	}
-	if _, ok := obj["summary"]; ok {
-		slog.Warn("responses_convert: reasoning.summary not supported by prism proxy, ignoring")
-	}
-	if e, ok := obj["effort"].(string); ok {
-		return e
-	}
-	return ""
-}
+var reasoningEffortFromRaw = util.ReasoningEffortFromRaw
 
 func chatCompletionToResponse(body []byte, model string, reqTools json.RawMessage) ([]byte, error) {
 	var comp chatCompletionResponse
@@ -396,15 +383,7 @@ func chatCompletionToResponse(body []byte, model string, reqTools json.RawMessag
 	return json.Marshal(resp)
 }
 
-// finishReasonToStatus maps an OpenAI finish_reason to a Responses API status.
-func finishReasonToStatus(reason string) string {
-	switch reason {
-	case "length", "content_filter":
-		return "incomplete"
-	default:
-		return "completed"
-	}
-}
+var finishReasonToStatus = util.FinishReasonToStatus
 
 type chatCompletionResponse struct {
 	Model   string `json:"model"`
@@ -466,53 +445,10 @@ func contentString(v any) string {
 	}
 }
 
-func rawStringField(m map[string]json.RawMessage, key string) (string, bool) {
-	raw, ok := m[key]
-	if !ok || len(raw) == 0 {
-		return "", false
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", false
-	}
-	return s, true
-}
-
-func rawBoolField(m map[string]json.RawMessage, key string) bool {
-	raw, ok := m[key]
-	if !ok {
-		return false
-	}
-	var b bool
-	if err := json.Unmarshal(raw, &b); err != nil {
-		return false
-	}
-	return b
-}
-
-func jsonRawToAny(raw json.RawMessage) any {
-	var v any
-	_ = json.Unmarshal(raw, &v)
-	return v
-}
-
-
-// isDeepSeekModel reports whether the upstream model name indicates a DeepSeek model.
-func isDeepSeekModel(model string) bool {
-	return strings.HasPrefix(strings.ToLower(model), "deepseek")
-}
-
-// mapThoughtLevel maps Codex thinking level to DeepSeek-compatible level.
-// low/medium/high → high, xhigh → max. Other values pass through unchanged.
-func mapThoughtLevel(level string) string {
-	switch strings.ToLower(level) {
-	case "low", "medium", "high":
-		return "high"
-	case "xhigh":
-		return "max"
-	default:
-		return level
-	}
-}
+var rawStringField = util.RawStringField
+var rawBoolField = util.RawBoolField
+var jsonRawToAny = util.JSONRawToAny
+var isDeepSeekModel = util.IsDeepSeekModel
+var mapThoughtLevel = util.MapThoughtLevel
 
 

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/dorokuma/prism/internal/util"
 )
 
 func TestStripCodexUpstreamBloat(t *testing.T) {
@@ -176,9 +178,9 @@ func TestStripCodexUpstreamBloat_DebugLogging(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(oldDefault)
 
-	oldDebug := debugMode
-	debugMode = true
-	defer func() { debugMode = oldDebug }()
+	oldDebug := util.DebugMode
+	util.DebugMode = true
+	defer func() { util.DebugMode = oldDebug }()
 
 	_ = stripCodexUpstreamBloat("Some system prompt.")
 

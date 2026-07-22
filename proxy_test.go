@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/dorokuma/prism/internal/util"
 )
 
 func TestRedactBody(t *testing.T) {
@@ -333,27 +335,27 @@ func TestRateLimiterCleanup(t *testing.T) {
 
 func TestRecordMetrics(t *testing.T) {
 	// Reset metrics
-	metricsRequestsTotal.Set(0)
-	metricsErrorsTotal.Set(0)
-	metricsRateLimitedTotal.Set(0)
-	metricsUpstreamRetries.Set(0)
+	util.MetricsRequestsTotal.Set(0)
+	util.MetricsErrorsTotal.Set(0)
+	util.MetricsRateLimitedTotal.Set(0)
+	util.MetricsUpstreamRetries.Set(0)
 
 	recordRequest(100 * time.Millisecond)
 	recordError()
 	recordRateLimited()
 	recordUpstreamRetry()
 
-	if metricsRequestsTotal.Value() != 1 {
-		t.Errorf("requests_total = %d, want 1", metricsRequestsTotal.Value())
+	if util.MetricsRequestsTotal.Value() != 1 {
+		t.Errorf("requests_total = %d, want 1", util.MetricsRequestsTotal.Value())
 	}
-	if metricsErrorsTotal.Value() != 1 {
-		t.Errorf("errors_total = %d, want 1", metricsErrorsTotal.Value())
+	if util.MetricsErrorsTotal.Value() != 1 {
+		t.Errorf("errors_total = %d, want 1", util.MetricsErrorsTotal.Value())
 	}
-	if metricsRateLimitedTotal.Value() != 1 {
-		t.Errorf("rate_limited_total = %d, want 1", metricsRateLimitedTotal.Value())
+	if util.MetricsRateLimitedTotal.Value() != 1 {
+		t.Errorf("rate_limited_total = %d, want 1", util.MetricsRateLimitedTotal.Value())
 	}
-	if metricsUpstreamRetries.Value() != 1 {
-		t.Errorf("upstream_retries = %d, want 1", metricsUpstreamRetries.Value())
+	if util.MetricsUpstreamRetries.Value() != 1 {
+		t.Errorf("upstream_retries = %d, want 1", util.MetricsUpstreamRetries.Value())
 	}
 }
 
@@ -733,7 +735,7 @@ data: [DONE]
 
 func TestHandleUpstreamResponse_NoDoubleCount(t *testing.T) {
 	// Reset metrics
-	metricsRequestsTotal.Set(0)
+	util.MetricsRequestsTotal.Set(0)
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -751,8 +753,8 @@ func TestHandleUpstreamResponse_NoDoubleCount(t *testing.T) {
 
 	proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{}, cfg)
 
-	if metricsRequestsTotal.Value() != 1 {
-		t.Errorf("requests_total = %d, want 1 (double counting detected)", metricsRequestsTotal.Value())
+	if util.MetricsRequestsTotal.Value() != 1 {
+		t.Errorf("requests_total = %d, want 1 (double counting detected)", util.MetricsRequestsTotal.Value())
 	}
 }
 

@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/dorokuma/prism/internal/util"
 )
 
 // ErrEmptyUpstreamStream is returned when the chat completion stream has no model output.
@@ -357,7 +359,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		// Upstream may stream reasoning_content (e.g. DeepSeek). Codex 0.142.5 expects
 		// response.reasoning_summary_text.delta (not reasoning_summary.delta).
 		if d.ReasoningContent != "" {
-				if debugMode {
+				if util.DebugMode {
 					slog.Debug("stream reasoning chunk", "req", requestIDFromCtx(ctx), "content", d.ReasoningContent)
 				}
 				tr.reasoningBuf.WriteString(d.ReasoningContent)
@@ -375,7 +377,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 				}
 			}
 		if d.Content != "" {
-			if debugMode {
+			if util.DebugMode {
 				slog.Debug("stream content chunk", "req", requestIDFromCtx(ctx), "content", d.Content)
 			}
 			tr.hadMessageContent = true
@@ -394,7 +396,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			}
 		}
 		if d.Refusal != "" {
-			if debugMode {
+			if util.DebugMode {
 				slog.Debug("stream refusal chunk", "req", requestIDFromCtx(ctx), "content", d.Refusal)
 			}
 			tr.hadMessageContent = true
@@ -431,13 +433,13 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 				st.namespace = NamespaceForTool(tc.Function.Name)
 			}
 			if !st.added && st.name != "" {
-				if debugMode {
+				if util.DebugMode {
 					slog.Debug("stream tool_call", "req", requestIDFromCtx(ctx), "name", st.name, "call_id", st.callID)
 				}
 				// Intercept tool_search for synthetic response
 				if st.name == "tool_search" && len(tr.searchToolCache) > 0 {
 					tr.pendingSearchID = st.itemID
-					if debugMode {
+					if util.DebugMode {
 						slog.Debug("stream tool_search intercepted", "req", requestIDFromCtx(ctx), "cached_tools", len(tr.searchToolCache))
 					}
 				}
@@ -469,7 +471,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 	}
 	if err := sc.Err(); err != nil {
-		if debugMode {
+		if util.DebugMode {
 			slog.Debug("stream scanner done", "req", requestIDFromCtx(ctx), "error", err)
 		}
 		// If the context is already cancelled, the client closed the
@@ -508,7 +510,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	}
 
 	if !hasSubstantive {
-		if debugMode {
+		if util.DebugMode {
 			slog.Debug("stream empty upstream, emitting response.failed", "req", requestIDFromCtx(ctx))
 		}
 		if err := tr.emit(dst, map[string]any{
@@ -529,7 +531,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	// Clean EOF (sc.Err() == nil) with content but without a [DONE]
 	// completion event: upstream disconnected before finishing the stream.
 	if !completed {
-		if debugMode {
+		if util.DebugMode {
 			slog.Debug("stream clean EOF without completion event", "req", requestIDFromCtx(ctx))
 		}
 		_ = tr.emit(dst, map[string]any{
@@ -545,7 +547,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		return fmt.Errorf("upstream stream ended without completion event")
 	}
 
-	if debugMode {
+	if util.DebugMode {
 		slog.Debug("stream ended", "req", requestIDFromCtx(ctx), "had_content", tr.hadMessageContent, "tools", len(tr.tools))
 	}
 
@@ -585,7 +587,7 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			}); err != nil {
 				return err
 			}
-			if debugMode {
+			if util.DebugMode {
 				slog.Debug("stream tool_search synthetic result emitted", "req", requestIDFromCtx(ctx), "tools", len(searchTools))
 			}
 			continue

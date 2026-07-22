@@ -8,11 +8,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dorokuma/prism/internal/util"
 )
 
 var upstreamHeaderAllowlist = map[string]bool{
@@ -38,27 +39,9 @@ var sensitiveClientHeaders = map[string]bool{
 	http.CanonicalHeaderKey("X-Auth-Token"): true,
 }
 
-var (
-	reAPIKey = regexp.MustCompile(`sk-[A-Za-z0-9_-]{10,}`)
-	reBearer = regexp.MustCompile(`Bearer [A-Za-z0-9_-]{10,}`)
-)
 
-// sensitiveJSONKeys names JSON object keys whose values should be redacted
-// in debug logs and error responses. Compared after strings.ToLower.
-var sensitiveJSONKeys = map[string]bool{
-	"api_key":        true,
-	"apikey":         true,
-	"token":          true,
-	"access_token":   true,
-	"refresh_token":  true,
-	"password":       true,
-	"passwd":         true,
-	"secret":         true,
-	"authorization":  true,
-	"key":            true,
-	"client_key":     true,
-	"session_key":    true,
-}
+
+
 
 func isHopByHop(key string) bool {
 	return hopByHopHeaders[http.CanonicalHeaderKey(key)]
@@ -813,145 +796,13 @@ func proxyModels(pool *Pool, w http.ResponseWriter, r *http.Request, cfg *Config
 	slog.Debug("models returning", "count", len(modelIDs), "req", requestIDFromCtx(r.Context()), "duration_ms", time.Since(start).Milliseconds())
 }
 
-// redactBody masks common sensitive patterns in error/response bodies for safe
-// logging. It first tries JSON-aware redaction (walk the object tree and replace
-// sensitive-key values with "***"); if the body is not valid JSON it falls back
-// to regex-based redaction of sk-* and Bearer tokens.
-func redactBody(body []byte) string {
-	return string(redactBodyBytes(body))
-}
-
-// redactBodyBytes is the []byte version of redactBody, for direct use in
-// response writing without an extra string allocation.
-func redactBodyBytes(body []byte) []byte {
-	if len(body) == 0 {
-		return body
-	}
-	// Try JSON-aware redaction first.
-	var parsed any
-	if err := json.Unmarshal(body, &parsed); err == nil && parsed != nil {
-		parsed = redactJSON(parsed, 0)
-		if out, err := json.Marshal(parsed); err == nil {
-			return out
-		}
-	}
-	// Fall back to regex-based redaction.
-	return []byte(redactBodyRegex(string(body)))
-}
-
-// redactBodyRegex applies regex-based redaction: sk-* keys and Bearer tokens.
-func redactBodyRegex(s string) string {
-	result := reAPIKey.ReplaceAllString(s, "sk-***")
-	result = reBearer.ReplaceAllString(result, "Bearer ***")
-	return result
-}
-
-// redactJSON recursively walks a JSON value and replaces sensitive string
-// values with "***". Arrays and nested objects are recursed into.  String
-// leaf values also get regex redaction for embedded sk-*/Bearer patterns.
-// depth is capped at 20 to prevent stack overflow from malicious nesting.
-// Returns the redacted value; when depth exceeds 20 the subtree is replaced
-// with "<redacted:too deep>" instead of being silently passed through.
-func redactJSON(v any, depth int) any {
-	if depth > redactJSONMaxDepth {
-		return "<redacted:too deep>"
-	}
-	switch val := v.(type) {
-	case map[string]any:
-		for k, vv := range val {
-			if sensitiveJSONKeys[strings.ToLower(k)] {
-				val[k] = "***"
-			} else if s, ok := vv.(string); ok {
-				val[k] = redactBodyRegex(s)
-			} else {
-				val[k] = redactJSON(vv, depth+1)
-			}
-		}
-		return val
-	case []any:
-		for i, item := range val {
-			if s, ok := item.(string); ok {
-				val[i] = redactBodyRegex(s)
-			} else {
-				val[i] = redactJSON(item, depth+1)
-			}
-		}
-		return val
-	}
-	return v
-}
-
-// redactBodyBytesWithKeys is like redactBodyBytes but also scrubs each non-empty
-// key from extraKeys as a literal substring inside string leaf values during
-// JSON redaction.  Keys are NOT replaced in the raw bytes before JSON parsing
-// to avoid corrupting JSON structure with short keys.
-func redactBodyBytesWithKeys(body []byte, extraKeys []string) []byte {
-	if len(body) == 0 {
-		return body
-	}
-	// Try JSON-aware redaction first (with key scrubbing inside string values).
-	var parsed any
-	if err := json.Unmarshal(body, &parsed); err == nil && parsed != nil {
-		parsed = redactJSONWithKeys(parsed, extraKeys, 0)
-		if out, err := json.Marshal(parsed); err == nil {
-			return out
-		}
-	}
-	// Fall back to regex-based redaction + substring scrubbing on raw text.
-	s := redactBodyRegex(string(body))
-	for _, k := range extraKeys {
-		if k == "" {
-			continue
-		}
-		s = strings.ReplaceAll(s, k, "***")
-	}
-	return []byte(s)
-}
-
-// redactJSONWithKeys is like redactJSON but additionally replaces any non-empty
-// key from extraKeys as a literal substring inside string leaf values (on top
-// of the existing regex redaction).
-func redactJSONWithKeys(v any, extraKeys []string, depth int) any {
-	if depth > redactJSONMaxDepth {
-		return "<redacted:too deep>"
-	}
-	switch val := v.(type) {
-	case map[string]any:
-		for k, vv := range val {
-			if sensitiveJSONKeys[strings.ToLower(k)] {
-				val[k] = "***"
-			} else if s, ok := vv.(string); ok {
-				val[k] = redactStringWithKeys(s, extraKeys)
-			} else {
-				val[k] = redactJSONWithKeys(vv, extraKeys, depth+1)
-			}
-		}
-		return val
-	case []any:
-		for i, item := range val {
-			if s, ok := item.(string); ok {
-				val[i] = redactStringWithKeys(s, extraKeys)
-			} else {
-				val[i] = redactJSONWithKeys(item, extraKeys, depth+1)
-			}
-		}
-		return val
-	}
-	return v
-}
-
-// redactStringWithKeys applies regex redaction then replaces each non-empty
-// extra key as a literal substring with "***".
-func redactStringWithKeys(s string, extraKeys []string) string {
-	s = redactBodyRegex(s)
-	for _, k := range extraKeys {
-		if k == "" {
-			continue
-		}
-		s = strings.ReplaceAll(s, k, "***")
-	}
-	return s
-}
+var redactBody = util.RedactBody
+var redactBodyBytes = util.RedactBodyBytes
+var redactBodyRegex = util.RedactBodyRegex
+var redactJSON = util.RedactJSON
+var redactBodyBytesWithKeys = util.RedactBodyBytesWithKeys
+var redactJSONWithKeys = util.RedactJSONWithKeys
+var redactStringWithKeys = util.RedactStringWithKeys
 
 // parseUsageFromChatCompletion extracts input/output token counts from a raw
 // chat completion response body (non-streaming).  Returns 0, 0 when the body
