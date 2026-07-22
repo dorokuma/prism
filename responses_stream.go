@@ -342,8 +342,8 @@ func translateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			}
 			// Capture tokens for audit (nil-safe; ctx without audit yields nil).
 			if a := auditFromCtx(ctx); a != nil {
-				a.tokensIn = chunk.Usage.PromptTokens
-				a.tokensOut = chunk.Usage.CompletionTokens
+				a.TokensIn = chunk.Usage.PromptTokens
+				a.TokensOut = chunk.Usage.CompletionTokens
 			}
 		}
 		if len(chunk.Choices) == 0 {
