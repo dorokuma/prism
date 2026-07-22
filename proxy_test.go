@@ -208,7 +208,9 @@ func TestHandleUpstreamErrorNoBody(t *testing.T) {
 		StatusCode: 500,
 		Body:       io.NopCloser(bytes.NewReader(nil)),
 	}
-	handleUpstreamError(&Account{cfg: AccountConfig{Name: "test"}}, resp, "test-req", "test-model")
+	p := NewPool([]AccountConfig{{Name: "test"}})
+	accs := p.AllAccounts()
+	handleUpstreamError(accs[0], resp, "test-req", "test-model")
 }
 
 func TestParseRetryAfter(t *testing.T) {

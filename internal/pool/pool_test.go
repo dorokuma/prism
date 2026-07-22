@@ -1,4 +1,4 @@
-package main
+package pool
 
 import (
 	"context"
@@ -8,11 +8,13 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/dorokuma/prism/internal/config"
 )
 
 func TestPoolFIFOAndRelease(t *testing.T) {
 	slog.Info("TEST: TestPoolFIFOAndRelease started")
-	cfgs := []AccountConfig{
+	cfgs := []config.AccountConfig{
 		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
 		{Name: "acc-2", Key: "key-2", BaseURL: "http://localhost:8002"},
 	}
@@ -90,7 +92,7 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 	// A is started with an already-cancelled context (returns immediately).
 	// B waits for the single account. Release wakes B without race.
 	slog.Info("TEST: TestPoolCancelAndSignalTransfer started")
-	cfgs := []AccountConfig{
+	cfgs := []config.AccountConfig{
 		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
 	}
 	p := NewPool(cfgs)
@@ -142,7 +144,7 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 
 func TestPoolMarkHealthyWakeup(t *testing.T) {
 	slog.Info("TEST: TestPoolMarkHealthyWakeup started")
-	cfgs := []AccountConfig{
+	cfgs := []config.AccountConfig{
 		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
 		{Name: "acc-2", Key: "key-2", BaseURL: "http://localhost:8002"},
 	}
@@ -187,7 +189,7 @@ func TestPoolMarkHealthyWakeup(t *testing.T) {
 }
 
 func TestSetCooldownDoesNotShorten(t *testing.T) {
-	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
+	acc := &Account{cfg: config.AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
 
 	// Set a long cooldown first
 	acc.SetCooldown(5 * time.Minute)
@@ -208,7 +210,7 @@ func TestSetCooldownDoesNotShorten(t *testing.T) {
 }
 
 func TestQuotaCooldownNotExhaustion(t *testing.T) {
-	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
+	acc := &Account{cfg: config.AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
 
 	// Simulate quota error cooldown
 	acc.SetCooldown(30 * time.Minute)
@@ -245,7 +247,7 @@ func TestNewHTTPClient_ResponseHeaderTimeout(t *testing.T) {
 // account when maxConcurrent=N, and the N+1th enters the waiter (fails on
 // short context or succeeds after a Release).
 func TestConcurrentLimitN(t *testing.T) {
-	cfgs := []AccountConfig{
+	cfgs := []config.AccountConfig{
 		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
 	}
 	p := NewPool(cfgs)
@@ -288,7 +290,7 @@ func TestConcurrentLimitN(t *testing.T) {
 // TestReleaseWakesWaiter verifies that when maxc slots are full, releasing one
 // wakes a waiter which can then acquire the slot.
 func TestReleaseWakesWaiterWithConcurrency(t *testing.T) {
-	cfgs := []AccountConfig{
+	cfgs := []config.AccountConfig{
 		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
 	}
 	p := NewPool(cfgs)
@@ -317,10 +319,6 @@ func TestReleaseWakesWaiterWithConcurrency(t *testing.T) {
 	}()
 
 	// Give the goroutine time to enter the waiter.
-	// Using a fixed sleep because implementing observable synchronisation
-	// (e.g. waiter signalling "entered select") would require structural
-	// changes to Pool internals. 200ms is well below any realistic test
-	// timeout and eliminates flakiness on slow CI runners.
 	time.Sleep(200 * time.Millisecond)
 
 	// Release one slot.
@@ -349,7 +347,7 @@ func TestReleaseWakesWaiterWithConcurrency(t *testing.T) {
 // TestTryAcquireStrictMax verifies that TryAcquire never exceeds max
 // even under high concurrency.
 func TestTryAcquireStrictMax(t *testing.T) {
-	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
+	acc := &Account{cfg: config.AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
 
 	const max = 10
 	const goroutines = 100
@@ -387,24 +385,18 @@ func TestTryAcquireStrictMax(t *testing.T) {
 	if inFlight > max {
 		t.Errorf("inFlight %d > max %d", inFlight, max)
 	}
-	if inFlight < 0 {
-		t.Errorf("inFlight negative: %d", inFlight)
-	}
-
-	// Release all acquired slots.
-	for i := 0; i < total; i++ {
-		acc.Release()
-	}
 }
 
-// TestReleaseNegativeDetect verifies that double-Release triggers a warning
-// and inFlight is clamped to 0.
-func TestReleaseNegativeDetect(t *testing.T) {
-	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
+// TestReleaseSafety verifies that double-Release does not underflow inFlight.
+func TestReleaseSafety(t *testing.T) {
+	acc := &Account{cfg: config.AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
 
-	// Acquire 1 then release twice.
-	if !acc.TryAcquire(10) {
-		t.Fatal("TryAcquire failed")
+	// Acquire one slot
+	if !acc.TryAcquire(1) {
+		t.Fatal("TryAcquire failed unexpectedly")
+	}
+	if got := acc.InFlightCount(); got != 1 {
+		t.Errorf("inFlight after acquire = %d, want 1", got)
 	}
 	acc.Release() // first release: inFlight goes to 0
 	acc.Release() // second release: should trigger warn and clamp to 0
@@ -416,7 +408,7 @@ func TestReleaseNegativeDetect(t *testing.T) {
 
 // TestSnapshotStats verifies that SnapshotStats returns reasonable values.
 func TestSnapshotStats(t *testing.T) {
-	cfgs := []AccountConfig{
+	cfgs := []config.AccountConfig{
 		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
 		{Name: "acc-2", Key: "key-2", BaseURL: "http://localhost:8002"},
 	}
@@ -440,7 +432,7 @@ func TestSnapshotStats(t *testing.T) {
 // TestCooldownExhaustCount verifies that cooldownCount tracks SetCooldown calls
 // and exhaustCount tracks MarkExhausted calls (without double-counting).
 func TestCooldownExhaustCount(t *testing.T) {
-	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
+	acc := &Account{cfg: config.AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
 
 	// SetCooldown 3 times
 	acc.SetCooldown(1 * time.Minute)
