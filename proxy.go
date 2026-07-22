@@ -680,7 +680,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 	}()
 
 	bodyBytes = transformRequestBody(bodyBytes, cfg)
-	if len(pool.accounts) == 0 {
+	if pool.AccountCount() == 0 {
 		aud.Error = "no accounts configured"
 		aud.ErrorType = "config_error"
 		writeJSON(sc, 503, map[string]any{
@@ -688,7 +688,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		})
 		return
 	}
-	maxAttempts := len(pool.accounts) * 2
+	maxAttempts := pool.AccountCount() * 2
 	maxConcurrent := resolveMaxConcurrent(opts.model, cfg)
 	slog.Debug("proxy request start", "request_id", requestID, "path", r.URL.Path, "stream", opts.stream, "responses_out", opts.responsesOut, "start", start.Format(time.RFC3339Nano), "max_concurrent", maxConcurrent)
 

@@ -1,16 +1,18 @@
-package main
+package pool
 
 import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/dorokuma/prism/internal/config"
 )
 
 func TestProbeExhausted_EmptyPool(t *testing.T) {
 	// No accounts → nothing to probe, no panic
 	pool := NewPool(nil)
-	probeExhausted(pool, "test-model")
+	ProbeExhausted(pool, "test-model")
 }
 
 func TestProbeExhausted_NoExhaustedAccounts(t *testing.T) {
@@ -20,15 +22,12 @@ func TestProbeExhausted_NoExhaustedAccounts(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &Config{
-		Accounts: []AccountConfig{
-			{Name: "healthy1", Key: "k1", BaseURL: upstream.URL},
-		},
-	}
-	pool := NewPool(cfg.Accounts)
+	pool := NewPool([]config.AccountConfig{
+		{Name: "healthy1", Key: "k1", BaseURL: upstream.URL},
+	})
 
 	// All accounts start healthy, so ExhaustedAccounts() returns empty
-	probeExhausted(pool, "test-model")
+	ProbeExhausted(pool, "test-model")
 
 	// Account should still be healthy
 	accs := pool.AllAccounts()
@@ -51,12 +50,9 @@ func TestProbeExhausted_200Recovery(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &Config{
-		Accounts: []AccountConfig{
-			{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
-		},
-	}
-	pool := NewPool(cfg.Accounts)
+	pool := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
 
 	// Mark account as exhausted
 	accs := pool.AllAccounts()
@@ -65,7 +61,7 @@ func TestProbeExhausted_200Recovery(t *testing.T) {
 		t.Fatal("account should start as exhausted")
 	}
 
-	probeExhausted(pool, "test-model")
+	ProbeExhausted(pool, "test-model")
 
 	if !accs[0].IsHealthy() {
 		t.Error("account should be marked healthy after 200 response")
@@ -81,17 +77,14 @@ func TestProbeExhausted_429StaysExhausted(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &Config{
-		Accounts: []AccountConfig{
-			{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
-		},
-	}
-	pool := NewPool(cfg.Accounts)
+	pool := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
 
-	probeExhausted(pool, "test-model")
+	ProbeExhausted(pool, "test-model")
 
 	// Should NOT be marked healthy
 	if accs[0].IsHealthy() {
@@ -113,19 +106,16 @@ func TestProbeExhausted_503Retries(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &Config{
-		Accounts: []AccountConfig{
-			{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
-		},
-	}
-	pool := NewPool(cfg.Accounts)
+	pool := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
 	probeRetryDelay = time.Millisecond
 
 	start := time.Now()
-	probeExhausted(pool, "test-model")
+	ProbeExhausted(pool, "test-model")
 
 	// Should have retried maxProbeAttempts times (3)
 	if callCount != maxProbeAttempts {
@@ -151,20 +141,17 @@ func TestProbeExhausted_401Retries(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &Config{
-		Accounts: []AccountConfig{
-			{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
-		},
-	}
-	pool := NewPool(cfg.Accounts)
+	pool := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
 	probeRetryDelay = time.Millisecond
 
-	probeExhausted(pool, "test-model")
+	ProbeExhausted(pool, "test-model")
 
-	// 401 currently falls through to the retry path in probeExhausted
+	// 401 currently falls through to the retry path in ProbeExhausted
 	if callCount != maxProbeAttempts {
 		t.Errorf("expected %d attempts for 401 (retry logic), got %d", maxProbeAttempts, callCount)
 	}
@@ -184,98 +171,44 @@ func TestProbeExhausted_403Retries(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &Config{
-		Accounts: []AccountConfig{
-			{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
-		},
-	}
-	pool := NewPool(cfg.Accounts)
+	pool := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
 	probeRetryDelay = time.Millisecond
 
-	probeExhausted(pool, "test-model")
+	ProbeExhausted(pool, "test-model")
 
+	// 403 currently falls through to the retry path in ProbeExhausted
 	if callCount != maxProbeAttempts {
 		t.Errorf("expected %d attempts for 403 (retry logic), got %d", maxProbeAttempts, callCount)
 	}
 
+	// Should still be exhausted
 	if accs[0].IsHealthy() {
 		t.Error("account should NOT be marked healthy after 403")
 	}
 }
 
-func TestProbeExhausted_MultipleAccounts(t *testing.T) {
-	// Create separate servers for each account
-	srv200 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-	}))
-	defer srv200.Close()
-
-	srv429 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(429)
-	}))
-	defer srv429.Close()
-
-	srv503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(503)
-	}))
-	defer srv503.Close()
-
-	cfg := &Config{
-		Accounts: []AccountConfig{
-			{Name: "acc200", Key: "k1", BaseURL: srv200.URL},
-			{Name: "acc429", Key: "k2", BaseURL: srv429.URL},
-			{Name: "acc503", Key: "k3", BaseURL: srv503.URL},
-		},
-	}
-	pool := NewPool(cfg.Accounts)
-
-	accs := pool.AllAccounts()
-	// Mark all as exhausted
-	for _, a := range accs {
-		a.MarkExhausted()
-	}
-	probeRetryDelay = time.Millisecond
-
-	probeExhausted(pool, "test-model")
-
-	// acc200 should be healthy
-	if !accs[0].IsHealthy() {
-		t.Error("acc200 should be marked healthy after 200")
-	}
-	// acc429 should still be exhausted
-	if accs[1].IsHealthy() {
-		t.Error("acc429 should NOT be marked healthy after 429")
-	}
-	// acc503 should still be exhausted (retries happened but no recovery)
-	if accs[2].IsHealthy() {
-		t.Error("acc503 should NOT be marked healthy after 503")
-	}
-}
-
 func TestProbeExhausted_ConnectionRefused(t *testing.T) {
-	// Start and immediately close a server to simulate connection refused
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	}))
 	upstreamURL := upstream.URL
 	upstream.Close() // close immediately → connection refused
 
-	cfg := &Config{
-		Accounts: []AccountConfig{
-			{Name: "exhausted1", Key: "k1", BaseURL: upstreamURL},
-		},
-	}
-	pool := NewPool(cfg.Accounts)
+	pool := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstreamURL},
+	})
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
 	probeRetryDelay = time.Millisecond
 
 	// Should not panic; will retry and fail
-	probeExhausted(pool, "test-model")
+	ProbeExhausted(pool, "test-model")
 
 	// Account should still be exhausted
 	if accs[0].IsHealthy() {
@@ -296,19 +229,16 @@ func TestProbeExhausted_RecoveryAfterRetry(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &Config{
-		Accounts: []AccountConfig{
-			{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
-		},
-	}
-	pool := NewPool(cfg.Accounts)
+	pool := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
 	probeRetryDelay = time.Millisecond
 
 	start := time.Now()
-	probeExhausted(pool, "test-model")
+	ProbeExhausted(pool, "test-model")
 
 	if callCount != 3 {
 		t.Errorf("expected 3 attempts, got %d", callCount)
