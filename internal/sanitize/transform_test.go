@@ -1,8 +1,12 @@
-package main
+package sanitize_test
 
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/sanitize"
+	"github.com/dorokuma/prism/internal/util"
 )
 
 func assertBodyUnchanged(t *testing.T, got, body []byte) {
@@ -17,12 +21,12 @@ func assertBodyUnchanged(t *testing.T, got, body []byte) {
 
 func TestTransformRequestBody_NilCfg(t *testing.T) {
 	body := []byte(`{"model":"glm-5.2","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}]}`)
-	got := transformRequestBody(body, nil)
+	got := sanitize.TransformRequestBody(body, nil)
 	assertBodyUnchanged(t, got, body)
 }
 
 func TestTransformRequestBody_StripGLM(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelRemap: map[string]string{"glm-5.2": "glm-standard"},
 		ModelTiers: map[string]string{"glm-standard": "glm-5.2"},
 		StripFields: map[string][]string{
@@ -31,11 +35,11 @@ func TestTransformRequestBody_StripGLM(t *testing.T) {
 	}
 
 	body := []byte(`{"model":"glm-5.2","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}],"temperature":0.7}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 
 	// Should be different from input (field stripped)
 	if string(got) == string(body) {
-		t.Fatal("transformRequestBody returned same body, expected stripped body")
+		t.Fatal("TransformRequestBody returned same body, expected stripped body")
 	}
 
 	var raw map[string]json.RawMessage
@@ -57,7 +61,7 @@ func TestTransformRequestBody_StripGLM(t *testing.T) {
 	}
 
 	// Model should also be remapped
-	model, ok := rawStringField(raw, "model")
+	model, ok := util.RawStringField(raw, "model")
 	if !ok {
 		t.Fatal("model field missing after transform")
 	}
@@ -67,7 +71,7 @@ func TestTransformRequestBody_StripGLM(t *testing.T) {
 }
 
 func TestTransformRequestBody_DeepSeekNoThinkingNoStrip(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelRemap: map[string]string{"deepseek-v4-pro": "frontier"},
 		ModelTiers: map[string]string{"frontier": "deepseek-v4-pro"},
 		StripFields: map[string][]string{
@@ -76,7 +80,7 @@ func TestTransformRequestBody_DeepSeekNoThinkingNoStrip(t *testing.T) {
 	}
 
 	body := []byte(`{"model":"deepseek-v4-pro","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}]}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 
 	// This is a DeepSeek model but has no thinking/reasoning_effort fields and
 	// no matching tier with strip_fields, so the body should be returned as-is.
@@ -84,7 +88,7 @@ func TestTransformRequestBody_DeepSeekNoThinkingNoStrip(t *testing.T) {
 }
 
 func TestTransformRequestBody_GLMNoStripField(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelRemap:  map[string]string{"glm-5.2": "glm-standard"},
 		ModelTiers:  map[string]string{"glm-standard": "glm-5.2"},
 		StripFields: map[string][]string{"glm-standard": {"prompt_cache_retention"}},
@@ -92,14 +96,14 @@ func TestTransformRequestBody_GLMNoStripField(t *testing.T) {
 
 	// Body without prompt_cache_retention, model should still be remapped
 	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(got, &raw); err != nil {
 		t.Fatalf("unmarshal result: %v", err)
 	}
 
-	model, _ := rawStringField(raw, "model")
+	model, _ := util.RawStringField(raw, "model")
 	if model != "glm-5.2" {
 		t.Errorf("model = %q, want glm-5.2", model)
 	}
@@ -109,7 +113,7 @@ func TestTransformRequestBody_GLMNoStripField(t *testing.T) {
 }
 
 func TestTransformRequestBody_StripMultipleFields(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelRemap: map[string]string{"glm-5.2": "glm-standard"},
 		ModelTiers: map[string]string{"glm-standard": "glm-5.2"},
 		StripFields: map[string][]string{
@@ -118,7 +122,7 @@ func TestTransformRequestBody_StripMultipleFields(t *testing.T) {
 	}
 
 	body := []byte(`{"model":"glm-5.2","prompt_cache_retention":5,"bad_field_1":"x","bad_field_2":"y","temperature":0.7,"messages":[{"role":"user","content":"hi"}]}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(got, &raw); err != nil {
@@ -145,21 +149,21 @@ func TestTransformRequestBody_StripMultipleFields(t *testing.T) {
 func TestTransformRequestBody_ModelRemapAndStrip(t *testing.T) {
 	// Virtual model glm-5.2 → tier glm-standard → upstream glm-5.2
 	// Then strip prompt_cache_retention for glm-standard
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelRemap:  map[string]string{"glm-5.2": "glm-standard"},
 		ModelTiers:  map[string]string{"glm-standard": "glm-5.2"},
 		StripFields: map[string][]string{"glm-standard": {"prompt_cache_retention"}},
 	}
 
 	body := []byte(`{"model":"glm-5.2","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}]}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(got, &raw); err != nil {
 		t.Fatalf("unmarshal result: %v", err)
 	}
 
-	model, _ := rawStringField(raw, "model")
+	model, _ := util.RawStringField(raw, "model")
 	if model != "glm-5.2" {
 		t.Errorf("model = %q, want glm-5.2 (remapped glm-5.2→glm-standard→glm-5.2)", model)
 	}
@@ -169,19 +173,19 @@ func TestTransformRequestBody_ModelRemapAndStrip(t *testing.T) {
 }
 
 func TestTransformRequestBody_NoStripForNonMatchingTier(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelRemap:  map[string]string{"gpt-5.5": "frontier"},
 		ModelTiers:  map[string]string{"frontier": "deepseek-v4-pro"},
 		StripFields: map[string][]string{"glm-standard": {"prompt_cache_retention"}},
 	}
 
 	body := []byte(`{"model":"gpt-5.5","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}]}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 
 	// Model gpt-5.5 → frontier → deepseek-v4-pro; no strip_fields for frontier tier
 	// But model remap did happen (gpt-5.5 → deepseek-v4-pro), so body should have changed
 	if string(got) == string(body) {
-		t.Fatal("transformRequestBody should have remapped model, but returned same body")
+		t.Fatal("TransformRequestBody should have remapped model, but returned same body")
 	}
 
 	var raw map[string]json.RawMessage
@@ -189,7 +193,7 @@ func TestTransformRequestBody_NoStripForNonMatchingTier(t *testing.T) {
 		t.Fatalf("unmarshal result: %v", err)
 	}
 
-	model, _ := rawStringField(raw, "model")
+	model, _ := util.RawStringField(raw, "model")
 	if model != "deepseek-v4-pro" {
 		t.Errorf("model = %q, want deepseek-v4-pro", model)
 	}
@@ -201,26 +205,26 @@ func TestTransformRequestBody_NoStripForNonMatchingTier(t *testing.T) {
 }
 
 func TestTransformRequestBody_InvalidJSON(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		StripFields: map[string][]string{"glm-standard": {"prompt_cache_retention"}},
 	}
 	body := []byte(`{invalid json}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 	assertBodyUnchanged(t, got, body)
 }
 
 func TestTransformRequestBody_DeepSeekThinkingRemap(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelRemap: map[string]string{"gpt-5.5": "frontier"},
 		ModelTiers: map[string]string{"frontier": "deepseek-v4-pro"},
 	}
 
 	// DeepSeek model with thinking.level = low, should be remapped to high
 	body := []byte(`{"model":"gpt-5.5","thinking":{"level":"low"},"messages":[{"role":"user","content":"hi"}]}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 
 	if string(got) == string(body) {
-		t.Fatal("transformRequestBody should have remapped thinking level, but returned same body")
+		t.Fatal("TransformRequestBody should have remapped thinking level, but returned same body")
 	}
 
 	var raw map[string]json.RawMessage
@@ -228,7 +232,7 @@ func TestTransformRequestBody_DeepSeekThinkingRemap(t *testing.T) {
 		t.Fatalf("unmarshal result: %v", err)
 	}
 
-	model, _ := rawStringField(raw, "model")
+	model, _ := util.RawStringField(raw, "model")
 	if model != "deepseek-v4-pro" {
 		t.Errorf("model = %q, want deepseek-v4-pro", model)
 	}
@@ -245,28 +249,28 @@ func TestTransformRequestBody_DeepSeekThinkingRemap(t *testing.T) {
 }
 
 func TestTransformRequestBody_EmptyModel(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelTiers:  map[string]string{"glm-standard": "glm-5.2"},
 		StripFields: map[string][]string{"glm-standard": {"prompt_cache_retention"}},
 	}
 	// Empty model → no remap, no strip
 	body := []byte(`{"model":"","messages":[{"role":"user","content":"hi"}]}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 	assertBodyUnchanged(t, got, body)
 }
 
 func TestTransformRequestBody_NoModelKey(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelTiers:  map[string]string{"glm-standard": "glm-5.2"},
 		StripFields: map[string][]string{"glm-standard": {"prompt_cache_retention"}},
 	}
 	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 	assertBodyUnchanged(t, got, body)
 }
 
 func TestTransformRequestBody_DeepSeekReasoningEffortRemap(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelRemap: map[string]string{"gpt-5.5": "frontier"},
 		ModelTiers: map[string]string{"frontier": "deepseek-v4-pro"},
 	}
@@ -283,10 +287,10 @@ func TestTransformRequestBody_DeepSeekReasoningEffortRemap(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			body := []byte(`{"model":"gpt-5.5","reasoning_effort":"` + tt.inputLevel + `","messages":[{"role":"user","content":"hi"}]}`)
-			got := transformRequestBody(body, cfg)
+			got := sanitize.TransformRequestBody(body, cfg)
 
 			if string(got) == string(body) {
-				t.Fatal("transformRequestBody should have remapped reasoning_effort, but returned same body")
+				t.Fatal("TransformRequestBody should have remapped reasoning_effort, but returned same body")
 			}
 
 			var raw map[string]json.RawMessage
@@ -294,7 +298,7 @@ func TestTransformRequestBody_DeepSeekReasoningEffortRemap(t *testing.T) {
 				t.Fatalf("unmarshal result: %v", err)
 			}
 
-			model, _ := rawStringField(raw, "model")
+			model, _ := util.RawStringField(raw, "model")
 			if model != "deepseek-v4-pro" {
 				t.Errorf("model = %q, want deepseek-v4-pro", model)
 			}
@@ -311,17 +315,16 @@ func TestTransformRequestBody_DeepSeekReasoningEffortRemap(t *testing.T) {
 }
 
 func TestTransformRequestBody_NonDeepSeekNonGLMNoStrip(t *testing.T) {
-	cfg := &Config{
+	cfg := &config.Config{
 		ModelRemap: map[string]string{"mimo-v2.5": "standard"},
 		ModelTiers: map[string]string{"standard": "mimo-v2.5"},
 		// No strip_fields for this tier — should not strip anything
 	}
 
 	body := []byte(`{"model":"mimo-v2.5","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}]}`)
-	got := transformRequestBody(body, cfg)
+	got := sanitize.TransformRequestBody(body, cfg)
 
 	// mimo-v2.5 is neither deepseek nor glm, has no matching strip_fields;
 	// model remap mimo-v2.5 → standard → mimo-v2.5 (no-op). Body unchanged.
 	assertBodyUnchanged(t, got, body)
 }
-

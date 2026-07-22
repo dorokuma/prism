@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dorokuma/prism/internal/sanitize"
 	"github.com/dorokuma/prism/internal/util"
 )
 
@@ -445,6 +446,7 @@ func contentString(v any) string {
 	}
 }
 
+var mergeConsecutiveAssistantMessages = sanitize.MergeConsecutiveAssistantMessages
 var rawStringField = util.RawStringField
 var rawBoolField = util.RawBoolField
 var jsonRawToAny = util.JSONRawToAny
