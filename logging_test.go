@@ -149,7 +149,7 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 
 		// Use responsesOut=true so handleUpstreamResponse goes through the
 		// responses_json path which calls chatCompletionToResponse and captures usage.
-		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{responsesOut: true}, cfg)
+		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), chatForwardOpts{ResponsesOut: true}, cfg)
 
 		out := h.output()
 		if !strings.Contains(out, `"tokens_in":20`) {
@@ -225,7 +225,7 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4","stream":true}`)))
 		r.Header.Set("Content-Type", "application/json")
 
-		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), chatForwardOpts{stream: true}, cfg)
+		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), chatForwardOpts{Stream: true}, cfg)
 
 		out := h.output()
 		if !strings.Contains(out, `"msg":"request.complete"`) {
@@ -277,7 +277,7 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4","stream":true}`)))
 		r.Header.Set("Content-Type", "application/json")
 
-		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), chatForwardOpts{stream: true}, cfg)
+		proxyChatWithBody(pool, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), chatForwardOpts{Stream: true}, cfg)
 
 		out := h.output()
 		if !strings.Contains(out, `"msg":"request.complete"`) {
