@@ -1,4 +1,4 @@
-package main
+package stream
 
 import (
 	"context"
@@ -25,7 +25,7 @@ func TestFlushWriter_Write(t *testing.T) {
 	rec := httptest.NewRecorder()
 	tw := &testResponseWriter{ResponseRecorder: rec}
 
-	fw := flushWriter{w: tw, f: tw}
+	fw := &flushWriter{w: tw, f: tw}
 
 	// Single write
 	n, err := fw.Write([]byte("hello"))
@@ -47,7 +47,7 @@ func TestFlushWriter_MultipleWrites(t *testing.T) {
 	rec := httptest.NewRecorder()
 	tw := &testResponseWriter{ResponseRecorder: rec}
 
-	fw := flushWriter{w: tw, f: tw}
+	fw := &flushWriter{w: tw, f: tw}
 
 	parts := []string{"Hello", " ", "World", "!"}
 	for _, p := range parts {
@@ -85,9 +85,9 @@ func TestStreamResponseBody_Normal(t *testing.T) {
 	rec := httptest.NewRecorder()
 	clientReq := httptest.NewRequest("POST", "/", nil)
 
-	n, err := streamResponseBody(rec, resp.Body, clientReq, "test-account")
+	n, err := StreamResponseBody(rec, resp.Body, clientReq, "test-account")
 	if err != nil {
-		t.Fatalf("streamResponseBody failed: %v", err)
+		t.Fatalf("StreamResponseBody failed: %v", err)
 	}
 
 	if n != int64(len(body)) {
@@ -140,7 +140,7 @@ func TestStreamResponseBody_ClientDisconnect(t *testing.T) {
 
 	// The pipe writer goroutine is synchronised with the reader: each Write
 	// blocks until the data has been consumed.  When io.Copy in
-	// streamResponseBody hits the Write error it will call
+	// StreamResponseBody hits the Write error it will call
 	// io.Copy(io.Discard, body) to drain the remaining data, which unblocks
 	// the next pipe Write.  We use a done channel to prove drain happened.
 	done := make(chan struct{})
@@ -152,7 +152,7 @@ func TestStreamResponseBody_ClientDisconnect(t *testing.T) {
 		pw.Write([]byte("chunk3_after_disconnect\n"))
 	}()
 
-	_, err := streamResponseBody(rec, pr, clientReq, "test-account")
+	_, err := StreamResponseBody(rec, pr, clientReq, "test-account")
 	if err == nil {
 		t.Error("expected error after writer failure, got nil")
 	}
@@ -195,9 +195,9 @@ func TestStreamResponseBody_LargeBody(t *testing.T) {
 	rec := httptest.NewRecorder()
 	clientReq := httptest.NewRequest("POST", "/", nil)
 
-	n, err := streamResponseBody(rec, resp.Body, clientReq, "test-account")
+	n, err := StreamResponseBody(rec, resp.Body, clientReq, "test-account")
 	if err != nil {
-		t.Fatalf("streamResponseBody failed: %v", err)
+		t.Fatalf("StreamResponseBody failed: %v", err)
 	}
 
 	expectedLen := int64(len(largeChunk) * 10)
