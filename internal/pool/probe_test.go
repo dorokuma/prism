@@ -253,3 +253,49 @@ func TestProbeExhausted_RecoveryAfterRetry(t *testing.T) {
 		t.Error("account should be marked healthy after 200 on retry")
 	}
 }
+
+func TestProbeExhausted_MultipleAccounts(t *testing.T) {
+	// Create separate servers for each account to test fan-out logic
+	srv200 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv200.Close()
+
+	srv429 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+	}))
+	defer srv429.Close()
+
+	srv503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(503)
+	}))
+	defer srv503.Close()
+
+	pool := NewPool([]config.AccountConfig{
+		{Name: "acc200", Key: "k1", BaseURL: srv200.URL},
+		{Name: "acc429", Key: "k2", BaseURL: srv429.URL},
+		{Name: "acc503", Key: "k3", BaseURL: srv503.URL},
+	})
+
+	accs := pool.AllAccounts()
+	// Mark all as exhausted
+	for _, a := range accs {
+		a.MarkExhausted()
+	}
+	probeRetryDelay = time.Millisecond
+
+	ProbeExhausted(pool, "test-model")
+
+	// acc200 (200 response) should be healthy
+	if !accs[0].IsHealthy() {
+		t.Error("acc200 should be marked healthy after 200")
+	}
+	// acc429 (429 response) should still be exhausted
+	if accs[1].IsHealthy() {
+		t.Error("acc429 should NOT be marked healthy after 429")
+	}
+	// acc503 (503 response) should still be exhausted (retries happened but no recovery)
+	if accs[2].IsHealthy() {
+		t.Error("acc503 should NOT be marked healthy after 503")
+	}
+}

@@ -380,7 +380,7 @@ func TestTryAcquireStrictMax(t *testing.T) {
 		t.Errorf("expected exactly %d acquired, got %d", max, total)
 	}
 
-	// inFlight must be <= max and non-negative.
+	// inFlight must be <= max.
 	inFlight := acc.InFlightCount()
 	if inFlight > max {
 		t.Errorf("inFlight %d > max %d", inFlight, max)
