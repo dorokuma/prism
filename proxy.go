@@ -466,10 +466,10 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		w.Write(redactBodyBytesWithKeys(errBody, []string{acc.Key()}))
 		// Audit: terminal 4xx
 		if a := auditFromCtx(r.Context()); a != nil {
-			a.status = resp.StatusCode
-			a.account = acc.Name()
-			a.errorType = "upstream_4xx"
-			a.error = errStr
+			a.Status = resp.StatusCode
+			a.Account = acc.Name()
+			a.ErrorType = "upstream_4xx"
+			a.Error = errStr
 		}
 		return true, nil
 	}
@@ -498,18 +498,18 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 			slog.Error("responses_stream translate error", "req", requestID, "model", opts.model, "account", acc.Name(), "error", err, "translate_ms", translateElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			recordError()
 			if a := auditFromCtx(r.Context()); a != nil {
-				a.status = http.StatusOK
-				a.account = acc.Name()
-				a.errorType = upstreamErrorType(err)
-				a.error = err.Error()
+				a.Status = http.StatusOK
+				a.Account = acc.Name()
+				a.ErrorType = upstreamErrorType(err)
+				a.Error = err.Error()
 			}
 			return true, err
 		}
 		slog.Debug("responses_stream translate done", "request_id", requestID, "account", acc.Name(), "translate_ms", translateElapsed, "elapsed", time.Since(start))
 		recordRequest(time.Since(start))
 		if a := auditFromCtx(r.Context()); a != nil {
-			a.status = http.StatusOK
-			a.account = acc.Name()
+			a.Status = http.StatusOK
+			a.Account = acc.Name()
 		}
 		return true, nil
 	}
@@ -521,9 +521,9 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		if err != nil {
 			slog.Warn("responses_json body read error", "request_id", requestID, "model", opts.model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			if a := auditFromCtx(r.Context()); a != nil {
-				a.account = acc.Name()
-				a.errorType = upstreamErrorType(err)
-				a.error = err.Error()
+				a.Account = acc.Name()
+				a.ErrorType = upstreamErrorType(err)
+				a.Error = err.Error()
 			}
 			return true, err
 		}
@@ -538,18 +538,18 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 				"error": map[string]any{"message": "upstream response translation failed", "code": "upstream_error"},
 			})
 			if a := auditFromCtx(r.Context()); a != nil {
-				a.status = http.StatusBadGateway
-				a.account = acc.Name()
-				a.errorType = "upstream_5xx"
-				a.error = err.Error()
+				a.Status = http.StatusBadGateway
+				a.Account = acc.Name()
+				a.ErrorType = "upstream_5xx"
+				a.Error = err.Error()
 			}
 			return true, nil
 		}
 		// Capture token usage from the response body for non-streaming audit.
 		if a := auditFromCtx(r.Context()); a != nil {
 			if tokensIn, tokensOut := parseUsageFromChatCompletion(rawBody); tokensIn > 0 || tokensOut > 0 {
-				a.tokensIn = tokensIn
-				a.tokensOut = tokensOut
+				a.TokensIn = tokensIn
+				a.TokensOut = tokensOut
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -558,8 +558,8 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		slog.Debug("responses_json done", "request_id", requestID, "account", acc.Name(), "written", n, "body_ms", bodyReadElapsed, "translate_ms", translateElapsed, "elapsed", time.Since(start))
 		recordRequest(time.Since(start))
 		if a := auditFromCtx(r.Context()); a != nil {
-			a.status = http.StatusOK
-			a.account = acc.Name()
+			a.Status = http.StatusOK
+			a.Account = acc.Name()
 		}
 		return true, nil
 	}
@@ -578,10 +578,10 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 			slog.Warn("legacy_stream body read error", "request_id", requestID, "model", opts.model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			recordError()
 			if a := auditFromCtx(r.Context()); a != nil {
-				a.status = resp.StatusCode
-				a.account = acc.Name()
-				a.errorType = upstreamErrorType(err)
-				a.error = err.Error()
+				a.Status = resp.StatusCode
+				a.Account = acc.Name()
+				a.ErrorType = upstreamErrorType(err)
+				a.Error = err.Error()
 			}
 			return true, err
 		}
@@ -592,8 +592,8 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		}
 		recordRequest(time.Since(start))
 		if a := auditFromCtx(r.Context()); a != nil {
-			a.status = resp.StatusCode
-			a.account = acc.Name()
+			a.Status = resp.StatusCode
+			a.Account = acc.Name()
 		}
 		return true, nil
 	}
@@ -606,10 +606,10 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 		slog.Warn("legacy_nonstream body read error", "request_id", requestID, "model", opts.model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 		recordError()
 		if a := auditFromCtx(r.Context()); a != nil {
-			a.status = resp.StatusCode
-			a.account = acc.Name()
-			a.errorType = upstreamErrorType(err)
-			a.error = err.Error()
+			a.Status = resp.StatusCode
+			a.Account = acc.Name()
+			a.ErrorType = upstreamErrorType(err)
+			a.Error = err.Error()
 		}
 		return true, err
 	}
@@ -617,8 +617,8 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 	// Capture token usage from the response body for non-streaming audit.
 	if a := auditFromCtx(r.Context()); a != nil {
 		if tokensIn, tokensOut := parseUsageFromChatCompletion(rawBody); tokensIn > 0 || tokensOut > 0 {
-			a.tokensIn = tokensIn
-			a.tokensOut = tokensOut
+			a.TokensIn = tokensIn
+			a.TokensOut = tokensOut
 		}
 	}
 	copyUpstreamHeaders(w, resp.Header)
@@ -627,8 +627,8 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 	slog.Debug("legacy_nonstream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
 	recordRequest(time.Since(start))
 	if a := auditFromCtx(r.Context()); a != nil {
-		a.status = resp.StatusCode
-		a.account = acc.Name()
+		a.Status = resp.StatusCode
+		a.Account = acc.Name()
 	}
 	return true, nil
 }
@@ -664,24 +664,24 @@ func resolveMaxConcurrent(model string, cfg *Config) int {
 func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyBytes []byte, start time.Time, opts chatForwardOpts, cfg *Config) {
 	requestID := requestIDFromCtx(r.Context())
 	aud := &requestAudit{
-		req:    requestID,
-		method: r.Method,
-		path:   r.URL.Path,
-		model:  opts.model,
+		Req:    requestID,
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Model:  opts.model,
 	}
 	r = r.WithContext(context.WithValue(r.Context(), auditKey{}, aud))
 	sc := &statusCapture{ResponseWriter: w}
 
 	defer func() {
-		aud.durationMs = float64(time.Since(start).Milliseconds())
-		aud.status = sc.code
+		aud.DurationMs = float64(time.Since(start).Milliseconds())
+		aud.Status = sc.Code
 		emitAudit(aud)
 	}()
 
 	bodyBytes = transformRequestBody(bodyBytes, cfg)
 	if len(pool.accounts) == 0 {
-		aud.error = "no accounts configured"
-		aud.errorType = "config_error"
+		aud.Error = "no accounts configured"
+		aud.ErrorType = "config_error"
 		writeJSON(sc, 503, map[string]any{
 			"error": map[string]any{"message": "No accounts configured", "code": "no_accounts"},
 		})
@@ -709,13 +709,13 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		if err != nil {
 			slog.Error("select account failed", "error", err)
 			recordError()
-			aud.error = err.Error()
+			aud.Error = err.Error()
 			if err == ErrNoHealthyAccounts {
-				aud.errorType = "no_healthy"
+				aud.ErrorType = "no_healthy"
 			} else if err == ErrSelectTimeout {
-				aud.errorType = "select_timeout"
+				aud.ErrorType = "select_timeout"
 			} else {
-				aud.errorType = "select_failed"
+				aud.ErrorType = "select_failed"
 			}
 			writeJSON(sc, 503, map[string]any{
 				"error": map[string]any{"message": "No healthy accounts available", "code": "no_accounts"},
@@ -725,8 +725,8 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 
 		// Record the last attempted account for audit, even if the upstream
 		// request later fails.
-		aud.account = acc.Name()
-		aud.concurrency = acc.InFlightCount()
+		aud.Account = acc.Name()
+		aud.Concurrency = acc.InFlightCount()
 
 		var terminalDone bool
 		var terminalFatalErr error
@@ -759,8 +759,8 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 	}
 	slog.Error("all accounts exhausted after retries", "request_id", requestID, "attempts", maxAttempts, "elapsed", time.Since(start))
 	recordError()
-	aud.error = "all accounts exhausted after retries"
-	aud.errorType = "all_exhausted"
+	aud.Error = "all accounts exhausted after retries"
+	aud.ErrorType = "all_exhausted"
 	writeJSON(sc, 503, map[string]any{
 		"error": map[string]any{"message": "All accounts exhausted after retries", "code": "all_exhausted"},
 	})
@@ -921,3 +921,5 @@ func transformRequestBody(body []byte, cfg *Config) []byte {
 func getTenantID(r *http.Request) string {
 	return "default"
 }
+
+

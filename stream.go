@@ -95,8 +95,8 @@ func streamResponseBody(w http.ResponseWriter, body io.ReadCloser, clientReq *ht
 	if clientReq != nil {
 		if a := auditFromCtx(clientReq.Context()); a != nil {
 			if tokensIn, tokensOut := parseStreamUsage(tail.bytes()); tokensIn > 0 || tokensOut > 0 {
-				a.tokensIn = tokensIn
-				a.tokensOut = tokensOut
+				a.TokensIn = tokensIn
+				a.TokensOut = tokensOut
 			}
 		}
 	}
