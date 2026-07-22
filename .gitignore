@@ -1,4 +1,5 @@
 prism
+!cmd/prism/
 config.yaml
 bin/
 .env
