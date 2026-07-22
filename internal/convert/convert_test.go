@@ -1,4 +1,4 @@
-package main
+package convert
 
 import (
 	"encoding/json"
@@ -13,7 +13,7 @@ func TestResponsesToChatCompletions(t *testing.T) {
 		"reasoning": {"effort": "high"},
 		"tools": [{"type":"function","name":"shell","parameters":{"type":"object"}}]
 	}`)
-	chat, stream, _, err := responsesToChatCompletions(body, "test-tenant")
+	chat, stream, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestConvertResponsesUsage(t *testing.T) {
 			"completion_tokens_details": {"reasoning_tokens": 30}
 		}
 	}`
-	out, err := chatCompletionToResponse([]byte(chatBody), "gpt-4", nil)
+	out, err := ChatCompletionToResponse([]byte(chatBody), "gpt-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,8 +95,6 @@ func TestConvertResponsesUsage(t *testing.T) {
 	}
 }
 
-
-
 func TestChatCompletionToResponse_FinishReason(t *testing.T) {
 	tests := []struct {
 		reason string
@@ -110,9 +108,9 @@ func TestChatCompletionToResponse_FinishReason(t *testing.T) {
 	}
 	for _, tc := range tests {
 		chatBody := `{"model":"gpt-4","choices":[{"finish_reason":"` + tc.reason + `","message":{"role":"assistant","content":"ok"}}]}`
-		out, err := chatCompletionToResponse([]byte(chatBody), "gpt-4", nil)
+		out, err := ChatCompletionToResponse([]byte(chatBody), "gpt-4", nil)
 		if err != nil {
-			t.Fatalf("chatCompletionToResponse(%q) error: %v", tc.reason, err)
+			t.Fatalf("ChatCompletionToResponse(%q) error: %v", tc.reason, err)
 		}
 		var resp map[string]any
 		if err := json.Unmarshal(out, &resp); err != nil {
@@ -131,7 +129,7 @@ func TestResponsesToChat_ParallelToolCalls(t *testing.T) {
 		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
 		"parallel_tool_calls": true
 	}`)
-	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	chat, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +149,7 @@ func TestResponsesToChat_ImageInputRejected(t *testing.T) {
 		"model": "deepseek-v4-pro",
 		"input": [{"type":"message","role":"user","content":[{"type":"image_url","image_url":"https://example.com/img.png"}]}]
 	}`)
-	_, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	_, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err == nil {
 		t.Fatal("expected error for image_url content, got nil")
 	}
@@ -163,7 +161,7 @@ func TestResponsesToChat_InputImageRejected(t *testing.T) {
 		"model": "deepseek-v4-pro",
 		"input": [{"type":"message","role":"user","content":[{"type":"input_image","image_url":"https://example.com/img.png"}]}]
 	}`)
-	_, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	_, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err == nil {
 		t.Fatal("expected error for input_image content, got nil")
 	}
@@ -176,7 +174,7 @@ func TestResponsesToChat_TextOnlyOK(t *testing.T) {
 		"stream": true,
 		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"},{"type":"output_text","text":"world"}]}]
 	}`)
-	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	chat, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err != nil {
 		t.Fatalf("unexpected error for text-only content: %v", err)
 	}
@@ -201,7 +199,7 @@ func TestResponsesToChat_TextStringOK(t *testing.T) {
 		"model": "deepseek-v4-pro",
 		"input": "hello world"
 	}`)
-	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	chat, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err != nil {
 		t.Fatalf("unexpected error for string content: %v", err)
 	}
@@ -256,7 +254,7 @@ func TestResponsesToChat_PreviousResponseIDRejected(t *testing.T) {
 		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
 		"previous_response_id": "resp_abc123"
 	}`)
-	_, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	_, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err == nil {
 		t.Fatal("expected error for previous_response_id, got nil")
 	}
@@ -275,7 +273,7 @@ func TestResponsesToChat_TextFormatJsonSchema(t *testing.T) {
 			}
 		}
 	}`)
-	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	chat, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +313,7 @@ func TestResponsesToChat_TextFormatJsonObject(t *testing.T) {
 			}
 		}
 	}`)
-	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	chat, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +341,7 @@ func TestResponsesToChat_UserSeedPassthrough(t *testing.T) {
 		"user": "user-123",
 		"seed": 42
 	}`)
-	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	chat, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +366,7 @@ func TestChatCompletionToResponse_CreatedAt(t *testing.T) {
 			"message": {"role": "assistant", "content": "Hello"}
 		}]
 	}`
-	out, err := chatCompletionToResponse([]byte(chatBody), "gpt-4", nil)
+	out, err := ChatCompletionToResponse([]byte(chatBody), "gpt-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +396,7 @@ func TestChatCompletionToResponse_Logprobs(t *testing.T) {
 			"message": {"role": "assistant", "content": "Hello"}
 		}]
 	}`)
-	out, err := chatCompletionToResponse(chatBody, "gpt-4", nil)
+	out, err := ChatCompletionToResponse(chatBody, "gpt-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +431,7 @@ func TestResponsesToChat_EncryptedContentRejected(t *testing.T) {
 		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
 		"include": ["encrypted_content"]
 	}`)
-	_, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	_, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err == nil {
 		t.Fatal("expected error for include=encrypted_content, got nil")
 	}
@@ -446,7 +444,7 @@ func TestResponsesToChat_StoreTrueWarns(t *testing.T) {
 		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
 		"store": true
 	}`)
-	chat, _, _, err := responsesToChatCompletions(body, "test-tenant")
+	chat, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err != nil {
 		t.Fatalf("unexpected error for store=true: %v", err)
 	}
