@@ -327,11 +327,19 @@ func TestRateLimiterAllow(t *testing.T) {
 
 func TestRateLimiterCleanup(t *testing.T) {
 	rl := newRateLimiter(10, 5)
-	// Create some buckets
-	rl.Allow("10.0.0.1")
-	rl.Allow("10.0.0.2")
-	if len(rl.buckets) != 2 {
-		t.Errorf("expected 2 buckets, got %d", len(rl.buckets))
+	// Create some buckets and verify via behavior (burst consumed)
+	for i := 0; i < 5; i++ {
+		if !rl.Allow("10.0.0.1") {
+			t.Errorf("burst allow 10.0.0.1 %d: expected true, got false", i)
+		}
+	}
+	// 6th request for 10.0.0.1 should be rate limited (burst exhausted)
+	if rl.Allow("10.0.0.1") {
+		t.Error("expected 10.0.0.1 to be rate limited after burst")
+	}
+	// Different IP should have its own bucket
+	if !rl.Allow("10.0.0.2") {
+		t.Error("different IP should be allowed")
 	}
 }
 

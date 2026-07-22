@@ -110,7 +110,7 @@ func main() {
 
 	// Rate limiter: 60 req/s per IP with burst of 100
 	rl := newRateLimiter(rateLimitPerSecond, rateLimitBurst)
-	rl.startCleanupLoop(metricCtx)
+	rl.StartCleanupLoop(metricCtx)
 
 	trustedProxies, err := ParseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
