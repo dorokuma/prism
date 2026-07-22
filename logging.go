@@ -90,17 +90,18 @@ func requestIDFromCtx(ctx context.Context) string {
 
 // requestAudit carries per-request fields for the final request.complete log line.
 type requestAudit struct {
-	req        string  // X-Request-ID
-	method     string  // HTTP method
-	path       string  // URL path
-	model      string  // requested model name
-	account    string  // upstream account used (last successful or attempted)
-	error      string  // error message (empty on success)
-	errorType  string  // short category for the error (empty on success)
-	status     int     // HTTP status written to client
-	durationMs float64 // total wall-clock duration in milliseconds
-	tokensIn   int     // prompt/input tokens consumed
-	tokensOut  int     // completion/output tokens produced
+	req         string  // X-Request-ID
+	method      string  // HTTP method
+	path        string  // URL path
+	model       string  // requested model name
+	account     string  // upstream account used (last successful or attempted)
+	error       string  // error message (empty on success)
+	errorType   string  // short category for the error (empty on success)
+	status      int     // HTTP status written to client
+	durationMs  float64 // total wall-clock duration in milliseconds
+	tokensIn    int     // prompt/input tokens consumed
+	tokensOut   int     // completion/output tokens produced
+	concurrency int     // in-flight count on the selected account at select time
 }
 
 // auditKey is the context key for *requestAudit.
@@ -128,6 +129,7 @@ func emitAudit(a *requestAudit) {
 		"duration_ms", a.durationMs,
 		"tokens_in", a.tokensIn,
 		"tokens_out", a.tokensOut,
+		"concurrency", a.concurrency,
 		"error", a.error,
 		"error_type", a.errorType,
 	)

@@ -650,6 +650,34 @@ func handleUpstreamResponse(acc *Account, w http.ResponseWriter, r *http.Request
 	return true, nil
 }
 
+// resolveMaxConcurrent returns the maximum concurrent requests per account
+// for the given model. Resolution order:
+//  1. cfg.MaxConcurrentPerAccount[model]  (exact match)
+//  2. cfg.MaxConcurrentPerAccount["*"]   (wildcard default)
+//  3. model name contains "flash" → deepseekV4FlashConcurrency * defaultConcurrencyRatio / 100
+//  4. model name contains "pro"   → deepseekV4ProConcurrency * defaultConcurrencyRatio / 100
+//  5. fallback: deepseekV4ProConcurrency * defaultConcurrencyRatio / 100 + warn
+func resolveMaxConcurrent(model string, cfg *Config) int {
+	if cfg.MaxConcurrentPerAccount != nil {
+		if v, ok := cfg.MaxConcurrentPerAccount[model]; ok && v > 0 {
+			return v
+		}
+		if v, ok := cfg.MaxConcurrentPerAccount["*"]; ok && v > 0 {
+			return v
+		}
+	}
+	modelLower := strings.ToLower(model)
+	if strings.Contains(modelLower, "flash") {
+		return deepseekV4FlashConcurrency * defaultConcurrencyRatio / 100
+	}
+	if strings.Contains(modelLower, "pro") {
+		return deepseekV4ProConcurrency * defaultConcurrencyRatio / 100
+	}
+	// Default for unknown models
+	slog.Warn("unknown model, using default concurrency", "model", model)
+	return deepseekV4ProConcurrency * defaultConcurrencyRatio / 100
+}
+
 func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyBytes []byte, start time.Time, opts chatForwardOpts, cfg *Config) {
 	requestID := requestIDFromCtx(r.Context())
 	aud := &requestAudit{
@@ -669,13 +697,16 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 
 	bodyBytes = transformRequestBody(bodyBytes, cfg)
 	if len(pool.accounts) == 0 {
+		aud.error = "no accounts configured"
+		aud.errorType = "config_error"
 		writeJSON(sc, 503, map[string]any{
 			"error": map[string]any{"message": "No accounts configured", "code": "no_accounts"},
 		})
 		return
 	}
 	maxAttempts := len(pool.accounts) * 2
-	slog.Debug("proxy request start", "request_id", requestID, "path", r.URL.Path, "stream", opts.stream, "responses_out", opts.responsesOut, "start", start.Format(time.RFC3339Nano))
+	maxConcurrent := resolveMaxConcurrent(opts.model, cfg)
+	slog.Debug("proxy request start", "request_id", requestID, "path", r.URL.Path, "stream", opts.stream, "responses_out", opts.responsesOut, "start", start.Format(time.RFC3339Nano), "max_concurrent", maxConcurrent)
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
 		if attempts > 0 {
@@ -684,7 +715,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 
 		selectCtx, cancel := context.WithTimeout(context.Background(), accountSelectTimeout)
 		selectStart := time.Now()
-		acc, err := pool.Select(selectCtx)
+		acc, err := pool.Select(selectCtx, maxConcurrent)
 		selectDuration := time.Since(selectStart).Milliseconds()
 		cancel()
 		accName := "nil"
@@ -695,6 +726,14 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		if err != nil {
 			slog.Error("select account failed", "error", err)
 			recordError()
+			aud.error = err.Error()
+			if err == ErrNoHealthyAccounts {
+				aud.errorType = "no_healthy"
+			} else if err == ErrSelectTimeout {
+				aud.errorType = "select_timeout"
+			} else {
+				aud.errorType = "select_failed"
+			}
 			writeJSON(sc, 503, map[string]any{
 				"error": map[string]any{"message": "No healthy accounts available", "code": "no_accounts"},
 			})
@@ -704,6 +743,7 @@ func proxyChatWithBody(pool *Pool, w http.ResponseWriter, r *http.Request, bodyB
 		// Record the last attempted account for audit, even if the upstream
 		// request later fails.
 		aud.account = acc.Name()
+		aud.concurrency = acc.InFlightCount()
 
 		var terminalDone bool
 		var terminalFatalErr error

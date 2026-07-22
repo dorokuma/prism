@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -19,12 +20,12 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 
 	ctx := context.Background()
 	slog.Info("TEST: Selecting acc1")
-	acc1, err := p.Select(ctx)
+	acc1, err := p.Select(ctx, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	slog.Info("TEST: Selecting acc2")
-	acc2, err := p.Select(ctx)
+	acc2, err := p.Select(ctx, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -34,7 +35,7 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 
 	go func() {
 		slog.Info("TEST: Goroutine 1 calling Select")
-		acc, err := p.Select(ctx)
+		acc, err := p.Select(ctx, 1)
 		slog.Info("TEST: Goroutine 1 Select returned", "account", acc.Name(), "error", err)
 		ch1 <- acc
 		slog.Info("TEST: Goroutine 1 sent to ch1")
@@ -42,7 +43,7 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 
 	go func() {
 		slog.Info("TEST: Goroutine 2 calling Select")
-		acc, err := p.Select(ctx)
+		acc, err := p.Select(ctx, 1)
 		slog.Info("TEST: Goroutine 2 Select returned", "account", acc.Name(), "error", err)
 		ch2 <- acc
 		slog.Info("TEST: Goroutine 2 sent to ch2")
@@ -95,11 +96,11 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 	p := NewPool(cfgs)
 
 	ctx := context.Background()
-	acc1, _ := p.Select(ctx) // occupies the only account
+	acc1, _ := p.Select(ctx, 1) // occupies the only account
 
 	accChB := make(chan *Account, 1)
 	go func() {
-		acc, _ := p.Select(ctx)
+		acc, _ := p.Select(ctx, 1)
 		accChB <- acc
 	}()
 
@@ -110,7 +111,7 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 
 	errChA := make(chan error, 1)
 	go func() {
-		_, err := p.Select(ctxCancel)
+		_, err := p.Select(ctxCancel, 1)
 		errChA <- err
 	}()
 
@@ -149,8 +150,8 @@ func TestPoolMarkHealthyWakeup(t *testing.T) {
 
 	ctx := context.Background()
 	// 占满这两个账号，把 acc-1 变为 Exhausted，acc-2 在长冷却中
-	acc1, _ := p.Select(ctx)
-	acc2, _ := p.Select(ctx)
+	acc1, _ := p.Select(ctx, 1)
+	acc2, _ := p.Select(ctx, 1)
 
 	acc1.MarkExhausted()
 	p.Release(acc1) // 此时 acc1 在 Exhausted 状态，不能用于 Select
@@ -161,7 +162,7 @@ func TestPoolMarkHealthyWakeup(t *testing.T) {
 	// 此时启动 Select，因为 acc2 处于健康但 cooldown 中，会阻塞等待它的 cooldown 计时器。
 	accCh := make(chan *Account, 1)
 	go func() {
-		acc, _ := p.Select(ctx)
+		acc, _ := p.Select(ctx, 1)
 		accCh <- acc
 	}()
 
@@ -235,5 +236,203 @@ func TestNewHTTPClient_ResponseHeaderTimeout(t *testing.T) {
 
 	if tr.ResponseHeaderTimeout == 0 {
 		t.Error("ResponseHeaderTimeout is 0, want non-zero defence for stale upstream connections")
+	}
+}
+
+// --- New concurrency tests ---
+
+// TestConcurrentLimitN verifies that N goroutines can all acquire the same
+// account when maxConcurrent=N, and the N+1th enters the waiter (fails on
+// short context or succeeds after a Release).
+func TestConcurrentLimitN(t *testing.T) {
+	cfgs := []AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+	}
+	p := NewPool(cfgs)
+	const maxc = 5
+
+	// Acquire maxc slots on the single account.
+	accs := make([]*Account, maxc)
+	for i := 0; i < maxc; i++ {
+		var err error
+		accs[i], err = p.Select(context.Background(), maxc)
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+	}
+
+	// N+1 should fail with timeout (short context).
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err := p.Select(ctx, maxc)
+	if err == nil {
+		t.Fatal("expected select to timeout when all slots are full")
+	}
+
+	// Release one, then N+1 should succeed.
+	p.Release(accs[0])
+	accN1, err := p.Select(context.Background(), maxc)
+	if err != nil {
+		t.Fatalf("select after release: %v", err)
+	}
+	if accN1.Name() != "acc-1" {
+		t.Errorf("expected acc-1, got %s", accN1.Name())
+	}
+	// Cleanup
+	for _, a := range accs[1:] {
+		p.Release(a)
+	}
+	p.Release(accN1)
+}
+
+// TestReleaseWakesWaiter verifies that when maxc slots are full, releasing one
+// wakes a waiter which can then acquire the slot.
+func TestReleaseWakesWaiterWithConcurrency(t *testing.T) {
+	cfgs := []AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+	}
+	p := NewPool(cfgs)
+	const maxc = 3
+
+	// Fill all maxc slots.
+	accs := make([]*Account, maxc)
+	for i := 0; i < maxc; i++ {
+		var err error
+		accs[i], err = p.Select(context.Background(), maxc)
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+	}
+
+	// Start a goroutine that waits for a slot.
+	ch := make(chan *Account, 1)
+	go func() {
+		acc, err := p.Select(context.Background(), maxc)
+		if err != nil {
+			t.Errorf("waiter select error: %v", err)
+			ch <- nil
+			return
+		}
+		ch <- acc
+	}()
+
+	// Give the goroutine time to enter the waiter.
+	// Using a fixed sleep because implementing observable synchronisation
+	// (e.g. waiter signalling "entered select") would require structural
+	// changes to Pool internals. 200ms is well below any realistic test
+	// timeout and eliminates flakiness on slow CI runners.
+	time.Sleep(200 * time.Millisecond)
+
+	// Release one slot.
+	p.Release(accs[0])
+
+	// Waiter should be woken up.
+	select {
+	case acc := <-ch:
+		if acc == nil {
+			t.Fatal("waiter got nil account")
+		}
+		if acc.Name() != "acc-1" {
+			t.Errorf("expected acc-1, got %s", acc.Name())
+		}
+		p.Release(acc)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: waiter was not woken up by Release")
+	}
+
+	// Cleanup remaining.
+	for _, a := range accs[1:] {
+		p.Release(a)
+	}
+}
+
+// TestTryAcquireStrictMax verifies that TryAcquire never exceeds max
+// even under high concurrency.
+func TestTryAcquireStrictMax(t *testing.T) {
+	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
+
+	const max = 10
+	const goroutines = 100
+
+	var wg sync.WaitGroup
+	acquired := make([]bool, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			if acc.TryAcquire(max) {
+				acquired[idx] = true
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Count how many acquired.
+	total := 0
+	for _, a := range acquired {
+		if a {
+			total++
+		}
+	}
+	if total > max {
+		t.Errorf("TryAcquire allowed %d > max %d", total, max)
+	}
+	if total != max {
+		t.Errorf("expected exactly %d acquired, got %d", max, total)
+	}
+
+	// inFlight must be <= max and non-negative.
+	inFlight := acc.InFlightCount()
+	if inFlight > max {
+		t.Errorf("inFlight %d > max %d", inFlight, max)
+	}
+	if inFlight < 0 {
+		t.Errorf("inFlight negative: %d", inFlight)
+	}
+
+	// Release all acquired slots.
+	for i := 0; i < total; i++ {
+		acc.Release()
+	}
+}
+
+// TestReleaseNegativeDetect verifies that double-Release triggers a warning
+// and inFlight is clamped to 0.
+func TestReleaseNegativeDetect(t *testing.T) {
+	acc := &Account{cfg: AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
+
+	// Acquire 1 then release twice.
+	if !acc.TryAcquire(10) {
+		t.Fatal("TryAcquire failed")
+	}
+	acc.Release() // first release: inFlight goes to 0
+	acc.Release() // second release: should trigger warn and clamp to 0
+
+	if got := acc.InFlightCount(); got != 0 {
+		t.Errorf("inFlight after double release = %d, want 0", got)
+	}
+}
+
+// TestSnapshotStats verifies that SnapshotStats returns reasonable values.
+func TestSnapshotStats(t *testing.T) {
+	cfgs := []AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+		{Name: "acc-2", Key: "key-2", BaseURL: "http://localhost:8002"},
+	}
+	p := NewPool(cfgs)
+
+	snap := p.SnapshotStats()
+	if snap.Total != 2 {
+		t.Errorf("Total = %d, want 2", snap.Total)
+	}
+	if snap.Healthy != 2 {
+		t.Errorf("Healthy = %d, want 2", snap.Healthy)
+	}
+	if snap.Exhausted != 0 {
+		t.Errorf("Exhausted = %d, want 0", snap.Exhausted)
+	}
+	if snap.InFlightSum != 0 {
+		t.Errorf("InFlightSum = %d, want 0", snap.InFlightSum)
 	}
 }

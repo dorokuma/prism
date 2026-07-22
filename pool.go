@@ -26,7 +26,8 @@ type Account struct {
 	status        AccountStatus
 	client        *http.Client
 	mu            sync.Mutex
-	borrowed      atomic.Bool
+	inFlight      atomic.Int32
+	totalRequests atomic.Int64
 	cooldownUntil time.Time
 }
 
@@ -46,7 +47,7 @@ func (a *Account) MarkExhausted() {
 	defer a.mu.Unlock()
 	if a.status == StatusHealthy {
 		a.status = StatusExhausted
-		slog.Warn("account marked exhausted", "account", a.Name())
+		slog.Warn("account marked exhausted", "account", a.Name(), "in_flight", a.inFlight.Load())
 	}
 }
 
@@ -78,17 +79,41 @@ func (a *Account) Status() AccountStatus {
 	return a.status
 }
 
-func (a *Account) TryBorrow() bool {
-	return a.borrowed.CompareAndSwap(false, true)
+func (a *Account) TryAcquire(max int) bool {
+	for {
+		cur := a.inFlight.Load()
+		if cur >= int32(max) {
+			return false
+		}
+		if a.inFlight.CompareAndSwap(cur, cur+1) {
+			a.totalRequests.Add(1)
+			return true
+		}
+	}
 }
 
 func (a *Account) Release() {
-	if !a.borrowed.CompareAndSwap(true, false) {
-		slog.Warn("Release called on already-released account", "account", a.Name())
+	for {
+		cur := a.inFlight.Load()
+		if cur <= 0 {
+			slog.Warn("Release on zero inFlight", "account", a.Name())
+			return
+		}
+		if a.inFlight.CompareAndSwap(cur, cur-1) {
+			return
+		}
 	}
 }
 
 
+
+func (a *Account) InFlightCount() int {
+	return int(a.inFlight.Load())
+}
+
+func (a *Account) TotalRequests() int64 {
+	return a.totalRequests.Load()
+}
 
 func (a *Account) SetCooldown(d time.Duration) {
 	a.mu.Lock()
@@ -97,7 +122,7 @@ func (a *Account) SetCooldown(d time.Duration) {
 	if newUntil.After(a.cooldownUntil) {
 		a.cooldownUntil = newUntil
 	}
-	slog.Warn("account cooldown", "account", a.Name(), "duration", d.String(), "until", a.cooldownUntil.Format(time.RFC3339))
+	slog.Warn("account cooldown", "account", a.Name(), "duration", d.String(), "until", a.cooldownUntil.Format(time.RFC3339), "in_flight", a.inFlight.Load())
 }
 
 func (a *Account) IsInCooldown() bool {
@@ -171,13 +196,9 @@ func (p *Pool) removeWaiterAndTransfer(elem *list.Element) {
 	}
 }
 
-func (p *Pool) trySelect() *Account {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.trySelectLocked()
-}
 
-func (p *Pool) trySelectLocked() *Account {
+
+func (p *Pool) trySelectLocked(maxConcurrent int) *Account {
 	if len(p.accounts) == 0 {
 		return nil
 	}
@@ -189,7 +210,7 @@ func (p *Pool) trySelectLocked() *Account {
 		if acc.IsInCooldown() {
 			continue
 		}
-		if acc.IsHealthy() && acc.TryBorrow() {
+		if acc.IsHealthy() && acc.TryAcquire(maxConcurrent) {
 			return acc
 		}
 	}
@@ -203,7 +224,7 @@ var ErrNoHealthyAccounts = errors.New("no healthy accounts available")
 // Under normal operation the caller's context (accountSelectTimeout) expires first, so this acts as a fallback.
 var ErrSelectTimeout = errors.New("select account timeout")
 
-func (p *Pool) Select(ctx context.Context) (*Account, error) {
+func (p *Pool) Select(ctx context.Context, maxConcurrent int) (*Account, error) {
 	timer := time.NewTimer(2 * accountSelectTimeout)
 	defer timer.Stop()
 
@@ -238,7 +259,7 @@ func (p *Pool) Select(ctx context.Context) (*Account, error) {
 			return nil, ErrNoHealthyAccounts
 		}
 
-		if acc := p.trySelectLocked(); acc != nil {
+		if acc := p.trySelectLocked(maxConcurrent); acc != nil {
 			p.mu.Unlock()
 			return acc, nil
 		}
@@ -313,4 +334,34 @@ func (p *Pool) ExhaustedAccounts() []*Account {
 		}
 	}
 	return out
+}
+
+// PoolSnapshot holds a point-in-time summary of pool state for metrics/observability.
+type PoolSnapshot struct {
+	Total        int
+	Healthy      int
+	Exhausted    int
+	InCooldown   int
+	InFlightSum  int
+}
+
+func (p *Pool) SnapshotStats() PoolSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var s PoolSnapshot
+	s.Total = len(p.accounts)
+	for _, a := range p.accounts {
+		a.mu.Lock()
+		if a.status == StatusHealthy {
+			s.Healthy++
+		} else {
+			s.Exhausted++
+		}
+		if time.Now().Before(a.cooldownUntil) {
+			s.InCooldown++
+		}
+		a.mu.Unlock()
+		s.InFlightSum += int(a.inFlight.Load())
+	}
+	return s
 }

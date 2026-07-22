@@ -22,22 +22,23 @@ type AccountConfig struct {
 
 // Config holds the top-level application configuration loaded from a YAML file.
 type Config struct {
-	Listen        string              `yaml:"listen"`
-	ProbeInterval time.Duration       `yaml:"probe_interval"`
-	WireAPI       string              `yaml:"wire_api"`
-	Accounts      []AccountConfig     `yaml:"accounts"`
-	ModelRemap    map[string]string   `yaml:"model_remap"`
-	ModelTiers    map[string]string   `yaml:"model_tiers"`
-	DefaultTier   string              `yaml:"default_tier"`
-	StripFields   map[string][]string `yaml:"strip_fields"`
-	Debug         bool                `yaml:"debug"`
-	MCPToolsJSON  string              `yaml:"mcp_tools_json"`
-	ProbeModel     string              `yaml:"probe_model"`
-	AuthToken      string              `yaml:"auth_token,omitempty"`
-	TLSCertFile    string              `yaml:"tls_cert_file,omitempty"`
-	TLSKeyFile     string              `yaml:"tls_key_file,omitempty"`
-	TrustedProxies []string            `yaml:"trusted_proxies,omitempty"`
-	LogLevel      string              `yaml:"log_level"`
+	Listen                   string              `yaml:"listen"`
+	ProbeInterval            time.Duration       `yaml:"probe_interval"`
+	WireAPI                  string              `yaml:"wire_api"`
+	Accounts                 []AccountConfig     `yaml:"accounts"`
+	ModelRemap               map[string]string   `yaml:"model_remap"`
+	ModelTiers               map[string]string   `yaml:"model_tiers"`
+	DefaultTier              string              `yaml:"default_tier"`
+	StripFields              map[string][]string `yaml:"strip_fields"`
+	Debug                    bool                `yaml:"debug"`
+	MCPToolsJSON             string              `yaml:"mcp_tools_json"`
+	ProbeModel               string              `yaml:"probe_model"`
+	AuthToken                string              `yaml:"auth_token,omitempty"`
+	TLSCertFile              string              `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile               string              `yaml:"tls_key_file,omitempty"`
+	TrustedProxies           []string            `yaml:"trusted_proxies,omitempty"`
+	LogLevel                 string              `yaml:"log_level"`
+	MaxConcurrentPerAccount  map[string]int     `yaml:"max_concurrent_per_account"`
 }
 
 func LoadConfig(path string) (*Config, error) {

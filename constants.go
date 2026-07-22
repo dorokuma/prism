@@ -9,6 +9,11 @@ var (
 )
 
 const (
+	// Concurrency limits for DeepSeek v4 (official × 90% safety margin)
+	deepseekV4ProConcurrency    = 500
+	deepseekV4FlashConcurrency  = 2500
+	defaultConcurrencyRatio     = 90
+
 	probeTimeout     = 30 * time.Second
 
 	// Rate limiting

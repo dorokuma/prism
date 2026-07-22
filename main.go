@@ -117,7 +117,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Periodically update pool metrics
+	// Periodically update pool metrics and per-account expvar
+	for _, a := range pool.AllAccounts() {
+		acc := a
+		expvar.Publish("pool_account_"+acc.Name()+"_in_flight", expvar.Func(func() any {
+			return acc.InFlightCount()
+		}))
+		expvar.Publish("pool_account_"+acc.Name()+"_total_requests", expvar.Func(func() any {
+			return acc.TotalRequests()
+		}))
+	}
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -126,16 +135,15 @@ func main() {
 			case <-metricCtx.Done():
 				return
 			case <-ticker.C:
-				all := pool.AllAccounts()
-				healthy, exhausted := 0, 0
-				for _, a := range all {
-					if a.IsHealthy() {
-						healthy++
-					} else {
-						exhausted++
-					}
-				}
-				updatePoolMetrics(healthy, exhausted)
+				snap := pool.SnapshotStats()
+				updatePoolMetrics(snap.Healthy, snap.Exhausted)
+				slog.Debug("pool stats",
+					"total", snap.Total,
+					"healthy", snap.Healthy,
+					"exhausted", snap.Exhausted,
+					"in_cooldown", snap.InCooldown,
+					"in_flight_sum", snap.InFlightSum,
+				)
 			}
 		}
 	}()
