@@ -6,3 +6,9 @@ bin/
 scripts/__pycache__/
 mcp_tools.json
 .codegraph/
+context_mode.db
+context_mode.db-shm
+context_mode.db-wal
+*.db
+*.db-shm
+*.db-wal
