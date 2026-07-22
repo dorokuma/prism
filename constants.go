@@ -1,42 +1,44 @@
 package main
 
-import "time"
+import (
+	"github.com/dorokuma/prism/internal/config"
+)
 
 var (
 	// Probe
-	maxProbeAttempts = 3
-	probeRetryDelay  = 2 * time.Second
+	maxProbeAttempts = config.MaxProbeAttempts
+	probeRetryDelay  = config.ProbeRetryDelay
 )
 
 const (
 	// Concurrency limits for DeepSeek v4 (official × 90% safety margin)
-	deepseekV4ProConcurrency    = 500
-	deepseekV4FlashConcurrency  = 2500
-	defaultConcurrencyRatio     = 90
+	deepseekV4ProConcurrency   = config.DeepseekV4ProConcurrency
+	deepseekV4FlashConcurrency = config.DeepseekV4FlashConcurrency
+	defaultConcurrencyRatio    = config.DefaultConcurrencyRatio
 
-	probeTimeout     = 30 * time.Second
+	probeTimeout = config.ProbeTimeout
 
 	// Rate limiting
-	rateLimitPerSecond = 60
-	rateLimitBurst     = 100
-	rateLimitIdleTTL   = 10 * time.Minute
+	rateLimitPerSecond = config.RateLimitPerSecond
+	rateLimitBurst     = config.RateLimitBurst
+	rateLimitIdleTTL   = config.RateLimitIdleTTL
 
 	// Upstream / proxy
-	upstreamTimeout      = 10 * time.Minute
-	streamMaxDuration    = 1 * time.Hour
-	upstreamRetryDelay   = 200 * time.Millisecond
-	accountSelectTimeout = 30 * time.Second
-	maxErrorBodyBytes    = 1 << 20
-	redactJSONMaxDepth   = 20
+	upstreamTimeout      = config.UpstreamTimeout
+	streamMaxDuration    = config.StreamMaxDuration
+	upstreamRetryDelay   = config.UpstreamRetryDelay
+	accountSelectTimeout = config.AccountSelectTimeout
+	maxErrorBodyBytes    = config.MaxErrorBodyBytes
+	redactJSONMaxDepth   = config.RedactJSONMaxDepth
 
 	// MCP cache
-	mcpCacheTTL = 30 * time.Minute
+	mcpCacheTTL = config.McpCacheTTL
 
 	// System prompt
-	systemPromptMaxRunes = 12000
-	truncationSuffix     = "\n\n[... truncated for upstream compatibility]"
+	systemPromptMaxRunes = config.SystemPromptMaxRunes
+	truncationSuffix     = config.TruncationSuffix
 
 	// Stream scanner
-	streamScannerInitialBuf = 64 * 1024
-	streamScannerMaxBuf     = 4 * 1024 * 1024
+	streamScannerInitialBuf = config.StreamScannerInitialBuf
+	streamScannerMaxBuf     = config.StreamScannerMaxBuf
 )
