@@ -1,5 +1,7 @@
 # prism
 
+> 版本：v0.5.2  日期：2026-07-23  状态：动态文档
+
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
 
@@ -133,3 +135,7 @@ systemctl kill -s HUP prism   # or restart
 ## License
 
 MIT
+
+## 变更日志
+
+- **2026-07-23** — v0.5.2 — provider 路由 (X-Prism-Provider)、磁盘模型缓存、prism setup 命令、probe 改为 GET /v1/models、model_remap_enabled 开关、credential 三层回退、清理 ProbeModel 死代码
