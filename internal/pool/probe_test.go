@@ -12,7 +12,7 @@ import (
 func TestProbeExhausted_EmptyPool(t *testing.T) {
 	// No accounts → nothing to probe, no panic
 	pool := NewPool(nil)
-	ProbeExhausted(pool, "test-model")
+	ProbeExhausted(pool)
 }
 
 func TestProbeExhausted_NoExhaustedAccounts(t *testing.T) {
@@ -27,7 +27,7 @@ func TestProbeExhausted_NoExhaustedAccounts(t *testing.T) {
 	})
 
 	// All accounts start healthy, so ExhaustedAccounts() returns empty
-	ProbeExhausted(pool, "test-model")
+	ProbeExhausted(pool)
 
 	// Account should still be healthy
 	accs := pool.AllAccounts()
@@ -38,12 +38,12 @@ func TestProbeExhausted_NoExhaustedAccounts(t *testing.T) {
 
 func TestProbeExhausted_200Recovery(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify it's a POST to /chat/completions
-		if r.Method != "POST" {
-			t.Errorf("expected POST, got %s", r.Method)
+		// Verify it's a GET to /v1/models
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
 		}
-		if r.URL.Path != "/chat/completions" {
-			t.Errorf("expected /chat/completions, got %s", r.URL.Path)
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("expected /v1/models, got %s", r.URL.Path)
 		}
 		w.WriteHeader(200)
 		w.Write([]byte(`{"choices":[{"message":{"content":"hi"}}]}`))
@@ -61,7 +61,7 @@ func TestProbeExhausted_200Recovery(t *testing.T) {
 		t.Fatal("account should start as exhausted")
 	}
 
-	ProbeExhausted(pool, "test-model")
+	ProbeExhausted(pool)
 
 	if !accs[0].IsHealthy() {
 		t.Error("account should be marked healthy after 200 response")
@@ -84,7 +84,7 @@ func TestProbeExhausted_429StaysExhausted(t *testing.T) {
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
 
-	ProbeExhausted(pool, "test-model")
+	ProbeExhausted(pool)
 
 	// Should NOT be marked healthy
 	if accs[0].IsHealthy() {
@@ -115,7 +115,7 @@ func TestProbeExhausted_503Retries(t *testing.T) {
 	probeRetryDelay = time.Millisecond
 
 	start := time.Now()
-	ProbeExhausted(pool, "test-model")
+	ProbeExhausted(pool)
 
 	// Should have retried maxProbeAttempts times (3)
 	if callCount != maxProbeAttempts {
@@ -149,7 +149,7 @@ func TestProbeExhausted_401Retries(t *testing.T) {
 	accs[0].MarkExhausted()
 	probeRetryDelay = time.Millisecond
 
-	ProbeExhausted(pool, "test-model")
+	ProbeExhausted(pool)
 
 	// 401 currently falls through to the retry path in ProbeExhausted
 	if callCount != maxProbeAttempts {
@@ -179,7 +179,7 @@ func TestProbeExhausted_403Retries(t *testing.T) {
 	accs[0].MarkExhausted()
 	probeRetryDelay = time.Millisecond
 
-	ProbeExhausted(pool, "test-model")
+	ProbeExhausted(pool)
 
 	// 403 currently falls through to the retry path in ProbeExhausted
 	if callCount != maxProbeAttempts {
@@ -208,7 +208,7 @@ func TestProbeExhausted_ConnectionRefused(t *testing.T) {
 	probeRetryDelay = time.Millisecond
 
 	// Should not panic; will retry and fail
-	ProbeExhausted(pool, "test-model")
+	ProbeExhausted(pool)
 
 	// Account should still be exhausted
 	if accs[0].IsHealthy() {
@@ -238,7 +238,7 @@ func TestProbeExhausted_RecoveryAfterRetry(t *testing.T) {
 	probeRetryDelay = time.Millisecond
 
 	start := time.Now()
-	ProbeExhausted(pool, "test-model")
+	ProbeExhausted(pool)
 
 	if callCount != 3 {
 		t.Errorf("expected 3 attempts, got %d", callCount)
@@ -284,7 +284,7 @@ func TestProbeExhausted_MultipleAccounts(t *testing.T) {
 	}
 	probeRetryDelay = time.Millisecond
 
-	ProbeExhausted(pool, "test-model")
+	ProbeExhausted(pool)
 
 	// acc200 (200 response) should be healthy
 	if !accs[0].IsHealthy() {

@@ -39,9 +39,6 @@ accounts:
 	if cfg.WireAPI != "both" {
 		t.Errorf("default wire_api = %q, want both", cfg.WireAPI)
 	}
-	if cfg.ProbeModel != "deepseek-chat" {
-		t.Errorf("default probe_model = %q, want deepseek-chat", cfg.ProbeModel)
-	}
 	if len(cfg.Accounts) != 1 {
 		t.Fatalf("expected 1 account, got %d", len(cfg.Accounts))
 	}
@@ -102,6 +99,7 @@ accounts:
 
 func TestConfigRemapModel(t *testing.T) {
 	cfg := &Config{
+		ModelRemapEnabled: true,
 		ModelRemap: map[string]string{
 			"gpt-4":   "premium",
 			"gpt-3.5": "standard",
@@ -132,6 +130,7 @@ func TestConfigRemapModel(t *testing.T) {
 
 func TestConfigRemapModelFallback(t *testing.T) {
 	cfg := &Config{
+		ModelRemapEnabled: true,
 		ModelRemap: map[string]string{
 			"gpt-4": "premium",
 		},
@@ -524,6 +523,7 @@ func TestReloadConfig_ModelRemapUpdated(t *testing.T) {
 model_tiers:
   tier1: upstream-a
   tier2: upstream-b
+model_remap_enabled: true
 model_remap:
   a: tier1
 accounts:
@@ -557,6 +557,7 @@ accounts:
 model_tiers:
   tier1: upstream-a
   tier2: upstream-b
+model_remap_enabled: true
 model_remap:
   b: tier2
 accounts:
@@ -747,6 +748,7 @@ func TestReloadConfig_OldConfigPreservedOnError(t *testing.T) {
 listen: 127.0.0.1:8080
 model_tiers:
   tier1: upstream-a
+model_remap_enabled: true
 model_remap:
   a: tier1
 accounts:

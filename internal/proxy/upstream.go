@@ -263,7 +263,7 @@ type doUpstreamResult struct {
 func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opts ChatForwardOpts, requestID string) doUpstreamResult {
 	ctx, cancel := upstreamContext(r, opts.Stream)
 
-	targetURL := acc.BaseURL() + "/chat/completions"
+	targetURL := util.JoinURLPath(acc.BaseURL(), "/chat/completions")
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
 	}

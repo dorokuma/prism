@@ -242,3 +242,129 @@ func (p *Pool) SnapshotStats() PoolSnapshot {
 	}
 	return s
 }
+
+// SelectByProvider is like Select but only considers accounts belonging to the given provider.
+// When provider is empty, it falls back to Select (all accounts).
+func (p *Pool) SelectByProvider(ctx context.Context, maxConcurrent int, provider string) (*Account, error) {
+	if provider == "" {
+		return p.Select(ctx, maxConcurrent)
+	}
+	timer := time.NewTimer(2 * config.AccountSelectTimeout)
+	defer timer.Stop()
+
+	for {
+		hasHealthy := false
+		allHealthyInCooldown := true
+		var minCooldown time.Duration
+		now := time.Now()
+
+		p.mu.Lock()
+		for _, acc := range p.accounts {
+			if acc.Provider() != provider {
+				continue
+			}
+			acc.mu.Lock()
+			isHealthy := acc.status == StatusHealthy
+			cooldownUntil := acc.cooldownUntil
+			acc.mu.Unlock()
+
+			if isHealthy {
+				hasHealthy = true
+				if cooldownUntil.After(now) {
+					remaining := cooldownUntil.Sub(now)
+					if minCooldown == 0 || remaining < minCooldown {
+						minCooldown = remaining
+					}
+				} else {
+					allHealthyInCooldown = false
+				}
+			}
+		}
+
+		if !hasHealthy {
+			p.mu.Unlock()
+			return nil, ErrNoHealthyAccounts
+		}
+
+		if acc := p.trySelectLockedByProvider(maxConcurrent, provider); acc != nil {
+			p.mu.Unlock()
+			return acc, nil
+		}
+
+		w := &waiter{
+			ch:     make(chan struct{}),
+			active: true,
+		}
+		elem := p.waiters.PushBack(w)
+		p.mu.Unlock()
+
+		var cooldownChan <-chan time.Time
+		var cooldownTimer *time.Timer
+		if allHealthyInCooldown && minCooldown > 0 {
+			cooldownTimer = time.NewTimer(minCooldown)
+			cooldownChan = cooldownTimer.C
+		}
+
+		var selectErr error
+		var isClosed bool
+		select {
+		case <-ctx.Done():
+			selectErr = ctx.Err()
+		case <-timer.C:
+			selectErr = ErrSelectTimeout
+		case <-w.ch:
+			isClosed = true
+		case <-cooldownChan:
+		}
+
+		if selectErr != nil {
+			p.removeWaiterAndTransfer(elem)
+			if cooldownTimer != nil {
+				cooldownTimer.Stop()
+			}
+			return nil, selectErr
+		}
+
+		if !isClosed {
+			select {
+			case <-w.ch:
+				isClosed = true
+			default:
+			}
+		}
+
+		if cooldownTimer != nil {
+			cooldownTimer.Stop()
+		}
+
+		if !isClosed {
+			p.removeWaiterAndTransfer(elem)
+		}
+	}
+}
+
+// trySelectLockedByProvider is like trySelectLocked but only considers accounts for the given provider.
+func (p *Pool) trySelectLockedByProvider(maxConcurrent int, provider string) *Account {
+	if len(p.accounts) == 0 {
+		return nil
+	}
+	if provider == "" {
+		return p.trySelectLocked(maxConcurrent)
+	}
+	startIdx := int(p.nextIdx % uint64(len(p.accounts)))
+	for i := 0; i < len(p.accounts); i++ {
+		idx := (startIdx + i) % len(p.accounts)
+		p.nextIdx++
+		acc := p.accounts[idx]
+		if acc.Provider() != provider {
+			continue
+		}
+		if acc.IsInCooldown() {
+			continue
+		}
+		if acc.IsHealthy() && acc.TryAcquire(maxConcurrent) {
+			return acc
+		}
+	}
+	return nil
+}

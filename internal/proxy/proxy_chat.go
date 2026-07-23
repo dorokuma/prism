@@ -68,7 +68,9 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		middleware.EmitAudit(aud)
 	}()
 
-	bodyBytes = sanitize.TransformRequestBody(bodyBytes, cfg)
+	if cfg.ModelRemapEnabled {
+		bodyBytes = sanitize.TransformRequestBody(bodyBytes, cfg)
+	}
 	if p.AccountCount() == 0 {
 		aud.Error = "no accounts configured"
 		aud.ErrorType = "config_error"
@@ -88,7 +90,8 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 
 		selectCtx, cancel := context.WithTimeout(context.Background(), config.AccountSelectTimeout)
 		selectStart := time.Now()
-		acc, err := p.Select(selectCtx, maxConcurrent)
+		provider := r.Header.Get("X-Prism-Provider")
+		acc, err := p.SelectByProvider(selectCtx, maxConcurrent, provider)
 		selectDuration := time.Since(selectStart).Milliseconds()
 		cancel()
 		accName := "nil"

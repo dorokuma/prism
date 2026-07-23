@@ -174,9 +174,10 @@ func TestTransformRequestBody_ModelRemapAndStrip(t *testing.T) {
 
 func TestTransformRequestBody_NoStripForNonMatchingTier(t *testing.T) {
 	cfg := &config.Config{
-		ModelRemap:  map[string]string{"gpt-5.5": "frontier"},
-		ModelTiers:  map[string]string{"frontier": "deepseek-v4-pro"},
-		StripFields: map[string][]string{"glm-standard": {"prompt_cache_retention"}},
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"gpt-5.5": "frontier"},
+		ModelTiers:        map[string]string{"frontier": "deepseek-v4-pro"},
+		StripFields:       map[string][]string{"glm-standard": {"prompt_cache_retention"}},
 	}
 
 	body := []byte(`{"model":"gpt-5.5","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}]}`)
@@ -215,8 +216,9 @@ func TestTransformRequestBody_InvalidJSON(t *testing.T) {
 
 func TestTransformRequestBody_DeepSeekThinkingRemap(t *testing.T) {
 	cfg := &config.Config{
-		ModelRemap: map[string]string{"gpt-5.5": "frontier"},
-		ModelTiers: map[string]string{"frontier": "deepseek-v4-pro"},
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"gpt-5.5": "frontier"},
+		ModelTiers:        map[string]string{"frontier": "deepseek-v4-pro"},
 	}
 
 	// DeepSeek model with thinking.level = low, should be remapped to high
@@ -271,8 +273,9 @@ func TestTransformRequestBody_NoModelKey(t *testing.T) {
 
 func TestTransformRequestBody_DeepSeekReasoningEffortRemap(t *testing.T) {
 	cfg := &config.Config{
-		ModelRemap: map[string]string{"gpt-5.5": "frontier"},
-		ModelTiers: map[string]string{"frontier": "deepseek-v4-pro"},
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"gpt-5.5": "frontier"},
+		ModelTiers:        map[string]string{"frontier": "deepseek-v4-pro"},
 	}
 
 	tests := []struct {

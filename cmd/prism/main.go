@@ -1,10 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"expvar"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/mcp"
 	"github.com/dorokuma/prism/internal/middleware"
@@ -29,6 +29,15 @@ func init() {
 }
 
 func main() {
+	// 检查是否运行 setup
+	if len(os.Args) > 1 && os.Args[1] == "setup" {
+		if err := runSetup(); err != nil {
+			fmt.Fprintf(os.Stderr, "setup 失败: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	cfg, err := config.LoadConfig("config.yaml")
 	if err != nil {
 		slog.Error("load config", "error", err)
@@ -44,16 +53,32 @@ func main() {
 	wire, _ := config.ParseWireAPIMode(cfg.WireAPI)
 	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", util.DebugMode, "auth", cfg.AuthToken != "", "tls", cfg.TLSCertFile != "")
 
-	// Initial health probe: check all accounts on startup, warn but don't block
-	pool.ProbeExhausted(p, cfg.ProbeModel)
+	// 初始化模型缓存
+	cacheDir := "/var/lib/prism/model_cache"
+	mc, err := cache.New(cacheDir, p, cfg)
+	if err != nil {
+		slog.Error("init model cache", "error", err)
+		os.Exit(1)
+	}
+	mc.LoadFromDisk()
 
-	// 启动时验证所有账号的连通性
-	slog.Info("starting initial health check for all accounts")
-	probeBody, _ := json.Marshal(map[string]any{
-		"model":      cfg.ProbeModel,
-		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
-		"max_tokens": 1,
+	// 后台异步填充缺失缓存，就位后同步 tools
+	mc.FetchAllAsync(func() {
+		mc.SyncTools(cfg)
 	})
+
+	// 启动 24h 后台刷新（刷新后也同步 tools）
+	mc.StartRefreshLoop(24*time.Hour, func() {
+		// 重新读 config，因为可能被 SIGHUP 热重载过
+		curCfg := holder.Load()
+		mc.SyncTools(curCfg)
+	})
+
+	// Initial health probe: check all accounts on startup, warn but don't block
+	pool.ProbeExhausted(p)
+
+	// 启动时验证所有账号的连通性——使用 /v1/models 探活
+	slog.Info("starting initial health check for all accounts")
 	sem := make(chan struct{}, 10)
 	var startupWg sync.WaitGroup
 	for _, acc := range p.AllAccounts() {
@@ -68,13 +93,12 @@ func main() {
 				}
 			}()
 
-			url := a.BaseURL() + "/chat/completions"
-			req, err := http.NewRequest("POST", url, bytes.NewReader(probeBody))
+			url := util.JoinURLPath(a.BaseURL(), "/v1/models")
+			req, err := http.NewRequest("GET", url, nil)
 			if err != nil {
 				slog.Warn("startup check failed to create request", "account", a.Name(), "error", err)
 				return
 			}
-			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Authorization", "Bearer "+a.Key())
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -108,12 +132,12 @@ func main() {
 	startupWg.Wait()
 
 	stop := make(chan struct{})
-	pool.StartProbeLoop(p, cfg.ProbeModel, cfg.ProbeInterval, stop)
+	pool.StartProbeLoop(p, cfg.ProbeInterval, stop)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
-	proxyHandler := proxy.NewProxyHandler(p, wire, holder)
+	proxyHandler := proxy.NewProxyHandler(p, wire, holder, mc)
 
 	metricCtx, metricCancel := context.WithCancel(context.Background())
 
@@ -225,10 +249,18 @@ func main() {
 				mcp.ClearMCPCache()
 				mcp.LoadMCPTools(curCfg.MCPToolsJSON)
 				slog.Info("mcp_tools.json reloaded", "path", curCfg.MCPToolsJSON)
+
+				// SIGHUP 时强制刷新模型缓存并同步 tools
+				mc.UpdateConfig(holder.Load())
+				mc.RefreshAll()
+				newCfg := holder.Load()
+				mc.SyncTools(newCfg)
+
 				continue
 			}
 			slog.Info("shutting down", "signal", sig.String())
 			close(stop)
+			mc.Stop()
 			metricCancel()
 			mcp.StopMCPCache()
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

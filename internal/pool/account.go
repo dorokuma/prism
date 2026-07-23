@@ -34,6 +34,14 @@ type Account struct {
 
 func (a *Account) Name() string         { return a.cfg.Name }
 func (a *Account) Key() string          { return a.cfg.Key }
+
+// Provider returns the provider name this account belongs to.
+// Empty string means the account belongs to no specific provider (backward compat).
+func (a *Account) Provider() string {
+	return a.cfg.Provider
+}
+
+
 func (a *Account) BaseURL() string      { return a.cfg.BaseURL }
 func (a *Account) Client() *http.Client { return a.client }
 

@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/pool"
 	"github.com/dorokuma/prism/internal/util"
@@ -11,7 +12,7 @@ import (
 
 // NewProxyHandler creates the main HTTP handler that routes requests to the
 // appropriate handler based on the request path.
-func NewProxyHandler(pp *pool.Pool, wire config.WireAPIMode, holder *config.ConfigHolder) http.Handler {
+func NewProxyHandler(pp *pool.Pool, wire config.WireAPIMode, holder *config.ConfigHolder, mc *cache.ModelCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := holder.Load()
 		if r.URL.Path == "/health" {
@@ -27,7 +28,7 @@ func NewProxyHandler(pp *pool.Pool, wire config.WireAPIMode, holder *config.Conf
 				})
 				return
 			}
-			proxyModels(pp, w, r, cfg)
+			proxyModels(mc, w, r, cfg)
 			return
 		}
 		if r.URL.Path == "/v1/chat/completions" {

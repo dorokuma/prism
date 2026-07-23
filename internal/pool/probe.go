@@ -1,9 +1,7 @@
 package pool
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -20,18 +18,18 @@ var (
 	probeRetryDelay  = config.ProbeRetryDelay
 )
 
-func StartProbeLoop(pool *Pool, probeModel string, interval time.Duration, stop <-chan struct{}) {
+func StartProbeLoop(pool *Pool, interval time.Duration, stop <-chan struct{}) {
 	if interval <= 0 {
 		interval = 10 * time.Minute
 	}
-	slog.Info("probe loop started", "interval", interval, "model", probeModel)
+	slog.Info("probe loop started", "interval", interval)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("panic in probe loop", "panic", r, "stack", string(debug.Stack()))
 			}
 		}()
-		ProbeExhausted(pool, probeModel)
+		ProbeExhausted(pool)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -40,23 +38,17 @@ func StartProbeLoop(pool *Pool, probeModel string, interval time.Duration, stop 
 				slog.Info("probe loop stopped")
 				return
 			case <-ticker.C:
-				ProbeExhausted(pool, probeModel)
+				ProbeExhausted(pool)
 			}
 		}
 	}()
 }
 
-func ProbeExhausted(pool *Pool, probeModel string) {
+func ProbeExhausted(pool *Pool) {
 	exhausted := pool.ExhaustedAccounts()
 	if len(exhausted) == 0 {
 		return
 	}
-
-	probeBody, _ := json.Marshal(map[string]any{
-		"model":      probeModel,
-		"messages":    []map[string]string{{"role": "user", "content": "hi"}},
-		"max_tokens":  1,
-	})
 
 	var wg sync.WaitGroup
 	for _, acc := range exhausted {
@@ -71,14 +63,13 @@ func ProbeExhausted(pool *Pool, probeModel string) {
 
 			for attempt := 1; attempt <= maxProbeAttempts; attempt++ {
 				stop := func() bool {
-					url := acc.BaseURL() + "/chat/completions"
-					req, err := http.NewRequest("POST", url, bytes.NewReader(probeBody))
+					url := util.JoinURLPath(acc.BaseURL(), "/v1/models")
+					req, err := http.NewRequest("GET", url, nil)
 					if err != nil {
 						slog.Warn("probe failed to create request", "account", acc.Name(), "error", err)
 						return true
 					}
 					req.Header.Set("Authorization", "Bearer "+acc.Key())
-					req.Header.Set("Content-Type", "application/json")
 
 					ctx, cancel := context.WithTimeout(context.Background(), config.ProbeTimeout)
 					defer cancel()
@@ -91,11 +82,6 @@ func ProbeExhausted(pool *Pool, probeModel string) {
 					}
 					defer resp.Body.Close()
 
-					respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
-					if readErr != nil {
-						slog.Warn("probe read body failed", "account", acc.Name(), "error", readErr)
-					}
-
 					if resp.StatusCode == 200 {
 						pool.MarkHealthy(acc)
 						slog.Info("probe recovered account", "account", acc.Name(), "status", 200)
@@ -107,6 +93,10 @@ func ProbeExhausted(pool *Pool, probeModel string) {
 						return true
 					}
 
+					respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+					if readErr != nil {
+						slog.Warn("probe read body failed", "account", acc.Name(), "error", readErr)
+					}
 					slog.Warn("probe account still exhausted", "account", acc.Name(), "status", resp.StatusCode, "attempt", attempt, "max_attempts", maxProbeAttempts, "body", util.RedactBody(respBody))
 					return false
 				}()

@@ -20,9 +20,10 @@ var LogLevelHook func(level string)
 
 // AccountConfig holds configuration for a single upstream API account.
 type AccountConfig struct {
-	Name    string `yaml:"name"`
-	Key     string `yaml:"key,omitempty"`
-	BaseURL string `yaml:"base_url"`
+	Name     string   `yaml:"name"`
+	Key      string   `yaml:"key,omitempty"`
+	Provider string   `yaml:"provider,omitempty"`
+	BaseURL  string   `yaml:"base_url"`
 }
 
 // Config holds the top-level application configuration loaded from a YAML file.
@@ -31,17 +32,18 @@ type Config struct {
 	ProbeInterval          time.Duration       `yaml:"probe_interval"`
 	WireAPI                string              `yaml:"wire_api"`
 	Accounts               []AccountConfig     `yaml:"accounts"`
+	ModelRemapEnabled bool                `yaml:"model_remap_enabled"`
 	ModelRemap             map[string]string   `yaml:"model_remap"`
 	ModelTiers             map[string]string   `yaml:"model_tiers"`
 	DefaultTier            string              `yaml:"default_tier"`
 	StripFields            map[string][]string `yaml:"strip_fields"`
 	Debug                  bool                `yaml:"debug"`
 	MCPToolsJSON           string              `yaml:"mcp_tools_json"`
-	ProbeModel             string              `yaml:"probe_model"`
 	AuthToken              string              `yaml:"auth_token,omitempty"`
 	TLSCertFile            string              `yaml:"tls_cert_file,omitempty"`
 	TLSKeyFile             string              `yaml:"tls_key_file,omitempty"`
 	TrustedProxies         []string            `yaml:"trusted_proxies,omitempty"`
+	Tools                  map[string]string   `yaml:"tools,omitempty"`
 	LogLevel               string              `yaml:"log_level"`
 	MaxConcurrentPerAccount map[string]int     `yaml:"max_concurrent_per_account"`
 }
@@ -70,14 +72,28 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.WireAPI == "" {
 		cfg.WireAPI = "both"
 	}
-	if cfg.ProbeModel == "" {
-		cfg.ProbeModel = "deepseek-chat"
-	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
 	if _, err := ParseWireAPIMode(cfg.WireAPI); err != nil {
 		return nil, err
+	}
+	// Support providers block
+	type providersConfig struct {
+		Providers map[string]struct {
+			Accounts []AccountConfig `yaml:"accounts"`
+		} `yaml:"providers"`
+	}
+	var pc providersConfig
+	if err := yaml.Unmarshal(data, &pc); err == nil && len(pc.Providers) > 0 {
+		var allAccounts []AccountConfig
+		for providerName, providerCfg := range pc.Providers {
+			for _, acc := range providerCfg.Accounts {
+				acc.Provider = providerName
+				allAccounts = append(allAccounts, acc)
+			}
+		}
+		cfg.Accounts = allAccounts
 	}
 	if len(cfg.Accounts) == 0 {
 		return nil, fmt.Errorf("no accounts configured")
@@ -145,6 +161,9 @@ func LoadConfig(path string) (*Config, error) {
 // pass through unchanged. Models IN model_remap whose tier has no upstream
 // mapping fall back to default_tier.
 func (c *Config) RemapModel(model string) string {
+	if !c.ModelRemapEnabled {
+		return model
+	}
 	if c.ModelRemap != nil {
 		if tier, ok := c.ModelRemap[model]; ok {
 			if upstream, ok := c.ModelTiers[tier]; ok && upstream != "" {
@@ -159,6 +178,29 @@ func (c *Config) RemapModel(model string) string {
 		}
 	}
 	return model
+}
+
+// ProviderNames returns all distinct provider names from account configs.
+func (c *Config) ProviderNames() []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, acc := range c.Accounts {
+		if acc.Provider != "" && !seen[acc.Provider] {
+			seen[acc.Provider] = true
+			out = append(out, acc.Provider)
+		}
+	}
+	return out
+}
+
+// GetTier returns the tier name for a virtual model, without resolving to upstream.
+func (c *Config) GetTier(model string) string {
+	if c.ModelRemap != nil {
+		if tier, ok := c.ModelRemap[model]; ok {
+			return tier
+		}
+	}
+	return ""
 }
 
 // AllModels returns both virtual model names (model_remap keys) and real
@@ -195,11 +237,20 @@ func (c *Config) VirtualModels() []string {
 // directory (CREDENTIALS_DIRECTORY). Returns the trimmed contents on success,
 // or "" if CREDENTIALS_DIRECTORY is unset or the file cannot be read.
 func getCredential(name string) string {
+	// 1. systemd LoadCredential
 	credDir := os.Getenv("CREDENTIALS_DIRECTORY")
-	if credDir == "" {
-		return ""
+	if credDir != "" {
+		data, err := os.ReadFile(filepath.Join(credDir, name))
+		if err == nil {
+			return strings.TrimSpace(string(data))
+		}
 	}
-	data, err := os.ReadFile(filepath.Join(credDir, name))
+	// 2. 环境变量
+	if key := os.Getenv(name); key != "" {
+		return key
+	}
+	// 3. 直接读 credstore（setup 生成的 unit 可不声明 LoadCredential）
+	data, err := os.ReadFile(filepath.Join("/etc/credstore/prism", name))
 	if err != nil {
 		return ""
 	}
@@ -258,9 +309,6 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	}
 	if oldCfg.ProbeInterval != newCfg.ProbeInterval {
 		warnings = append(warnings, "probe_interval changed: restart required to take effect")
-	}
-	if oldCfg.ProbeModel != newCfg.ProbeModel {
-		warnings = append(warnings, "probe_model changed: restart required to take effect")
 	}
 	if oldCfg.WireAPI != newCfg.WireAPI {
 		warnings = append(warnings, "wire_api changed: restart required to take effect")

@@ -137,7 +137,7 @@ func TestNewProxyHandlerModelsEndpoint(t *testing.T) {
 	}
 	p := pool.NewPool(nil)
 	holder := config.NewConfigHolder(cfg)
-	handler := NewProxyHandler(p, config.WireAPIBoth, holder)
+	handler := NewProxyHandler(p, config.WireAPIBoth, holder, nil)
 
 	// Test GET /v1/models
 	w := httptest.NewRecorder()
