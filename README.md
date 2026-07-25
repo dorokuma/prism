@@ -1,6 +1,6 @@
 # prism
 
-> 版本：v0.5.2  日期：2026-07-23  状态：动态文档
+> 版本：v0.6.0  日期：2026-07-23  状态：动态文档
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -80,6 +80,7 @@ upstream model name. The resolution logic is:
 > behavior only applies `default_tier` to models that exist in `model_remap` but
 > whose target tier has no upstream mapping.
 | `mcp_tools_json` | string | — | Optional path to tool-definitions JSON |
+| `model_metadata` | map | — | Per-model metadata returned by /v1/models: context_window, max_tokens, reasoning, input, cost, thinking_level_map, extra |
 | `probe_model` | string | `deepseek-chat` | Startup/probe model id |
 
 ### `wire_api`
@@ -138,4 +139,5 @@ MIT
 
 ## 变更日志
 
+- **2026-07-23** — v0.6.0 — /v1/models 返回 model_metadata（context_window/max_tokens/cost/think 等）、syncPIModelsJSON 改为 merge 不覆盖、config 新增 model_metadata 配置段
 - **2026-07-23** — v0.5.2 — provider 路由 (X-Prism-Provider)、磁盘模型缓存、prism setup 命令、probe 改为 GET /v1/models、model_remap_enabled 开关、credential 三层回退、清理 ProbeModel 死代码

@@ -13,6 +13,30 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ModelCost defines per-model pricing rates.
+type ModelCost struct {
+	Input      float64 `yaml:"input"`
+	Output     float64 `yaml:"output"`
+	CacheRead  float64 `yaml:"cache_read"`
+	CacheWrite float64 `yaml:"cache_write"`
+}
+
+// ModelMetadata defines optional per-model metadata that prism returns
+// via /v1/models for agent/tool auto-discovery. All fields are optional;
+// agents use what they understand and ignore the rest.
+type ModelMetadata struct {
+	ContextWindow    *int                `yaml:"context_window,omitempty"`
+	MaxTokens        *int                `yaml:"max_tokens,omitempty"`
+	Reasoning        *bool               `yaml:"reasoning,omitempty"`
+	Input            []string            `yaml:"input,omitempty"`
+	Cost             *ModelCost          `yaml:"cost,omitempty"`
+	ThinkingLevelMap map[string]*string  `yaml:"thinking_level_map,omitempty"`
+	Extra            map[string]any      `yaml:"extra,omitempty"`
+}
+
+// ModelMetadataMap is a convenience alias for map[string]ModelMetadata.
+type ModelMetadataMap map[string]ModelMetadata
+
 // LogLevelHook is a package-level hook for setting the log level at runtime.
 // It is set by the main package during initialization to enable hot-reload
 // of the log level via ReloadConfig.
@@ -44,6 +68,7 @@ type Config struct {
 	TLSKeyFile             string              `yaml:"tls_key_file,omitempty"`
 	TrustedProxies         []string            `yaml:"trusted_proxies,omitempty"`
 	Tools                  map[string]string   `yaml:"tools,omitempty"`
+	ModelMetadata          ModelMetadataMap    `yaml:"model_metadata,omitempty"`
 	LogLevel               string              `yaml:"log_level"`
 	MaxConcurrentPerAccount map[string]int     `yaml:"max_concurrent_per_account"`
 }

@@ -22,9 +22,9 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 		sort.Strings(modelIDs)
 		data := make([]map[string]any, len(modelIDs))
 		for i, id := range modelIDs {
-			data[i] = map[string]any{
+			data[i] = enrichModel(map[string]any{
 				"id": id, "object": "model", "created": 1700000000, "owned_by": "prism",
-			}
+			}, id, cfg)
 		}
 		util.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 		slog.Debug("models returning (remap)", "count", len(modelIDs), "req", requestID, "duration_ms", time.Since(start).Milliseconds())
@@ -57,12 +57,51 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 
 	data := make([]map[string]any, len(models))
 	for i, m := range models {
-		data[i] = map[string]any{
+		entry := map[string]any{
 			"id": m.ID, "object": m.Object, "created": m.Created, "owned_by": m.OwnedBy,
 		}
+		data[i] = enrichModel(entry, m.ID, cfg)
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	slog.Debug("models returning", "provider", provider, "count", len(models), "req", requestID, "duration_ms", time.Since(start).Milliseconds())
+}
+
+// enrichModel merges optional model_metadata from config into the response entry.
+// Extra fields are appended to the map; tools that don't understand them ignore them.
+func enrichModel(entry map[string]any, modelID string, cfg *config.Config) map[string]any {
+	meta, ok := cfg.ModelMetadata[modelID]
+	if !ok {
+		return entry
+	}
+	if meta.ContextWindow != nil {
+		entry["context_window"] = *meta.ContextWindow
+	}
+	if meta.MaxTokens != nil {
+		entry["max_tokens"] = *meta.MaxTokens
+	}
+	if meta.Reasoning != nil {
+		entry["reasoning"] = *meta.Reasoning
+	}
+	if len(meta.Input) > 0 {
+		entry["input"] = meta.Input
+	}
+	if meta.Cost != nil {
+		entry["cost"] = map[string]float64{
+			"input":       meta.Cost.Input,
+			"output":      meta.Cost.Output,
+			"cache_read":  meta.Cost.CacheRead,
+			"cache_write": meta.Cost.CacheWrite,
+		}
+	}
+	if len(meta.ThinkingLevelMap) > 0 {
+		entry["thinking_level_map"] = meta.ThinkingLevelMap
+	}
+	if len(meta.Extra) > 0 {
+		for k, v := range meta.Extra {
+			entry[k] = v
+		}
+	}
+	return entry
 }
 
 // getTenantID returns the tenant identifier for the request.

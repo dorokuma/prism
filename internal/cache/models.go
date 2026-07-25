@@ -301,18 +301,22 @@ func (mc *ModelCache) SyncTools(cfg *config.Config) {
 	}
 }
 
-// syncPIModelsJSON reads/creates a PI models.json file and updates
-// the Prism-managed provider entries with current cache data.
+// syncPIModelsJSON merges upstream model IDs into pi's models.json.
+//
+// For each Prism-managed provider:
+//   - Removed models → entry deleted entirely
+//   - New models      → entry created with { "id": "..." } + metadata from
+//                        config.ModelMetadata when available
+//   - Existing models → all fields preserved as-is (user metadata kept intact)
+//
+// Non-Prim providers in the file are untouched.
 func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.Config) error {
-	type piModel struct {
-		ID string `json:"id"`
-	}
 	type piProvider struct {
-		BaseURL string            `json:"baseUrl"`
-		API     string            `json:"api"`
-		APIKey  string            `json:"apiKey"`
-		Headers map[string]string `json:"headers,omitempty"`
-		Models  []piModel         `json:"models"`
+		BaseURL string              `json:"baseUrl"`
+		API     string              `json:"api"`
+		APIKey  string              `json:"apiKey"`
+		Headers map[string]string   `json:"headers,omitempty"`
+		Models  []map[string]any    `json:"models"`
 	}
 	type piConfig struct {
 		Providers map[string]piProvider `json:"providers"`
@@ -331,18 +335,73 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 		return fmt.Errorf("create dir: %w", err)
 	}
 
-	// Update provider entries for each configured provider
-	providers := cfg.ProviderNames()
-	for _, provider := range providers {
+	for _, provider := range cfg.ProviderNames() {
 		models := mc.GetModels(provider)
 		if models == nil {
 			slog.Warn("no cache for provider, skipping sync", "provider", provider)
 			continue
 		}
-		entries := make([]piModel, len(models))
-		for i, m := range models {
-			entries[i] = piModel{ID: m.ID}
+
+		// Build set of upstream model IDs
+		upstreamIDs := make(map[string]bool, len(models))
+		for _, m := range models {
+			upstreamIDs[m.ID] = true
 		}
+
+		// Filter existing entries: keep only those still in upstream
+		existingByID := make(map[string]map[string]any)
+		if oldProvider, ok := pc.Providers[provider]; ok {
+			for _, entry := range oldProvider.Models {
+				id, _ := entry["id"].(string)
+				if id != "" && upstreamIDs[id] {
+					existingByID[id] = entry
+				}
+			}
+		}
+
+		// Build new model list
+		entries := make([]map[string]any, 0, len(models))
+		for _, m := range models {
+			if existing, ok := existingByID[m.ID]; ok {
+				// Preserve existing entry entirely
+				entries = append(entries, existing)
+			} else {
+				// New model: create entry with id + optional metadata from config
+				entry := map[string]any{"id": m.ID}
+				if meta, ok := cfg.ModelMetadata[m.ID]; ok {
+					if meta.ContextWindow != nil {
+						entry["contextWindow"] = *meta.ContextWindow
+					}
+					if meta.MaxTokens != nil {
+						entry["maxTokens"] = *meta.MaxTokens
+					}
+					if meta.Reasoning != nil {
+						entry["reasoning"] = *meta.Reasoning
+					}
+					if len(meta.Input) > 0 {
+						entry["input"] = meta.Input
+					}
+					if meta.Cost != nil {
+						entry["cost"] = map[string]float64{
+							"input":       meta.Cost.Input,
+							"output":      meta.Cost.Output,
+							"cacheRead":   meta.Cost.CacheRead,
+							"cacheWrite":  meta.Cost.CacheWrite,
+						}
+					}
+					if len(meta.ThinkingLevelMap) > 0 {
+						entry["thinkingLevelMap"] = meta.ThinkingLevelMap
+					}
+					if len(meta.Extra) > 0 {
+						for k, v := range meta.Extra {
+							entry[k] = v
+						}
+					}
+				}
+				entries = append(entries, entry)
+			}
+		}
+
 		pc.Providers[provider] = piProvider{
 			BaseURL: baseURL,
 			API:     "openai-completions",
