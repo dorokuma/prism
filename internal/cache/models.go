@@ -20,12 +20,12 @@ import (
 
 // ModelCache manages per-provider model list caches persisted to disk.
 type ModelCache struct {
-	dir      string
-	caches   map[string]*providerCache
-	mu       sync.RWMutex
-	pool     *pool.Pool
-	cfg      *config.Config
-	stop     chan struct{}
+	dir    string
+	caches map[string]*providerCache
+	mu     sync.RWMutex
+	pool   *pool.Pool
+	cfg    *config.Config
+	stop   chan struct{}
 }
 
 type providerCache struct {
@@ -306,17 +306,17 @@ func (mc *ModelCache) SyncTools(cfg *config.Config) {
 // For each Prism-managed provider:
 //   - Removed models → entry deleted entirely
 //   - New models      → entry created with { "id": "..." } + metadata from
-//                        config.ModelMetadata when available
+//     config.ModelMetadata when available
 //   - Existing models → all fields preserved as-is (user metadata kept intact)
 //
-// Non-Prim providers in the file are untouched.
+// Non-Prism providers in the file are untouched.
 func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.Config) error {
 	type piProvider struct {
-		BaseURL string              `json:"baseUrl"`
-		API     string              `json:"api"`
-		APIKey  string              `json:"apiKey"`
-		Headers map[string]string   `json:"headers,omitempty"`
-		Models  []map[string]any    `json:"models"`
+		BaseURL string            `json:"baseUrl"`
+		API     string            `json:"api"`
+		APIKey  string            `json:"apiKey"`
+		Headers map[string]string `json:"headers,omitempty"`
+		Models  []map[string]any  `json:"models"`
 	}
 	type piConfig struct {
 		Providers map[string]piProvider `json:"providers"`
@@ -327,6 +327,7 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 	if data, err := os.ReadFile(path); err == nil {
 		if err := json.Unmarshal(data, &pc); err != nil {
 			slog.Warn("pi models.json parse error, overwriting", "path", path, "error", err)
+			pc = piConfig{Providers: make(map[string]piProvider)}
 		}
 	}
 
@@ -383,10 +384,10 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 					}
 					if meta.Cost != nil {
 						entry["cost"] = map[string]float64{
-							"input":       meta.Cost.Input,
-							"output":      meta.Cost.Output,
-							"cacheRead":   meta.Cost.CacheRead,
-							"cacheWrite":  meta.Cost.CacheWrite,
+							"input":      meta.Cost.Input,
+							"output":     meta.Cost.Output,
+							"cacheRead":  meta.Cost.CacheRead,
+							"cacheWrite": meta.Cost.CacheWrite,
 						}
 					}
 					if len(meta.ThinkingLevelMap) > 0 {
@@ -415,8 +416,12 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return fmt.Errorf("write: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename: %w", err)
 	}
 
 	slog.Info("pi models.json synced", "path", path, "providers", len(pc.Providers))

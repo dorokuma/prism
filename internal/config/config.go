@@ -25,13 +25,13 @@ type ModelCost struct {
 // via /v1/models for agent/tool auto-discovery. All fields are optional;
 // agents use what they understand and ignore the rest.
 type ModelMetadata struct {
-	ContextWindow    *int                `yaml:"context_window,omitempty"`
-	MaxTokens        *int                `yaml:"max_tokens,omitempty"`
-	Reasoning        *bool               `yaml:"reasoning,omitempty"`
-	Input            []string            `yaml:"input,omitempty"`
-	Cost             *ModelCost          `yaml:"cost,omitempty"`
-	ThinkingLevelMap map[string]*string  `yaml:"thinking_level_map,omitempty"`
-	Extra            map[string]any      `yaml:"extra,omitempty"`
+	ContextWindow    *int               `yaml:"context_window,omitempty"`
+	MaxTokens        *int               `yaml:"max_tokens,omitempty"`
+	Reasoning        *bool              `yaml:"reasoning,omitempty"`
+	Input            []string           `yaml:"input,omitempty"`
+	Cost             *ModelCost         `yaml:"cost,omitempty"`
+	ThinkingLevelMap map[string]*string `yaml:"thinking_level_map,omitempty"`
+	Extra            map[string]any     `yaml:"extra,omitempty"`
 }
 
 // ModelMetadataMap is a convenience alias for map[string]ModelMetadata.
@@ -44,33 +44,33 @@ var LogLevelHook func(level string)
 
 // AccountConfig holds configuration for a single upstream API account.
 type AccountConfig struct {
-	Name     string   `yaml:"name"`
-	Key      string   `yaml:"key,omitempty"`
-	Provider string   `yaml:"provider,omitempty"`
-	BaseURL  string   `yaml:"base_url"`
+	Name     string `yaml:"name"`
+	Key      string `yaml:"key,omitempty"`
+	Provider string `yaml:"provider,omitempty"`
+	BaseURL  string `yaml:"base_url"`
 }
 
 // Config holds the top-level application configuration loaded from a YAML file.
 type Config struct {
-	Listen                 string              `yaml:"listen"`
-	ProbeInterval          time.Duration       `yaml:"probe_interval"`
-	WireAPI                string              `yaml:"wire_api"`
-	Accounts               []AccountConfig     `yaml:"accounts"`
-	ModelRemapEnabled bool                `yaml:"model_remap_enabled"`
-	ModelRemap             map[string]string   `yaml:"model_remap"`
-	ModelTiers             map[string]string   `yaml:"model_tiers"`
-	DefaultTier            string              `yaml:"default_tier"`
-	StripFields            map[string][]string `yaml:"strip_fields"`
-	Debug                  bool                `yaml:"debug"`
-	MCPToolsJSON           string              `yaml:"mcp_tools_json"`
-	AuthToken              string              `yaml:"auth_token,omitempty"`
-	TLSCertFile            string              `yaml:"tls_cert_file,omitempty"`
-	TLSKeyFile             string              `yaml:"tls_key_file,omitempty"`
-	TrustedProxies         []string            `yaml:"trusted_proxies,omitempty"`
-	Tools                  map[string]string   `yaml:"tools,omitempty"`
-	ModelMetadata          ModelMetadataMap    `yaml:"model_metadata,omitempty"`
-	LogLevel               string              `yaml:"log_level"`
-	MaxConcurrentPerAccount map[string]int     `yaml:"max_concurrent_per_account"`
+	Listen                  string              `yaml:"listen"`
+	ProbeInterval           time.Duration       `yaml:"probe_interval"`
+	WireAPI                 string              `yaml:"wire_api"`
+	Accounts                []AccountConfig     `yaml:"accounts"`
+	ModelRemapEnabled       bool                `yaml:"model_remap_enabled"`
+	ModelRemap              map[string]string   `yaml:"model_remap"`
+	ModelTiers              map[string]string   `yaml:"model_tiers"`
+	DefaultTier             string              `yaml:"default_tier"`
+	StripFields             map[string][]string `yaml:"strip_fields"`
+	Debug                   bool                `yaml:"debug"`
+	MCPToolsJSON            string              `yaml:"mcp_tools_json"`
+	AuthToken               string              `yaml:"auth_token,omitempty"`
+	TLSCertFile             string              `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile              string              `yaml:"tls_key_file,omitempty"`
+	TrustedProxies          []string            `yaml:"trusted_proxies,omitempty"`
+	Tools                   map[string]string   `yaml:"tools,omitempty"`
+	ModelMetadata           ModelMetadataMap    `yaml:"model_metadata,omitempty"`
+	LogLevel                string              `yaml:"log_level"`
+	MaxConcurrentPerAccount map[string]int      `yaml:"max_concurrent_per_account"`
 }
 
 // LoadConfig reads a YAML config file, unmarshals it into Config, applies
