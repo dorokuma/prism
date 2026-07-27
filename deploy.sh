@@ -1,70 +1,60 @@
 #!/bin/bash
-# prism 一键部署：编译 → 停止服务 → 原子替换二进制 → 重启 → 验证
-set -e
+# prism 部署：编译 → 原子替换二进制 → systemctl restart → 健康验证 → 失败自动回退
+#
+# 本脚本只做机械部署，不做 git。
+# 原因：commit message / Changelog 内容 / tag 号每次都不同，需调用方（主代理）判断，
+# 写死在脚本里无意义。调用方负责：部署前改 README+commit+tag（本地），部署成功后再 push。
+#
+# 部署前提：代码改动已 commit + tag（本地）。本脚本编译当前工作区代码。
+# 退出码：0 成功；1 新版失败已回退旧版；2 回退后仍不健康（需人工）；3 前置失败（编译/备份，prism 未受影响）。
+set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BINARY="/usr/local/bin/prism"
+BACKUP="${BINARY}.bak"
+HEALTH_URL="http://127.0.0.1:18790/health"
 
 echo "=== 编译 ==="
-cd "$ROOT"
-go build -o ./bin/prism ./cmd/prism 2>&1
+cd "$ROOT" || exit 3
+if ! go build -o ./bin/prism ./cmd/prism; then
+  echo "BUILD FAILED — prism 未受影响，仍在跑旧版本"
+  exit 3
+fi
 echo "BUILD OK ($(du -h ./bin/prism | cut -f1))"
 
-echo "=== 停止旧进程 ==="
-if systemctl is-active --quiet prism 2>/dev/null; then
-  systemctl stop prism 2>&1 && echo "stopped prism.service"
-  # systemd 停服后等待进程退出
-  for i in $(seq 1 15); do
-    if ! systemctl is-active --quiet prism 2>/dev/null; then
-      break
-    fi
-    sleep 1
-  done
-else
-  # 回退：直接 kill
-  OLD_PID=$(pgrep -x prism 2>/dev/null || true)
-  if [ -n "$OLD_PID" ]; then
-    kill "$OLD_PID" 2>/dev/null && echo "killed pid $OLD_PID" || echo "no process to kill"
-    sleep 2
-  else
-    echo "prism 未运行"
-  fi
+echo "=== 备份旧二进制 ==="
+if ! cp -a "$BINARY" "$BACKUP"; then
+  echo "备份失败，中止（prism 未受影响）"
+  exit 3
 fi
+echo "BACKUP → $BACKUP"
 
-echo "=== 替换二进制 ==="
+echo "=== 原子替换二进制（运行中进程持旧 inode，不受影响继续跑）==="
 install -m 755 ./bin/prism "$BINARY"
-echo "DEPLOYED → $BINARY"
 rm -rf ./bin
-echo "cleaned build output ./bin"
+echo "INSTALLED → $BINARY"
 
-echo "=== 启动服务 ==="
-if systemctl list-unit-files prism.service &>/dev/null; then
-  systemctl start prism 2>&1
-  sleep 2
-  if systemctl is-active --quiet prism 2>/dev/null; then
-    echo "prism.service started OK"
-  else
-    echo "WARN: prism.service 启动失败，检查 journalctl -u prism"
-  fi
-else
-  echo "WARN: 无 prism.service，跳过 systemctl 启动"
+echo "=== systemctl restart 加载新二进制（停机窗口仅 restart 瞬间，不单独 stop）==="
+systemctl restart prism || true
+sleep 2
+
+echo "=== 健康验证 ==="
+if systemctl is-active --quiet prism && curl -sf "$HEALTH_URL" >/dev/null; then
+  echo "DEPLOY OK: prism active + health ok"
+  rm -f "$BACKUP"
+  exit 0
 fi
 
-echo "=== 验证 ==="
-# prism 无 version 子命令，通过运行二进制（不传 config）检查是否正常
-"$BINARY" 2>&1 | head -3 || true
-echo "二进制就绪: $BINARY"
-
-echo "=== 提交推送 ==="
-cd "$ROOT"
-git add -A
-if git diff --cached --quiet; then
-  echo "无改动，跳过提交"
-else
-  TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-  git commit -m "deploy ${TAG}" 2>&1 || echo "commit 无改动"
-  git push 2>&1 || echo "push 失败（无远程或网络问题）"
-  echo "PUSHED"
+echo "=== 健康验证失败，自动回退到旧二进制 ==="
+install -m 755 "$BACKUP" "$BINARY"
+systemctl restart prism || true
+sleep 2
+if systemctl is-active --quiet prism && curl -sf "$HEALTH_URL" >/dev/null; then
+  echo "ROLLBACK OK: 已回退旧版本（新版本启动失败）。代码未 push，可 git reset 撤销"
+  echo "查失败原因：journalctl -u prism -n 50 --no-pager"
+  exit 1
 fi
 
-echo "=== 完成 ==="
+echo "CRITICAL: 回退后仍不健康，prism 可能已停机，需人工介入"
+echo "journalctl -u prism -n 50 --no-pager"
+exit 2
