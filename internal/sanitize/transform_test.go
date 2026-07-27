@@ -20,6 +20,49 @@ func assertBodyUnchanged(t *testing.T, got, body []byte) {
 	}
 }
 
+// ── Message role normalization tests ──────────────────────────────────
+
+// TestTransformRequestBody_DevRoleToSystem verifies that a message with
+// role:"developer" is rewritten to role:"system" while every other field
+// (including non-developer roles) is preserved verbatim.
+func TestTransformRequestBody_DevRoleToSystem(t *testing.T) {
+	cfg := &config.Config{}
+	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"developer","content":"You are a helpful assistant."},{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	var messages []map[string]any
+	if err := json.Unmarshal(raw["messages"], &messages); err != nil {
+		t.Fatalf("unmarshal messages: %v", err)
+	}
+
+	if len(messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(messages))
+	}
+	if role, _ := messages[0]["role"].(string); role != "system" {
+		t.Errorf("messages[0].role = %q, want system", role)
+	}
+	if role, _ := messages[1]["role"].(string); role != "user" {
+		t.Errorf("messages[1].role = %q, want user", role)
+	}
+	if content, _ := messages[0]["content"].(string); content != "You are a helpful assistant." {
+		t.Errorf("messages[0].content = %q, want preserved content", content)
+	}
+}
+
+// TestTransformRequestBody_NoDevRole_NoChange verifies that when no message has
+// role:"developer", the body is returned unchanged (same slice identity).
+func TestTransformRequestBody_NoDevRole_NoChange(t *testing.T) {
+	cfg := &config.Config{}
+	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+	assertBodyUnchanged(t, got, body)
+}
+
 func TestTransformRequestBody_NilCfg(t *testing.T) {
 	body := []byte(`{"model":"glm-5.2","prompt_cache_retention":5,"messages":[{"role":"user","content":"hi"}]}`)
 	got := sanitize.TransformRequestBody(body, nil)
