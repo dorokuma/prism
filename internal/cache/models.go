@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,8 +31,20 @@ type ModelCache struct {
 }
 
 type providerCache struct {
-	Models    []ModelEntry `json:"models"`
-	UpdatedAt time.Time    `json:"updated_at"`
+	Models    []ModelEntry         `json:"models"`
+	Meta      map[string]ModelMeta `json:"meta,omitempty"`
+	UpdatedAt time.Time            `json:"updated_at"`
+}
+
+// ModelMeta holds metadata pulled from a provider's upstream endpoint
+// (e.g. ollama /api/show). It is persisted in the on-disk cache under the
+// "meta" key (omitempty + nil keeps the cache backward compatible with the
+// old format that had no such key).
+type ModelMeta struct {
+	ContextWindow *int     `json:"context_window,omitempty"`
+	MaxTokens     *int     `json:"max_tokens,omitempty"`
+	Reasoning     *bool    `json:"reasoning,omitempty"`
+	Input         []string `json:"input,omitempty"`
 }
 
 // ModelEntry represents a single model from /v1/models response.
@@ -176,6 +190,7 @@ func (mc *ModelCache) Fetch(provider string) error {
 
 	pc := &providerCache{
 		Models:    upstream.Data,
+		Meta:      mc.fetchOllamaMeta(account, upstream.Data), // ollama only; non-ollama returns nil
 		UpdatedAt: time.Now(),
 	}
 
@@ -304,10 +319,14 @@ func (mc *ModelCache) SyncTools(cfg *config.Config) {
 // syncPIModelsJSON merges upstream model IDs into pi's models.json.
 //
 // For each Prism-managed provider:
-//   - Removed models → entry deleted entirely
+//   - Existing models → rebuilt entry: prism-managed fields (contextWindow/
+//     maxTokens/reasoning/input/cost/thinkingLevelMap + config.Extra keys)
+//     are overwritten from upstream meta + config metadata; any other keys
+//     on the previous entry (e.g. a hand-edited "name") are preserved.
+//     This guarantees already-existing models also receive metadata written
+//     by config/upstream (fixes e.g. glm-5.2 showing context=128k).
 //   - New models      → entry created with { "id": "..." } + metadata from
 //     config.ModelMetadata when available
-//   - Existing models → all fields preserved as-is (user metadata kept intact)
 //
 // Non-Prism providers in the file are untouched.
 func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.Config) error {
@@ -360,47 +379,52 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 			}
 		}
 
-		// Build new model list
+		// Build new model list (unified rebuild).
+		//
+		// Every upstream model gets a freshly-built entry. Prism-managed
+		// fields (contextWindow/maxTokens/reasoning/input/cost/
+		// thinkingLevelMap + config.Extra keys) are always overwritten from
+		// upstream meta + config metadata; any other keys present on a
+		// previous entry (e.g. a hand-edited "name") are preserved. This
+		// guarantees already-existing models also receive metadata written
+		// by config/upstream (fixes e.g. glm-5.2 showing context=128k).
 		entries := make([]map[string]any, 0, len(models))
+
+		// Keys that prism fully controls and always overwrites.
+		prismManaged := map[string]bool{
+			"contextWindow":    true,
+			"maxTokens":        true,
+			"reasoning":        true,
+			"input":            true,
+			"cost":             true,
+			"thinkingLevelMap": true,
+		}
+		// Config-declared extra keys are also prism-managed.
+		for _, cm := range cfg.ModelMetadata {
+			for k := range cm.Extra {
+				prismManaged[k] = true
+			}
+		}
+
 		for _, m := range models {
-			if existing, ok := existingByID[m.ID]; ok {
-				// Preserve existing entry entirely
-				entries = append(entries, existing)
-			} else {
-				// New model: create entry with id + optional metadata from config
-				entry := map[string]any{"id": m.ID}
-				if meta, ok := cfg.ModelMetadata[m.ID]; ok {
-					if meta.ContextWindow != nil {
-						entry["contextWindow"] = *meta.ContextWindow
-					}
-					if meta.MaxTokens != nil {
-						entry["maxTokens"] = *meta.MaxTokens
-					}
-					if meta.Reasoning != nil {
-						entry["reasoning"] = *meta.Reasoning
-					}
-					if len(meta.Input) > 0 {
-						entry["input"] = meta.Input
-					}
-					if meta.Cost != nil {
-						entry["cost"] = map[string]float64{
-							"input":      meta.Cost.Input,
-							"output":     meta.Cost.Output,
-							"cacheRead":  meta.Cost.CacheRead,
-							"cacheWrite": meta.Cost.CacheWrite,
-						}
-					}
-					if len(meta.ThinkingLevelMap) > 0 {
-						entry["thinkingLevelMap"] = meta.ThinkingLevelMap
-					}
-					if len(meta.Extra) > 0 {
-						for k, v := range meta.Extra {
-							entry[k] = v
-						}
+			existing := existingByID[m.ID] // may be nil
+			upMeta, _ := mc.GetModelMeta(provider, m.ID)
+			cfgMeta := cfg.ModelMetadata[m.ID]
+			merged := mergeMeta(upMeta, cfgMeta)
+
+			entry := map[string]any{"id": m.ID}
+			if existing != nil {
+				// Preserve non-managed keys from the old entry
+				// (e.g. hand-edited name), dropping managed ones that
+				// will be re-derived below.
+				for k, v := range existing {
+					if k != "id" && !prismManaged[k] {
+						entry[k] = v
 					}
 				}
-				entries = append(entries, entry)
 			}
+			applyMergedCamel(entry, merged, cfgMeta)
+			entries = append(entries, entry)
 		}
 
 		pc.Providers[provider] = piProvider{
@@ -416,14 +440,217 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	// Direct overwrite (not tmp+rename): pi's models.json lives in /root/.pi/agent/
+	// (root-owned dir; prism user has file write via chown but not dir write),
+	// so atomic tmp+rename (needs dir write) is impossible here. models.json is
+	// fully regenerable by sync, so non-atomic overwrite is acceptable.
+	if err := os.WriteFile(path, data, 0664); err != nil {
 		return fmt.Errorf("write: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("rename: %w", err)
 	}
 
 	slog.Info("pi models.json synced", "path", path, "providers", len(pc.Providers))
 	return nil
+}
+
+// rootURL strips the trailing "/v1" (and any trailing slash) from a base URL
+// so it can be joined with ollama's "/api/show" endpoint. JoinURLPath is not
+// suitable because /api/show is not under /v1.
+func rootURL(base string) string {
+	base = strings.TrimSuffix(base, "/")
+	return strings.TrimSuffix(base, "/v1")
+}
+
+// deriveContextLength scans an ollama model_info map for a key ending in
+// ".context_length" and returns its (int) value. The exact key is
+// architecture-dependent (e.g. "llama.context_length"), so we match by suffix
+// rather than hard-coding it.
+func deriveContextLength(modelInfo map[string]any) *int {
+	if modelInfo == nil {
+		return nil
+	}
+	for k, v := range modelInfo {
+		if !strings.HasSuffix(k, ".context_length") {
+			continue
+		}
+		switch n := v.(type) {
+		case float64:
+			i := int(n)
+			return &i
+		case int:
+			return &n
+		case json.Number:
+			if i, err := n.Int64(); err == nil {
+				i2 := int(i)
+				return &i2
+			}
+		}
+	}
+	return nil
+}
+
+// fetchOllamaShow queries ollama's /api/show endpoint for a single model and
+// extracts its metadata (currently just context_window from model_info).
+// A non-200, timeout, or parse error is returned as an error so the caller can
+// skip the model without failing the whole fetch.
+func (mc *ModelCache) fetchOllamaShow(acc *pool.Account, id string) (ModelMeta, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	body, err := json.Marshal(map[string]string{"name": id})
+	if err != nil {
+		return ModelMeta{}, fmt.Errorf("marshal show body: %w", err)
+	}
+	url := rootURL(acc.BaseURL()) + "/api/show"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return ModelMeta{}, fmt.Errorf("create show request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := acc.Key(); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+
+	resp, err := acc.Client().Do(req)
+	if err != nil {
+		return ModelMeta{}, fmt.Errorf("show request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return ModelMeta{}, fmt.Errorf("api/show returned %d: %s", resp.StatusCode, string(b))
+	}
+
+	var show struct {
+		ModelInfo map[string]any `json:"model_info"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&show); err != nil {
+		return ModelMeta{}, fmt.Errorf("decode show response: %w", err)
+	}
+	return ModelMeta{ContextWindow: deriveContextLength(show.ModelInfo)}, nil
+}
+
+// fetchOllamaMeta fetches metadata for every model from ollama's /api/show
+// endpoint. Only ollama providers (per cfg.EffortSchema) are queried; all other
+// providers return nil. A single model's failure is logged and skipped — it
+// never fails the enclosing Fetch. Up to 4 requests run concurrently.
+func (mc *ModelCache) fetchOllamaMeta(acc *pool.Account, models []ModelEntry) map[string]ModelMeta {
+	if acc == nil || mc.cfg == nil || mc.cfg.EffortSchema(acc.Provider()) != "ollama" {
+		return nil
+	}
+	return mc.collectOllamaMeta(acc, models)
+}
+
+// collectOllamaMeta performs the concurrent /api/show fan-out. It is the
+// testable core of fetchOllamaMeta (which adds the ollama-only gate).
+func (mc *ModelCache) collectOllamaMeta(acc *pool.Account, models []ModelEntry) map[string]ModelMeta {
+	if len(models) == 0 {
+		return nil
+	}
+	result := make(map[string]ModelMeta)
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, m := range models {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			meta, err := mc.fetchOllamaShow(acc, id)
+			if err != nil {
+				slog.Warn("fetch ollama /api/show failed, skipping model",
+					"provider", acc.Provider(), "model", id, "error", err)
+				return
+			}
+			mu.Lock()
+			result[id] = meta
+			mu.Unlock()
+		}(m.ID)
+	}
+	wg.Wait()
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// GetModelMeta returns the upstream metadata for a single model, if known.
+func (mc *ModelCache) GetModelMeta(provider, id string) (ModelMeta, bool) {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	pc := mc.caches[provider]
+	if pc == nil || pc.Meta == nil {
+		return ModelMeta{}, false
+	}
+	meta, ok := pc.Meta[id]
+	return meta, ok
+}
+
+// GetMeta returns the upstream metadata map for a provider.
+func (mc *ModelCache) GetMeta(provider string) map[string]ModelMeta {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	pc := mc.caches[provider]
+	if pc == nil {
+		return nil
+	}
+	return pc.Meta
+}
+
+// mergeMeta combines upstream metadata with config metadata. Config fields
+// that are set (non-nil/non-empty) override the upstream value of the same
+// field. cost/thinkingLevelMap/Extra come only from config and are not part
+// of ModelMeta, so they are handled separately by applyMergedCamel.
+func mergeMeta(up ModelMeta, cfg config.ModelMetadata) ModelMeta {
+	merged := up
+	if cfg.ContextWindow != nil {
+		merged.ContextWindow = cfg.ContextWindow
+	}
+	if cfg.MaxTokens != nil {
+		merged.MaxTokens = cfg.MaxTokens
+	}
+	if cfg.Reasoning != nil {
+		merged.Reasoning = cfg.Reasoning
+	}
+	if len(cfg.Input) > 0 {
+		merged.Input = cfg.Input
+	}
+	return merged
+}
+
+// applyMergedCamel writes the merged metadata into a pi models.json entry using
+// camelCase keys (models.json convention). ContextWindow/MaxTokens/Reasoning/
+// Input come from merged (upstream + config override); cost/thinkingLevelMap/
+// extra come only from cfgMeta (config-only). Prism-managed fields already on
+// the entry are overwritten; this is the single place models.json metadata is
+// written.
+func applyMergedCamel(entry map[string]any, merged ModelMeta, cfgMeta config.ModelMetadata) {
+	if merged.ContextWindow != nil {
+		entry["contextWindow"] = *merged.ContextWindow
+	}
+	if merged.MaxTokens != nil {
+		entry["maxTokens"] = *merged.MaxTokens
+	}
+	if merged.Reasoning != nil {
+		entry["reasoning"] = *merged.Reasoning
+	}
+	if len(merged.Input) > 0 {
+		entry["input"] = merged.Input
+	}
+	if cfgMeta.Cost != nil {
+		entry["cost"] = map[string]float64{
+			"input":      cfgMeta.Cost.Input,
+			"output":     cfgMeta.Cost.Output,
+			"cacheRead":  cfgMeta.Cost.CacheRead,
+			"cacheWrite": cfgMeta.Cost.CacheWrite,
+		}
+	}
+	if len(cfgMeta.ThinkingLevelMap) > 0 {
+		entry["thinkingLevelMap"] = cfgMeta.ThinkingLevelMap
+	}
+	if len(cfgMeta.Extra) > 0 {
+		for k, v := range cfgMeta.Extra {
+			entry[k] = v
+		}
+	}
 }

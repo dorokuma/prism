@@ -60,10 +60,35 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 		entry := map[string]any{
 			"id": m.ID, "object": m.Object, "created": m.Created, "owned_by": m.OwnedBy,
 		}
+		// Layer upstream metadata (snake_case, /v1/models convention) beneath
+		// config metadata. enrichModel below overwrites the same snake_case
+		// keys with config values, so config always wins over upstream.
+		if meta, ok := mc.GetModelMeta(provider, m.ID); ok {
+			applyUpstreamMetaSnake(entry, meta)
+		}
 		data[i] = enrichModel(entry, m.ID, cfg)
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	slog.Debug("models returning", "provider", provider, "count", len(models), "req", requestID, "duration_ms", time.Since(start).Milliseconds())
+}
+
+// applyUpstreamMetaSnake writes upstream model metadata into a /v1/models
+// response entry using snake_case keys. It must stay strictly separate from
+// applyMergedCamel (camelCase, for pi's models.json). Config metadata is
+// applied later by enrichModel, overwriting these same keys when present.
+func applyUpstreamMetaSnake(entry map[string]any, meta cache.ModelMeta) {
+	if meta.ContextWindow != nil {
+		entry["context_window"] = *meta.ContextWindow
+	}
+	if meta.MaxTokens != nil {
+		entry["max_tokens"] = *meta.MaxTokens
+	}
+	if meta.Reasoning != nil {
+		entry["reasoning"] = *meta.Reasoning
+	}
+	if len(meta.Input) > 0 {
+		entry["input"] = meta.Input
+	}
 }
 
 // enrichModel merges optional model_metadata from config into the response entry.

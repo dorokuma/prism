@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.7.0  Date: 2026-07-27  Status: living document
+> Version: v0.8.0  Date: 2026-07-27  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -139,6 +139,7 @@ MIT
 
 ## Changelog
 
+- **2026-07-27** — v0.8.0 — feat: model metadata single source of truth — fetch from upstream (ollama /api/show for context_length) + config model_metadata field-level override, syncPIModelsJSON rewrites existing models too (fixes glm-5.2 128k→1M), /v1/models returns upstream+config merged metadata, cache ModelMeta + providerCache.Meta
 - **2026-07-27** — v0.7.0 — feat: provider-dimension effort mapping (X-Prism-Provider header → opencode/ollama schema), same model no crosstalk across providers (glm-5.2/deepseek differ opencode vs ollama), ollama profiles match ollama.com real levels (xhigh→max, off→none, no thinking.type), drop outer ModelRemapEnabled gate (Apply always runs, remap still internally gated), config base_url host detection for provider schema
 - **2026-07-27** — v0.6.2 — feat: generic reasoning effort mapping (internal/reasoning package), downward-proximity clamp, per-model effort remap for non-DeepSeek models (hy3/glm/kimi/qwen/mimo/minimax), DeepSeek behavior unchanged
 - **2026-07-25** — v0.6.1 — fix: gofmt alignment, Non-Prim→Non-Prism typo, syncPIModelsJSON unmarshal-fail pc reset, atomic write (tmp+rename)
