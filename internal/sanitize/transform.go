@@ -6,11 +6,13 @@ import (
 	"sort"
 
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/reasoning"
 	"github.com/dorokuma/prism/internal/util"
 )
 
-// TransformRequestBody applies model remap, thinking field remap (for DeepSeek),
-// and strips unsupported fields (per config) in a single JSON parse/marshal pass.
+// TransformRequestBody applies model remap, reasoning effort / thinking mapping
+// (per upstream model via internal/reasoning), and strips unsupported fields
+// (per config) in a single JSON parse/marshal pass.
 // Returns the original body unchanged if no transformation was needed.
 func TransformRequestBody(body []byte, cfg *config.Config) []byte {
 	if cfg == nil {
@@ -35,37 +37,9 @@ func TransformRequestBody(body []byte, cfg *config.Config) []byte {
 		}
 	}
 
-	// Step 2: Thinking field remap for DeepSeek models
-	if util.IsDeepSeekModel(model) {
-		if thinkRaw, ok := raw["thinking"]; ok && len(thinkRaw) > 0 && string(thinkRaw) != "null" {
-			var thinking map[string]any
-			if err := json.Unmarshal(thinkRaw, &thinking); err == nil {
-				if level, ok := thinking["level"].(string); ok {
-					mapped := util.MapThoughtLevel(level)
-					if mapped != level {
-						slog.Debug("thinking level remap", "model", model, "from", level, "to", mapped)
-						thinking["level"] = mapped
-						if b, err := json.Marshal(thinking); err == nil {
-							raw["thinking"] = json.RawMessage(b)
-							changed = true
-						}
-					}
-				}
-			}
-		}
-		if effortRaw, ok := raw["reasoning_effort"]; ok && len(effortRaw) > 0 && string(effortRaw) != "null" {
-			var effort string
-			if err := json.Unmarshal(effortRaw, &effort); err == nil {
-				mapped := util.MapThoughtLevel(effort)
-				if mapped != effort {
-					slog.Debug("reasoning_effort remap", "model", model, "from", effort, "to", mapped)
-					if b, err := json.Marshal(mapped); err == nil {
-						raw["reasoning_effort"] = json.RawMessage(b)
-						changed = true
-					}
-				}
-			}
-		}
+	// Step 2: Reasoning effort / thinking mapping for all models
+	if reasoning.Apply(raw, model) {
+		changed = true
 	}
 
 	// Step 3: Strip unsupported fields per tier config

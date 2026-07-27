@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.6.1  Date: 2026-07-25  Status: living document
+> Version: v0.6.2  Date: 2026-07-27  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -139,6 +139,7 @@ MIT
 
 ## Changelog
 
+- **2026-07-27** — v0.6.2 — feat: generic reasoning effort mapping (internal/reasoning package), downward-proximity clamp, per-model effort remap for non-DeepSeek models (hy3/glm/kimi/qwen/mimo/minimax), DeepSeek behavior unchanged
 - **2026-07-25** — v0.6.1 — fix: gofmt alignment, Non-Prim→Non-Prism typo, syncPIModelsJSON unmarshal-fail pc reset, atomic write (tmp+rename)
 - **2026-07-23** — v0.6.0 — /v1/models returns model_metadata (context_window/max_tokens/cost/think etc.), syncPIModelsJSON changed to merge (no overwrite), config adds model_metadata section
 - **2026-07-23** — v0.5.2 — provider routing (X-Prism-Provider), disk model cache, prism setup command, probe changed to GET /v1/models, model_remap_enabled toggle, credential three-tier fallback, cleanup of ProbeModel dead code

@@ -331,3 +331,481 @@ func TestTransformRequestBody_NonDeepSeekNonGLMNoStrip(t *testing.T) {
 	// model remap mimo-v2.5 → standard → mimo-v2.5 (no-op). Body unchanged.
 	assertBodyUnchanged(t, got, body)
 }
+
+// ── New generic effort mapping tests ─────────────────────────────────
+
+func TestTransformRequestBody_GLM52_EffortMap(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"glm-5.2": "glm-tier"},
+		ModelTiers:        map[string]string{"glm-tier": "glm-5.2"},
+	}
+
+	body := []byte(`{"model":"glm-5.2","reasoning_effort":"xhigh","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	if string(got) == string(body) {
+		t.Fatal("TransformRequestBody should have applied effort mapping, body unchanged")
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// reasoning_effort should be xhigh (1:1 mapping)
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "xhigh" {
+		t.Errorf("reasoning_effort = %q, want xhigh", got)
+	}
+
+	// thinking.type should be enabled
+	var thinking map[string]any
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("unmarshal thinking: %v", err)
+	}
+	if typ, _ := thinking["type"].(string); typ != "enabled" {
+		t.Errorf("thinking.type = %q, want enabled", typ)
+	}
+}
+
+func TestTransformRequestBody_GLM51_Toggle(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"glm-5.1": "glm51-tier"},
+		ModelTiers:        map[string]string{"glm51-tier": "glm-5.1"},
+	}
+
+	body := []byte(`{"model":"glm-5.1","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	if string(got) == string(body) {
+		t.Fatal("body should have changed")
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// reasoning_effort should be stripped
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be stripped")
+	}
+
+	// thinking.type should be enabled
+	var thinking map[string]any
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("unmarshal thinking: %v", err)
+	}
+	if typ, _ := thinking["type"].(string); typ != "enabled" {
+		t.Errorf("thinking.type = %q, want enabled", typ)
+	}
+}
+
+func TestTransformRequestBody_KimiK3_EffortClampDown(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"kimi-k3": "k3-tier"},
+		ModelTiers:        map[string]string{"k3-tier": "kimi-k3"},
+	}
+
+	body := []byte(`{"model":"kimi-k3","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// medium → low (clamp down)
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "low" {
+		t.Errorf("reasoning_effort = %q, want low", got)
+	}
+}
+
+func TestTransformRequestBody_KimiK26_Toggle(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"kimi-k2.6": "k26-tier"},
+		ModelTiers:        map[string]string{"k26-tier": "kimi-k2.6"},
+	}
+
+	body := []byte(`{"model":"kimi-k2.6","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// reasoning_effort should be stripped
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be stripped")
+	}
+
+	// thinking.type should be enabled
+	var thinking map[string]any
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("unmarshal thinking: %v", err)
+	}
+	if typ, _ := thinking["type"].(string); typ != "enabled" {
+		t.Errorf("thinking.type = %q, want enabled", typ)
+	}
+}
+
+func TestTransformRequestBody_Qwen37_Budget(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"qwen3.7-plus": "qwen37-tier"},
+		ModelTiers:        map[string]string{"qwen37-tier": "qwen3.7-plus"},
+	}
+
+	body := []byte(`{"model":"qwen3.7-plus","reasoning_effort":"xhigh","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// reasoning_effort should be stripped
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be stripped")
+	}
+
+	// enable_thinking should be true
+	if !util.RawBoolField(raw, "enable_thinking") {
+		t.Error("enable_thinking should be true")
+	}
+
+	// thinking_budget should be 81920
+	var budget int
+	if err := json.Unmarshal(raw["thinking_budget"], &budget); err != nil {
+		t.Fatalf("thinking_budget not an int: %v", err)
+	}
+	if budget != 81920 {
+		t.Errorf("thinking_budget = %d, want 81920", budget)
+	}
+}
+
+func TestTransformRequestBody_Qwen36_Budget(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"qwen3.6-plus": "qwen36-tier"},
+		ModelTiers:        map[string]string{"qwen36-tier": "qwen3.6-plus"},
+	}
+
+	body := []byte(`{"model":"qwen3.6-plus","reasoning_effort":"xhigh","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// thinking_budget should be 81920 (not 262144)
+	var budget int
+	if err := json.Unmarshal(raw["thinking_budget"], &budget); err != nil {
+		t.Fatalf("thinking_budget not an int: %v", err)
+	}
+	if budget != 81920 {
+		t.Errorf("thinking_budget = %d, want 81920", budget)
+	}
+
+	// enable_thinking should be true
+	if !util.RawBoolField(raw, "enable_thinking") {
+		t.Error("enable_thinking should be true")
+	}
+}
+
+func TestTransformRequestBody_Hy3_EffortClampDown(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"hy3": "hy3-tier"},
+		ModelTiers:        map[string]string{"hy3-tier": "hy3"},
+	}
+
+	body := []byte(`{"model":"hy3","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// medium → low (downward proximity)
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "low" {
+		t.Errorf("reasoning_effort = %q, want low", got)
+	}
+
+	// thinking.type should be enabled
+	var thinking map[string]any
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("unmarshal thinking: %v", err)
+	}
+	if typ, _ := thinking["type"].(string); typ != "enabled" {
+		t.Errorf("thinking.type = %q, want enabled", typ)
+	}
+}
+
+func TestTransformRequestBody_Hy3_XhighClamp(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"hy3": "hy3-tier"},
+		ModelTiers:        map[string]string{"hy3-tier": "hy3"},
+	}
+
+	body := []byte(`{"model":"hy3","reasoning_effort":"xhigh","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// xhigh → high (clamp to max)
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "high" {
+		t.Errorf("reasoning_effort = %q, want high", got)
+	}
+
+	// thinking.type should be enabled
+	var thinking map[string]any
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("unmarshal thinking: %v", err)
+	}
+	if typ, _ := thinking["type"].(string); typ != "enabled" {
+		t.Errorf("thinking.type = %q, want enabled", typ)
+	}
+}
+
+func TestTransformRequestBody_MiMo_Toggle(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"mimo-v2.5": "mimo-tier"},
+		ModelTiers:        map[string]string{"mimo-tier": "mimo-v2.5"},
+	}
+
+	body := []byte(`{"model":"mimo-v2.5","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// reasoning_effort should be stripped
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be stripped")
+	}
+
+	// thinking.type should be enabled
+	var thinking map[string]any
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("unmarshal thinking: %v", err)
+	}
+	if typ, _ := thinking["type"].(string); typ != "enabled" {
+		t.Errorf("thinking.type = %q, want enabled", typ)
+	}
+}
+
+func TestTransformRequestBody_MiniMaxM3_Off(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"minimax-m3": "m3-tier"},
+		ModelTiers:        map[string]string{"m3-tier": "minimax-m3"},
+	}
+
+	body := []byte(`{"model":"minimax-m3","reasoning_effort":"off","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// reasoning_effort should be stripped
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be stripped")
+	}
+
+	// thinking should be "disabled"
+	var thinking string
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("thinking is not a string: %v", err)
+	}
+	if thinking != "disabled" {
+		t.Errorf("thinking = %q, want disabled", thinking)
+	}
+}
+
+func TestTransformRequestBody_MiniMaxM2_ForceOn(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"minimax-m2.7": "m27-tier"},
+		ModelTiers:        map[string]string{"m27-tier": "minimax-m2.7"},
+	}
+
+	body := []byte(`{"model":"minimax-m2.7","reasoning_effort":"off","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// reasoning_effort should be stripped
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be stripped")
+	}
+
+	// thinking should be "adaptive" (forced on)
+	var thinking string
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("thinking is not a string: %v", err)
+	}
+	if thinking != "adaptive" {
+		t.Errorf("thinking = %q, want adaptive", thinking)
+	}
+}
+
+func TestTransformRequestBody_NoThinkingModel_Strip(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"unknown-v1": "unknown-tier"},
+		ModelTiers:        map[string]string{"unknown-tier": "grok-4.5"},
+	}
+
+	body := []byte(`{"model":"unknown-v1","reasoning_effort":"high","thinking":{"level":"high"},"messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// Both should be stripped for unsupported model
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be stripped for unsupported model")
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Error("thinking should be stripped for unsupported model")
+	}
+}
+
+func TestTransformRequestBody_ThinkingLevelPath(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"glm-5.2": "glm-tier"},
+		ModelTiers:        map[string]string{"glm-tier": "glm-5.2"},
+	}
+
+	// Use thinking.level (no reasoning_effort)
+	body := []byte(`{"model":"glm-5.2","thinking":{"level":"xhigh"},"messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// reasoning_effort should be written from thinking.level mapping
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "xhigh" {
+		t.Errorf("reasoning_effort = %q, want xhigh", got)
+	}
+
+	// thinking.type should be enabled
+	var thinking map[string]any
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("unmarshal thinking: %v", err)
+	}
+	if typ, _ := thinking["type"].(string); typ != "enabled" {
+		t.Errorf("thinking.type = %q, want enabled", typ)
+	}
+	// thinking.level should have been cleaned up (not in EnumFields for glm-5.2)
+	if _, exists := thinking["level"]; exists {
+		t.Error("thinking.level should have been removed")
+	}
+}
+
+func TestTransformRequestBody_NoEffortField_NoOp(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"glm-5.2": "glm-tier"},
+		ModelTiers:        map[string]string{"glm-tier": "glm-5.2"},
+	}
+
+	// No reasoning_effort or thinking.level fields
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"temperature":0.7}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	// Model remap: glm-5.2 → glm-tier → glm-5.2 (identity). Body unchanged.
+	assertBodyUnchanged(t, got, body)
+}
+
+func TestTransformRequestBody_Off_DeepSeekPassthrough(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"gpt-5.5": "frontier"},
+		ModelTiers:        map[string]string{"frontier": "deepseek-v4-pro"},
+	}
+
+	body := []byte(`{"model":"gpt-5.5","reasoning_effort":"off","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// Model should be remapped, but reasoning_effort=off should remain untouched
+	model, _ := util.RawStringField(raw, "model")
+	if model != "deepseek-v4-pro" {
+		t.Errorf("model = %q, want deepseek-v4-pro", model)
+	}
+
+	// reasoning_effort should still be "off" (passthrough)
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "off" {
+		t.Errorf("reasoning_effort = %q, want off (passthrough)", got)
+	}
+}
+
+func TestTransformRequestBody_Qwen_Off_StripsBudget(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"qwen3.7-plus": "qwen37-tier"},
+		ModelTiers:        map[string]string{"qwen37-tier": "qwen3.7-plus"},
+	}
+
+	body := []byte(`{"model":"qwen3.7-plus","reasoning_effort":"off","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// reasoning_effort should be stripped
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be stripped")
+	}
+
+	// enable_thinking should be false
+	if util.RawBoolField(raw, "enable_thinking") {
+		t.Error("enable_thinking should be false for off")
+	}
+
+	// thinking_budget should be deleted
+	if _, ok := raw["thinking_budget"]; ok {
+		t.Error("thinking_budget should be deleted for off")
+	}
+}
+
+// unmarshalString is a test helper that extracts a string from json.RawMessage.
+func unmarshalString(t *testing.T, raw json.RawMessage) string {
+	t.Helper()
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		t.Fatalf("unmarshal string: %v (raw=%s)", err, string(raw))
+	}
+	return s
+}
