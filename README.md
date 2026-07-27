@@ -1,6 +1,6 @@
 # prism
 
-> 版本：v0.6.1  日期：2026-07-25  状态：动态文档
+> Version: v0.6.1  Date: 2026-07-25  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -137,8 +137,8 @@ systemctl kill -s HUP prism   # or restart
 
 MIT
 
-## 变更日志
+## Changelog
 
 - **2026-07-25** — v0.6.1 — fix: gofmt alignment, Non-Prim→Non-Prism typo, syncPIModelsJSON unmarshal-fail pc reset, atomic write (tmp+rename)
-- **2026-07-23** — v0.6.0 — /v1/models 返回 model_metadata（context_window/max_tokens/cost/think 等）、syncPIModelsJSON 改为 merge 不覆盖、config 新增 model_metadata 配置段
-- **2026-07-23** — v0.5.2 — provider 路由 (X-Prism-Provider)、磁盘模型缓存、prism setup 命令、probe 改为 GET /v1/models、model_remap_enabled 开关、credential 三层回退、清理 ProbeModel 死代码
+- **2026-07-23** — v0.6.0 — /v1/models returns model_metadata (context_window/max_tokens/cost/think etc.), syncPIModelsJSON changed to merge (no overwrite), config adds model_metadata section
+- **2026-07-23** — v0.5.2 — provider routing (X-Prism-Provider), disk model cache, prism setup command, probe changed to GET /v1/models, model_remap_enabled toggle, credential three-tier fallback, cleanup of ProbeModel dead code
