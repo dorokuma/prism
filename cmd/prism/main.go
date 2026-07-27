@@ -64,7 +64,7 @@ func main() {
 
 	// 后台异步填充缺失缓存，就位后同步 tools
 	mc.FetchAllAsync(func() {
-		mc.SyncTools(cfg)
+		mc.SyncTools(holder.Load())
 	})
 
 	// 启动 24h 后台刷新（刷新后也同步 tools）

@@ -131,9 +131,18 @@ func (mc *ModelCache) FetchAllAsync(onDone func()) {
 			continue
 		}
 		mc.mu.RLock()
-		_, exists := mc.caches[provider]
+		pc, exists := mc.caches[provider]
 		mc.mu.RUnlock()
-		if exists {
+		needsFetch := !exists
+		if exists && mc.cfg != nil && mc.cfg.EffortSchema(provider) == "ollama" && len(pc.Models) > 0 {
+			// Self-heal: old cache files (pre-Meta) have Models but nil/empty Meta.
+			// Force a Fetch so /api/show runs and populates Meta, without needing
+			// a manual SIGHUP. New caches (Meta present) are left untouched.
+			if pc.Meta == nil || len(pc.Meta) == 0 {
+				needsFetch = true
+			}
+		}
+		if !needsFetch {
 			continue
 		}
 		wg.Add(1)
@@ -405,11 +414,19 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 				prismManaged[k] = true
 			}
 		}
+		// Per-provider override entries may also declare extra keys.
+		for _, pp := range cfg.ModelMetadataPerProvider {
+			for _, cm := range pp {
+				for k := range cm.Extra {
+					prismManaged[k] = true
+				}
+			}
+		}
 
 		for _, m := range models {
 			existing := existingByID[m.ID] // may be nil
 			upMeta, _ := mc.GetModelMeta(provider, m.ID)
-			cfgMeta := cfg.ModelMetadata[m.ID]
+			cfgMeta, _ := cfg.LookupModelMetadata(provider, m.ID)
 			merged := mergeMeta(upMeta, cfgMeta)
 
 			entry := map[string]any{"id": m.ID}

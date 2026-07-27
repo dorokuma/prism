@@ -24,7 +24,7 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 		for i, id := range modelIDs {
 			data[i] = enrichModel(map[string]any{
 				"id": id, "object": "model", "created": 1700000000, "owned_by": "prism",
-			}, id, cfg)
+			}, "", id, cfg)
 		}
 		util.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 		slog.Debug("models returning (remap)", "count", len(modelIDs), "req", requestID, "duration_ms", time.Since(start).Milliseconds())
@@ -66,7 +66,7 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 		if meta, ok := mc.GetModelMeta(provider, m.ID); ok {
 			applyUpstreamMetaSnake(entry, meta)
 		}
-		data[i] = enrichModel(entry, m.ID, cfg)
+		data[i] = enrichModel(entry, provider, m.ID, cfg)
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	slog.Debug("models returning", "provider", provider, "count", len(models), "req", requestID, "duration_ms", time.Since(start).Milliseconds())
@@ -93,8 +93,8 @@ func applyUpstreamMetaSnake(entry map[string]any, meta cache.ModelMeta) {
 
 // enrichModel merges optional model_metadata from config into the response entry.
 // Extra fields are appended to the map; tools that don't understand them ignore them.
-func enrichModel(entry map[string]any, modelID string, cfg *config.Config) map[string]any {
-	meta, ok := cfg.ModelMetadata[modelID]
+func enrichModel(entry map[string]any, provider, modelID string, cfg *config.Config) map[string]any {
+	meta, ok := cfg.LookupModelMetadata(provider, modelID)
 	if !ok {
 		return entry
 	}

@@ -743,6 +743,74 @@ accounts:
 	}
 }
 
+// SetProviderSchemaForTest sets the unexported providerSchema map on a Config
+// so tests can exercise EffortSchema/provider-aware lookups without going
+// through LoadConfig (which derives the schema from account base_url hosts).
+func SetProviderSchemaForTest(c *Config, schema map[string]string) {
+	c.providerSchema = schema
+}
+
+func TestLookupModelMetadata_FallbackToDefault(t *testing.T) {
+	cfg := &Config{
+		ModelMetadata: ModelMetadataMap{
+			"glm-5.2": {ContextWindow: intPtr(1000000)},
+		},
+	}
+	// No per-provider layer: lookup for any provider falls back to default.
+	meta, ok := cfg.LookupModelMetadata("ollama-cloud", "glm-5.2")
+	if !ok {
+		t.Fatalf("expected glm-5.2 to be found via default fallback")
+	}
+	if meta.ContextWindow == nil || *meta.ContextWindow != 1000000 {
+		t.Fatalf("ContextWindow = %v, want 1000000", meta.ContextWindow)
+	}
+	// Unknown model: not found.
+	if _, ok := cfg.LookupModelMetadata("ollama-cloud", "nope"); ok {
+		t.Fatalf("expected unknown model to be not found")
+	}
+}
+
+func TestLookupModelMetadata_PerProviderReplacesDefault(t *testing.T) {
+	cfg := &Config{
+		ModelMetadata: ModelMetadataMap{
+			// default layer: deepseek-v4-pro = 1M context
+			"deepseek-v4-pro": {ContextWindow: intPtr(1000000)},
+		},
+		ModelMetadataPerProvider: map[string]ModelMetadataMap{
+			"ollama-cloud": {
+				// per-provider override: entry present but context_window omitted
+				// (nil) → full replacement of the default entry. The nil
+				// ContextWindow must NOT become the default 1M.
+				"deepseek-v4-pro": {Reasoning: boolPtr(true)},
+			},
+		},
+	}
+
+	// ollama-cloud: per-provider entry fully replaces default → no ContextWindow.
+	meta, ok := cfg.LookupModelMetadata("ollama-cloud", "deepseek-v4-pro")
+	if !ok {
+		t.Fatalf("expected per-provider deepseek-v4-pro to be found")
+	}
+	if meta.ContextWindow != nil {
+		t.Fatalf("per-provider ContextWindow = %v, want nil (full replace, not merge)", *meta.ContextWindow)
+	}
+	if meta.Reasoning == nil || *meta.Reasoning != true {
+		t.Fatalf("per-provider Reasoning = %v, want true", meta.Reasoning)
+	}
+
+	// opencode-go: no per-provider entry → default layer wins (1M).
+	meta2, ok := cfg.LookupModelMetadata("opencode-go", "deepseek-v4-pro")
+	if !ok {
+		t.Fatalf("expected default deepseek-v4-pro to be found for opencode-go")
+	}
+	if meta2.ContextWindow == nil || *meta2.ContextWindow != 1000000 {
+		t.Fatalf("opencode-go ContextWindow = %v, want 1000000 (default fallback)", meta2.ContextWindow)
+	}
+}
+
+func intPtr(i int) *int    { return &i }
+func boolPtr(b bool) *bool { return &b }
+
 func TestEffortSchema_Ollama(t *testing.T) {
 	cfg := loadProviderSchemaCfg(t)
 	if got := cfg.EffortSchema("ollama-cloud"); got != "ollama" {

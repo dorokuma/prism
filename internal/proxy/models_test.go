@@ -50,7 +50,8 @@ func findModel(data []map[string]any, id string) map[string]any {
 	return nil
 }
 
-func intPtr(i int) *int { return &i }
+func intPtr(i int) *int    { return &i }
+func boolPtr(b bool) *bool { return &b }
 
 // TestProxyModels_ReturnsUpstreamMeta verifies /v1/models returns upstream
 // metadata in snake_case when present, even without config metadata.
@@ -132,7 +133,97 @@ func TestProxyModels_ConfigOverridesUpstream(t *testing.T) {
 	}
 }
 
-// TestProxyModels_NoProviderHeader_Empty is a regression: without the
+// TestProxyModels_PerProviderNoCrossTalk verifies the same model resolved via
+// different providers gets different metadata (T2): ollama-cloud deepseek-v4-pro
+// reports upstream 512K (no per-provider context_window override), while
+// opencode-go deepseek-v4-pro reports the default 1M config value.
+func TestProxyModels_PerProviderNoCrossTalk(t *testing.T) {
+	providers := []string{"ollama-cloud", "opencode-go"}
+	caches := map[string]*cache.ModelCache{}
+	for _, p := range providers {
+		caches[p] = newModelCacheWithMeta(t, p,
+			[]cache.ModelEntry{{ID: "deepseek-v4-pro", Object: "model", Created: 1, OwnedBy: p}},
+			map[string]cache.ModelMeta{"deepseek-v4-pro": {ContextWindow: intPtr(512000)}},
+		)
+	}
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a", Provider: "ollama-cloud", BaseURL: "https://ollama.com/v1"},
+			{Name: "b", Provider: "opencode-go", BaseURL: "https://opencode.ai/zen"},
+		},
+		ModelMetadata: config.ModelMetadataMap{
+			"deepseek-v4-pro": {ContextWindow: intPtr(1000000)},
+		},
+		ModelMetadataPerProvider: map[string]config.ModelMetadataMap{
+			"ollama-cloud": {
+				"deepseek-v4-pro": {Reasoning: boolPtr(true)},
+			},
+		},
+	}
+
+	for _, p := range providers {
+		r := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		r.Header.Set("X-Prism-Provider", p)
+		w := httptest.NewRecorder()
+		proxyModels(caches[p], w, r, cfg)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("provider %s: status = %d, want 200", p, w.Code)
+		}
+		var resp struct {
+			Data []map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("provider %s: decode: %v", p, err)
+		}
+		m := findModel(resp.Data, "deepseek-v4-pro")
+		if m == nil {
+			t.Fatalf("provider %s: deepseek-v4-pro not in response", p)
+		}
+		cw, ok := m["context_window"].(float64)
+		if !ok {
+			t.Fatalf("provider %s: context_window missing: %v", p, m)
+		}
+		want := 512000
+		if p == "opencode-go" {
+			want = 1000000
+		}
+		if int(cw) != want {
+			t.Fatalf("provider %s: context_window = %v, want %d", p, int(cw), want)
+		}
+	}
+}
+
+// TestEnrichModel_EmptyProviderFallsBackToDefault verifies enrichModel with an
+// empty provider string uses the default layer, while a concrete provider uses
+// its per-provider override.
+func TestEnrichModel_EmptyProviderFallsBackToDefault(t *testing.T) {
+	cfg := &config.Config{
+		ModelMetadata: config.ModelMetadataMap{
+			"deepseek-v4-pro": {ContextWindow: intPtr(1000000)},
+		},
+		ModelMetadataPerProvider: map[string]config.ModelMetadataMap{
+			"ollama-cloud": {
+				"deepseek-v4-pro": {ContextWindow: intPtr(512000)},
+			},
+		},
+	}
+
+	// Empty provider → default layer (1M).
+	empty := enrichModel(map[string]any{"id": "deepseek-v4-pro"}, "", "deepseek-v4-pro", cfg)
+	cw, ok := empty["context_window"].(int)
+	if !ok || cw != 1000000 {
+		t.Fatalf("empty provider context_window = %v (%T), want 1000000 (default)", empty["context_window"], empty["context_window"])
+	}
+
+	// Concrete provider ollama-cloud → per-provider override (512K).
+	withP := enrichModel(map[string]any{"id": "deepseek-v4-pro"}, "ollama-cloud", "deepseek-v4-pro", cfg)
+	pcw, ok := withP["context_window"].(int)
+	if !ok || pcw != 512000 {
+		t.Fatalf("ollama-cloud context_window = %v (%T), want 512000 (per-provider)", withP["context_window"], withP["context_window"])
+	}
+}
+
 // X-Prism-Provider header, an empty list is returned.
 func TestProxyModels_NoProviderHeader_Empty(t *testing.T) {
 	mc := newModelCacheWithMeta(t, "p",

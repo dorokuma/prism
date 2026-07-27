@@ -53,25 +53,26 @@ type AccountConfig struct {
 
 // Config holds the top-level application configuration loaded from a YAML file.
 type Config struct {
-	Listen                  string              `yaml:"listen"`
-	ProbeInterval           time.Duration       `yaml:"probe_interval"`
-	WireAPI                 string              `yaml:"wire_api"`
-	Accounts                []AccountConfig     `yaml:"accounts"`
-	ModelRemapEnabled       bool                `yaml:"model_remap_enabled"`
-	ModelRemap              map[string]string   `yaml:"model_remap"`
-	ModelTiers              map[string]string   `yaml:"model_tiers"`
-	DefaultTier             string              `yaml:"default_tier"`
-	StripFields             map[string][]string `yaml:"strip_fields"`
-	Debug                   bool                `yaml:"debug"`
-	MCPToolsJSON            string              `yaml:"mcp_tools_json"`
-	AuthToken               string              `yaml:"auth_token,omitempty"`
-	TLSCertFile             string              `yaml:"tls_cert_file,omitempty"`
-	TLSKeyFile              string              `yaml:"tls_key_file,omitempty"`
-	TrustedProxies          []string            `yaml:"trusted_proxies,omitempty"`
-	Tools                   map[string]string   `yaml:"tools,omitempty"`
-	ModelMetadata           ModelMetadataMap    `yaml:"model_metadata,omitempty"`
-	LogLevel                string              `yaml:"log_level"`
-	MaxConcurrentPerAccount map[string]int      `yaml:"max_concurrent_per_account"`
+	Listen                   string                      `yaml:"listen"`
+	ProbeInterval            time.Duration               `yaml:"probe_interval"`
+	WireAPI                  string                      `yaml:"wire_api"`
+	Accounts                 []AccountConfig             `yaml:"accounts"`
+	ModelRemapEnabled        bool                        `yaml:"model_remap_enabled"`
+	ModelRemap               map[string]string           `yaml:"model_remap"`
+	ModelTiers               map[string]string           `yaml:"model_tiers"`
+	DefaultTier              string                      `yaml:"default_tier"`
+	StripFields              map[string][]string         `yaml:"strip_fields"`
+	Debug                    bool                        `yaml:"debug"`
+	MCPToolsJSON             string                      `yaml:"mcp_tools_json"`
+	AuthToken                string                      `yaml:"auth_token,omitempty"`
+	TLSCertFile              string                      `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile               string                      `yaml:"tls_key_file,omitempty"`
+	TrustedProxies           []string                    `yaml:"trusted_proxies,omitempty"`
+	Tools                    map[string]string           `yaml:"tools,omitempty"`
+	ModelMetadata            ModelMetadataMap            `yaml:"model_metadata,omitempty"`
+	ModelMetadataPerProvider map[string]ModelMetadataMap `yaml:"model_metadata_per_provider,omitempty"`
+	LogLevel                 string                      `yaml:"log_level"`
+	MaxConcurrentPerAccount  map[string]int              `yaml:"max_concurrent_per_account"`
 
 	// providerSchema maps a provider name to its effort schema ("ollama" or
 	// empty for opencode). Precomputed from account base_url hosts at load time.
@@ -209,6 +210,28 @@ func buildProviderSchema(accs []AccountConfig) map[string]string {
 func isOllamaHost(baseURL string) bool {
 	u, err := url.Parse(baseURL)
 	return err == nil && strings.HasSuffix(u.Host, "ollama.com")
+}
+
+// LookupModelMetadata resolves per-model metadata for (provider, model).
+// It first checks the per-provider override layer ModelMetadataPerProvider;
+// if an entry exists there it is returned in full (replacing the default
+// entry). Otherwise it falls back to the default ModelMetadata layer. The
+// boolean reports whether any entry was found. A per-provider entry fully
+// replaces the default entry (it is NOT field-merged): this is what keeps a
+// model in one provider from inheriting the default layer's fields (which
+// would otherwise cause cross-provider crosstalk, e.g. a 1M context_window
+// from the default layer leaking into a provider whose upstream reports 512K).
+func (c *Config) LookupModelMetadata(provider, model string) (ModelMetadata, bool) {
+	if c == nil {
+		return ModelMetadata{}, false
+	}
+	if pp, ok := c.ModelMetadataPerProvider[provider]; ok {
+		if meta, ok := pp[model]; ok {
+			return meta, true
+		}
+	}
+	meta, ok := c.ModelMetadata[model]
+	return meta, ok
 }
 
 // EffortSchema returns the effort-mapping schema for the given provider
