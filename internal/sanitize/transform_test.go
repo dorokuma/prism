@@ -23,12 +23,12 @@ func assertBodyUnchanged(t *testing.T, got, body []byte) {
 // ── Message role normalization tests ──────────────────────────────────
 
 // TestTransformRequestBody_DevRoleToSystem verifies that a message with
-// role:"developer" is rewritten to role:"system" while every other field
-// (including non-developer roles) is preserved verbatim.
+// role:"developer" is rewritten to role:"system" for ollama-schema providers
+// while every other field (including non-developer roles) is preserved verbatim.
 func TestTransformRequestBody_DevRoleToSystem(t *testing.T) {
-	cfg := &config.Config{}
-	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"developer","content":"You are a helpful assistant."},{"role":"user","content":"hi"}]}`)
-	got := sanitize.TransformRequestBody(body, cfg)
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"developer","content":"You are a helpful assistant."},{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "ollama-cloud")
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(got, &raw); err != nil {
@@ -54,12 +54,33 @@ func TestTransformRequestBody_DevRoleToSystem(t *testing.T) {
 	}
 }
 
+// TestTransformRequestBody_DevRoleNotChangedOnOpencode verifies that
+// role:"developer" is NOT rewritten for opencode-schema providers (they may
+// support the developer role natively).
+func TestTransformRequestBody_DevRoleNotChangedOnOpencode(t *testing.T) {
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"developer","content":"sys"},{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "opencode-go")
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	var messages []map[string]any
+	if err := json.Unmarshal(raw["messages"], &messages); err != nil {
+		t.Fatalf("unmarshal messages: %v", err)
+	}
+	if role, _ := messages[0]["role"].(string); role != "developer" {
+		t.Errorf("messages[0].role = %q, want developer (unchanged on opencode)", role)
+	}
+}
+
 // TestTransformRequestBody_NoDevRole_NoChange verifies that when no message has
 // role:"developer", the body is returned unchanged (same slice identity).
 func TestTransformRequestBody_NoDevRole_NoChange(t *testing.T) {
-	cfg := &config.Config{}
-	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}]}`)
-	got := sanitize.TransformRequestBody(body, cfg)
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "ollama-cloud")
 	assertBodyUnchanged(t, got, body)
 }
 

@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.9.1  Date: 2026-07-27  Status: living document
+> Version: v0.9.2  Date: 2026-07-27  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -139,6 +139,7 @@ MIT
 
 ## Changelog
 
+- **2026-07-27** — v0.9.2 — fix: TransformRequestBodyForProvider normalizes `role:developer` → `role:system` in /v1/chat/completions, gated to ollama-schema providers only (Ollama silently drops developer-role content, causing SYSTEM.md/AGENTS.md loss for reasoning models with auto-detected supportsDeveloperRole=true; opencode-schema providers unaffected)
 - **2026-07-27** — v0.9.1 — fix: TransformRequestBodyForProvider now normalizes `role:developer` → `role:system` in /v1/chat/completions messages (Ollama silently drops developer-role content, causing SYSTEM.md/AGENTS.md to be lost for reasoning models auto-detected as supportsDeveloperRole=true)
 - **2026-07-27** — v0.9.0 — feat: startup auto-fetch ollama /api/show (self-heal old cache without Meta, no manual SIGHUP) + provider-scoped model_metadata (default + per-provider override layer, same model no crosstalk across providers, e.g. deepseek-v4-pro ollama upstream 512K vs opencode-go config 1M)
 - **2026-07-27** — v0.8.0 — feat: model metadata single source of truth — fetch from upstream (ollama /api/show for context_length) + config model_metadata field-level override, syncPIModelsJSON rewrites existing models too (fixes glm-5.2 128k→1M), /v1/models returns upstream+config merged metadata, cache ModelMeta + providerCache.Meta
