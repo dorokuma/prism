@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,6 +72,10 @@ type Config struct {
 	ModelMetadata           ModelMetadataMap    `yaml:"model_metadata,omitempty"`
 	LogLevel                string              `yaml:"log_level"`
 	MaxConcurrentPerAccount map[string]int      `yaml:"max_concurrent_per_account"`
+
+	// providerSchema maps a provider name to its effort schema ("ollama" or
+	// empty for opencode). Precomputed from account base_url hosts at load time.
+	providerSchema map[string]string
 }
 
 // LoadConfig reads a YAML config file, unmarshals it into Config, applies
@@ -161,6 +166,8 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("trusted_proxies: invalid CIDR %q: %v", s, err)
 		}
 	}
+	// Precompute the provider → effort schema map from account base_url hosts.
+	cfg.providerSchema = buildProviderSchema(cfg.Accounts)
 	// Startup validation: warn if GLM/z-ai upstreams lack prompt_cache_retention in strip_fields
 	for tier, upstream := range cfg.ModelTiers {
 		upstreamLower := strings.ToLower(upstream)
@@ -179,6 +186,39 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+func buildProviderSchema(accs []AccountConfig) map[string]string {
+	m := map[string]string{}
+	for _, a := range accs {
+		if a.Provider == "" {
+			continue
+		}
+		if _, ok := m[a.Provider]; ok {
+			continue
+		}
+		if isOllamaHost(a.BaseURL) {
+			m[a.Provider] = "ollama"
+		} else {
+			m[a.Provider] = ""
+		}
+	}
+	return m
+}
+
+func isOllamaHost(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	return err == nil && strings.HasSuffix(u.Host, "ollama.com")
+}
+
+// EffortSchema returns the effort-mapping schema for the given provider
+// ("ollama" for ollama-cloud hosts, empty string for opencode). An empty or
+// unconfigured provider defaults to the opencode schema.
+func (c *Config) EffortSchema(provider string) string {
+	if c == nil || provider == "" {
+		return ""
+	}
+	return c.providerSchema[provider]
 }
 
 // RemapModel resolves a virtual model name to its upstream model via

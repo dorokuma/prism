@@ -743,6 +743,58 @@ accounts:
 	}
 }
 
+func TestEffortSchema_Ollama(t *testing.T) {
+	cfg := loadProviderSchemaCfg(t)
+	if got := cfg.EffortSchema("ollama-cloud"); got != "ollama" {
+		t.Errorf("EffortSchema(ollama-cloud)=%q, want ollama", got)
+	}
+}
+
+func TestEffortSchema_Opencode(t *testing.T) {
+	cfg := loadProviderSchemaCfg(t)
+	if got := cfg.EffortSchema("opencode-go"); got != "" {
+		t.Errorf("EffortSchema(opencode-go)=%q, want empty (opencode)", got)
+	}
+}
+
+func TestEffortSchema_EmptyProvider(t *testing.T) {
+	cfg := loadProviderSchemaCfg(t)
+	if got := cfg.EffortSchema(""); got != "" {
+		t.Errorf("EffortSchema(\"\")=%q, want empty", got)
+	}
+}
+
+func loadProviderSchemaCfg(t *testing.T) *Config {
+	t.Helper()
+	content := `
+providers:
+  ollama-cloud:
+    accounts:
+      - name: ollama-acc
+        key: test-key-12345
+        base_url: https://ollama.com/v1
+  opencode-go:
+    accounts:
+      - name: opencode-acc
+        key: test-key-12345
+        base_url: https://opencode.ai/zen
+`
+	f, err := os.CreateTemp("", "cfg-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cfg, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	return cfg
+}
+
 func TestReloadConfig_OldConfigPreservedOnError(t *testing.T) {
 	content1 := `
 listen: 127.0.0.1:8080

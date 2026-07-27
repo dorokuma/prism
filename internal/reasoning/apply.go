@@ -9,10 +9,16 @@ import (
 )
 
 // Apply examines the reasoning-effort / thinking.level fields in raw and
-// applies the mapping rules for the given upstream model. It returns true
-// if the raw map was modified.
+// applies the mapping rules for the given upstream model using the default
+// opencode schema. It returns true if the raw map was modified.
 func Apply(raw map[string]json.RawMessage, model string) bool {
-	p := ProfileFor(model)
+	return ApplyWithSchema(raw, model, SchemaOpencode)
+}
+
+// ApplyWithSchema is like Apply but selects the profile table via schema
+// (see reasoning.Schema*). It returns true if the raw map was modified.
+func ApplyWithSchema(raw map[string]json.RawMessage, model, schema string) bool {
+	p := ProfileFor(model, schema)
 
 	if p.Form == FormNone {
 		return stripAll(raw)
@@ -39,11 +45,27 @@ func Apply(raw map[string]json.RawMessage, model string) bool {
 	if level == "off" {
 		switch p.Form {
 		case FormEnum:
-			for _, f := range p.EnumFields {
-				deleteNestedField(raw, f)
+			if p.OffValue != "" {
+				// ollama: off → write OffValue (keep field, do not touch toggle)
+				for _, f := range p.EnumFields {
+					setNestedField(raw, f, p.OffValue)
+				}
+				if p.ForceOn {
+					slog.Warn("model does not support disabling thinking, forcing",
+						"model", model, "forced", p.OffValue)
+				}
+			} else {
+				// opencode: delete enum fields + toggle off (original behaviour)
+				for _, f := range p.EnumFields {
+					deleteNestedField(raw, f)
+				}
+				if p.ToggleField != "" {
+					setNestedField(raw, p.ToggleField, p.ToggleOff)
+				}
 			}
-			if p.ToggleField != "" {
-				setNestedField(raw, p.ToggleField, p.ToggleOff)
+			// Clean up the abstract entry field not consumed by this profile.
+			if !sliceContains(p.EnumFields, "thinking.level") {
+				deleteNestedField(raw, "thinking.level")
 			}
 			changed = true
 

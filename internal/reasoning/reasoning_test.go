@@ -2,6 +2,7 @@ package reasoning
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/dorokuma/prism/internal/util"
@@ -11,7 +12,7 @@ import (
 
 func TestProfileFor_Order(t *testing.T) {
 	t.Run("glm-5.2 not swallowed by glm-5", func(t *testing.T) {
-		p := ProfileFor("glm-5.2-v2")
+		p := ProfileForModel("glm-5.2-v2")
 		if p.Form != FormEnum {
 			t.Fatalf("glm-5.2: got Form=%s, want enum", p.Form)
 		}
@@ -22,14 +23,14 @@ func TestProfileFor_Order(t *testing.T) {
 	})
 
 	t.Run("glm-5 falls to toggle", func(t *testing.T) {
-		p := ProfileFor("glm-5")
+		p := ProfileForModel("glm-5")
 		if p.Form != FormToggle {
 			t.Fatalf("glm-5: got Form=%s, want toggle", p.Form)
 		}
 	})
 
 	t.Run("minimax-m2.7 not mis-matched", func(t *testing.T) {
-		p := ProfileFor("minimax-m2.7")
+		p := ProfileForModel("minimax-m2.7")
 		if p.Form != FormToggle {
 			t.Fatalf("minimax-m2.7: got Form=%s, want toggle", p.Form)
 		}
@@ -42,7 +43,7 @@ func TestProfileFor_Order(t *testing.T) {
 	})
 
 	t.Run("minimax-m3 is toggle switchable", func(t *testing.T) {
-		p := ProfileFor("minimax-m3")
+		p := ProfileForModel("minimax-m3")
 		if p.Form != FormToggle {
 			t.Fatalf("minimax-m3: got Form=%s, want toggle", p.Form)
 		}
@@ -52,7 +53,7 @@ func TestProfileFor_Order(t *testing.T) {
 	})
 
 	t.Run("mimo- not confused with minimax", func(t *testing.T) {
-		p := ProfileFor("mimo-v2.5")
+		p := ProfileForModel("mimo-v2.5")
 		if p.Form != FormToggle {
 			t.Fatalf("mimo-v2.5: got Form=%s, want toggle", p.Form)
 		}
@@ -62,7 +63,7 @@ func TestProfileFor_Order(t *testing.T) {
 	})
 
 	t.Run("deepseek prefix", func(t *testing.T) {
-		p := ProfileFor("deepseek-v4-pro")
+		p := ProfileForModel("deepseek-v4-pro")
 		if p.Form != FormEnum {
 			t.Fatalf("deepseek: got Form=%s, want enum", p.Form)
 		}
@@ -72,7 +73,7 @@ func TestProfileFor_Order(t *testing.T) {
 	})
 
 	t.Run("qwen3.7-plus is budget", func(t *testing.T) {
-		p := ProfileFor("qwen3.7-plus-v1")
+		p := ProfileForModel("qwen3.7-plus-v1")
 		if p.Form != FormBudget {
 			t.Fatalf("qwen3.7-plus: got Form=%s, want budget", p.Form)
 		}
@@ -82,7 +83,7 @@ func TestProfileFor_Order(t *testing.T) {
 	})
 
 	t.Run("qwen3.6-plus budget 81920 not 262144", func(t *testing.T) {
-		p := ProfileFor("qwen3.6-plus")
+		p := ProfileForModel("qwen3.6-plus")
 		if p.BudgetMax != 81920 {
 			t.Errorf("qwen3.6-plus BudgetMax=%d, want 81920", p.BudgetMax)
 		}
@@ -90,17 +91,17 @@ func TestProfileFor_Order(t *testing.T) {
 }
 
 func TestProfileFor_Unknown(t *testing.T) {
-	p := ProfileFor("grok-4.5")
+	p := ProfileForModel("grok-4.5")
 	if p.Form != FormNone {
 		t.Errorf("grok-4.5: got Form=%s, want none", p.Form)
 	}
 
-	p = ProfileFor("")
+	p = ProfileForModel("")
 	if p.Form != FormNone {
 		t.Errorf("empty: got Form=%s, want none", p.Form)
 	}
 
-	p = ProfileFor("non-existent-model-123")
+	p = ProfileForModel("non-existent-model-123")
 	if p.Form != FormNone {
 		t.Errorf("unknown: got Form=%s, want none", p.Form)
 	}
@@ -451,5 +452,229 @@ func TestApply_FormNone_NoFields(t *testing.T) {
 	changed := Apply(raw, "grok-4.5")
 	if changed {
 		t.Error("no thinking fields → no change")
+	}
+}
+
+// ── ProfileFor: ollama schema ───────────────────────────────────────
+
+func TestProfileFor_Ollama_GLM52(t *testing.T) {
+	p := ProfileFor("glm-5.2", SchemaOllama)
+	if p.Form != FormEnum {
+		t.Fatalf("glm-5.2 ollama: got Form=%s, want enum", p.Form)
+	}
+	if p.EffortMap["xhigh"] != "max" {
+		t.Errorf("glm-5.2 ollama EffortMap[xhigh]=%q, want max", p.EffortMap["xhigh"])
+	}
+	if p.ToggleField != "" {
+		t.Errorf("glm-5.2 ollama ToggleField=%q, want empty", p.ToggleField)
+	}
+	if p.OffValue != "none" {
+		t.Errorf("glm-5.2 ollama OffValue=%q, want none", p.OffValue)
+	}
+}
+
+func TestProfileFor_Ollama_Qwen3VL_Before_Qwen3(t *testing.T) {
+	pVL := ProfileFor("qwen3-vl", SchemaOllama)
+	if !pVL.ForceOn {
+		t.Error("qwen3-vl should have ForceOn=true (NO_OFF)")
+	}
+	if pVL.OffValue != "low" {
+		t.Errorf("qwen3-vl OffValue=%q, want low", pVL.OffValue)
+	}
+	if pVL.EffortMap["xhigh"] != "max" {
+		t.Errorf("qwen3-vl EffortMap[xhigh]=%q, want max", pVL.EffortMap["xhigh"])
+	}
+
+	pQ := ProfileFor("qwen3", SchemaOllama)
+	if pQ.ForceOn {
+		t.Error("qwen3 should have ForceOn=false (binary)")
+	}
+	if pQ.EffortMap["low"] != "medium" {
+		t.Errorf("qwen3 EffortMap[low]=%q, want medium", pQ.EffortMap["low"])
+	}
+	if pQ.EffortMap["xhigh"] != "medium" {
+		t.Errorf("qwen3 EffortMap[xhigh]=%q, want medium (binary clamps to medium)", pQ.EffortMap["xhigh"])
+	}
+	if pQ.OffValue != "none" {
+		t.Errorf("qwen3 OffValue=%q, want none", pQ.OffValue)
+	}
+}
+
+func TestProfileFor_Ollama_Default_Fallback(t *testing.T) {
+	p := ProfileFor("deepseek-v4-pro", SchemaOllama)
+	if p.Form != FormEnum {
+		t.Fatalf("ollama default: got Form=%s, want enum (not FormNone)", p.Form)
+	}
+	if p.DeepSeekCompat {
+		t.Error("ollama deepseek-v4-pro should NOT use DeepSeekCompat (uses default ollama profile)")
+	}
+	if p.OffValue != "none" {
+		t.Errorf("ollama default OffValue=%q, want none", p.OffValue)
+	}
+}
+
+func TestProfileFor_NonCrosstalk_SameModel(t *testing.T) {
+	opencodeGLM := ProfileFor("glm-5.2", SchemaOpencode)
+	ollamaGLM := ProfileFor("glm-5.2", SchemaOllama)
+	if opencodeGLM.ToggleField == ollamaGLM.ToggleField {
+		t.Error("glm-5.2 should differ across schemas (toggle field)")
+	}
+	if opencodeGLM.ToggleField != "thinking.type" {
+		t.Errorf("opencode glm-5.2 ToggleField=%q, want thinking.type", opencodeGLM.ToggleField)
+	}
+	if ollamaGLM.ToggleField != "" {
+		t.Errorf("ollama glm-5.2 ToggleField=%q, want empty", ollamaGLM.ToggleField)
+	}
+
+	opencodeDS := ProfileFor("deepseek-v4-pro", SchemaOpencode)
+	ollamaDS := ProfileFor("deepseek-v4-pro", SchemaOllama)
+	if !opencodeDS.DeepSeekCompat {
+		t.Error("opencode deepseek-v4-pro should have DeepSeekCompat=true")
+	}
+	if ollamaDS.DeepSeekCompat {
+		t.Error("ollama deepseek-v4-pro should have DeepSeekCompat=false")
+	}
+}
+
+// ── Apply: ollama schema ────────────────────────────────────────────
+
+func TestApply_Ollama_GLM52_Xhigh(t *testing.T) {
+	raw := rawFromJSON(t, `{"reasoning_effort":"xhigh"}`)
+	changed := ApplyWithSchema(raw, "glm-5.2", SchemaOllama)
+	if !changed {
+		t.Fatal("expected change")
+	}
+	if got := strField(t, raw, "reasoning_effort"); got != "max" {
+		t.Errorf("reasoning_effort=%q, want max", got)
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Error("ollama glm-5.2 should not set thinking.type")
+	}
+}
+
+func TestApply_Ollama_GLM52_Off(t *testing.T) {
+	raw := rawFromJSON(t, `{"reasoning_effort":"off"}`)
+	changed := ApplyWithSchema(raw, "glm-5.2", SchemaOllama)
+	if !changed {
+		t.Fatal("expected change")
+	}
+	// off → reasoning_effort=none (set value, not delete)
+	if got := strField(t, raw, "reasoning_effort"); got != "none" {
+		t.Errorf("reasoning_effort=%q, want none (set value, not delete)", got)
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Error("ollama glm-5.2 should not set thinking.type")
+	}
+}
+
+func TestApply_Ollama_GLM52_LowClampsUp(t *testing.T) {
+	raw := rawFromJSON(t, `{"reasoning_effort":"low"}`)
+	changed := ApplyWithSchema(raw, "glm-5.2", SchemaOllama)
+	if !changed {
+		t.Fatal("expected change")
+	}
+	// glm-5.2 only exposes off/high/max; low/med clamp up to high (keeps thinking on)
+	if got := strField(t, raw, "reasoning_effort"); got != "high" {
+		t.Errorf("reasoning_effort=%q, want high (clamp up, keep thinking)", got)
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Error("ollama glm-5.2 should not set thinking.type")
+	}
+}
+
+func TestApply_Ollama_GPTOSS_OffForceOn(t *testing.T) {
+	raw := rawFromJSON(t, `{"reasoning_effort":"off"}`)
+	changed := ApplyWithSchema(raw, "gpt-oss", SchemaOllama)
+	if !changed {
+		t.Fatal("expected change")
+	}
+	// off → low (set value, not delete) + Warn
+	if got := strField(t, raw, "reasoning_effort"); got != "low" {
+		t.Errorf("gpt-oss off: reasoning_effort=%q, want low", got)
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Error("ollama gpt-oss should not set thinking.type")
+	}
+
+	raw2 := rawFromJSON(t, `{"reasoning_effort":"xhigh"}`)
+	if !ApplyWithSchema(raw2, "gpt-oss", SchemaOllama) {
+		t.Fatal("expected change")
+	}
+	// xhigh clamped to high (no max exposed)
+	if got := strField(t, raw2, "reasoning_effort"); got != "high" {
+		t.Errorf("gpt-oss xhigh: reasoning_effort=%q, want high (clamp)", got)
+	}
+}
+
+func TestApply_Ollama_Qwen3_Binary(t *testing.T) {
+	cases := map[string]string{
+		"off":    "none",
+		"low":    "medium",
+		"medium": "medium",
+		"high":   "medium",
+		"xhigh":  "medium",
+	}
+	for in, want := range cases {
+		raw := rawFromJSON(t, fmt.Sprintf(`{"reasoning_effort":%q}`, in))
+		if !ApplyWithSchema(raw, "qwen3", SchemaOllama) {
+			t.Fatalf("qwen3 %s: expected change", in)
+		}
+		if got := strField(t, raw, "reasoning_effort"); got != want {
+			t.Errorf("qwen3 %s: reasoning_effort=%q, want %q", in, got, want)
+		}
+		if _, ok := raw["thinking"]; ok {
+			t.Errorf("qwen3 %s: ollama should not set thinking.type", in)
+		}
+	}
+}
+
+func TestApply_Ollama_KimiK2Thinking_OffForceOn(t *testing.T) {
+	raw := rawFromJSON(t, `{"reasoning_effort":"off"}`)
+	changed := ApplyWithSchema(raw, "kimi-k2-thinking", SchemaOllama)
+	if !changed {
+		t.Fatal("expected change")
+	}
+	// off → low (set value) + Warn
+	if got := strField(t, raw, "reasoning_effort"); got != "low" {
+		t.Errorf("kimi-k2-thinking off: reasoning_effort=%q, want low", got)
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Error("ollama kimi-k2-thinking should not set thinking.type")
+	}
+}
+
+func TestApply_Ollama_Default_DeepSeek(t *testing.T) {
+	// deepseek-v4-pro under ollama schema uses the DEFAULT profile:
+	// xhigh → max (reasoning_effort only), off → none; no thinking.type.
+	raw := rawFromJSON(t, `{"reasoning_effort":"xhigh"}`)
+	if !ApplyWithSchema(raw, "deepseek-v4-pro", SchemaOllama) {
+		t.Fatal("expected change")
+	}
+	if got := strField(t, raw, "reasoning_effort"); got != "max" {
+		t.Errorf("ollama deepseek xhigh: reasoning_effort=%q, want max", got)
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Error("ollama deepseek should not set thinking.type")
+	}
+
+	raw2 := rawFromJSON(t, `{"reasoning_effort":"off"}`)
+	if !ApplyWithSchema(raw2, "deepseek-v4-pro", SchemaOllama) {
+		t.Fatal("expected change")
+	}
+	if got := strField(t, raw2, "reasoning_effort"); got != "none" {
+		t.Errorf("ollama deepseek off: reasoning_effort=%q, want none", got)
+	}
+}
+
+func TestApply_Ollama_ThinkingLevelPath(t *testing.T) {
+	raw := rawFromJSON(t, `{"thinking":{"level":"high"}}`)
+	if !ApplyWithSchema(raw, "glm-5.2", SchemaOllama) {
+		t.Fatal("expected change")
+	}
+	if got := strField(t, raw, "reasoning_effort"); got != "high" {
+		t.Errorf("reasoning_effort=%q, want high", got)
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Error("ollama should not keep thinking object (no thinking.type)")
 	}
 }

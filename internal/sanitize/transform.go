@@ -15,6 +15,14 @@ import (
 // (per config) in a single JSON parse/marshal pass.
 // Returns the original body unchanged if no transformation was needed.
 func TransformRequestBody(body []byte, cfg *config.Config) []byte {
+	return TransformRequestBodyForProvider(body, cfg, "")
+}
+
+// TransformRequestBodyForProvider is like TransformRequestBody but selects the
+// effort schema via the upstream provider (read from the X-Prism-Provider
+// header by the caller). The provider is used to choose between the opencode
+// and ollama profile tables. An empty provider selects the opencode table.
+func TransformRequestBodyForProvider(body []byte, cfg *config.Config, provider string) []byte {
 	if cfg == nil {
 		return body
 	}
@@ -38,7 +46,8 @@ func TransformRequestBody(body []byte, cfg *config.Config) []byte {
 	}
 
 	// Step 2: Reasoning effort / thinking mapping for all models
-	if reasoning.Apply(raw, model) {
+	schema := cfg.EffortSchema(provider)
+	if reasoning.ApplyWithSchema(raw, model, schema) {
 		changed = true
 	}
 

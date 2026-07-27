@@ -68,9 +68,13 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		middleware.EmitAudit(aud)
 	}()
 
-	if cfg.ModelRemapEnabled {
-		bodyBytes = sanitize.TransformRequestBody(bodyBytes, cfg)
-	}
+	// Read the upstream provider up front so it can be reused both for the
+	// effort-mapping transform and for account selection (SelectByProvider).
+	// It selects the effort schema (opencode vs ollama).
+	provider := r.Header.Get("X-Prism-Provider")
+	// Transform now always runs; model remap inside is still gated by
+	// cfg.ModelRemapEnabled (real model name passes through when disabled).
+	bodyBytes = sanitize.TransformRequestBodyForProvider(bodyBytes, cfg, provider)
 	if p.AccountCount() == 0 {
 		aud.Error = "no accounts configured"
 		aud.ErrorType = "config_error"
@@ -90,7 +94,6 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 
 		selectCtx, cancel := context.WithTimeout(context.Background(), config.AccountSelectTimeout)
 		selectStart := time.Now()
-		provider := r.Header.Get("X-Prism-Provider")
 		acc, err := p.SelectByProvider(selectCtx, maxConcurrent, provider)
 		selectDuration := time.Since(selectStart).Milliseconds()
 		cancel()

@@ -2,6 +2,7 @@ package sanitize_test
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/dorokuma/prism/internal/config"
@@ -797,6 +798,186 @@ func TestTransformRequestBody_Qwen_Off_StripsBudget(t *testing.T) {
 	// thinking_budget should be deleted
 	if _, ok := raw["thinking_budget"]; ok {
 		t.Error("thinking_budget should be deleted for off")
+	}
+}
+
+// ── Provider-dimension effort schema tests ──────────────────────────────
+
+// testProvidersYAML configures two providers: an ollama-cloud host (→ ollama
+// schema) and an opencode-go host (→ opencode schema). EffortSchema is derived
+// from the account base_url hosts, so no extra YAML fields are needed.
+const testProvidersYAML = `
+providers:
+  ollama-cloud:
+    accounts:
+      - name: ollama-acc
+        key: test-key-12345
+        base_url: https://ollama.com/v1
+  opencode-go:
+    accounts:
+      - name: opencode-acc
+        key: test-key-12345
+        base_url: https://opencode.ai/zen
+`
+
+func loadProviderCfg(t testing.TB) *config.Config {
+	t.Helper()
+	f, err := os.CreateTemp("", "cfg-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := f.Name()
+	if _, err := f.Write([]byte(testProvidersYAML)); err != nil {
+		f.Close()
+		os.Remove(name)
+		t.Fatal(err)
+	}
+	f.Close()
+	defer os.Remove(name)
+
+	cfg, err := config.LoadConfig(name)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	return cfg
+}
+
+func TestTransformRequestBody_Ollama_GLM52(t *testing.T) {
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"glm-5.2","reasoning_effort":"xhigh","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "ollama-cloud")
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "max" {
+		t.Errorf("reasoning_effort=%q, want max", got)
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Error("ollama glm-5.2 should not set thinking.type")
+	}
+}
+
+func TestTransformRequestBody_Opencode_GLM52(t *testing.T) {
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"glm-5.2","reasoning_effort":"xhigh","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "opencode-go")
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "xhigh" {
+		t.Errorf("reasoning_effort=%q, want xhigh (opencode 1:1)", got)
+	}
+	var thinking map[string]any
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("thinking not object: %v", err)
+	}
+	if typ, _ := thinking["type"].(string); typ != "enabled" {
+		t.Errorf("thinking.type=%q, want enabled", typ)
+	}
+}
+
+func TestTransformRequestBody_CrossProvider_DeepSeek(t *testing.T) {
+	cfg := loadProviderCfg(t)
+
+	t.Run("opencode deepseek xhigh double-write", func(t *testing.T) {
+		body := []byte(`{"model":"deepseek-v4-pro","reasoning_effort":"xhigh","thinking":{"level":"xhigh"}}`)
+		got := sanitize.TransformRequestBodyForProvider(body, cfg, "opencode-go")
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(got, &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got := unmarshalString(t, raw["reasoning_effort"]); got != "max" {
+			t.Errorf("reasoning_effort=%q, want max", got)
+		}
+		var thinking map[string]any
+		if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+			t.Fatalf("thinking not object: %v", err)
+		}
+		if lvl, _ := thinking["level"].(string); lvl != "max" {
+			t.Errorf("thinking.level=%q, want max (DeepSeekCompat double-write)", lvl)
+		}
+	})
+
+	t.Run("ollama deepseek xhigh reasoning_effort only", func(t *testing.T) {
+		body := []byte(`{"model":"deepseek-v4-pro","reasoning_effort":"xhigh","thinking":{"level":"xhigh"}}`)
+		got := sanitize.TransformRequestBodyForProvider(body, cfg, "ollama-cloud")
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(got, &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got := unmarshalString(t, raw["reasoning_effort"]); got != "max" {
+			t.Errorf("reasoning_effort=%q, want max", got)
+		}
+		if _, ok := raw["thinking"]; ok {
+			t.Error("ollama deepseek should drop thinking object (DEFAULT profile, no double-write)")
+		}
+	})
+
+	t.Run("opencode deepseek off passthrough", func(t *testing.T) {
+		body := []byte(`{"model":"deepseek-v4-pro","reasoning_effort":"off"}`)
+		got := sanitize.TransformRequestBodyForProvider(body, cfg, "opencode-go")
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(got, &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got := unmarshalString(t, raw["reasoning_effort"]); got != "off" {
+			t.Errorf("reasoning_effort=%q, want off (passthrough)", got)
+		}
+	})
+
+	t.Run("ollama deepseek off sets none", func(t *testing.T) {
+		body := []byte(`{"model":"deepseek-v4-pro","reasoning_effort":"off"}`)
+		got := sanitize.TransformRequestBodyForProvider(body, cfg, "ollama-cloud")
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(got, &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got := unmarshalString(t, raw["reasoning_effort"]); got != "none" {
+			t.Errorf("reasoning_effort=%q, want none (ollama DEFAULT, set value)", got)
+		}
+	})
+}
+
+func TestTransformRequestBody_Ollama_OffSetsNone(t *testing.T) {
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"glm-5.2","reasoning_effort":"off","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "ollama-cloud")
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// reasoning_effort still present, value=none (not deleted)
+	if _, ok := raw["reasoning_effort"]; !ok {
+		t.Fatal("reasoning_effort should still be present (set to none, not deleted)")
+	}
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "none" {
+		t.Errorf("reasoning_effort=%q, want none", got)
+	}
+}
+
+func TestTransformRequestBody_EmptyProvider_DefaultOpencode(t *testing.T) {
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"glm-5.2","reasoning_effort":"xhigh","messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "") // empty provider → opencode
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "xhigh" {
+		t.Errorf("reasoning_effort=%q, want xhigh (opencode 1:1)", got)
+	}
+	var thinking map[string]any
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("thinking not object: %v", err)
+	}
+	if typ, _ := thinking["type"].(string); typ != "enabled" {
+		t.Errorf("thinking.type=%q, want enabled", typ)
 	}
 }
 

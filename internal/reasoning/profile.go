@@ -12,6 +12,16 @@ const (
 	FormBudget Form = "budget"
 )
 
+// Effort schema identifiers select which profile table a model is mapped
+// against. They are derived from the upstream provider's base_url host
+// (see config.buildProviderSchema) and carry no new YAML configuration.
+const (
+	// SchemaOpencode is the default opencode-go schema (empty string).
+	SchemaOpencode = ""
+	// SchemaOllama selects the ollama-cloud profile table.
+	SchemaOllama = "ollama"
+)
+
 // Profile holds the reasoning-effort mapping rules for one upstream model
 // (or a family sharing the same prefix).
 type Profile struct {
@@ -37,6 +47,12 @@ type Profile struct {
 
 	// Value to write when turning thinking off (for ToggleField).
 	ToggleOff string
+
+	// FormEnum only — when set, an abstract "off" level writes this value into
+	// EnumFields instead of deleting them + toggling off. Empty means the
+	// opencode behaviour (delete enum fields + set ToggleOff). Used by the
+	// ollama schema where thinking cannot be disabled via field deletion.
+	OffValue string
 
 	// FormToggle only — delete reasoning_effort and thinking.level from the request body.
 	StripEnumOnToggle bool
@@ -220,16 +236,95 @@ var builtinProfiles = []namedProfile{
 	},
 }
 
-// ProfileFor returns the Profile for the given upstream model name.
-// It performs a longest-prefix match against the built-in table.
-// Unmatched models return a Profile with FormNone.
-func ProfileFor(model string) Profile {
+// ollamaProfiles maps ollama-cloud upstream models against their real
+// thinking levels. All profiles use FormEnum with EnumFields=["reasoning_effort"]
+// and no ToggleField (ollama does not use thinking.type). OffValue (set when a
+// model exposes a "none"/disabled level) is written instead of deleting the
+// field; ForceOn forces the minimum real level + Warn when the model cannot
+// disable thinking at all.
+var ollamaProfiles = []namedProfile{
+	{
+		prefixes: []string{"gpt-oss"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high", "xhigh": "high"},
+			EnumFields: []string{"reasoning_effort"},
+			OffValue:   "low",
+			ForceOn:    true,
+		},
+	},
+	{
+		prefixes: []string{"glm-5.2"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "high", "medium": "high", "high": "high", "xhigh": "max"},
+			EnumFields: []string{"reasoning_effort"},
+			OffValue:   "none",
+		},
+	},
+	{
+		prefixes: []string{"qwen3-vl"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high", "xhigh": "max"},
+			EnumFields: []string{"reasoning_effort"},
+			OffValue:   "low",
+			ForceOn:    true,
+		},
+	},
+	{
+		prefixes: []string{"qwen3"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "medium", "medium": "medium", "high": "medium", "xhigh": "medium"},
+			EnumFields: []string{"reasoning_effort"},
+			OffValue:   "none",
+		},
+	},
+	{
+		prefixes: []string{"kimi-k2-thinking"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high", "xhigh": "max"},
+			EnumFields: []string{"reasoning_effort"},
+			OffValue:   "low",
+			ForceOn:    true,
+		},
+	},
+	{
+		prefixes: []string{"minimax"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high", "xhigh": "max"},
+			EnumFields: []string{"reasoning_effort"},
+			OffValue:   "low",
+			ForceOn:    true,
+		},
+	},
+}
+
+// ollamaDefaultProfile is the fallback for ollama-schema models that do not
+// match any explicit ollama prefix. It covers deepseek-v4-pro/hy3/mimo and any
+// unlisted model. EffortMap 1:1, no thinking.type, off→none (set value).
+var ollamaDefaultProfile = Profile{
+	Form:       FormEnum,
+	EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high", "xhigh": "max"},
+	EnumFields: []string{"reasoning_effort"},
+	OffValue:   "none",
+}
+
+// ProfileFor returns the Profile for the given upstream model name, using the
+// profile table selected by schema. schema == SchemaOllama selects the
+// ollama-cloud table (with ollamaDefaultProfile fallback); any other value
+// (including the empty opencode schema) uses the built-in opencode table
+// (with a FormNone fallback).
+func matchPrefix(profiles []namedProfile, model string) (Profile, bool) {
 	m := strings.ToLower(model)
 
 	var best *Profile
 	bestLen := 0
 
-	for _, np := range builtinProfiles {
+	for _, np := range profiles {
 		for _, prefix := range np.prefixes {
 			if strings.HasPrefix(m, prefix) && len(prefix) > bestLen {
 				best = &np.profile
@@ -239,7 +334,31 @@ func ProfileFor(model string) Profile {
 	}
 
 	if best != nil {
-		return *best
+		return *best, true
+	}
+	return Profile{}, false
+}
+
+// ProfileFor returns the Profile for the given upstream model name, using the
+// profile table selected by schema. schema == SchemaOllama selects the
+// ollama-cloud table (with ollamaDefaultProfile fallback); any other value
+// (including the empty opencode schema) uses the built-in opencode table
+// (with a FormNone fallback).
+func ProfileFor(model, schema string) Profile {
+	if schema == SchemaOllama {
+		if p, ok := matchPrefix(ollamaProfiles, model); ok {
+			return p
+		}
+		return ollamaDefaultProfile
+	}
+	if p, ok := matchPrefix(builtinProfiles, model); ok {
+		return p
 	}
 	return Profile{Form: FormNone}
+}
+
+// ProfileForModel is a convenience wrapper around ProfileFor with the default
+// opencode schema. Kept for backward compatibility with existing callers/tests.
+func ProfileForModel(model string) Profile {
+	return ProfileFor(model, SchemaOpencode)
 }
