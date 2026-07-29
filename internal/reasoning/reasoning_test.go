@@ -92,8 +92,8 @@ func TestProfileFor_Order(t *testing.T) {
 
 func TestProfileFor_Unknown(t *testing.T) {
 	p := ProfileForModel("grok-4.5")
-	if p.Form != FormNone {
-		t.Errorf("grok-4.5: got Form=%s, want none", p.Form)
+	if p.Form != FormEnum {
+		t.Errorf("grok-4.5: got Form=%s, want enum", p.Form)
 	}
 
 	p = ProfileForModel("")
@@ -435,7 +435,7 @@ func TestApply_Qwen_Off_StripsBudget(t *testing.T) {
 
 func TestApply_NoThinkingModel_Strip(t *testing.T) {
 	raw := rawFromJSON(t, `{"reasoning_effort":"high","thinking":{"level":"high"}}`)
-	changed := Apply(raw, "grok-4.5")
+	changed := Apply(raw, "truly-unknown-model-xyz")
 	if !changed {
 		t.Fatal("expected change")
 	}
@@ -449,7 +449,7 @@ func TestApply_NoThinkingModel_Strip(t *testing.T) {
 
 func TestApply_FormNone_NoFields(t *testing.T) {
 	raw := rawFromJSON(t, `{"model":"unknown"}`)
-	changed := Apply(raw, "grok-4.5")
+	changed := Apply(raw, "truly-unknown-model-xyz")
 	if changed {
 		t.Error("no thinking fields → no change")
 	}

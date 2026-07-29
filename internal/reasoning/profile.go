@@ -234,6 +234,14 @@ var builtinProfiles = []namedProfile{
 			BudgetMax: 81920,
 		},
 	},
+	{
+		prefixes: []string{"grok-4.5"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high"},
+			EnumFields: []string{"reasoning_effort"},
+		},
+	},
 }
 
 // ollamaProfiles maps ollama-cloud upstream models against their real
