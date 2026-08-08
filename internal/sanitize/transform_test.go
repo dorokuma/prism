@@ -737,7 +737,12 @@ func TestTransformRequestBody_NoThinkingModel_Strip(t *testing.T) {
 	cfg := &config.Config{
 		ModelRemapEnabled: true,
 		ModelRemap:        map[string]string{"unknown-v1": "unknown-tier"},
-		ModelTiers:        map[string]string{"unknown-tier": "grok-4.5"},
+		// The upstream model must have NO reasoning profile in
+		// internal/reasoning (opencode table): such models fall back to
+		// FormNone and both reasoning_effort and thinking are stripped.
+		// grok-4.5 is NOT a valid stand-in anymore — it has a FormEnum
+		// profile supporting reasoning_effort (see profile.go).
+		ModelTiers: map[string]string{"unknown-tier": "non-existent-model-123"},
 	}
 
 	body := []byte(`{"model":"unknown-v1","reasoning_effort":"high","thinking":{"level":"high"},"messages":[{"role":"user","content":"hi"}]}`)
@@ -754,6 +759,33 @@ func TestTransformRequestBody_NoThinkingModel_Strip(t *testing.T) {
 	}
 	if _, ok := raw["thinking"]; ok {
 		t.Error("thinking should be stripped for unsupported model")
+	}
+}
+
+func TestTransformRequestBody_Grok45_KeepsReasoningEffort(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"grok-4.5": "grok-tier"},
+		ModelTiers:        map[string]string{"grok-tier": "grok-4.5"},
+	}
+
+	body := []byte(`{"model":"grok-4.5","reasoning_effort":"high","thinking":{"level":"high"},"messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// grok-4.5 has a FormEnum profile supporting reasoning_effort
+	// (internal/reasoning/profile.go) → the field must be mapped, NOT stripped.
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "high" {
+		t.Errorf("reasoning_effort = %q, want high", got)
+	}
+
+	// thinking.level is not part of the grok-4.5 schema → cleaned up.
+	if _, ok := raw["thinking"]; ok {
+		t.Error("thinking should be cleaned up for grok-4.5")
 	}
 }
 

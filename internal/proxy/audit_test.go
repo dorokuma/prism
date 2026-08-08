@@ -337,7 +337,19 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 		restore := stashSlog(h)
 		defer restore()
 
-		// Two accounts so that when the first cools down (30s), the second
+		// Both accounts return 500, so each attempt cools the used account
+		// down for upstreamCooldown (default 30s). With the default values
+		// every retry's SelectByProvider would wait out the 30s cooldown,
+		// making this subtest ~30s (and the package >120s overall). Shrink
+		// both the cooldown and the select timeout to milliseconds: all four
+		// attempts now drain in ~600ms and the error_type stays determinis-
+		// tically all_exhausted (select timeout never fires).
+		restoreCooldown := SetUpstreamCooldownForTest(10 * time.Millisecond)
+		defer restoreCooldown()
+		restoreSelect := SetAccountSelectTimeoutForTest(100 * time.Millisecond)
+		defer restoreSelect()
+
+		// Two accounts so that when the first cools down, the second
 		// is available immediately — test completes in ms not seconds.
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)

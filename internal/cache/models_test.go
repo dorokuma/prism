@@ -528,3 +528,119 @@ func TestRootURL(t *testing.T) {
 		}
 	}
 }
+
+// TestSyncPIModelsJSON_SkipPISync verifies that a provider whose account sets
+// skip_pi_sync=true keeps its hand-maintained models.json entry untouched
+// (e.g. agentrouter-anthropic with api: anthropic-messages), while a normal
+// provider is still synced.
+func TestSyncPIModelsJSON_SkipPISync(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "models.json")
+
+	writePIModelsJSON(t, path, map[string]any{
+		"agentrouter-anthropic": map[string]any{
+			"baseUrl": "https://gw.example.com/",
+			"api":     "anthropic-messages",
+			"apiKey":  "prism-dummy-key",
+			"headers": map[string]any{"X-Prism-Provider": "agentrouter-anthropic"},
+			"models": []map[string]any{
+				{"id": "claude-opus-5", "contextWindow": 1000000},
+			},
+		},
+		"opencode-go": map[string]any{
+			"baseUrl": "http://127.0.0.1:18790/v1",
+			"api":     "openai-completions",
+			"apiKey":  "prism-dummy-key",
+			"models": []map[string]any{
+				{"id": "deepseek-v4-pro"},
+			},
+		},
+	})
+
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "agentrouter-anthropic", BaseURL: "https://gw.example.com/", SkipPISync: true},
+			{Name: "a2", Provider: "opencode-go", BaseURL: "https://opencode.ai/zen/go/v1"},
+		},
+	}
+
+	mc := NewForTest(map[string]*providerCache{
+		"agentrouter-anthropic": {Models: []ModelEntry{{ID: "claude-opus-5", Object: "model", Created: 1, OwnedBy: "anthropic"}}},
+		"opencode-go":           {Models: []ModelEntry{{ID: "deepseek-v4-pro", Object: "model", Created: 1, OwnedBy: "opencode"}}},
+	})
+
+	if err := mc.syncPIModelsJSON(path, "http://127.0.0.1:18790/v1", cfg); err != nil {
+		t.Fatalf("syncPIModelsJSON: %v", err)
+	}
+
+	// Read back the file and verify the skip provider entry is byte-identical
+	// to what we wrote (hand-maintained, api: anthropic-messages preserved).
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read synced file: %v", err)
+	}
+	var pc struct {
+		Providers map[string]struct {
+			BaseURL string           `json:"baseUrl"`
+			API     string           `json:"api"`
+			Models  []map[string]any `json:"models"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(data, &pc); err != nil {
+		t.Fatalf("unmarshal synced file: %v", err)
+	}
+	ant, ok := pc.Providers["agentrouter-anthropic"]
+	if !ok {
+		t.Fatal("agentrouter-anthropic entry missing after sync")
+	}
+	if ant.API != "anthropic-messages" {
+		t.Errorf("agentrouter-anthropic api = %q, want anthropic-messages (must be preserved)", ant.API)
+	}
+	if ant.BaseURL != "https://gw.example.com/" {
+		t.Errorf("agentrouter-anthropic baseUrl = %q, want https://gw.example.com/ (must be preserved)", ant.BaseURL)
+	}
+	if len(ant.Models) != 1 || ant.Models[0]["contextWindow"] == nil {
+		t.Errorf("agentrouter-anthropic models should be preserved untouched, got %v", ant.Models)
+	}
+	// The normal provider must still be synced/rewritten to point at prism.
+	oc, ok := pc.Providers["opencode-go"]
+	if !ok {
+		t.Fatal("opencode-go entry missing after sync")
+	}
+	if oc.BaseURL != "http://127.0.0.1:18790/v1" {
+		t.Errorf("opencode-go baseUrl = %q, want prism base", oc.BaseURL)
+	}
+}
+
+// TestFetchAllAsync_SkipPISync verifies skip_pi_sync providers are not fetched
+// (no upstream HTTP) — avoids useless /v1/models requests for providers whose
+// pi metadata is hand-maintained.
+func TestFetchAllAsync_SkipPISync(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "agentrouter-anthropic", BaseURL: upstream.URL, SkipPISync: true},
+		},
+	}
+	mc := NewForTest(map[string]*providerCache{})
+	mc.cfg = cfg
+
+	done := make(chan struct{})
+	mc.FetchAllAsync(func() { close(done) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("FetchAllAsync timed out")
+	}
+	if hits != 0 {
+		t.Errorf("expected 0 upstream fetches for skip_pi_sync provider, got %d", hits)
+	}
+}

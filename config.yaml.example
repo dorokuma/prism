@@ -69,3 +69,68 @@ accounts:
 # Optional: tool definitions cache for request injection (Codex-related).
 # Production path matches service data dir:
 mcp_tools_json: "/var/lib/prism/mcp_tools.json"
+
+# ---------------------------------------------------------------------------
+# agentrouter 账号池示例（可选接入；默认全部注释，不影响现有账号）
+#
+# 4 个账号 = 2 把 key × 两协议（openai / anthropic）。key 一律省略，走凭证：
+#   LB_KEY_AGENTROUTER_OAI_1 / LB_KEY_AGENTROUTER_OAI_2 /
+#   LB_KEY_AGENTROUTER_ANT_1 / LB_KEY_AGENTROUTER_ANT_2
+# （账号名连字符转下划线后大写，规则同 account-1 → LB_KEY_ACCOUNT_1）
+#
+# probe_path: disabled —— 探活端点（GET /v1/models）未实测，disabled 表示
+# 不发探活请求；exhausted 账号会在每个 probe_interval 周期被乐观置回
+# healthy。若确认 GET /v1/models 可用，把该行改成 probe_path: /v1/models
+# 或删掉即可，不需要改代码。
+#
+# auth_header（可选，账号级）：默认写 Authorization: Bearer <key>；若上游
+# 只认 x-api-key 之类的自定义头，设为该头名即可（值写裸 key，不再写
+# Authorization 头）。
+#
+# skip_pi_sync: true —— agentrouter 的 pi models.json 元数据（例如
+# api: anthropic-messages 与模型 contextWindow 等）由人工维护，prism 不
+# 抓取上游模型、不覆盖该 provider 条目。
+#
+# 上游专用请求头（User-Agent、anthropic-beta、x-app 等）由 prism 在转发
+# 时按账号注入，pi 侧只需带 X-Prism-Provider 头即可。
+# ---------------------------------------------------------------------------
+# providers:
+#   agentrouter-openai:
+#     accounts:
+#       - name: agentrouter-oai-1
+#         base_url: https://your-gateway.example.com/v1
+#         skip_pi_sync: true
+#         probe_path: disabled
+#         # auth_header: x-api-key
+#         headers:
+#           Originator: codex_cli_rs
+#           User-Agent: codex-cli/1.0.0
+#           x-app: cli
+#       - name: agentrouter-oai-2
+#         base_url: https://your-gateway.example.com/v1
+#         skip_pi_sync: true
+#         probe_path: disabled
+#         headers:
+#           Originator: codex_cli_rs
+#           User-Agent: codex-cli/1.0.0
+#           x-app: cli
+#   agentrouter-anthropic:
+#     accounts:
+#       - name: agentrouter-ant-1
+#         base_url: https://your-gateway.example.com/
+#         skip_pi_sync: true
+#         probe_path: disabled
+#         headers:
+#           User-Agent: "claude-cli/1.0.0 (external, cli)"
+#           anthropic-beta: "claude-code-20250219,interleaved-thinking-20250219"
+#           anthropic-dangerous-direct-browser-access: "true"
+#           x-app: cli
+#       - name: agentrouter-ant-2
+#         base_url: https://your-gateway.example.com/
+#         skip_pi_sync: true
+#         probe_path: disabled
+#         headers:
+#           User-Agent: "claude-cli/1.0.0 (external, cli)"
+#           anthropic-beta: "claude-code-20250219,interleaved-thinking-20250219"
+#           anthropic-dangerous-direct-browser-access: "true"
+#           x-app: cli

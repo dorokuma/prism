@@ -49,6 +49,31 @@ type AccountConfig struct {
 	Key      string `yaml:"key,omitempty"`
 	Provider string `yaml:"provider,omitempty"`
 	BaseURL  string `yaml:"base_url"`
+	// Headers are account-level custom headers applied to every upstream
+	// request (chat/messages forwards and probe requests). They override
+	// same-named client headers, but can never set the credential header
+	// (Authorization, or the account's auth_header) — that always comes
+	// from the account key. Nil/omitted = no extra headers (backward compat).
+	Headers map[string]string `yaml:"headers,omitempty"`
+	// AuthHeader overrides the credential header name for this account.
+	// Semantics (implemented in pool.ApplyAuthHeader, used by both upstream
+	// forwards and probe requests):
+	//   - empty/omitted, or canonical form == "Authorization":
+	//     write "Authorization: Bearer <key>" (identical to current behavior)
+	//   - any other value (e.g. "x-api-key"):
+	//     write "<auth_header>: <key>" (raw key, NO Bearer prefix) and do
+	//     NOT write an Authorization header at all
+	AuthHeader string `yaml:"auth_header,omitempty"`
+	// ProbePath overrides the health-check GET path for this account.
+	// Empty or "default" = "/v1/models"; an explicit path (e.g. "/models")
+	// is used as-is (joined with base_url); "-", "disabled" or "none"
+	// disables probing entirely (exhausted accounts are optimistically
+	// marked healthy each probe cycle, no HTTP request is sent).
+	ProbePath string `yaml:"probe_path,omitempty"`
+	// SkipPISync excludes the provider from prism-managed pi models.json
+	// sync (and from upstream model fetching): its pi metadata is
+	// hand-maintained and must not be overwritten by prism.
+	SkipPISync bool `yaml:"skip_pi_sync,omitempty"`
 }
 
 // Config holds the top-level application configuration loaded from a YAML file.
@@ -422,13 +447,36 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	return warnings, nil
 }
 
-// accountsEqual compares two account slices by name, base_url, and key.
+// accountsEqual compares two account slices by every field that cannot be
+// hot-reloaded (name, base_url, key, provider, headers, auth_header,
+// probe_path, skip_pi_sync). A change in any of them means the Pool (built
+// once at startup) is stale and a restart is required.
 func accountsEqual(a, b []AccountConfig) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if a[i].Name != b[i].Name || a[i].BaseURL != b[i].BaseURL || a[i].Key != b[i].Key {
+		if a[i].Name != b[i].Name ||
+			a[i].BaseURL != b[i].BaseURL ||
+			a[i].Key != b[i].Key ||
+			a[i].Provider != b[i].Provider ||
+			a[i].AuthHeader != b[i].AuthHeader ||
+			a[i].ProbePath != b[i].ProbePath ||
+			a[i].SkipPISync != b[i].SkipPISync ||
+			!stringMapsEqual(a[i].Headers, b[i].Headers) {
+			return false
+		}
+	}
+	return true
+}
+
+// stringMapsEqual compares two string maps for key/value equality.
+func stringMapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
 			return false
 		}
 	}

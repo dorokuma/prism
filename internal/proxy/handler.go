@@ -51,6 +51,20 @@ func NewProxyHandler(pp *pool.Pool, wire config.WireAPIMode, holder *config.Conf
 			proxyResponses(pp, w, r, cfg)
 			return
 		}
+		if r.URL.Path == "/v1/messages" {
+			if r.Method != http.MethodPost {
+				util.WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{
+					"error": map[string]any{"message": "method not allowed", "code": "method_not_allowed"},
+				})
+				return
+			}
+			// /v1/messages (anthropic messages) is an independent third surface
+			// and is always enabled: wire_api only governs OpenAI legacy chat
+			// vs responses and is not a subset relationship with anthropic
+			// messages (a responses-only deployment must still reach it).
+			proxyMessages(pp, w, r, cfg)
+			return
+		}
 		util.WriteJSON(w, http.StatusNotFound, map[string]any{
 			"error": map[string]any{"message": "not found", "code": "not_found"},
 		})

@@ -24,6 +24,15 @@ type ChatForwardOpts struct {
 	Model        string
 	ReqTools     json.RawMessage
 	TenantID     string
+
+	// UpstreamPath is the upstream POST path; empty means
+	// "/chat/completions" (backward compatible with all existing callers).
+	UpstreamPath string
+
+	// SkipSanitize skips sanitize.TransformRequestBodyForProvider. It must be
+	// true for the anthropic /v1/messages surface whose body is NOT a chat
+	// completion body (remap/effort/strip would corrupt it).
+	SkipSanitize bool
 }
 
 func proxyChat(p *pool.Pool, w http.ResponseWriter, r *http.Request, cfg *config.Config) {
@@ -72,9 +81,14 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 	// effort-mapping transform and for account selection (SelectByProvider).
 	// It selects the effort schema (opencode vs ollama).
 	provider := r.Header.Get("X-Prism-Provider")
-	// Transform now always runs; model remap inside is still gated by
-	// cfg.ModelRemapEnabled (real model name passes through when disabled).
-	bodyBytes = sanitize.TransformRequestBodyForProvider(bodyBytes, cfg, provider)
+	// Transform normally runs for every request; model remap inside is still
+	// gated by cfg.ModelRemapEnabled (real model name passes through when
+	// disabled). The /v1/messages surface (anthropic body, not a chat
+	// completion) opts out via SkipSanitize: the body must pass through
+	// byte-for-byte.
+	if !opts.SkipSanitize {
+		bodyBytes = sanitize.TransformRequestBodyForProvider(bodyBytes, cfg, provider)
+	}
 	if p.AccountCount() == 0 {
 		aud.Error = "no accounts configured"
 		aud.ErrorType = "config_error"

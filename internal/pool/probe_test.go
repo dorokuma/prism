@@ -299,3 +299,155 @@ func TestProbeExhausted_MultipleAccounts(t *testing.T) {
 		t.Error("acc503 should NOT be marked healthy after 503")
 	}
 }
+
+func TestAccountHeadersAccessor(t *testing.T) {
+	cfg := config.AccountConfig{
+		Name:       "acc1",
+		Key:        "k1",
+		BaseURL:    "https://x.com/v1",
+		Headers:    map[string]string{"User-Agent": "ua", "x-app": "cli"},
+		AuthHeader: "x-api-key",
+		ProbePath:  "/custom",
+		SkipPISync: true,
+	}
+	acc := &Account{cfg: cfg}
+	if len(acc.Headers()) != 2 || acc.Headers()["User-Agent"] != "ua" {
+		t.Errorf("Headers() = %v", acc.Headers())
+	}
+	if acc.AuthHeader() != "x-api-key" {
+		t.Errorf("AuthHeader() = %q", acc.AuthHeader())
+	}
+	if acc.ProbePath() != "/custom" {
+		t.Errorf("ProbePath() = %q", acc.ProbePath())
+	}
+	if !acc.SkipPISync() {
+		t.Error("SkipPISync() = false, want true")
+	}
+}
+
+// TestProbeExhausted_CustomProbePath verifies an account with probe_path=/custom
+// is probed at that exact path (not /v1/models) and recovers on 200.
+func TestProbeExhausted_CustomProbePath(t *testing.T) {
+	gotPath := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/custom" {
+			t.Errorf("expected probe at /custom, got %s", r.URL.Path)
+		}
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	pool := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL, ProbePath: "/custom"},
+	})
+
+	accs := pool.AllAccounts()
+	accs[0].MarkExhausted()
+
+	ProbeExhausted(pool)
+
+	if !accs[0].IsHealthy() {
+		t.Error("account should be marked healthy after 200 on custom path")
+	}
+	if gotPath != "/custom" {
+		t.Errorf("probe path = %q, want /custom", gotPath)
+	}
+}
+
+// TestProbeExhausted_DisabledOptimistic verifies probe_path: disabled sends
+// ZERO HTTP requests and optimistically marks the exhausted account healthy.
+func TestProbeExhausted_DisabledOptimistic(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		t.Error("no HTTP request should be sent when probe is disabled")
+		w.WriteHeader(500)
+	}))
+	defer upstream.Close()
+
+	pool := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL, ProbePath: "disabled"},
+	})
+
+	accs := pool.AllAccounts()
+	accs[0].MarkExhausted()
+
+	ProbeExhausted(pool)
+
+	if !accs[0].IsHealthy() {
+		t.Error("account should be optimistically marked healthy when probe is disabled")
+	}
+	if hits != 0 {
+		t.Errorf("expected 0 HTTP requests, got %d", hits)
+	}
+}
+
+// TestProbeExhausted_DefaultPathStillV1Models is a regression test: accounts
+// without probe_path keep probing GET /v1/models.
+func TestProbeExhausted_DefaultPathStillV1Models(t *testing.T) {
+	gotPath := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	pool := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
+
+	accs := pool.AllAccounts()
+	accs[0].MarkExhausted()
+
+	ProbeExhausted(pool)
+
+	if !accs[0].IsHealthy() {
+		t.Error("account should be marked healthy after 200")
+	}
+	if gotPath != "/v1/models" {
+		t.Errorf("default probe path = %q, want /v1/models", gotPath)
+	}
+}
+
+// TestProbeSendsAccountHeaders verifies probe requests carry account-level
+// headers and the account credential header (Bearer by default).
+func TestProbeSendsAccountHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") != "claude-cli/1.0.0 (external, cli)" {
+			t.Errorf("probe User-Agent = %q", r.Header.Get("User-Agent"))
+		}
+		if r.Header.Get("anthropic-beta") != "claude-code-20250219" {
+			t.Errorf("probe anthropic-beta = %q", r.Header.Get("anthropic-beta"))
+		}
+		if r.Header.Get("Authorization") != "Bearer k1" {
+			t.Errorf("probe Authorization = %q, want Bearer k1", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	pool := NewPool([]config.AccountConfig{
+		{
+			Name:    "exhausted1",
+			Key:     "k1",
+			BaseURL: upstream.URL,
+			Headers: map[string]string{
+				"User-Agent":     "claude-cli/1.0.0 (external, cli)",
+				"anthropic-beta": "claude-code-20250219",
+			},
+		},
+	})
+
+	accs := pool.AllAccounts()
+	accs[0].MarkExhausted()
+
+	ProbeExhausted(pool)
+
+	if !accs[0].IsHealthy() {
+		t.Error("account should be marked healthy after 200")
+	}
+}

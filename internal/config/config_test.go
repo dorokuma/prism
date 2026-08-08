@@ -915,3 +915,136 @@ auth_token: ""
 		t.Errorf("after failed reload listen = %q, want 127.0.0.1:8080 (old config preserved)", curCfg.Listen)
 	}
 }
+
+// TestAccountConfigHeadersProbePathYAML verifies that the account-level
+// headers / auth_header / probe_path / skip_pi_sync fields parse from YAML
+// (both the providers block and the flat accounts block) and survive the
+// providers→accounts flattening.
+func TestAccountConfigHeadersProbePathYAML(t *testing.T) {
+	content := `
+providers:
+  agentrouter-anthropic:
+    accounts:
+      - name: agentrouter-ant-1
+        base_url: https://gw.example.com/
+        skip_pi_sync: true
+        probe_path: disabled
+        headers:
+          User-Agent: "claude-cli/1.0.0 (external, cli)"
+          anthropic-beta: "claude-code-20250219,interleaved-thinking-20250219"
+          x-app: cli
+  agentrouter-openai:
+    accounts:
+      - name: agentrouter-oai-1
+        base_url: https://gw.example.com/v1
+        skip_pi_sync: true
+        probe_path: /custom-probe
+        auth_header: x-api-key
+        headers:
+          Originator: codex_cli_rs
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// Keys must be present (env fallback would fail otherwise).
+	t.Setenv("LB_KEY_AGENTROUTER_ANT_1", "test-key-ant-1")
+	t.Setenv("LB_KEY_AGENTROUTER_OAI_1", "test-key-oai-1")
+
+	cfg, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(cfg.Accounts) != 2 {
+		t.Fatalf("accounts = %d, want 2", len(cfg.Accounts))
+	}
+
+	var ant, oai *AccountConfig
+	for i := range cfg.Accounts {
+		switch cfg.Accounts[i].Name {
+		case "agentrouter-ant-1":
+			ant = &cfg.Accounts[i]
+		case "agentrouter-oai-1":
+			oai = &cfg.Accounts[i]
+		}
+	}
+	if ant == nil || oai == nil {
+		t.Fatalf("expected both accounts, got %v", cfg.Accounts)
+	}
+
+	if ant.Provider != "agentrouter-anthropic" {
+		t.Errorf("ant provider = %q, want agentrouter-anthropic", ant.Provider)
+	}
+	if !ant.SkipPISync {
+		t.Error("ant skip_pi_sync = false, want true")
+	}
+	if ant.ProbePath != "disabled" {
+		t.Errorf("ant probe_path = %q, want disabled", ant.ProbePath)
+	}
+	if ant.AuthHeader != "" {
+		t.Errorf("ant auth_header = %q, want empty", ant.AuthHeader)
+	}
+	if len(ant.Headers) != 3 {
+		t.Fatalf("ant headers = %v, want 3 entries", ant.Headers)
+	}
+	if ant.Headers["User-Agent"] != "claude-cli/1.0.0 (external, cli)" {
+		t.Errorf("ant User-Agent = %q", ant.Headers["User-Agent"])
+	}
+	if ant.Headers["anthropic-beta"] != "claude-code-20250219,interleaved-thinking-20250219" {
+		t.Errorf("ant anthropic-beta = %q", ant.Headers["anthropic-beta"])
+	}
+	if ant.Headers["x-app"] != "cli" {
+		t.Errorf("ant x-app = %q", ant.Headers["x-app"])
+	}
+
+	if oai.Provider != "agentrouter-openai" {
+		t.Errorf("oai provider = %q, want agentrouter-openai", oai.Provider)
+	}
+	if !oai.SkipPISync {
+		t.Error("oai skip_pi_sync = false, want true")
+	}
+	if oai.ProbePath != "/custom-probe" {
+		t.Errorf("oai probe_path = %q, want /custom-probe", oai.ProbePath)
+	}
+	if oai.AuthHeader != "x-api-key" {
+		t.Errorf("oai auth_header = %q, want x-api-key", oai.AuthHeader)
+	}
+	if oai.Headers["Originator"] != "codex_cli_rs" {
+		t.Errorf("oai Originator = %q", oai.Headers["Originator"])
+	}
+}
+
+// TestAccountsEqualIncludesHeaders verifies accountsEqual detects changes in
+// the account-level metadata fields (headers / probe_path / auth_header /
+// skip_pi_sync / provider) so hot reload warns instead of silently ignoring
+// them.
+func TestAccountsEqualIncludesHeaders(t *testing.T) {
+	base := []AccountConfig{{Name: "a", Key: "k", BaseURL: "https://x.com/v1", Provider: "p"}}
+
+	if !accountsEqual(base, []AccountConfig{{Name: "a", Key: "k", BaseURL: "https://x.com/v1", Provider: "p"}}) {
+		t.Error("identical accounts should be equal")
+	}
+
+	cases := []struct {
+		name string
+		b    AccountConfig
+	}{
+		{"headers added", AccountConfig{Name: "a", Key: "k", BaseURL: "https://x.com/v1", Provider: "p", Headers: map[string]string{"User-Agent": "ua"}}},
+		{"header value changed", AccountConfig{Name: "a", Key: "k", BaseURL: "https://x.com/v1", Provider: "p", Headers: map[string]string{"User-Agent": "other"}}},
+		{"probe_path changed", AccountConfig{Name: "a", Key: "k", BaseURL: "https://x.com/v1", Provider: "p", ProbePath: "/custom"}},
+		{"auth_header changed", AccountConfig{Name: "a", Key: "k", BaseURL: "https://x.com/v1", Provider: "p", AuthHeader: "x-api-key"}},
+		{"skip_pi_sync changed", AccountConfig{Name: "a", Key: "k", BaseURL: "https://x.com/v1", Provider: "p", SkipPISync: true}},
+		{"provider changed", AccountConfig{Name: "a", Key: "k", BaseURL: "https://x.com/v1", Provider: "other"}},
+	}
+	for _, tc := range cases {
+		if accountsEqual(base, []AccountConfig{tc.b}) {
+			t.Errorf("accountsEqual should be false when %s", tc.name)
+		}
+	}
+}

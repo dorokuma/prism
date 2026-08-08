@@ -28,6 +28,13 @@ var upstreamHeaderAllowlist = map[string]bool{
 	"Retry-After":         true,
 }
 
+// upstreamCooldown is the cooldown applied to an account after a temporary
+// upstream failure (5xx, connection error, 429 without Retry-After). It is a
+// variable (not a const) so tests can shrink it to milliseconds via
+// SetUpstreamCooldownForTest; the default 30s is unchanged production
+// behavior.
+var upstreamCooldown = 30 * time.Second
+
 var hopByHopHeaders = map[string]bool{
 	"Connection":          true,
 	"Transfer-Encoding":   true,
@@ -151,7 +158,7 @@ func handleUpstreamError(acc *pool.Account, resp *http.Response, requestID strin
 		}
 		cd := parseRetryAfter(resp)
 		if cd <= 0 {
-			cd = 30 * time.Second
+			cd = upstreamCooldown
 		}
 		if cd > 5*time.Minute {
 			cd = 5 * time.Minute
@@ -167,7 +174,7 @@ func handleUpstreamError(acc *pool.Account, resp *http.Response, requestID strin
 		return
 	}
 
-	acc.SetCooldown(30 * time.Second)
+	acc.SetCooldown(upstreamCooldown)
 	slog.Warn("upstream temporary error, cooling down", append(baseAttrs, "body", util.RedactBody(bodyBytes), "error_type", "upstream_5xx")...)
 }
 
@@ -263,7 +270,11 @@ type doUpstreamResult struct {
 func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opts ChatForwardOpts, requestID string) doUpstreamResult {
 	ctx, cancel := upstreamContext(r, opts.Stream)
 
-	targetURL := util.JoinURLPath(acc.BaseURL(), "/chat/completions")
+	upPath := opts.UpstreamPath
+	if upPath == "" {
+		upPath = "/chat/completions"
+	}
+	targetURL := util.JoinURLPath(acc.BaseURL(), upPath)
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
 	}
@@ -275,9 +286,19 @@ func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opt
 		util.RecordUpstreamRetry()
 		return doUpstreamResult{retry: true}
 	}
+	// Header order (account headers can never override the credential):
+	//   1. copy safe client headers (Authorization/hop-by-hop/sensitive dropped)
+	//   2. apply account-level headers (override same-named client headers)
+	//   3. apply the account credential header (Authorization: Bearer <key>,
+	//      or the account's custom auth_header when configured)
+	//   4. default Content-Type to application/json when unset (accounts may
+	//      explicitly set their own Content-Type)
 	copyClientHeaders(req.Header, r.Header)
-	req.Header.Set("Authorization", "Bearer "+acc.Key())
-	req.Header.Set("Content-Type", "application/json")
+	pool.ApplyAccountHeaders(req.Header, acc)
+	pool.ApplyAuthHeader(req.Header, acc)
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := acc.Client().Do(req)
 	if err != nil {
@@ -288,7 +309,7 @@ func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opt
 			util.RecordError()
 			return doUpstreamResult{retry: false, fatalErr: fmt.Errorf("client disconnected: %w", r.Context().Err())}
 		}
-		acc.SetCooldown(30 * time.Second)
+		acc.SetCooldown(upstreamCooldown)
 		slog.Warn("chat retry, upstream connection error", "req", requestID, "model", opts.Model, "account", acc.Name(), "error", err, "error_type", upstreamErrorType(err))
 		util.RecordUpstreamRetry()
 		return doUpstreamResult{retry: true}
@@ -347,7 +368,7 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 		if readErr != nil {
 			slog.Warn("failed to read upstream 5xx body", "req", requestID, "error", readErr)
 		}
-		acc.SetCooldown(30 * time.Second)
+		acc.SetCooldown(upstreamCooldown)
 		slog.Warn("upstream 5xx error, cooling down", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", util.RedactBody(errBody), "error_type", "upstream_5xx")
 		util.RecordUpstreamRetry()
 		return false, nil

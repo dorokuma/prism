@@ -81,6 +81,23 @@ func (mc *ModelCache) filePath(provider string) string {
 	return filepath.Join(mc.dir, provider+".json")
 }
 
+// providerSkipPISync reports whether a provider is excluded from
+// prism-managed pi models.json sync and from upstream model fetching. A
+// provider is skipped when any of its accounts sets skip_pi_sync=true: its
+// pi metadata (e.g. agentrouter-anthropic with api: anthropic-messages) is
+// hand-maintained and must not be overwritten by prism.
+func providerSkipPISync(cfg *config.Config, provider string) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, acc := range cfg.Accounts {
+		if acc.Provider == provider && acc.SkipPISync {
+			return true
+		}
+	}
+	return false
+}
+
 // LoadFromDisk reads all cached provider model lists from disk.
 // Missing files are silently skipped.
 func (mc *ModelCache) LoadFromDisk() {
@@ -90,6 +107,9 @@ func (mc *ModelCache) LoadFromDisk() {
 	for _, acc := range mc.cfg.Accounts {
 		provider := acc.Provider
 		if provider == "" {
+			continue
+		}
+		if providerSkipPISync(mc.cfg, provider) {
 			continue
 		}
 		fp := mc.filePath(provider)
@@ -128,6 +148,9 @@ func (mc *ModelCache) FetchAllAsync(onDone func()) {
 	for _, acc := range mc.cfg.Accounts {
 		provider := acc.Provider
 		if provider == "" {
+			continue
+		}
+		if providerSkipPISync(mc.cfg, provider) {
 			continue
 		}
 		mc.mu.RLock()
@@ -227,6 +250,9 @@ func (mc *ModelCache) RefreshStale() {
 		if provider == "" {
 			continue
 		}
+		if providerSkipPISync(mc.cfg, provider) {
+			continue
+		}
 		mc.mu.RLock()
 		pc := mc.caches[provider]
 		mc.mu.RUnlock()
@@ -244,6 +270,9 @@ func (mc *ModelCache) RefreshAll() {
 	for _, acc := range mc.cfg.Accounts {
 		provider := acc.Provider
 		if provider == "" {
+			continue
+		}
+		if providerSkipPISync(mc.cfg, provider) {
 			continue
 		}
 		if err := mc.Fetch(provider); err != nil {
@@ -365,6 +394,13 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 	}
 
 	for _, provider := range cfg.ProviderNames() {
+		if providerSkipPISync(cfg, provider) {
+			// Preserve the existing models.json entry untouched (it is
+			// hand-maintained, e.g. agentrouter-anthropic with
+			// api: anthropic-messages).
+			slog.Info("skip_pi_sync, preserving models.json entry", "provider", provider)
+			continue
+		}
 		models := mc.GetModels(provider)
 		if models == nil {
 			slog.Warn("no cache for provider, skipping sync", "provider", provider)

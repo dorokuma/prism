@@ -8,6 +8,12 @@ var (
 
 	// ProbeRetryDelay is the delay between probe retries.
 	ProbeRetryDelay = 2 * time.Second
+
+	// AccountSelectTimeout is the timeout for account selection.
+	// A variable (not a const) so tests can shrink it to milliseconds (see
+	// SetAccountSelectTimeoutForTest in internal/proxy/export_test.go);
+	// the default 30s is unchanged.
+	AccountSelectTimeout = 30 * time.Second
 )
 
 const (
@@ -40,9 +46,6 @@ const (
 
 	// UpstreamRetryDelay is the delay between upstream retries.
 	UpstreamRetryDelay = 200 * time.Millisecond
-
-	// AccountSelectTimeout is the timeout for account selection.
-	AccountSelectTimeout = 30 * time.Second
 
 	// MaxErrorBodyBytes is the maximum bytes to read from an error response body.
 	MaxErrorBodyBytes = 1 << 20

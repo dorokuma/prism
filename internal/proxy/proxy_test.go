@@ -275,6 +275,13 @@ func TestUpstreamError4xxPassthrough(t *testing.T) {
 }
 
 func TestUpstream5xxCooldown(t *testing.T) {
+	// Shrink the cooldown/select timeout so the retry loop drains in ms
+	// instead of waiting ~30s per cooldown expiry (see audit_test.go 5xx).
+	restoreCooldown := SetUpstreamCooldownForTest(10 * time.Millisecond)
+	defer restoreCooldown()
+	restoreSelect := SetAccountSelectTimeoutForTest(100 * time.Millisecond)
+	defer restoreSelect()
+
 	// Mock upstream returning 503
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -338,6 +345,13 @@ func TestClientDisconnectedNoRetry(t *testing.T) {
 }
 
 func TestUpstreamConnectionErrorRetry(t *testing.T) {
+	// Shrink the cooldown/select timeout so the retry loop drains in ms
+	// instead of waiting ~30s per cooldown expiry.
+	restoreCooldown := SetUpstreamCooldownForTest(10 * time.Millisecond)
+	defer restoreCooldown()
+	restoreSelect := SetAccountSelectTimeoutForTest(100 * time.Millisecond)
+	defer restoreSelect()
+
 	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: "http://127.0.0.1:1"}}}
 	p := pool.NewPool(cfg.Accounts)
 
@@ -383,6 +397,13 @@ func TestUpstream401Retry(t *testing.T) {
 }
 
 func TestUpstream429CooldownRetry(t *testing.T) {
+	// Shrink the cooldown/select timeout so the retry loop drains in ms
+	// instead of waiting ~30s per cooldown expiry.
+	restoreCooldown := SetUpstreamCooldownForTest(10 * time.Millisecond)
+	defer restoreCooldown()
+	restoreSelect := SetAccountSelectTimeoutForTest(100 * time.Millisecond)
+	defer restoreSelect()
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(429)
@@ -560,5 +581,382 @@ func TestCopyUpstreamHeaders_Allowlist(t *testing.T) {
 		if dst.Get(disallowed) != "" {
 			t.Errorf("disallowed header %q leaked through", disallowed)
 		}
+	}
+}
+
+// TestDoUpstreamAccountHeadersOverride verifies account headers override
+// same-named client headers (User-Agent) and the credential header is always
+// Authorization: Bearer <key>.
+func TestDoUpstreamAccountHeadersOverride(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") != "codex-cli/1.0.0" {
+			t.Errorf("upstream User-Agent = %q, want account header to win", r.Header.Get("User-Agent"))
+		}
+		if r.Header.Get("Originator") != "codex_cli_rs" {
+			t.Errorf("upstream Originator = %q", r.Header.Get("Originator"))
+		}
+		if r.Header.Get("x-app") != "cli" {
+			t.Errorf("upstream x-app = %q", r.Header.Get("x-app"))
+		}
+		if r.Header.Get("Authorization") != "Bearer sk-test-key" {
+			t.Errorf("upstream Authorization = %q, want Bearer sk-test-key", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{
+		Name:     "test",
+		Key:      "sk-test-key",
+		BaseURL:  upstream.URL,
+		Provider: "agentrouter-openai",
+		Headers: map[string]string{
+			"User-Agent": "codex-cli/1.0.0",
+			"Originator": "codex_cli_rs",
+			"x-app":      "cli",
+		},
+	}}}
+	p := pool.NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}`)))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("User-Agent", "client-ua-should-lose")
+
+	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}`), time.Now(), ChatForwardOpts{}, cfg)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+// TestDoUpstreamIgnoresAccountAuthorizationHeader verifies an Authorization
+// key inside account headers is ignored (credential only comes from the key).
+func TestDoUpstreamIgnoresAccountAuthorizationHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer sk-test-key" {
+			t.Errorf("upstream Authorization = %q, want Bearer sk-test-key (account header must be ignored)", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{
+		Name:    "test",
+		Key:     "sk-test-key",
+		BaseURL: upstream.URL,
+		Headers: map[string]string{
+			"Authorization": "Bearer injected-by-account",
+		},
+	}}}
+	p := pool.NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+// TestAuthHeaderEmptyStillBearer verifies the default auth_header (empty)
+// keeps the legacy Authorization: Bearer <key> form and no custom header.
+func TestAuthHeaderEmptyStillBearer(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer sk-test-key" {
+			t.Errorf("upstream Authorization = %q, want Bearer sk-test-key", r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("x-api-key") != "" {
+			t.Errorf("upstream x-api-key = %q, want empty", r.Header.Get("x-api-key"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{
+		Name:       "test",
+		Key:        "sk-test-key",
+		BaseURL:    upstream.URL,
+		AuthHeader: "", // omitted → Bearer
+	}}}
+	p := pool.NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+// TestAuthHeaderCustomNoAuthorization verifies auth_header: x-api-key sends
+// the raw key in x-api-key and NO Authorization header.
+func TestAuthHeaderCustomNoAuthorization(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-api-key") != "sk-test-key" {
+			t.Errorf("upstream x-api-key = %q, want raw key sk-test-key", r.Header.Get("x-api-key"))
+		}
+		if r.Header.Get("Authorization") != "" {
+			t.Errorf("upstream Authorization = %q, want empty when auth_header is custom", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{
+		Name:       "test",
+		Key:        "sk-test-key",
+		BaseURL:    upstream.URL,
+		AuthHeader: "x-api-key",
+	}}}
+	p := pool.NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+// TestChatCompletionsStillDefaultPath is a regression test: the chat path
+// still forwards to /chat/completions.
+func TestChatCompletionsStillDefaultPath(t *testing.T) {
+	gotPath := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	p := pool.NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if gotPath != "/chat/completions" {
+		t.Errorf("upstream path = %q, want /chat/completions", gotPath)
+	}
+}
+
+// TestMessagesRoutePassthrough verifies POST /v1/messages reaches the
+// upstream at /v1/messages with the body byte-for-byte unchanged.
+func TestMessagesRoutePassthrough(t *testing.T) {
+	reqBody := []byte(`{"model":"claude-opus-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("upstream path = %q, want /v1/messages", r.URL.Path)
+		}
+		got, _ := io.ReadAll(r.Body)
+		if !bytes.Equal(got, reqBody) {
+			t.Errorf("upstream body mismatch:\n got %s\nwant %s", got, reqBody)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"id":"msg_1","type":"message","content":[{"type":"text","text":"ok"}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	p := pool.NewPool(cfg.Accounts)
+	holder := config.NewConfigHolder(cfg)
+	handler := NewProxyHandler(p, config.WireAPIBoth, holder, nil)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
+	r.Header.Set("Content-Type", "application/json")
+
+	handler.ServeHTTP(rec, r)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"msg_1"`) {
+		t.Errorf("response body should pass through: %s", rec.Body.String())
+	}
+}
+
+// TestMessagesMethodNotAllowed verifies non-POST /v1/messages gets a 405.
+func TestMessagesMethodNotAllowed(t *testing.T) {
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: "http://127.0.0.1:1"}}}
+	p := pool.NewPool(cfg.Accounts)
+	holder := config.NewConfigHolder(cfg)
+	handler := NewProxyHandler(p, config.WireAPIBoth, holder, nil)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/v1/messages", nil)
+	handler.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rec.Code)
+	}
+}
+
+// TestMessagesSkipSanitize verifies the /v1/messages body is NOT run through
+// TransformRequestBodyForProvider: model remap must not apply, while the chat
+// path with the same body DOES remap the model name.
+func TestMessagesSkipSanitize(t *testing.T) {
+	reqBody := []byte(`{"model":"gpt-5.5","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)
+
+	// Chat path: remap gpt-5.5 → deepseek-v4-pro (via frontier tier).
+	chatGotModel := ""
+	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var raw map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		chatGotModel, _ = raw["model"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer chatUpstream.Close()
+
+	// Messages path: body must pass through untouched (model stays gpt-5.5).
+	msgGotModel := ""
+	msgGotBody := []byte{}
+	msgUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		msgGotBody, _ = io.ReadAll(r.Body)
+		var raw map[string]any
+		_ = json.Unmarshal(msgGotBody, &raw)
+		msgGotModel, _ = raw["model"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"id":"msg_1","type":"message","content":[]}`))
+	}))
+	defer msgUpstream.Close()
+
+	// Chat path with remap enabled.
+	chatCfg := &config.Config{
+		Accounts:          []config.AccountConfig{{Name: "test", Key: "k", BaseURL: chatUpstream.URL}},
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"gpt-5.5": "frontier"},
+		ModelTiers:        map[string]string{"frontier": "deepseek-v4-pro"},
+	}
+	pChat := pool.NewPool(chatCfg.Accounts)
+	recChat := httptest.NewRecorder()
+	rChat := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(reqBody))
+	rChat.Header.Set("Content-Type", "application/json")
+	proxyChatWithBody(pChat, recChat, rChat, reqBody, time.Now(), ChatForwardOpts{}, chatCfg)
+	if recChat.Code != 200 {
+		t.Fatalf("chat status = %d", recChat.Code)
+	}
+	if chatGotModel != "deepseek-v4-pro" {
+		t.Errorf("chat path remapped model = %q, want deepseek-v4-pro", chatGotModel)
+	}
+
+	// Messages path: same config, sanitize skipped.
+	msgCfg := &config.Config{
+		Accounts:          []config.AccountConfig{{Name: "test", Key: "k", BaseURL: msgUpstream.URL}},
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"gpt-5.5": "frontier"},
+		ModelTiers:        map[string]string{"frontier": "deepseek-v4-pro"},
+	}
+	pMsg := pool.NewPool(msgCfg.Accounts)
+	recMsg := httptest.NewRecorder()
+	rMsg := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
+	rMsg.Header.Set("Content-Type", "application/json")
+	proxyChatWithBody(pMsg, recMsg, rMsg, reqBody, time.Now(), ChatForwardOpts{
+		UpstreamPath: "/v1/messages",
+		SkipSanitize: true,
+	}, msgCfg)
+	if recMsg.Code != 200 {
+		t.Fatalf("messages status = %d", recMsg.Code)
+	}
+	if msgGotModel != "gpt-5.5" {
+		t.Errorf("messages path model = %q, want gpt-5.5 (sanitize must be skipped)", msgGotModel)
+	}
+	if !bytes.Equal(msgGotBody, reqBody) {
+		t.Errorf("messages path body should be byte-for-byte unchanged:\n got %s\nwant %s", msgGotBody, reqBody)
+	}
+}
+
+// TestMessagesStreamSSE verifies streaming /v1/messages passes SSE bytes
+// through to the client unchanged (no responses translation).
+func TestMessagesStreamSSE(t *testing.T) {
+	sse := "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\ndata: [DONE]\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		w.Write([]byte(sse))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	p := pool.NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-5","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(p, rec, r, []byte(`{"model":"claude-opus-5","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`), time.Now(), ChatForwardOpts{
+		Stream:       true,
+		UpstreamPath: "/v1/messages",
+		SkipSanitize: true,
+	}, cfg)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != sse {
+		t.Errorf("SSE bytes not passed through unchanged:\n got %q\nwant %q", rec.Body.String(), sse)
+	}
+}
+
+// TestWireAPIResponsesStillAllowsMessages verifies wire_api=responses keeps
+// /v1/messages enabled while /v1/chat/completions is disabled.
+func TestWireAPIResponsesStillAllowsMessages(t *testing.T) {
+	reqBody := []byte(`{"model":"claude-opus-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"id":"msg_1","type":"message","content":[]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	p := pool.NewPool(cfg.Accounts)
+	holder := config.NewConfigHolder(cfg)
+	handler := NewProxyHandler(p, config.WireAPIResponses, holder, nil)
+
+	// /v1/chat/completions → 404 under responses-only wire.
+	recChat := httptest.NewRecorder()
+	rChat := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(reqBody))
+	handler.ServeHTTP(recChat, rChat)
+	if recChat.Code != http.StatusNotFound {
+		t.Errorf("chat status = %d, want 404 under wire_api=responses", recChat.Code)
+	}
+
+	// /v1/messages → 200, always enabled.
+	recMsg := httptest.NewRecorder()
+	rMsg := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
+	rMsg.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(recMsg, rMsg)
+	if recMsg.Code != 200 {
+		t.Errorf("messages status = %d, want 200 under wire_api=responses", recMsg.Code)
 	}
 }

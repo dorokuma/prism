@@ -4,7 +4,6 @@ import (
 	"context"
 	"expvar"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -77,7 +76,8 @@ func main() {
 	// Initial health probe: check all accounts on startup, warn but don't block
 	pool.ProbeExhausted(p)
 
-	// 启动时验证所有账号的连通性——使用 /v1/models 探活
+	// 启动时验证所有账号的连通性——使用账号级 probe_path 探活
+	// （默认 GET /v1/models；probe_path: disabled 的账号跳过且保持 healthy）
 	slog.Info("starting initial health check for all accounts")
 	sem := make(chan struct{}, 10)
 	var startupWg sync.WaitGroup
@@ -93,38 +93,27 @@ func main() {
 				}
 			}()
 
-			url := util.JoinURLPath(a.BaseURL(), "/v1/models")
-			req, err := http.NewRequest("GET", url, nil)
-			if err != nil {
-				slog.Warn("startup check failed to create request", "account", a.Name(), "error", err)
+			statusCode, bodyBytes, skipped, err := pool.ProbeAccountOnce(a)
+			if skipped {
+				// probe_path: disabled → 不发探活请求、不改状态，只记 Info
+				slog.Info("startup check skipped, probe disabled", "account", a.Name())
 				return
 			}
-			req.Header.Set("Authorization", "Bearer "+a.Key())
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			req = req.WithContext(ctx)
-			resp, err := a.Client().Do(req)
 			if err != nil {
 				slog.Warn("startup check request failed", "account", a.Name(), "error", err)
 				a.SetCooldown(5 * time.Minute)
 				return
 			}
-			defer resp.Body.Close()
-			limitReader := io.LimitReader(resp.Body, 4096)
-			bodyBytes, readErr := io.ReadAll(limitReader)
-			if readErr != nil {
-				slog.Warn("startup check read body failed", "account", a.Name(), "error", readErr)
-			}
-			if resp.StatusCode == 200 {
+			if statusCode == 200 {
 				slog.Info("startup check OK", "account", a.Name(), "status", 200)
-			} else if resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 403 || proxy.IsPermanentCredentialError(bodyBytes) || proxy.IsQuotaError(bodyBytes) {
-				slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", resp.StatusCode, "body", util.RedactBody(bodyBytes))
+			} else if statusCode == 401 || statusCode == 402 || statusCode == 403 || proxy.IsPermanentCredentialError(bodyBytes) || proxy.IsQuotaError(bodyBytes) {
+				slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", statusCode, "body", util.RedactBody(bodyBytes))
 				a.MarkExhausted()
-			} else if resp.StatusCode == 429 {
+			} else if statusCode == 429 {
 				slog.Warn("startup check temporary quota error, cooling down", "account", a.Name(), "status", 429, "body", util.RedactBody(bodyBytes))
 				a.SetCooldown(2 * time.Minute)
 			} else {
-				slog.Warn("startup check temporary error, cooling down", "account", a.Name(), "status", resp.StatusCode, "body", util.RedactBody(bodyBytes))
+				slog.Warn("startup check temporary error, cooling down", "account", a.Name(), "status", statusCode, "body", util.RedactBody(bodyBytes))
 				a.SetCooldown(5 * time.Minute)
 			}
 		}(acc)
