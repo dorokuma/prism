@@ -81,6 +81,26 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 	// effort-mapping transform and for account selection (SelectByProvider).
 	// It selects the effort schema (opencode vs ollama).
 	provider := r.Header.Get("X-Prism-Provider")
+	if provider == "" {
+		if cfg.DefaultProvider != "" {
+			// Config-driven fallback: route through the default provider's
+			// normal per-provider round-robin.
+			provider = cfg.DefaultProvider
+		} else {
+			// No header and no default → reject. Never fall back to whole-pool
+			// selection (that could route an account to the wrong provider).
+			aud.Error = "missing X-Prism-Provider header"
+			aud.ErrorType = "missing_provider"
+			slog.Warn("request rejected: missing X-Prism-Provider header", "request_id", requestID, "path", r.URL.Path)
+			util.WriteJSON(sc, 400, map[string]any{
+				"error": map[string]any{
+					"message": "missing X-Prism-Provider header",
+					"type":    "invalid_request_error",
+				},
+			})
+			return
+		}
+	}
 	// Transform normally runs for every request; model remap inside is still
 	// gated by cfg.ModelRemapEnabled (real model name passes through when
 	// disabled). The /v1/messages surface (anthropic body, not a chat

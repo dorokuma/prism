@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.11.0  Date: 2026-08-08  Status: living document
+> Version: v0.12.0  Date: 2026-08-08  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -63,6 +63,8 @@ systemctl restart prism   # only when you intend downtime / reload
 | `model_tiers` | map | — | Tier → upstream model |
 | `model_remap` | map | — | Virtual model → tier |
 | `default_tier` | string | — | Fallback tier |
+| `default_provider` | string | — | Fallback provider for requests missing the X-Prism-Provider header; unset = reject them with HTTP 400 |
+| `max_concurrent_per_account` | map | — | Model → max concurrent requests per account (exact match; silences the unknown-model default warning) |
 
 ### Model remapping behavior
 
@@ -138,6 +140,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-08** — v0.12.0 — feat: new `default_provider` config option; requests missing the X-Prism-Provider header now route through the configured default provider when set, otherwise return HTTP 400 (missing X-Prism-Provider header) instead of falling back to whole-pool account selection, which could previously hit an account of a different provider (e.g. deepseek-v4-flash landing on agentrouter-ant-2, gpt-5.6-sol landing on agentrouter-ant-1); explicit `max_concurrent_per_account` example added so per-model concurrency is configured instead of falling back to the built-in default with an "unknown model" warning
 
 - **2026-08-08** — v0.11.0 — fix: account selection is now true per-provider round-robin. Previously all providers shared a single pool-wide cursor whose start index was computed modulo the total number of accounts, and the cursor advanced by the number of accounts scanned per attempt; a provider's first account on the ring was therefore picked disproportionately often (measured 3:0 on one two-account provider and 6:2 on another), and high-traffic providers polluted the rotation of low-traffic ones. Each provider now has its own cursor that rotates strictly within its own account subset, advancing exactly one position per successful selection, and the full-pool Select path advances its cursor the same way; new tests guard rotation order, cross-provider isolation, cooldown skipping, and uniform full-pool rotation
 - **2026-08-08** — v0.10.2 — docs: correct the syncPIModelsJSON write-strategy comment — direct overwrite preserves the existing owner/mode of pi models.json, which is what lets prism write it through group permissions; tmp+rename would reassign ownership

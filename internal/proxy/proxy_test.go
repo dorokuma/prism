@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -107,6 +110,7 @@ func TestProxyChatWithBodyEmptyPool(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "some-provider")
 
 	proxyChatWithBody(p, w, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, &config.Config{})
 
@@ -216,12 +220,13 @@ func TestUpstreamError4xxPassthrough(t *testing.T) {
 	}))
 	defer upstreamJSON.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstreamJSON.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstreamJSON.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -257,12 +262,13 @@ func TestUpstreamError4xxPassthrough(t *testing.T) {
 	}))
 	defer upstreamPlain.Close()
 
-	cfg2 := &config.Config{Accounts: []config.AccountConfig{{Name: "test2", Key: "k", BaseURL: upstreamPlain.URL}}}
+	cfg2 := &config.Config{Accounts: []config.AccountConfig{{Name: "test2", Key: "k", BaseURL: upstreamPlain.URL, Provider: "test2"}}}
 	p2 := pool.NewPool(cfg2.Accounts)
 
 	rec2 := httptest.NewRecorder()
 	r2 := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r2.Header.Set("Content-Type", "application/json")
+	r2.Header.Set("X-Prism-Provider", "test2")
 
 	proxyChatWithBody(p2, rec2, r2, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg2)
 
@@ -290,12 +296,13 @@ func TestUpstream5xxCooldown(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -352,12 +359,13 @@ func TestUpstreamConnectionErrorRetry(t *testing.T) {
 	restoreSelect := SetAccountSelectTimeoutForTest(100 * time.Millisecond)
 	defer restoreSelect()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: "http://127.0.0.1:1"}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: "http://127.0.0.1:1", Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -378,12 +386,13 @@ func TestUpstream401Retry(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -411,12 +420,13 @@ func TestUpstream429CooldownRetry(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -443,12 +453,13 @@ data: [DONE]
 	}))
 	defer upstream.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{ResponsesOut: false, Stream: false}, cfg)
 
@@ -471,12 +482,13 @@ func TestHandleUpstreamResponse_NoDoubleCount(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -624,6 +636,7 @@ func TestDoUpstreamAccountHeadersOverride(t *testing.T) {
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}`)))
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("User-Agent", "client-ua-should-lose")
+	r.Header.Set("X-Prism-Provider", "agentrouter-openai")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -646,9 +659,10 @@ func TestDoUpstreamIgnoresAccountAuthorizationHeader(t *testing.T) {
 	defer upstream.Close()
 
 	cfg := &config.Config{Accounts: []config.AccountConfig{{
-		Name:    "test",
-		Key:     "sk-test-key",
-		BaseURL: upstream.URL,
+		Name:     "test",
+		Key:      "sk-test-key",
+		BaseURL:  upstream.URL,
+		Provider: "test",
 		Headers: map[string]string{
 			"Authorization": "Bearer injected-by-account",
 		},
@@ -658,6 +672,7 @@ func TestDoUpstreamIgnoresAccountAuthorizationHeader(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -686,6 +701,7 @@ func TestAuthHeaderEmptyStillBearer(t *testing.T) {
 		Name:       "test",
 		Key:        "sk-test-key",
 		BaseURL:    upstream.URL,
+		Provider:   "test",
 		AuthHeader: "", // omitted → Bearer
 	}}}
 	p := pool.NewPool(cfg.Accounts)
@@ -693,6 +709,7 @@ func TestAuthHeaderEmptyStillBearer(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -721,6 +738,7 @@ func TestAuthHeaderCustomNoAuthorization(t *testing.T) {
 		Name:       "test",
 		Key:        "sk-test-key",
 		BaseURL:    upstream.URL,
+		Provider:   "test",
 		AuthHeader: "x-api-key",
 	}}}
 	p := pool.NewPool(cfg.Accounts)
@@ -728,6 +746,7 @@ func TestAuthHeaderCustomNoAuthorization(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -748,12 +767,13 @@ func TestChatCompletionsStillDefaultPath(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -783,7 +803,7 @@ func TestMessagesRoutePassthrough(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 	holder := config.NewConfigHolder(cfg)
 	handler := NewProxyHandler(p, config.WireAPIBoth, holder, nil)
@@ -791,6 +811,7 @@ func TestMessagesRoutePassthrough(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	handler.ServeHTTP(rec, r)
 
@@ -852,7 +873,7 @@ func TestMessagesSkipSanitize(t *testing.T) {
 
 	// Chat path with remap enabled.
 	chatCfg := &config.Config{
-		Accounts:          []config.AccountConfig{{Name: "test", Key: "k", BaseURL: chatUpstream.URL}},
+		Accounts:          []config.AccountConfig{{Name: "test", Key: "k", BaseURL: chatUpstream.URL, Provider: "test"}},
 		ModelRemapEnabled: true,
 		ModelRemap:        map[string]string{"gpt-5.5": "frontier"},
 		ModelTiers:        map[string]string{"frontier": "deepseek-v4-pro"},
@@ -861,6 +882,7 @@ func TestMessagesSkipSanitize(t *testing.T) {
 	recChat := httptest.NewRecorder()
 	rChat := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(reqBody))
 	rChat.Header.Set("Content-Type", "application/json")
+	rChat.Header.Set("X-Prism-Provider", "test")
 	proxyChatWithBody(pChat, recChat, rChat, reqBody, time.Now(), ChatForwardOpts{}, chatCfg)
 	if recChat.Code != 200 {
 		t.Fatalf("chat status = %d", recChat.Code)
@@ -871,7 +893,7 @@ func TestMessagesSkipSanitize(t *testing.T) {
 
 	// Messages path: same config, sanitize skipped.
 	msgCfg := &config.Config{
-		Accounts:          []config.AccountConfig{{Name: "test", Key: "k", BaseURL: msgUpstream.URL}},
+		Accounts:          []config.AccountConfig{{Name: "test", Key: "k", BaseURL: msgUpstream.URL, Provider: "test"}},
 		ModelRemapEnabled: true,
 		ModelRemap:        map[string]string{"gpt-5.5": "frontier"},
 		ModelTiers:        map[string]string{"frontier": "deepseek-v4-pro"},
@@ -880,6 +902,7 @@ func TestMessagesSkipSanitize(t *testing.T) {
 	recMsg := httptest.NewRecorder()
 	rMsg := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
 	rMsg.Header.Set("Content-Type", "application/json")
+	rMsg.Header.Set("X-Prism-Provider", "test")
 	proxyChatWithBody(pMsg, recMsg, rMsg, reqBody, time.Now(), ChatForwardOpts{
 		UpstreamPath: "/v1/messages",
 		SkipSanitize: true,
@@ -906,12 +929,13 @@ func TestMessagesStreamSSE(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-5","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"claude-opus-5","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`), time.Now(), ChatForwardOpts{
 		Stream:       true,
@@ -938,7 +962,7 @@ func TestWireAPIResponsesStillAllowsMessages(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 	holder := config.NewConfigHolder(cfg)
 	handler := NewProxyHandler(p, config.WireAPIResponses, holder, nil)
@@ -955,8 +979,198 @@ func TestWireAPIResponsesStillAllowsMessages(t *testing.T) {
 	recMsg := httptest.NewRecorder()
 	rMsg := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
 	rMsg.Header.Set("Content-Type", "application/json")
+	rMsg.Header.Set("X-Prism-Provider", "test")
 	handler.ServeHTTP(recMsg, rMsg)
 	if recMsg.Code != 200 {
 		t.Errorf("messages status = %d, want 200 under wire_api=responses", recMsg.Code)
+	}
+}
+
+// TestHeadlessRequestRejectedWithoutDefaultProvider verifies that a request
+// without X-Prism-Provider and without cfg.DefaultProvider is rejected with
+// HTTP 400 and never reaches any upstream account.
+func TestHeadlessRequestRejectedWithoutDefaultProvider(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{
+		Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "prov",
+	}}}
+	p := pool.NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+
+	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+
+	if rec.Code != 400 {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	errObj, ok := body["error"].(map[string]any)
+	if !ok {
+		t.Fatal("response missing error object")
+	}
+	if errObj["message"] != "missing X-Prism-Provider header" {
+		t.Errorf("error message = %q, want 'missing X-Prism-Provider header'", errObj["message"])
+	}
+	if errObj["type"] != "invalid_request_error" {
+		t.Errorf("error type = %q, want invalid_request_error", errObj["type"])
+	}
+	if upstreamHits.Load() != 0 {
+		t.Errorf("upstream received %d requests, want 0 (no account may be selected)", upstreamHits.Load())
+	}
+}
+
+// TestHeadlessRequestUsesDefaultProviderRoundRobin verifies that headless
+// requests with cfg.DefaultProvider set are routed through that provider's
+// accounts with strict per-provider round-robin alternation, and never touch
+// accounts of other providers.
+func TestHeadlessRequestUsesDefaultProviderRoundRobin(t *testing.T) {
+	var mu sync.Mutex
+	var hits []string
+
+	newUpstream := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			hits = append(hits, name)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+		}))
+	}
+	upA := newUpstream("prov-a")
+	defer upA.Close()
+	upB := newUpstream("prov-b")
+	defer upB.Close()
+	upDecoy := newUpstream("other")
+	defer upDecoy.Close()
+
+	cfg := &config.Config{
+		DefaultProvider: "prov",
+		Accounts: []config.AccountConfig{
+			{Name: "prov-a", Key: "k", BaseURL: upA.URL, Provider: "prov"},
+			{Name: "prov-b", Key: "k", BaseURL: upB.URL, Provider: "prov"},
+			{Name: "other-1", Key: "k", BaseURL: upDecoy.URL, Provider: "other"},
+		},
+	}
+	p := pool.NewPool(cfg.Accounts)
+
+	for i := 0; i < 4; i++ {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+		r.Header.Set("Content-Type", "application/json")
+		proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+		if rec.Code != 200 {
+			t.Fatalf("request %d: status = %d, want 200", i, rec.Code)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"prov-a", "prov-b", "prov-a", "prov-b"}
+	if !reflect.DeepEqual(hits, want) {
+		t.Errorf("round-robin sequence = %v, want %v", hits, want)
+	}
+	for _, h := range hits {
+		if h == "other" {
+			t.Error("decoy provider account was hit by a headless default-provider request")
+		}
+	}
+}
+
+// TestHeaderRequestStillWinsOverDefaultProvider verifies that an explicit
+// X-Prism-Provider header takes precedence over cfg.DefaultProvider (the
+// with-header behavior is unchanged).
+func TestHeaderRequestStillWinsOverDefaultProvider(t *testing.T) {
+	var mu sync.Mutex
+	var hits []string
+
+	newUpstream := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			hits = append(hits, name)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+		}))
+	}
+	upA := newUpstream("prov-a")
+	defer upA.Close()
+	upB := newUpstream("prov-b")
+	defer upB.Close()
+	upDecoy := newUpstream("other-1")
+	defer upDecoy.Close()
+
+	cfg := &config.Config{
+		DefaultProvider: "other", // must lose to the explicit header
+		Accounts: []config.AccountConfig{
+			{Name: "prov-a", Key: "k", BaseURL: upA.URL, Provider: "prov"},
+			{Name: "prov-b", Key: "k", BaseURL: upB.URL, Provider: "prov"},
+			{Name: "other-1", Key: "k", BaseURL: upDecoy.URL, Provider: "other"},
+		},
+	}
+	p := pool.NewPool(cfg.Accounts)
+
+	for i := 0; i < 4; i++ {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "prov")
+		proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+		if rec.Code != 200 {
+			t.Fatalf("request %d: status = %d, want 200", i, rec.Code)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"prov-a", "prov-b", "prov-a", "prov-b"}
+	if !reflect.DeepEqual(hits, want) {
+		t.Errorf("round-robin sequence = %v, want %v", hits, want)
+	}
+	for _, h := range hits {
+		if h == "other-1" {
+			t.Error("default provider account was hit despite explicit header")
+		}
+	}
+}
+
+// TestResolveMaxConcurrentExactMatchNoWarn verifies that an exact
+// max_concurrent_per_account entry is used and no "unknown model" warning is
+// logged.
+func TestResolveMaxConcurrentExactMatchNoWarn(t *testing.T) {
+	cfg := &config.Config{MaxConcurrentPerAccount: map[string]int{
+		"claude-opus-5": 8,
+		"*":             100,
+	}}
+	var buf bytes.Buffer
+	oldDefault := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(oldDefault)
+
+	if got := resolveMaxConcurrent("claude-opus-5", cfg); got != 8 {
+		t.Errorf("resolveMaxConcurrent(claude-opus-5) = %d, want 8", got)
+	}
+	if got := resolveMaxConcurrent("any-unknown-model", cfg); got != 100 {
+		t.Errorf("resolveMaxConcurrent(unknown with wildcard) = %d, want 100", got)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("unexpected warn logged: %s", buf.String())
 	}
 }

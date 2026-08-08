@@ -63,8 +63,8 @@ func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 func (h *capturingHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
-func (h *capturingHandler) WithGroup(name string) slog.Handler      { return h }
-func (h *capturingHandler) output() string { h.mu.Lock(); defer h.mu.Unlock(); return string(h.buf) }
+func (h *capturingHandler) WithGroup(name string) slog.Handler       { return h }
+func (h *capturingHandler) output() string                           { h.mu.Lock(); defer h.mu.Unlock(); return string(h.buf) }
 
 // stashSlog replaces the default slog.Logger with one that writes into h
 // and returns a restore function.  Callers must defer the restore func.
@@ -92,12 +92,13 @@ func TestAuditLog_RequestComplete(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL}}}
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
 	p := pool.NewPool(cfg.Accounts)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
 	// Inject a request ID to get a meaningful audit.req.
 	ctx := context.WithValue(r.Context(), util.RequestIDKey{}, "audit-test-1")
 	r = r.WithContext(ctx)
@@ -143,12 +144,13 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL, Provider: "t"}}}
 		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "t")
 
 		// Use responsesOut=true so handleUpstreamResponse goes through the
 		// responses_json path which calls chatCompletionToResponse and captures usage.
@@ -176,12 +178,13 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL, Provider: "t"}}}
 		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "t")
 
 		// Legacy path: responsesOut=false (default), non-streaming.
 		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
@@ -221,12 +224,13 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL, Provider: "t"}}}
 		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4","stream":true}`)))
 		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "t")
 
 		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), ChatForwardOpts{Stream: true}, cfg)
 
@@ -273,12 +277,13 @@ func TestAuditLog_TokensCaptured(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL, Provider: "t"}}}
 		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4","stream":true}`)))
 		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "t")
 
 		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), ChatForwardOpts{Stream: true}, cfg)
 
@@ -317,12 +322,13 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL}}}
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL, Provider: "t"}}}
 		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "t")
 
 		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -357,14 +363,15 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 		defer upstream.Close()
 
 		cfg := &config.Config{Accounts: []config.AccountConfig{
-			{Name: "a1", Key: "k1", BaseURL: upstream.URL},
-			{Name: "a2", Key: "k2", BaseURL: upstream.URL},
+			{Name: "a1", Key: "k1", BaseURL: upstream.URL, Provider: "a"},
+			{Name: "a2", Key: "k2", BaseURL: upstream.URL, Provider: "a"},
 		}}
 		p := pool.NewPool(cfg.Accounts)
 
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "a")
 
 		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
@@ -386,6 +393,7 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 		rec := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
 		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "none")
 
 		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, &config.Config{})
 

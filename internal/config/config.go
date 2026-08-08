@@ -99,6 +99,11 @@ type Config struct {
 	ModelMetadataPerProvider map[string]ModelMetadataMap `yaml:"model_metadata_per_provider,omitempty"`
 	LogLevel                 string                      `yaml:"log_level"`
 	MaxConcurrentPerAccount  map[string]int              `yaml:"max_concurrent_per_account"`
+	// DefaultProvider is the fallback provider used when a request arrives
+	// without the X-Prism-Provider header. Empty (default) = reject such
+	// requests with HTTP 400 instead of falling back to whole-pool selection
+	// (which could route an account to the wrong provider).
+	DefaultProvider string `yaml:"default_provider"`
 
 	// providerSchema maps a provider name to its effort schema ("ollama" or
 	// empty for opencode). Precomputed from account base_url hosts at load time.
@@ -154,6 +159,11 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if len(cfg.Accounts) == 0 {
 		return nil, fmt.Errorf("no accounts configured")
+	}
+	// default_provider must reference a provider that actually exists;
+	// otherwise requests without X-Prism-Provider would silently break.
+	if cfg.DefaultProvider != "" && !cfg.hasProvider(cfg.DefaultProvider) {
+		return nil, fmt.Errorf("default_provider %q not found among configured providers", cfg.DefaultProvider)
 	}
 	if cfg.ModelTiers == nil {
 		cfg.ModelTiers = map[string]string{}
@@ -292,6 +302,16 @@ func (c *Config) RemapModel(model string) string {
 		}
 	}
 	return model
+}
+
+// hasProvider reports whether any account belongs to the given provider name.
+func (c *Config) hasProvider(name string) bool {
+	for _, acc := range c.Accounts {
+		if acc.Provider == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ProviderNames returns all distinct provider names from account configs.

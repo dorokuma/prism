@@ -66,6 +66,31 @@ accounts:
   - name: account-2
     base_url: https://opencode.ai/zen/go/v1
 
+# ---------------------------------------------------------------------------
+# 可选：default_provider —— 请求未带 X-Prism-Provider 头时的兜底 provider。
+# 不配（默认）= 拒绝无头请求：直接返回 HTTP 400
+#   {"error":{"message":"missing X-Prism-Provider header","type":"invalid_request_error"}}
+# 不会回退到全池选择（回退会让任意账号被命中，导致账号跨 provider 串用）。
+# 配置后：无头请求按该 provider 走正常的 per-provider 轮转。
+# 值必须是下方 providers（或 accounts 的 provider 字段）中已存在的 provider 名，
+# 否则启动报错退出。
+# ---------------------------------------------------------------------------
+# default_provider: "agentrouter-anthropic"
+
+# ---------------------------------------------------------------------------
+# 可选：max_concurrent_per_account —— 按模型名精确匹配的单账号最大并发。
+# 未命中的模型回退到代码内置默认值（含 flash/pro 关键字推断），并打
+# "unknown model, using default concurrency" 告警；显式列出即可消除告警。
+# 值含义：agentrouter（第三方中转网关）账号取保守值 8；opencode-go 侧模型
+# 与 deepseek-v4-pro 同量级取 450。
+# ---------------------------------------------------------------------------
+# max_concurrent_per_account:
+#   claude-opus-5: 8
+#   claude-opus-4-8: 8
+#   gpt-5.6-sol: 8
+#   mimo-v2.5: 450
+#   grok-4.5: 450
+
 # Optional: tool definitions cache for request injection (Codex-related).
 # Production path matches service data dir:
 mcp_tools_json: "/var/lib/prism/mcp_tools.json"

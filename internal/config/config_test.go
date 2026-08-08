@@ -1048,3 +1048,66 @@ func TestAccountsEqualIncludesHeaders(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadConfigDefaultProviderValid(t *testing.T) {
+	content := `
+providers:
+  agentrouter-anthropic:
+    accounts:
+      - name: ant-1
+        key: k
+        base_url: https://api.example.com
+      - name: ant-2
+        key: k
+        base_url: https://api.example.com
+default_provider: agentrouter-anthropic
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig with valid default_provider: %v", err)
+	}
+	if cfg.DefaultProvider != "agentrouter-anthropic" {
+		t.Errorf("DefaultProvider = %q, want agentrouter-anthropic", cfg.DefaultProvider)
+	}
+	if len(cfg.Accounts) != 2 {
+		t.Errorf("accounts = %d, want 2", len(cfg.Accounts))
+	}
+}
+
+func TestLoadConfigDefaultProviderUnknown(t *testing.T) {
+	content := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: opencode-go
+default_provider: no-such-provider
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	_, err = LoadConfig(f.Name())
+	if err == nil {
+		t.Fatal("LoadConfig with unknown default_provider: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "default_provider") || !strings.Contains(err.Error(), "no-such-provider") {
+		t.Errorf("error = %q, want it to mention default_provider no-such-provider", err)
+	}
+}
