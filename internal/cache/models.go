@@ -492,10 +492,12 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	// Direct overwrite (not tmp+rename): pi's models.json lives in /root/.pi/agent/
-	// (root-owned dir; prism user has file write via chown but not dir write),
-	// so atomic tmp+rename (needs dir write) is impossible here. models.json is
-	// fully regenerable by sync, so non-atomic overwrite is acceptable.
+	// Direct overwrite (not tmp+rename): preserves the existing owner and mode
+	// of pi's models.json (root:pi-sync 0664), which is what lets the prism user
+	// write the file through group permissions. tmp+rename would create the new
+	// file owned by prism; with NoNewPrivileges and an empty CapabilityBoundingSet
+	// the process has no CAP_CHOWN to restore ownership, so direct overwrite is
+	// strictly better here.
 	if err := os.WriteFile(path, data, 0664); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
