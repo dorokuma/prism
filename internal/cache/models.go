@@ -82,10 +82,11 @@ func (mc *ModelCache) filePath(provider string) string {
 }
 
 // providerSkipPISync reports whether a provider is excluded from
-// prism-managed pi models.json sync and from upstream model fetching. A
-// provider is skipped when any of its accounts sets skip_pi_sync=true: its
-// pi metadata (e.g. agentrouter-anthropic with api: anthropic-messages) is
-// hand-maintained and must not be overwritten by prism.
+// prism-managed pi models.json sync. A provider is skipped when any of its
+// accounts sets skip_pi_sync=true: its pi metadata (e.g.
+// agentrouter-anthropic with api: anthropic-messages) is hand-maintained and
+// must not be overwritten by prism. The flag does NOT affect upstream model
+// fetching (the model cache fetches like any other provider).
 func providerSkipPISync(cfg *config.Config, provider string) bool {
 	if cfg == nil {
 		return false
@@ -107,9 +108,6 @@ func (mc *ModelCache) LoadFromDisk() {
 	for _, acc := range mc.cfg.Accounts {
 		provider := acc.Provider
 		if provider == "" {
-			continue
-		}
-		if providerSkipPISync(mc.cfg, provider) {
 			continue
 		}
 		fp := mc.filePath(provider)
@@ -148,9 +146,6 @@ func (mc *ModelCache) FetchAllAsync(onDone func()) {
 	for _, acc := range mc.cfg.Accounts {
 		provider := acc.Provider
 		if provider == "" {
-			continue
-		}
-		if providerSkipPISync(mc.cfg, provider) {
 			continue
 		}
 		mc.mu.RLock()
@@ -198,7 +193,17 @@ func (mc *ModelCache) Fetch(provider string) error {
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+account.Key())
+	// Header semantics identical to doUpstreamRequest: account-level headers
+	// (Set, override same-named defaults) → account credential (Bearer, or
+	// the custom auth_header) → Content-Type default only when unset.
+	// Gateways that authenticate on client identity headers (e.g.
+	// Originator/x-app) reject fetches that only carry Authorization, so the
+	// account headers must be applied here too.
+	pool.ApplyAccountHeaders(req.Header, account)
+	pool.ApplyAuthHeader(req.Header, account)
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -250,9 +255,6 @@ func (mc *ModelCache) RefreshStale() {
 		if provider == "" {
 			continue
 		}
-		if providerSkipPISync(mc.cfg, provider) {
-			continue
-		}
 		mc.mu.RLock()
 		pc := mc.caches[provider]
 		mc.mu.RUnlock()
@@ -270,9 +272,6 @@ func (mc *ModelCache) RefreshAll() {
 	for _, acc := range mc.cfg.Accounts {
 		provider := acc.Provider
 		if provider == "" {
-			continue
-		}
-		if providerSkipPISync(mc.cfg, provider) {
 			continue
 		}
 		if err := mc.Fetch(provider); err != nil {
@@ -559,9 +558,12 @@ func (mc *ModelCache) fetchOllamaShow(acc *pool.Account, id string) (ModelMeta, 
 		return ModelMeta{}, fmt.Errorf("create show request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := acc.Key(); key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
-	}
+	// Account-level headers + credential, same semantics as doUpstreamRequest:
+	// account headers override via Set (an account-configured Content-Type
+	// wins over the default above); the credential comes from acc.Key() via
+	// ApplyAuthHeader (Bearer, or the custom auth_header).
+	pool.ApplyAccountHeaders(req.Header, acc)
+	pool.ApplyAuthHeader(req.Header, acc)
 
 	resp, err := acc.Client().Do(req)
 	if err != nil {

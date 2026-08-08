@@ -71,8 +71,9 @@ type AccountConfig struct {
 	// marked healthy each probe cycle, no HTTP request is sent).
 	ProbePath string `yaml:"probe_path,omitempty"`
 	// SkipPISync excludes the provider from prism-managed pi models.json
-	// sync (and from upstream model fetching): its pi metadata is
-	// hand-maintained and must not be overwritten by prism.
+	// sync only: its pi metadata is hand-maintained and must not be
+	// overwritten by prism. It does NOT affect upstream model fetching —
+	// the model cache still fetches this provider like any other.
 	SkipPISync bool `yaml:"skip_pi_sync,omitempty"`
 }
 

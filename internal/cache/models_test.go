@@ -529,6 +529,147 @@ func TestRootURL(t *testing.T) {
 	}
 }
 
+// TestFetch_AppliesAccountHeaders guards the v0.10.1 bug: /v1/models cache
+// fetches previously carried only Authorization and were rejected with 401 by
+// gateways that authenticate on client identity headers (e.g. Originator/
+// x-app). The upstream below returns 401 unless the account-level headers are
+// present — Fetch must succeed, proving the headers are applied.
+func TestFetch_AppliesAccountHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Originator") != "codex_cli_rs" || r.Header.Get("x-app") != "cli" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"unauthorized client detected","type":"unauthorized_client_error"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data": []map[string]any{
+				{"id": "claude-opus-4-8", "object": "model", "created": 1, "owned_by": "agentrouter"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		pool: pool.NewPool([]config.AccountConfig{
+			{
+				Name:     "a1",
+				Provider: "agentrouter-openai",
+				BaseURL:  srv.URL + "/v1",
+				Key:      "test-key-12345",
+				Headers:  map[string]string{"Originator": "codex_cli_rs", "x-app": "cli"},
+			},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	if err := mc.Fetch("agentrouter-openai"); err != nil {
+		t.Fatalf("Fetch with account headers: %v", err)
+	}
+	models := mc.GetModels("agentrouter-openai")
+	if len(models) != 1 || models[0].ID != "claude-opus-4-8" {
+		t.Fatalf("expected fetched model list, got %v", models)
+	}
+}
+
+// TestFetch_AuthHeaderCustom verifies a custom auth_header (e.g. x-api-key)
+// applies to /v1/models fetches with the same semantics as doUpstreamRequest:
+// the upstream receives the raw key in x-api-key and NO Authorization header.
+func TestFetch_AuthHeaderCustom(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-api-key") != "raw-key-98765" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"unauthorized"}}`))
+			return
+		}
+		if r.Header.Get("Authorization") != "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"Authorization must not be sent"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data": []map[string]any{
+				{"id": "gpt-5.6-sol", "object": "model", "created": 1, "owned_by": "agentrouter"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		pool: pool.NewPool([]config.AccountConfig{
+			{
+				Name:       "a1",
+				Provider:   "agentrouter-openai",
+				BaseURL:    srv.URL + "/v1",
+				Key:        "raw-key-98765",
+				AuthHeader: "x-api-key",
+			},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	if err := mc.Fetch("agentrouter-openai"); err != nil {
+		t.Fatalf("Fetch with custom auth_header: %v", err)
+	}
+	models := mc.GetModels("agentrouter-openai")
+	if len(models) != 1 || models[0].ID != "gpt-5.6-sol" {
+		t.Fatalf("expected fetched model list, got %v", models)
+	}
+}
+
+// TestFetchOllamaShow_AppliesAccountHeaders verifies the /api/show path also
+// carries account-level headers and the custom auth_header (same semantics as
+// the /v1/models fetch): the server rejects requests without them.
+func TestFetchOllamaShow_AppliesAccountHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/show" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Originator") != "codex_cli_rs" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Header.Get("x-api-key") != "raw-key-98765" || r.Header.Get("Authorization") != "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model_info": map[string]any{"x.context_length": 128000},
+		})
+	}))
+	defer srv.Close()
+
+	acc := pool.NewPool([]config.AccountConfig{
+		{
+			Name:       "a",
+			Provider:   "ollama-cloud",
+			BaseURL:    srv.URL + "/v1",
+			Key:        "raw-key-98765",
+			AuthHeader: "x-api-key",
+			Headers:    map[string]string{"Originator": "codex_cli_rs"},
+		},
+	}).AllAccounts()[0]
+
+	mc := &ModelCache{}
+	meta, err := mc.fetchOllamaShow(acc, "llama")
+	if err != nil {
+		t.Fatalf("fetchOllamaShow: %v", err)
+	}
+	if meta.ContextWindow == nil || *meta.ContextWindow != 128000 {
+		t.Fatalf("ContextWindow = %v, want 128000", meta.ContextWindow)
+	}
+}
+
 // TestSyncPIModelsJSON_SkipPISync verifies that a provider whose account sets
 // skip_pi_sync=true keeps its hand-maintained models.json entry untouched
 // (e.g. agentrouter-anthropic with api: anthropic-messages), while a normal
@@ -612,16 +753,17 @@ func TestSyncPIModelsJSON_SkipPISync(t *testing.T) {
 	}
 }
 
-// TestFetchAllAsync_SkipPISync verifies skip_pi_sync providers are not fetched
-// (no upstream HTTP) — avoids useless /v1/models requests for providers whose
-// pi metadata is hand-maintained.
+// TestFetchAllAsync_SkipPISync verifies the narrowed v0.10.1 semantics:
+// skip_pi_sync no longer suppresses upstream fetching — the provider IS
+// fetched and cached like any other — but syncPIModelsJSON still refuses to
+// overwrite its hand-maintained pi models.json entry.
 func TestFetchAllAsync_SkipPISync(t *testing.T) {
 	hits := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		w.Write([]byte(`{"object":"list","data":[]}`))
+		w.Write([]byte(`{"object":"list","data":[{"id":"claude-opus-5","object":"model","created":1,"owned_by":"agentrouter"}]}`))
 	}))
 	defer upstream.Close()
 
@@ -630,9 +772,16 @@ func TestFetchAllAsync_SkipPISync(t *testing.T) {
 			{Name: "a1", Provider: "agentrouter-anthropic", BaseURL: upstream.URL, SkipPISync: true},
 		},
 	}
-	mc := NewForTest(map[string]*providerCache{})
-	mc.cfg = cfg
+	dir := t.TempDir()
+	mc := &ModelCache{
+		dir:    dir,
+		caches: map[string]*providerCache{},
+		pool:   pool.NewPool(cfg.Accounts),
+		cfg:    cfg,
+		stop:   make(chan struct{}),
+	}
 
+	// 1) FetchAllAsync must fetch the skip_pi_sync provider (no longer skipped).
 	done := make(chan struct{})
 	mc.FetchAllAsync(func() { close(done) })
 	select {
@@ -640,7 +789,51 @@ func TestFetchAllAsync_SkipPISync(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("FetchAllAsync timed out")
 	}
-	if hits != 0 {
-		t.Errorf("expected 0 upstream fetches for skip_pi_sync provider, got %d", hits)
+	if hits != 1 {
+		t.Errorf("expected exactly 1 upstream fetch for skip_pi_sync provider, got %d", hits)
+	}
+	models := mc.GetModels("agentrouter-anthropic")
+	if len(models) != 1 || models[0].ID != "claude-opus-5" {
+		t.Fatalf("expected fetched models for skip_pi_sync provider, got %v", models)
+	}
+
+	// 2) syncPIModelsJSON must still preserve the hand-maintained entry.
+	path := filepath.Join(dir, "models.json")
+	writePIModelsJSON(t, path, map[string]any{
+		"agentrouter-anthropic": map[string]any{
+			"baseUrl": "https://gw.example.com/",
+			"api":     "anthropic-messages",
+			"apiKey":  "prism-dummy-key",
+			"headers": map[string]any{"X-Prism-Provider": "agentrouter-anthropic"},
+			"models": []map[string]any{
+				{"id": "claude-opus-5", "contextWindow": 1000000},
+			},
+		},
+	})
+	if err := mc.syncPIModelsJSON(path, "http://127.0.0.1:18790/v1", cfg); err != nil {
+		t.Fatalf("syncPIModelsJSON: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read synced file: %v", err)
+	}
+	var pc struct {
+		Providers map[string]struct {
+			API    string           `json:"api"`
+			Models []map[string]any `json:"models"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(data, &pc); err != nil {
+		t.Fatalf("unmarshal synced file: %v", err)
+	}
+	ant, ok := pc.Providers["agentrouter-anthropic"]
+	if !ok {
+		t.Fatal("agentrouter-anthropic entry missing after sync")
+	}
+	if ant.API != "anthropic-messages" {
+		t.Errorf("agentrouter-anthropic api = %q, want anthropic-messages (must be preserved)", ant.API)
+	}
+	if len(ant.Models) != 1 || ant.Models[0]["contextWindow"] == nil {
+		t.Errorf("agentrouter-anthropic models should be preserved untouched, got %v", ant.Models)
 	}
 }
