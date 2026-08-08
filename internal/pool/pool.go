@@ -12,11 +12,20 @@ import (
 
 // Pool manages a set of upstream accounts with round-robin selection and
 // a FIFO wait queue for contention when all accounts are busy.
+//
+// Round-robin state: each provider has its own account slice
+// (providerAccounts) and its own cursor (providerNextIdx) that rotates
+// strictly within that slice, plus a single fallback cursor (nextIdx) for
+// the full-pool Select path. A cursor only advances past the account that
+// was actually selected, so selections rotate uniformly and traffic on one
+// provider never pollutes another provider's rotation.
 type Pool struct {
-	accounts []*Account
-	nextIdx  uint64
-	mu       sync.Mutex
-	waiters  *list.List
+	accounts         []*Account
+	providerAccounts map[string][]*Account
+	providerNextIdx  map[string]uint64
+	nextIdx          uint64
+	mu               sync.Mutex
+	waiters          *list.List
 }
 
 func NewPool(cfgs []config.AccountConfig) *Pool {
@@ -28,9 +37,20 @@ func NewPool(cfgs []config.AccountConfig) *Pool {
 			client: newHTTPClient(),
 		}
 	}
+	// Per-provider account slices preserve the flattened config (YAML) order
+	// within a provider. Providers themselves may appear in any order because
+	// config flattening iterates a Go map; that randomness is confined to
+	// provider order and does not affect in-provider rotation.
+	providerAccounts := make(map[string][]*Account)
+	for _, acc := range accs {
+		prov := acc.Provider()
+		providerAccounts[prov] = append(providerAccounts[prov], acc)
+	}
 	return &Pool{
-		accounts: accs,
-		waiters:  list.New(),
+		accounts:         accs,
+		providerAccounts: providerAccounts,
+		providerNextIdx:  make(map[string]uint64),
+		waiters:          list.New(),
 	}
 }
 
@@ -77,12 +97,14 @@ func (p *Pool) trySelectLocked(maxConcurrent int) *Account {
 	startIdx := int(p.nextIdx % uint64(len(p.accounts)))
 	for i := 0; i < len(p.accounts); i++ {
 		idx := (startIdx + i) % len(p.accounts)
-		p.nextIdx++
 		acc := p.accounts[idx]
 		if acc.IsInCooldown() {
 			continue
 		}
 		if acc.IsHealthy() && acc.TryAcquire(maxConcurrent) {
+			// Advance exactly one position per successful selection so the
+			// full-pool rotation stays uniform.
+			p.nextIdx = uint64(idx) + 1
 			return acc
 		}
 	}
@@ -215,11 +237,11 @@ func (p *Pool) ExhaustedAccounts() []*Account {
 
 // PoolSnapshot holds a point-in-time summary of pool state for metrics/observability.
 type PoolSnapshot struct {
-	Total        int
-	Healthy      int
-	Exhausted    int
-	InCooldown   int
-	InFlightSum  int
+	Total       int
+	Healthy     int
+	Exhausted   int
+	InCooldown  int
+	InFlightSum int
 }
 
 func (p *Pool) SnapshotStats() PoolSnapshot {
@@ -343,26 +365,30 @@ func (p *Pool) SelectByProvider(ctx context.Context, maxConcurrent int, provider
 	}
 }
 
-// trySelectLockedByProvider is like trySelectLocked but only considers accounts for the given provider.
+// trySelectLockedByProvider is like trySelectLocked but only considers the
+// accounts of the given provider, rotating through that provider's own
+// account subset with its own cursor so one provider's selections never
+// advance or pollute another provider's rotation.
 func (p *Pool) trySelectLockedByProvider(maxConcurrent int, provider string) *Account {
-	if len(p.accounts) == 0 {
-		return nil
-	}
 	if provider == "" {
 		return p.trySelectLocked(maxConcurrent)
 	}
-	startIdx := int(p.nextIdx % uint64(len(p.accounts)))
-	for i := 0; i < len(p.accounts); i++ {
-		idx := (startIdx + i) % len(p.accounts)
-		p.nextIdx++
-		acc := p.accounts[idx]
-		if acc.Provider() != provider {
-			continue
-		}
+	accs := p.providerAccounts[provider]
+	if len(accs) == 0 {
+		return nil
+	}
+	startIdx := int(p.providerNextIdx[provider] % uint64(len(accs)))
+	for i := 0; i < len(accs); i++ {
+		idx := (startIdx + i) % len(accs)
+		acc := accs[idx]
 		if acc.IsInCooldown() {
 			continue
 		}
 		if acc.IsHealthy() && acc.TryAcquire(maxConcurrent) {
+			// Land the cursor right after the selected account so the next
+			// selection continues the rotation; skipped (cooldown/busy)
+			// accounts fall behind the cursor instead of being re-picked.
+			p.providerNextIdx[provider] = uint64(idx) + 1
 			return acc
 		}
 	}

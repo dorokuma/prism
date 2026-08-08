@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -74,7 +75,10 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
-	// 验证获取到的账号确实是 acc-1 和 acc-2 (顺序可能因调度而异)
+	// 验证获取到的账号确实是 acc-1 和 acc-2。选中本身现在是确定性的
+	// round-robin（先 acc-1 再 acc-2，游标只在成功选中时前进 1），两个等待
+	// 协程按 FIFO 依次被唤醒；但主循环从两个 channel 读回的先后仍可能因
+	// 调度而异，所以这里按集合断言，不按顺序。
 	names := map[string]bool{}
 	for _, acc := range results {
 		names[acc.Name()] = true
@@ -241,7 +245,172 @@ func TestNewHTTPClient_ResponseHeaderTimeout(t *testing.T) {
 	}
 }
 
-// --- New concurrency tests ---
+// --- Round-robin selection tests ---
+
+// TestSelectByProviderRoundRobinStrict verifies that consecutive
+// SelectByProvider calls for a single two-account provider strictly alternate
+// between the accounts in config (YAML) order.
+func TestSelectByProviderRoundRobinStrict(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "a1", Key: "key-a1", BaseURL: "http://localhost:8001", Provider: "prov"},
+		{Name: "a2", Key: "key-a2", BaseURL: "http://localhost:8002", Provider: "prov"},
+	}
+	p := NewPool(cfgs)
+	ctx := context.Background()
+
+	var got []string
+	for i := 0; i < 6; i++ {
+		acc, err := p.SelectByProvider(ctx, 1, "prov")
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+		got = append(got, acc.Name())
+		p.Release(acc)
+	}
+	want := []string{"a1", "a2", "a1", "a2", "a1", "a2"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("round-robin sequence = %v, want %v", got, want)
+	}
+}
+
+// TestSelectByProviderCrossProviderIsolation verifies that interleaved
+// requests to two providers each rotate strictly within their own account
+// subset: provider A gets a1,a2,a1,a2 and provider B gets b1,b2,b1,b2 — one
+// provider's traffic never advances another provider's rotation.
+func TestSelectByProviderCrossProviderIsolation(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "a1", Key: "key-a1", BaseURL: "http://localhost:8001", Provider: "provA"},
+		{Name: "a2", Key: "key-a2", BaseURL: "http://localhost:8002", Provider: "provA"},
+		{Name: "b1", Key: "key-b1", BaseURL: "http://localhost:8003", Provider: "provB"},
+		{Name: "b2", Key: "key-b2", BaseURL: "http://localhost:8004", Provider: "provB"},
+	}
+	p := NewPool(cfgs)
+	ctx := context.Background()
+
+	var gotA, gotB []string
+	for i := 0; i < 4; i++ {
+		acc, err := p.SelectByProvider(ctx, 1, "provA")
+		if err != nil {
+			t.Fatalf("select A %d: %v", i, err)
+		}
+		gotA = append(gotA, acc.Name())
+		p.Release(acc)
+
+		acc, err = p.SelectByProvider(ctx, 1, "provB")
+		if err != nil {
+			t.Fatalf("select B %d: %v", i, err)
+		}
+		gotB = append(gotB, acc.Name())
+		p.Release(acc)
+	}
+	if want := []string{"a1", "a2", "a1", "a2"}; !slices.Equal(gotA, want) {
+		t.Errorf("provider A sequence = %v, want %v", gotA, want)
+	}
+	if want := []string{"b1", "b2", "b1", "b2"}; !slices.Equal(gotB, want) {
+		t.Errorf("provider B sequence = %v, want %v", gotB, want)
+	}
+}
+
+// TestSelectByProviderHighTrafficIsolation reproduces the production defect:
+// a single-account high-traffic provider must not pollute the rotation of a
+// two-account provider. After 100 selections on the busy provider, the
+// low-traffic provider still splits 2:2 in strict alternation (not 3:1 or
+// 4:0).
+func TestSelectByProviderHighTrafficIsolation(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "plan-3", Key: "key-plan", BaseURL: "http://localhost:8001", Provider: "plan"},
+		{Name: "oai-1", Key: "key-oai1", BaseURL: "http://localhost:8002", Provider: "agentrouter-openai"},
+		{Name: "oai-2", Key: "key-oai2", BaseURL: "http://localhost:8003", Provider: "agentrouter-openai"},
+	}
+	p := NewPool(cfgs)
+	ctx := context.Background()
+
+	// 100 selections on the high-traffic single-account provider.
+	for i := 0; i < 100; i++ {
+		acc, err := p.SelectByProvider(ctx, 1, "plan")
+		if err != nil {
+			t.Fatalf("plan select %d: %v", i, err)
+		}
+		if acc.Name() != "plan-3" {
+			t.Fatalf("plan select %d got %s, want plan-3", i, acc.Name())
+		}
+		p.Release(acc)
+	}
+
+	// The low-traffic provider must still rotate strictly 2:2.
+	var got []string
+	for i := 0; i < 4; i++ {
+		acc, err := p.SelectByProvider(ctx, 1, "agentrouter-openai")
+		if err != nil {
+			t.Fatalf("agent select %d: %v", i, err)
+		}
+		got = append(got, acc.Name())
+		p.Release(acc)
+	}
+	want := []string{"oai-1", "oai-2", "oai-1", "oai-2"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("low-traffic provider sequence = %v, want %v (high-traffic provider polluted the rotation)", got, want)
+	}
+}
+
+// TestSelectByProviderCooldownRoundRobin verifies that rotation stays strict
+// between the available accounts when one account is in cooldown: with three
+// accounts and the middle one cooling down, requests must alternate between
+// the other two (cooldown accounts are skipped without breaking the cycle).
+func TestSelectByProviderCooldownRoundRobin(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "c1", Key: "key-c1", BaseURL: "http://localhost:8001", Provider: "prov"},
+		{Name: "c2", Key: "key-c2", BaseURL: "http://localhost:8002", Provider: "prov"},
+		{Name: "c3", Key: "key-c3", BaseURL: "http://localhost:8003", Provider: "prov"},
+	}
+	p := NewPool(cfgs)
+	ctx := context.Background()
+
+	for _, acc := range p.AllAccounts() {
+		if acc.Name() == "c2" {
+			acc.SetCooldown(time.Hour)
+		}
+	}
+
+	var got []string
+	for i := 0; i < 6; i++ {
+		acc, err := p.SelectByProvider(ctx, 1, "prov")
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+		got = append(got, acc.Name())
+		p.Release(acc)
+	}
+	want := []string{"c1", "c3", "c1", "c3", "c1", "c3"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("cooldown round-robin sequence = %v, want %v", got, want)
+	}
+}
+
+// TestSelectRoundRobinUniform verifies the full-pool Select path (no
+// provider) also rotates uniformly: two accounts strictly alternate.
+func TestSelectRoundRobinUniform(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+		{Name: "acc-2", Key: "key-2", BaseURL: "http://localhost:8002"},
+	}
+	p := NewPool(cfgs)
+	ctx := context.Background()
+
+	var got []string
+	for i := 0; i < 6; i++ {
+		acc, err := p.Select(ctx, 1)
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+		got = append(got, acc.Name())
+		p.Release(acc)
+	}
+	want := []string{"acc-1", "acc-2", "acc-1", "acc-2", "acc-1", "acc-2"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("full-pool round-robin sequence = %v, want %v", got, want)
+	}
+}
 
 // TestConcurrentLimitN verifies that N goroutines can all acquire the same
 // account when maxConcurrent=N, and the N+1th enters the waiter (fails on

@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.10.2  Date: 2026-08-08  Status: living document
+> Version: v0.11.0  Date: 2026-08-08  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -139,6 +139,7 @@ MIT
 
 ## Changelog
 
+- **2026-08-08** — v0.11.0 — fix: account selection is now true per-provider round-robin. Previously all providers shared a single pool-wide cursor whose start index was computed modulo the total number of accounts, and the cursor advanced by the number of accounts scanned per attempt; a provider's first account on the ring was therefore picked disproportionately often (measured 3:0 on one two-account provider and 6:2 on another), and high-traffic providers polluted the rotation of low-traffic ones. Each provider now has its own cursor that rotates strictly within its own account subset, advancing exactly one position per successful selection, and the full-pool Select path advances its cursor the same way; new tests guard rotation order, cross-provider isolation, cooldown skipping, and uniform full-pool rotation
 - **2026-08-08** — v0.10.2 — docs: correct the syncPIModelsJSON write-strategy comment — direct overwrite preserves the existing owner/mode of pi models.json, which is what lets prism write it through group permissions; tmp+rename would reassign ownership
 - **2026-08-08** — v0.10.1 — fix: per-account headers and auth_header now also apply to model cache fetches (/v1/models and ollama /api/show), previously only chat forwarding and probes carried them — gateways that authenticate on client identity headers rejected model fetches with 401; skip_pi_sync narrowed to its original meaning (never overwrite hand-maintained pi models.json entries) and no longer suppresses upstream model fetching
 - **2026-08-08** — v0.10.0 — feat: agentrouter-class external provider accounts join the pool load balancer; per-account headers and auth_header (default Authorization Bearer, configurable e.g. x-api-key); anthropic /v1/messages pure passthrough route independent of wire_api gating; per-account probe_path with disabled support (optimistic recovery, no permanent exhausted when probe endpoint unavailable); skip_pi_sync opt-out so hand-maintained pi models.json entries are never overwritten
