@@ -435,10 +435,12 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 			return true, nil
 		}
 		// Capture token usage from the response body for non-streaming audit.
+		// The parser is selected by the upstream path (see
+		// parseUsageForResponseBody): /v1/messages responses are Anthropic
+		// form (input_tokens/...), everything else is OpenAI form.
 		if a := middleware.AuditFromCtx(r.Context()); a != nil {
-			if tokensIn, tokensOut := parseUsageFromChatCompletion(rawBody); tokensIn > 0 || tokensOut > 0 {
-				a.TokensIn = tokensIn
-				a.TokensOut = tokensOut
+			if u := parseUsageForResponseBody(rawBody, opts); u.Prompt > 0 || u.Completion > 0 {
+				a.ApplyUsage(u)
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -504,10 +506,15 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 	}
 	util.DumpDebugUpstreamResponse(rawBody)
 	// Capture token usage from the response body for non-streaming audit.
+	// The parser is selected by the upstream path (see
+	// parseUsageForResponseBody): /v1/messages responses are Anthropic form
+	// (input_tokens/...), everything else is OpenAI form. This is the path
+	// that fixes Anthropic usage being counted as zero: previously the
+	// OpenAI prompt_tokens/completion_tokens field names were looked up in
+	// an Anthropic body and always resolved to 0.
 	if a := middleware.AuditFromCtx(r.Context()); a != nil {
-		if tokensIn, tokensOut := parseUsageFromChatCompletion(rawBody); tokensIn > 0 || tokensOut > 0 {
-			a.TokensIn = tokensIn
-			a.TokensOut = tokensOut
+		if u := parseUsageForResponseBody(rawBody, opts); u.Prompt > 0 || u.Completion > 0 {
+			a.ApplyUsage(u)
 		}
 	}
 	copyUpstreamHeaders(w, resp.Header)

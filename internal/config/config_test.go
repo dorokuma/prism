@@ -1111,3 +1111,330 @@ default_provider: no-such-provider
 		t.Errorf("error = %q, want it to mention default_provider no-such-provider", err)
 	}
 }
+
+// TestLoadConfig_UsageDefaults: a config without a usage section must get the
+// documented defaults (enabled=false → opt-in, db_path next to the model
+// cache dir, tuned channel/batch/flush, 30-day retention).
+func TestLoadConfig_UsageDefaults(t *testing.T) {
+	content := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Usage.Enabled {
+		t.Error("usage.enabled default must be false (opt-in: existing deployments unchanged)")
+	}
+	if cfg.Usage.DBPath != "/var/lib/prism/usage.db" {
+		t.Errorf("usage.db_path default = %q, want /var/lib/prism/usage.db", cfg.Usage.DBPath)
+	}
+	if cfg.Usage.RetentionDays != 30 {
+		t.Errorf("usage.retention_days default = %d, want 30", cfg.Usage.RetentionDays)
+	}
+	if cfg.Usage.ChannelSize != 4096 {
+		t.Errorf("usage.channel_size default = %d, want 4096", cfg.Usage.ChannelSize)
+	}
+	if cfg.Usage.BatchSize != 50 {
+		t.Errorf("usage.batch_size default = %d, want 50", cfg.Usage.BatchSize)
+	}
+	if cfg.Usage.BatchFlushMS != 200 {
+		t.Errorf("usage.batch_flush_ms default = %d, want 200", cfg.Usage.BatchFlushMS)
+	}
+}
+
+// TestLoadConfig_UsageExplicit: a populated usage section maps field-for-field
+// onto UsageConfig (the wiring stage converts it to internal/usage.Config).
+func TestLoadConfig_UsageExplicit(t *testing.T) {
+	content := `
+usage:
+  enabled: true
+  db_path: /tmp/custom-usage.db
+  retention_days: 7
+  channel_size: 512
+  batch_size: 10
+  batch_flush_ms: 50
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.Usage.Enabled {
+		t.Error("usage.enabled = false, want true")
+	}
+	if cfg.Usage.DBPath != "/tmp/custom-usage.db" {
+		t.Errorf("usage.db_path = %q, want /tmp/custom-usage.db", cfg.Usage.DBPath)
+	}
+	if cfg.Usage.RetentionDays != 7 {
+		t.Errorf("usage.retention_days = %d, want 7", cfg.Usage.RetentionDays)
+	}
+	if cfg.Usage.ChannelSize != 512 {
+		t.Errorf("usage.channel_size = %d, want 512", cfg.Usage.ChannelSize)
+	}
+	if cfg.Usage.BatchSize != 10 {
+		t.Errorf("usage.batch_size = %d, want 10", cfg.Usage.BatchSize)
+	}
+	if cfg.Usage.BatchFlushMS != 50 {
+		t.Errorf("usage.batch_flush_ms = %d, want 50", cfg.Usage.BatchFlushMS)
+	}
+}
+
+// TestLoadConfig_UsageRetentionDaysZeroExplicit: an EXPLICIT retention_days:
+// 0 must be preserved (it means "keep forever, disable cleanup"), while an
+// absent field defaults to 30. yaml zero values cannot distinguish the two
+// on a plain int, which is why UsageConfig tracks explicit presence.
+func TestLoadConfig_UsageRetentionDaysZeroExplicit(t *testing.T) {
+	content := `
+usage:
+  enabled: true
+  retention_days: 0
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	cfg := loadCfgString(t, content)
+	if cfg.Usage.RetentionDays != 0 {
+		t.Errorf("usage.retention_days = %d, want 0 (explicit 0 must be preserved)", cfg.Usage.RetentionDays)
+	}
+}
+
+// TestLoadConfig_UsageDefaultKeyID: usage.default_key_id defaults to
+// "anonymous" when absent, honors an explicit value, and an explicit empty
+// string falls back to "anonymous" (an empty key_id would split one GROUP BY
+// group into two and must never be configurable into existence).
+func TestLoadConfig_UsageDefaultKeyID(t *testing.T) {
+	t.Run("absent defaults to anonymous", func(t *testing.T) {
+		content := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		cfg := loadCfgString(t, content)
+		if cfg.Usage.DefaultKeyID != "anonymous" {
+			t.Errorf("usage.default_key_id default = %q, want anonymous", cfg.Usage.DefaultKeyID)
+		}
+	})
+
+	t.Run("explicit value honored", func(t *testing.T) {
+		content := `
+usage:
+  default_key_id: gateway-pi
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		cfg := loadCfgString(t, content)
+		if cfg.Usage.DefaultKeyID != "gateway-pi" {
+			t.Errorf("usage.default_key_id = %q, want gateway-pi", cfg.Usage.DefaultKeyID)
+		}
+	})
+
+	t.Run("explicit empty string falls back to anonymous", func(t *testing.T) {
+		content := `
+usage:
+  default_key_id: ""
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+		cfg := loadCfgString(t, content)
+		if cfg.Usage.DefaultKeyID != "anonymous" {
+			t.Errorf("usage.default_key_id with explicit empty = %q, want anonymous", cfg.Usage.DefaultKeyID)
+		}
+	})
+}
+
+// TestReloadConfig_UsageDBPathChangedWarning: db_path cannot be hot-reloaded
+// (the store is opened once at startup) → ReloadConfig must warn.
+func TestReloadConfig_UsageDBPathChangedWarning(t *testing.T) {
+	content1 := `
+usage:
+  enabled: true
+  db_path: /var/lib/prism/usage.db
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	content2 := `
+usage:
+  enabled: true
+  db_path: /var/lib/prism/other.db
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "usage.db_path") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning about usage.db_path change, got: %v", warnings)
+	}
+}
+
+// TestReloadConfig_UsageEnabledChangedWarning: toggling usage.enabled cannot
+// take effect without restart (the recorder is built once at startup).
+func TestReloadConfig_UsageEnabledChangedWarning(t *testing.T) {
+	content1 := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	content2 := `
+usage:
+  enabled: true
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "usage.enabled") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning about usage.enabled change, got: %v", warnings)
+	}
+}
+
+// TestReloadConfig_UsageUnchangedNoWarning: reloading an identical usage
+// section must not produce restart warnings.
+func TestReloadConfig_UsageUnchangedNoWarning(t *testing.T) {
+	content1 := `
+usage:
+  enabled: true
+  db_path: /var/lib/prism/usage.db
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	content2 := `
+usage:
+  enabled: true
+  db_path: /var/lib/prism/usage.db
+  retention_days: 90
+  batch_size: 123
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	for _, w := range warnings {
+		if strings.Contains(w, "usage") {
+			t.Errorf("unexpected usage warning for tuning-knob change: %q", w)
+		}
+	}
+}

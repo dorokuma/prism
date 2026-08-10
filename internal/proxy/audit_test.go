@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/pool"
 	"github.com/dorokuma/prism/internal/util"
 )
@@ -403,6 +404,261 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 		}
 		if !strings.Contains(out, `"status":503`) {
 			t.Errorf("expected status=503 for empty pool, got: %s", out)
+		}
+	})
+}
+
+// TestAuditLog_AnthropicNonStreamingUsage verifies that a non-streaming
+// /v1/messages (Anthropic Messages API) response has its input/output/cache
+// token usage captured. Regression for the bug where the OpenAI field names
+// (prompt_tokens/completion_tokens) were looked up in an Anthropic body and
+// everything came out as zero.
+func TestAuditLog_AnthropicNonStreamingUsage(t *testing.T) {
+	h := &capturingHandler{}
+	restore := stashSlog(h)
+	defer restore()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"msg_01XFDUDYJgAACzvnptvVoYEL","type":"message","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":250,"output_tokens":40,"cache_creation_input_tokens":50,"cache_read_input_tokens":200}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
+	p := pool.NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
+
+	ProxyChatWithBody(p, rec, r, []byte(`{"model":"claude-opus-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`), time.Now(), ChatForwardOpts{
+		UpstreamPath: "/v1/messages",
+		SkipSanitize: true,
+	}, cfg)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected status 200, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	out := h.output()
+	// Legacy aliases stay populated.
+	if !strings.Contains(out, `"tokens_in":250`) {
+		t.Errorf("expected tokens_in=250 (input_tokens), got: %s", out)
+	}
+	if !strings.Contains(out, `"tokens_out":40`) {
+		t.Errorf("expected tokens_out=40 (output_tokens), got: %s", out)
+	}
+	// v2 fields.
+	if !strings.Contains(out, `"prompt_tokens":250`) {
+		t.Errorf("expected prompt_tokens=250, got: %s", out)
+	}
+	if !strings.Contains(out, `"completion_tokens":40`) {
+		t.Errorf("expected completion_tokens=40, got: %s", out)
+	}
+	if !strings.Contains(out, `"total_tokens":290`) {
+		t.Errorf("expected total_tokens=290 (250+40), got: %s", out)
+	}
+	if !strings.Contains(out, `"cached_tokens":200`) {
+		t.Errorf("expected cached_tokens=200 (cache_read_input_tokens), got: %s", out)
+	}
+	if !strings.Contains(out, `"cache_write_tokens":50`) {
+		t.Errorf("expected cache_write_tokens=50 (cache_creation_input_tokens), got: %s", out)
+	}
+}
+
+// TestAuditLog_AnthropicStreamingUsage verifies that a streaming /v1/messages
+// response has input tokens captured from the stream-head message_start event
+// and output tokens from the stream-tail message_delta event, with the SSE
+// bytes passed through unchanged.
+func TestAuditLog_AnthropicStreamingUsage(t *testing.T) {
+	h := &capturingHandler{}
+	restore := stashSlog(h)
+	defer restore()
+
+	sse := "event: message_start\n" +
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"usage\":{\"input_tokens\":250,\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":200}}}\n\n" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n" +
+		"event: message_delta\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":40}}\n\n" +
+		"event: message_stop\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sse))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
+	p := pool.NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-5","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
+
+	ProxyChatWithBody(p, rec, r, []byte(`{"model":"claude-opus-5","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`), time.Now(), ChatForwardOpts{
+		Stream:       true,
+		UpstreamPath: "/v1/messages",
+		SkipSanitize: true,
+	}, cfg)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+	// SSE passed through byte-for-byte.
+	if rec.Body.String() != sse {
+		t.Errorf("SSE passthrough broken:\n got %q\nwant %q", rec.Body.String(), sse)
+	}
+
+	out := h.output()
+	if !strings.Contains(out, `"tokens_in":250`) {
+		t.Errorf("expected tokens_in=250 (message_start input_tokens), got: %s", out)
+	}
+	if !strings.Contains(out, `"tokens_out":40`) {
+		t.Errorf("expected tokens_out=40 (message_delta output_tokens), got: %s", out)
+	}
+	if !strings.Contains(out, `"total_tokens":290`) {
+		t.Errorf("expected total_tokens=290, got: %s", out)
+	}
+	if !strings.Contains(out, `"cached_tokens":200`) {
+		t.Errorf("expected cached_tokens=200, got: %s", out)
+	}
+	if !strings.Contains(out, `"cache_write_tokens":50`) {
+		t.Errorf("expected cache_write_tokens=50, got: %s", out)
+	}
+}
+
+// TestAuditLog_Metadata verifies the proxy chat concurrency point fills
+// Provider (resolved provider), Stream (request stream flag), KeyID (API key
+// name from the auth middleware context) and Success (2xx && no error type).
+func TestAuditLog_Metadata(t *testing.T) {
+	t.Run("success_non_streaming", func(t *testing.T) {
+		h := &capturingHandler{}
+		restore := stashSlog(h)
+		defer restore()
+
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+		}))
+		defer upstream.Close()
+
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
+		p := pool.NewPool(cfg.Accounts)
+
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "test")
+		// Simulate the auth middleware having recorded the key NAME.
+		r = r.WithContext(middleware.WithAPIKey(r.Context(), "key-1"))
+
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+
+		out := h.output()
+		for _, want := range []string{`"provider":"test"`, `"stream":false`, `"key_id":"key-1"`, `"success":true`, `"status":200`} {
+			if !strings.Contains(out, want) {
+				t.Errorf("audit missing %s, got: %s", want, out)
+			}
+		}
+	})
+
+	t.Run("success_streaming", func(t *testing.T) {
+		h := &capturingHandler{}
+		restore := stashSlog(h)
+		defer restore()
+
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
+		}))
+		defer upstream.Close()
+
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
+		p := pool.NewPool(cfg.Accounts)
+
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4","stream":true}`)))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "test")
+		r = r.WithContext(middleware.WithAPIKey(r.Context(), "key-2"))
+
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4","stream":true}`), time.Now(), ChatForwardOpts{Stream: true}, cfg)
+
+		out := h.output()
+		for _, want := range []string{`"provider":"test"`, `"stream":true`, `"key_id":"key-2"`, `"success":true`} {
+			if !strings.Contains(out, want) {
+				t.Errorf("audit missing %s, got: %s", want, out)
+			}
+		}
+	})
+
+	t.Run("failure_4xx", func(t *testing.T) {
+		h := &capturingHandler{}
+		restore := stashSlog(h)
+		defer restore()
+
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"message":"bad request"}}`))
+		}))
+		defer upstream.Close()
+
+		cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "test"}}}
+		p := pool.NewPool(cfg.Accounts)
+
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Prism-Provider", "test")
+		r = r.WithContext(middleware.WithAPIKey(r.Context(), "key-3"))
+
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+
+		out := h.output()
+		for _, want := range []string{`"provider":"test"`, `"stream":false`, `"key_id":"key-3"`, `"success":false`, `"error_type":"upstream_4xx"`, `"status":400`} {
+			if !strings.Contains(out, want) {
+				t.Errorf("audit missing %s, got: %s", want, out)
+			}
+		}
+	})
+
+	t.Run("provider_default_fallback", func(t *testing.T) {
+		// No X-Prism-Provider header: cfg.DefaultProvider resolves the
+		// provider and the audit must record the effective one.
+		h := &capturingHandler{}
+		restore := stashSlog(h)
+		defer restore()
+
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+		}))
+		defer upstream.Close()
+
+		cfg := &config.Config{
+			Accounts:        []config.AccountConfig{{Name: "test", Key: "k", BaseURL: upstream.URL, Provider: "defprov"}},
+			DefaultProvider: "defprov",
+		}
+		p := pool.NewPool(cfg.Accounts)
+
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+		r.Header.Set("Content-Type", "application/json")
+
+		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+
+		out := h.output()
+		if !strings.Contains(out, `"provider":"defprov"`) {
+			t.Errorf("expected provider=defprov (default fallback), got: %s", out)
 		}
 	})
 }

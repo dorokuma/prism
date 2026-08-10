@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/dorokuma/prism/internal/config"
-	"github.com/dorokuma/prism/internal/convert"
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/pool"
 	"github.com/dorokuma/prism/internal/sanitize"
+	"github.com/dorokuma/prism/internal/usagemeta"
 	"github.com/dorokuma/prism/internal/util"
 )
 
@@ -74,6 +74,7 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 	defer func() {
 		aud.DurationMs = float64(time.Since(start).Milliseconds())
 		aud.Status = sc.Code
+		aud.Success = sc.Code >= 200 && sc.Code < 300 && aud.ErrorType == ""
 		middleware.EmitAudit(aud)
 	}()
 
@@ -101,6 +102,12 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 			return
 		}
 	}
+	// Record the effective provider, stream flag and authenticated key name
+	// once provider resolution is done. KeyID is the API key NAME from the
+	// auth middleware — tokens are never stored or logged.
+	aud.Provider = provider
+	aud.Stream = opts.Stream
+	aud.KeyID = middleware.APIKeyFromContext(r.Context())
 	// Transform normally runs for every request; model remap inside is still
 	// gated by cfg.ModelRemapEnabled (real model name passes through when
 	// disabled). The /v1/messages surface (anthropic body, not a chat
@@ -225,14 +232,29 @@ func resolveMaxConcurrent(model string, cfg *config.Config) int {
 }
 
 // parseUsageFromChatCompletion extracts input/output token counts from a raw
-// chat completion response body (non-streaming).  Returns 0, 0 when the body
-// cannot be parsed or the usage field is absent.
+// chat completion response body (non-streaming). Returns 0, 0 when the body
+// cannot be parsed or the usage field is absent. It is a thin wrapper over
+// the shared OpenAI-form parser (usagemeta.ParseOpenAI) — there is no second
+// parallel parsing implementation. Callers that need the full field set use
+// parseUsageForResponseBody + middleware.RequestAudit.ApplyUsage instead.
 func parseUsageFromChatCompletion(body []byte) (tokensIn, tokensOut int) {
-	var comp convert.ChatCompletionResponse
-	if err := json.Unmarshal(body, &comp); err != nil || comp.Usage == nil {
-		return 0, 0
+	u := usagemeta.ParseOpenAI(body)
+	return u.Prompt, u.Completion
+}
+
+// parseUsageForResponseBody selects the usage parser for a non-streaming
+// upstream response body by the upstream path the request was sent to:
+// /v1/messages (Anthropic Messages API) returns input_tokens/output_tokens/
+// cache_read_input_tokens/cache_creation_input_tokens, every other upstream
+// returns the OpenAI prompt_tokens/completion_tokens form. Path-based
+// selection is correct because the upstream path determines the wire
+// format: /v1/messages always speaks Anthropic, /chat/completions and
+// /v1/responses always speak OpenAI.
+func parseUsageForResponseBody(body []byte, opts ChatForwardOpts) usagemeta.Usage {
+	if opts.UpstreamPath == "/v1/messages" {
+		return usagemeta.ParseAnthropic(body)
 	}
-	return comp.Usage.PromptTokens, comp.Usage.CompletionTokens
+	return usagemeta.ParseOpenAI(body)
 }
 
 // ProxyChatWithBody is an exported wrapper around proxyChatWithBody for use by

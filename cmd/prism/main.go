@@ -5,6 +5,7 @@ import (
 	"expvar"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,6 +21,7 @@ import (
 	"github.com/dorokuma/prism/internal/pool"
 	"github.com/dorokuma/prism/internal/proxy"
 	"github.com/dorokuma/prism/internal/ratelimit"
+	"github.com/dorokuma/prism/internal/usage"
 	"github.com/dorokuma/prism/internal/util"
 )
 
@@ -27,11 +29,215 @@ func init() {
 	config.LogLevelHook = middleware.SetLogLevel
 }
 
+// ---------------------------------------------------------------------------
+// Usage recording wiring. Degradation constraint (highest priority): every
+// usage-related failure — store open/migrate, disk full, SQLITE_BUSY, full
+// queue, pricing problems — is logged and counted inside internal/usage and
+// NEVER returned to the request path, never panics, never blocks request
+// finalization. The recorder is a safe no-op in all failure modes, so HTTP
+// serving and /v1 forwarding are unaffected.
+// ---------------------------------------------------------------------------
+
+// usageRecorderAdapter maps middleware.UsageEvent onto usage.Event and
+// forwards it to the usage.Recorder. It is injected into middleware by main;
+// middleware itself never imports internal/usage.
+//
+// Pricing is deliberately NOT done in Record: cost is computed exactly once,
+// on the synchronous request finalization path, by Price (registered with
+// middleware.SetUsagePricer) BEFORE the request.complete line is written.
+// The resulting amount is carried on the event and the async write path
+// never re-prices, so the audit log amount and the database amount are the
+// same value by construction (single pricing point: usage.ComputeCost).
+type usageRecorderAdapter struct {
+	holder *config.ConfigHolder
+	rec    *usage.Recorder
+}
+
+func (a *usageRecorderAdapter) Record(e middleware.UsageEvent) {
+	a.rec.Record(usage.Event{
+		Ts:               time.Now(),
+		RequestID:        e.RequestID,
+		Path:             e.Path,
+		Model:            e.Model,
+		Provider:         e.Provider,
+		Account:          e.Account,
+		KeyID:            e.KeyID,
+		Stream:           e.Stream,
+		Success:          e.Success,
+		Status:           e.Status,
+		ErrorType:        e.ErrorType,
+		PromptTokens:     e.PromptTokens,
+		CompletionTokens: e.CompletionTokens,
+		TotalTokens:      e.TotalTokens,
+		CachedTokens:     e.CachedTokens,
+		ReasoningTokens:  e.ReasoningTokens,
+		CacheWriteTokens: e.CacheWriteTokens,
+		DurationMS:       e.DurationMS,
+		Source:           e.Source,
+		Cost:             e.Cost,
+		CostStatus:       e.CostStatus,
+	})
+}
+
+// Price computes the USD cost for one audit record from the current config
+// (via the ConfigHolder atomic pointer, so a SIGHUP hot reload applies to
+// new requests). It is called synchronously by middleware.EmitAudit before
+// the request.complete line is written; middleware fills RequestAudit from
+// the result and forwards the same value on the usage event, so the audit
+// log amount and the persisted amount are identical. A nil result means the
+// model has no known price (cost persisted as NULL, status missing_price).
+func (a *usageRecorderAdapter) Price(audit *middleware.RequestAudit) (*float64, string) {
+	price := priceFor(a.holder.Load(), audit.Provider, audit.Model)
+	return usage.ComputeCost(
+		int64(audit.PromptTokens),
+		int64(audit.CompletionTokens),
+		int64(audit.CachedTokens),
+		int64(audit.CacheWriteTokens),
+		audit.UsageSource,
+		price,
+	)
+}
+
+// priceFor resolves the per-million-token USD price for (provider, model)
+// from the model_metadata config layers (default layer + per-provider
+// override, in LookupModelMetadata order). A nil result means the model has
+// no known price: the usage layer then persists cost as NULL with
+// cost_status "missing_price". No unit conversion is applied here — config
+// prices are already USD per 1M tokens and usage.ComputeCost divides by 1e6.
+func priceFor(cfg *config.Config, provider, model string) *usage.Price {
+	if cfg == nil {
+		return nil
+	}
+	meta, ok := cfg.LookupModelMetadata(provider, model)
+	if !ok || meta.Cost == nil {
+		return nil
+	}
+	return &usage.Price{
+		Input:      meta.Cost.Input,
+		Output:     meta.Cost.Output,
+		CacheRead:  meta.Cost.CacheRead,
+		CacheWrite: meta.Cost.CacheWrite,
+	}
+}
+
+// shutdownHTTPAndDrainUsage is the ordered shutdown sequence for the HTTP
+// server and the usage recorder. Order matters: srv.Shutdown must complete
+// FIRST so every in-flight request has finished its deferred usage emission
+// (middleware.EmitAudit → recorder.Record), and only THEN may the recorder
+// be closed and its buffered events flushed. Closing the recorder first
+// would silently drop the usage of requests that finish during graceful
+// shutdown.
+//
+// Timeout budget: the 30s context is spent entirely on srv.Shutdown (the
+// HTTP layer, where in-flight streams can legitimately take a while). The
+// recorder drain runs afterwards under its own bounded budget
+// (usage.Recorder.Close: normally milliseconds; worst case 2×5s, only when
+// the store itself is stuck). The two phases are sequential, so the
+// worst-case total is 30s + 10s = 40s; the drain phase only ever starts
+// once the HTTP layer is quiescent.
+func shutdownHTTPAndDrainUsage(srv *http.Server, usageRec *usage.Recorder) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		slog.Error("shutdown error", "error", err)
+	}
+	// Drain buffered usage events. nil-safe no-op when usage is disabled or
+	// the recorder failed to start.
+	usageRec.Close()
+}
+
+// startUsageRecorder builds the usage store + recorder from application
+// configuration and starts it. It never returns an error: usage.Open/Migrate
+// failures are logged and counted inside usage and the recorder degrades to
+// a no-op (Record/Close on a nil or stopped recorder are no-ops), so HTTP
+// startup is never blocked. It returns the recorder (nil when usage is
+// disabled or failed to start) and the store (nil when disabled) for the
+// /admin/usage/summary handler.
+func startUsageRecorder(cfg *config.Config) (*usage.Recorder, usage.Store) {
+	if cfg == nil || !cfg.Usage.Enabled {
+		return nil, nil
+	}
+	store := usage.NewSQLiteStore(cfg.Usage.DBPath)
+	rec := usage.NewRecorder(usage.Config{
+		Enabled:       cfg.Usage.Enabled,
+		DBPath:        cfg.Usage.DBPath,
+		RetentionDays: cfg.Usage.RetentionDays,
+		ChannelSize:   cfg.Usage.ChannelSize,
+		BatchSize:     cfg.Usage.BatchSize,
+		BatchFlushMS:  cfg.Usage.BatchFlushMS,
+	}, store)
+	rec.Start()
+	return rec, store
+}
+
+// newHTTPHandler builds the root HTTP handler: /metrics, the
+// /admin/usage/summary admin endpoint, the global api_keys auth gate and the
+// proxy dispatch. Extracted from main so tests can exercise the wiring
+// invariant that usage degradation never breaks /v1 forwarding.
+func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *ratelimit.RateLimiter, trustedProxies []*net.IPNet, summaryHandler http.Handler) http.Handler {
+	return middleware.RequestIDMiddleware(ratelimit.RateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			token := os.Getenv("METRICS_TOKEN")
+			allowed := (token != "" && middleware.CheckAuth(r, token)) || middleware.IsLocalhost(r)
+			if !allowed {
+				util.WriteJSON(w, http.StatusUnauthorized, map[string]any{
+					"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
+				})
+				return
+			}
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			expvar.Handler().ServeHTTP(w, r)
+			return
+		}
+		// /admin/usage/summary carries its own PRISM_ADMIN_TOKEN Bearer auth
+		// (plus localhost allow) and is deliberately mounted BEFORE the
+		// global api_keys gate, mirroring the /metrics precedent.
+		if r.URL.Path == "/admin/usage/summary" {
+			summaryHandler.ServeHTTP(w, r)
+			return
+		}
+		curCfg := holder.Load()
+		if r.URL.Path != "/health" {
+			keyName, ok := middleware.Authenticate(r, curCfg.APIKeys)
+			if !ok {
+				slog.Warn("auth_failed", "req", util.RequestIDFromCtx(r.Context()), "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+				util.WriteJSON(w, http.StatusUnauthorized, map[string]any{
+					"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
+				})
+				return
+			}
+			// Auth disabled (no api_keys configured): Authenticate returns the
+			// fixed "anonymous" label; replace it with the configured
+			// usage.default_key_id so the recorded key_id follows config
+			// (default "anonymous"). With keys configured the matched key
+			// NAME wins and is never overridden.
+			if len(curCfg.APIKeys) == 0 {
+				keyName = curCfg.Usage.DefaultKeyID
+			}
+			r = r.WithContext(middleware.WithAPIKey(r.Context(), keyName))
+		}
+		// Timeout decisions are delegated to proxyChatWithBody which applies
+		// per-request timeouts based on the actual stream setting (parsed
+		// from the JSON body, not headers).
+		proxyHandler.ServeHTTP(w, r)
+	}), rl, trustedProxies))
+}
+
 func main() {
 	// 检查是否运行 setup
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
 		if err := runSetup(); err != nil {
 			fmt.Fprintf(os.Stderr, "setup 失败: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// prism usage: 直接只读查询 usage 数据库，不依赖服务运行。分发方式与
+	// setup 一致（os.Args[1] 硬编码分支），在加载配置之前处理。
+	if len(os.Args) > 1 && os.Args[1] == "usage" {
+		if err := runUsage(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "usage 失败: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -50,7 +256,7 @@ func main() {
 	mcp.LoadMCPTools(cfg.MCPToolsJSON)
 	p := pool.NewPool(cfg.Accounts)
 	wire, _ := config.ParseWireAPIMode(cfg.WireAPI)
-	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", util.DebugMode, "auth", cfg.AuthToken != "", "tls", cfg.TLSCertFile != "")
+	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", util.DebugMode, "auth", len(cfg.APIKeys) > 0, "auth_keys", len(cfg.APIKeys), "tls", cfg.TLSCertFile != "")
 
 	// 初始化模型缓存
 	cacheDir := "/var/lib/prism/model_cache"
@@ -128,6 +334,21 @@ func main() {
 
 	proxyHandler := proxy.NewProxyHandler(p, wire, holder, mc)
 
+	// Usage recording wiring: opt-in, never blocks startup, degrades to a
+	// no-op on any failure. The summary handler is always registered; when
+	// usage is disabled or the store failed it answers 503 store_unavailable.
+	// The default key_id for requests without an authenticated api key applies
+	// to the audit log and usage rows regardless of whether recording is
+	// enabled, so it is installed unconditionally.
+	usageRec, usageStore := startUsageRecorder(cfg)
+	middleware.SetUsageDefaultKeyID(cfg.Usage.DefaultKeyID)
+	if usageRec != nil {
+		adapter := &usageRecorderAdapter{holder: holder, rec: usageRec}
+		middleware.SetUsageRecorder(adapter)
+		middleware.SetUsagePricer(adapter.Price)
+	}
+	summaryHandler := usage.NewSummaryHandler(usageStore)
+
 	metricCtx, metricCancel := context.WithCancel(context.Background())
 
 	// Rate limiter: 60 req/s per IP with burst of 100
@@ -178,36 +399,8 @@ func main() {
 	}()
 
 	srv := &http.Server{
-		Addr: cfg.Listen,
-		Handler: middleware.RequestIDMiddleware(ratelimit.RateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/metrics" {
-				token := os.Getenv("METRICS_TOKEN")
-				allowed := (token != "" && middleware.CheckAuth(r, token)) || middleware.IsLocalhost(r)
-				if !allowed {
-					util.WriteJSON(w, http.StatusUnauthorized, map[string]any{
-						"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
-					})
-					return
-				}
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				expvar.Handler().ServeHTTP(w, r)
-				return
-			}
-			curCfg := holder.Load()
-			if curCfg.AuthToken != "" && r.URL.Path != "/health" {
-				if !middleware.CheckAuth(r, curCfg.AuthToken) {
-					slog.Warn("auth_failed", "req", util.RequestIDFromCtx(r.Context()), "path", r.URL.Path, "remote_addr", r.RemoteAddr)
-					util.WriteJSON(w, http.StatusUnauthorized, map[string]any{
-						"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
-					})
-					return
-				}
-			}
-			// Timeout decisions are delegated to proxyChatWithBody which
-			// applies per-request timeouts based on the actual stream
-			// setting (parsed from the JSON body, not headers).
-			proxyHandler.ServeHTTP(w, r)
-		}), rl, trustedProxies)),
+		Addr:              cfg.Listen,
+		Handler:           newHTTPHandler(holder, proxyHandler, rl, trustedProxies, summaryHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -232,6 +425,11 @@ func main() {
 					}
 					newCfg := holder.Load()
 					util.DebugMode = newCfg.Debug
+					// Keep the EmitAudit key_id fallback in sync with the
+					// reloaded usage.default_key_id: the auth-disabled path in
+					// newHTTPHandler reads the holder live, so the fallback
+					// must follow or the two paths would drift until restart.
+					middleware.SetUsageDefaultKeyID(newCfg.Usage.DefaultKeyID)
 				}
 				// Always reload MCP tools from current config (new or old).
 				curCfg := holder.Load()
@@ -252,11 +450,12 @@ func main() {
 			mc.Stop()
 			metricCancel()
 			mcp.StopMCPCache()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := srv.Shutdown(ctx); err != nil {
-				slog.Error("shutdown error", "error", err)
-			}
+			// Graceful shutdown order: stop the HTTP server first and wait for
+			// in-flight requests to finish (their deferred EmitAudit → Record
+			// runs during Shutdown), THEN drain the usage recorder. The old
+			// order (Close before Shutdown) silently dropped the usage of
+			// requests still in flight during graceful shutdown.
+			shutdownHTTPAndDrainUsage(srv, usageRec)
 			return
 		}
 	}()

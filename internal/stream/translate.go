@@ -14,6 +14,7 @@ import (
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/mcp"
 	"github.com/dorokuma/prism/internal/middleware"
+	"github.com/dorokuma/prism/internal/usagemeta"
 	"github.com/dorokuma/prism/internal/util"
 )
 
@@ -38,12 +39,12 @@ type chatStreamChunk struct {
 		Logprobs     any    `json:"logprobs"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens            int `json:"prompt_tokens"`
-		CompletionTokens        int `json:"completion_tokens"`
-		TotalTokens             int `json:"total_tokens"`
-		PromptCacheHitTokens    int `json:"prompt_cache_hit_tokens"`
-		PromptCacheMissTokens   int `json:"prompt_cache_miss_tokens"`
-		PromptTokensDetails     *struct {
+		PromptTokens          int `json:"prompt_tokens"`
+		CompletionTokens      int `json:"completion_tokens"`
+		TotalTokens           int `json:"total_tokens"`
+		PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+		PromptTokensDetails   *struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
 		CompletionTokensDetails *struct {
@@ -113,9 +114,15 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 				}
 			}
 			// Capture tokens for audit (nil-safe; ctx without audit yields nil).
+			// The already-unmarshalled chunk is re-serialised so the single
+			// shared OpenAI parser (usagemeta.ParseOpenAI) stays the one
+			// source of truth for the field mapping — including the
+			// prompt_cache_hit_tokens → prompt_tokens_details.cached_tokens
+			// fallback above.
 			if a := middleware.AuditFromCtx(ctx); a != nil {
-				a.TokensIn = chunk.Usage.PromptTokens
-				a.TokensOut = chunk.Usage.CompletionTokens
+				if raw, err := json.Marshal(chunk.Usage); err == nil {
+					a.ApplyUsage(usagemeta.ParseOpenAI(raw))
+				}
 			}
 		}
 		if len(chunk.Choices) == 0 {

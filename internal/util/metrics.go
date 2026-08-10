@@ -8,11 +8,11 @@ import (
 
 // Metrics collected by the proxy.
 var (
-	MetricsRequestsTotal    = expvar.NewInt("requests_total")
-	MetricsErrorsTotal      = expvar.NewInt("errors_total")
-	MetricsRateLimitedTotal = expvar.NewInt("rate_limited_total")
-	MetricsUpstreamRetries  = expvar.NewInt("upstream_retries")
-	MetricsAccountsHealthy  expvar.Int
+	MetricsRequestsTotal     = expvar.NewInt("requests_total")
+	MetricsErrorsTotal       = expvar.NewInt("errors_total")
+	MetricsRateLimitedTotal  = expvar.NewInt("rate_limited_total")
+	MetricsUpstreamRetries   = expvar.NewInt("upstream_retries")
+	MetricsAccountsHealthy   expvar.Int
 	MetricsAccountsExhausted expvar.Int
 
 	metricsRequestDurationMu sync.Mutex
@@ -59,4 +59,44 @@ func RecordUpstreamRetry() {
 func UpdatePoolMetrics(healthy, exhausted int) {
 	MetricsAccountsHealthy.Set(int64(healthy))
 	MetricsAccountsExhausted.Set(int64(exhausted))
+}
+
+// Usage persistence counters. Accounting model (see internal/usage/writer.go
+// for the full protocol):
+//   - usage_events_written counts EVENTS persisted (+1 per event, after the
+//     batch commit).
+//   - usage_events_dropped counts EVENTS that will never be persisted (+1
+//     per event): queue full, recorder already closed, flush panic batch,
+//     failed batch, per-event insert failure, close-without-started drain.
+//     Identity: written + dropped == total Record calls (no event counted
+//     twice), except the documented Close-timeout case where the worker is
+//     stuck forever and the buffer is deliberately not counted.
+//   - usage_write_errors counts failure INCIDENTS (+1 per open/migrate/
+//     cleanup failure, flush panic, failed batch, per-event insert failure).
+//     It is not an event counter: one failed batch of N events is one
+//     incident, with the N events accounted by dropped.
+var (
+	MetricsUsageEventsWritten = expvar.NewInt("usage_events_written")
+	MetricsUsageEventsDropped = expvar.NewInt("usage_events_dropped")
+	MetricsUsageWriteErrors   = expvar.NewInt("usage_write_errors")
+)
+
+// RecordUsageEventsWritten records one usage event persisted to the store.
+func RecordUsageEventsWritten() {
+	MetricsUsageEventsWritten.Add(1)
+}
+
+// RecordUsageEventsDropped records one usage event that will never be
+// persisted (queue full, recorder already closed, or a write-layer failure
+// that lost the event). Event-granular: one call per lost event.
+func RecordUsageEventsDropped() {
+	MetricsUsageEventsDropped.Add(1)
+}
+
+// RecordUsageWriteErrors records one usage persistence failure INCIDENT
+// (open/migrate/cleanup failure, flush panic, failed batch, per-event insert
+// failure). Incident-granular, not event-granular: a batch of N lost events
+// is one incident (the N events are counted by RecordUsageEventsDropped).
+func RecordUsageWriteErrors() {
+	MetricsUsageWriteErrors.Add(1)
 }

@@ -17,9 +17,30 @@
 debug: false
 listen: "127.0.0.1:18790"
 
-# Optional authentication token for /v1/* endpoints. When set, clients must
-# send "Authorization: Bearer <token>". Env var: PRISM_AUTH_TOKEN.
+# Optional authentication for /v1/* endpoints (excluding /health). Two forms,
+# both supported; clients send "Authorization: Bearer <token>".
+#
+# 1) Legacy single token (still fully supported). Env var: PRISM_AUTH_TOKEN.
+#    auth_token: "your-secret-token"
+#
+# 2) Multiple named keys (new):
+#    api_keys:
+#      - name: ci-bot
+#        token: "sk-ci-..."
+#      - name: human
+#        token: "sk-human-..."
+#    The key NAME (never the token) is recorded in audit logs as key_id.
+#
+# Merge rules when both are configured:
+#   - api_keys empty + auth_token set → a single key {name: default, token: <auth_token>}.
+#   - both set → auth_token is appended as {name: default, token: <auth_token>}
+#     UNLESS its value already equals an api_keys token (then that api_keys
+#     entry's name wins and no extra default entry is injected).
+#   - neither set + non-loopback listen → startup error (loopback allows no auth).
 # auth_token: "your-secret-token"
+# api_keys:
+#   - name: default
+#     token: "your-secret-token"
 
 # Optional TLS. When both set, server listens with HTTPS. Env vars: PRISM_TLS_CERT, PRISM_TLS_KEY.
 # tls_cert_file: "/path/to/cert.pem"
@@ -57,6 +78,75 @@ model_remap:
   gpt-5.4-mini: standard
   gpt-5.3-codex: standard
   glm-5.2: glm-standard
+
+# ---------------------------------------------------------------------------
+# 可选：model_metadata —— /v1/models 返回的按模型元数据（context_window /
+# max_tokens / reasoning / input / cost / thinking_level_map / extra）。
+# cost 字段单位：USD per 1M tokens（每百万 token 的美元价）。
+# 例如 input: 0.6 表示每百万输入 token 0.6 美元。依据：生产配置实际数值量级
+# 0.14 ~ 4.4，且 internal/proxy/models.go 与 internal/cache/models.go 全程
+# 纯透传无换算，单位即上游原始单位。
+# ---------------------------------------------------------------------------
+# model_metadata:
+#   deepseek-v4-pro:
+#     context_window: 1000000
+#     cost:
+#       input: 0.6
+#       output: 2.4
+#       cache_read: 0.12
+#       cache_write: 0.6
+
+# ---------------------------------------------------------------------------
+# 可选：usage —— 每次请求的 token 用量与费用落 SQLite，供
+# GET /admin/usage/summary 聚合查询。默认关闭（enabled: false，opt-in：
+# 不配 usage 段时现有部署行为完全不变）。
+#
+#   启用后降级保证：usage 的任何故障（库打不开、磁盘满、SQLITE_BUSY、
+#   队列满、计价异常）一律只打日志加计数器（expvar usage_write_errors /
+#   usage_events_dropped / usage_events_written），绝不影响 /v1 代理转发，
+#   绝不 panic，绝不阻塞请求收尾。
+#
+#   enabled:        总开关。默认 false。
+#   db_path:        SQLite 文件路径。默认 /var/lib/prism/usage.db（与模型
+#                   缓存目录 /var/lib/prism/model_cache 同级）。
+#                   ⚠ 不可热更：修改后必须重启进程才生效（SIGHUP 热重载
+#                   会打 restart required 告警，实际仍用旧库）。
+#   retention_days: 事件保留天数，超期的定期清理删除。默认 30；显式配 0
+#                    = 永久保留，关闭清理（注意：不配才是 30，配 0 不是）。
+#   channel_size:   内存事件队列容量。默认 4096；队列满时丢事件并计数，
+#                   绝不阻塞请求。
+#   batch_size:     单 worker 攒批写入条数。默认 50。
+#   batch_flush_ms: 批刷新间隔毫秒。默认 200。
+#   default_key_id: 未携带已认证 api key 的请求（鉴权关闭、或早期拒绝路径）
+#                   落库的 key_id。默认 anonymous——网关不知道客户端叫什么，
+#                   需要按客户端归一时显式配置（显式配空串 = 用默认值）。
+#                   配了 api_keys 且请求带正确 key 时仍记 key 的 name。
+#
+#   计价：成本单价取 model_metadata[].cost（USD per 1M tokens，见上），
+#   按请求当时的配置（provider + model）解析；查不到单价的模型成本记为
+#   NULL / cost_status=missing_price，token 照常入库。
+#   口径：OpenAI 口径的 prompt_tokens 包含缓存部分（cached 按 cache_read
+#   单价另计）；Anthropic 口径的 input_tokens 不含缓存（cache_read /
+#   cache_creation 平级另算，input 全额计价）。每行落库 usage_source
+#   （openai / anthropic）便于核对计价依据。
+#
+#   查询接口：GET /admin/usage/summary
+#     - 鉴权：环境变量 PRISM_ADMIN_TOKEN（Authorization: Bearer <token>，
+#       常量时间比较）；本机 localhost 请求直接放行（与 /metrics 一致）。
+#     - 不走业务 api_keys 鉴权，挂载在全局鉴权之前。
+#     - 支持参数：from/to（unix 秒）、group_by（model/provider/account/
+#       key_id/stream/success/hour/day）、model/provider/account/key_id/
+#       stream/success 过滤、limit（默认 100，上限 1000）。
+#     - usage 未启用或库打开失败时返回 503 store_unavailable。
+# ---------------------------------------------------------------------------
+# usage:
+#   enabled: true
+#   db_path: "/var/lib/prism/usage.db"
+#   retention_days: 30
+#   channel_size: 4096
+#   batch_size: 50
+#   batch_flush_ms: 200
+#   default_key_id: anonymous
 
 accounts:
   # name "account-1" → credential/env LB_KEY_ACCOUNT_1

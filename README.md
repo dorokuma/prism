@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.12.0  Date: 2026-08-08  Status: living document
+> Version: v0.13.0  Date: 2026-08-10  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -65,6 +65,7 @@ systemctl restart prism   # only when you intend downtime / reload
 | `default_tier` | string | — | Fallback tier |
 | `default_provider` | string | — | Fallback provider for requests missing the X-Prism-Provider header; unset = reject them with HTTP 400 |
 | `max_concurrent_per_account` | map | — | Model → max concurrent requests per account (exact match; silences the unknown-model default warning) |
+| `usage` | map | disabled | Token usage recording to SQLite: `enabled` (default false, opt-in), `db_path` (default `/var/lib/prism/usage.db`; NOT hot-reloadable), `retention_days` (absent → default 30; explicit `0` → keep forever, cleanup disabled), `channel_size` (default 4096), `batch_size` (default 50), `batch_flush_ms` (default 200), `default_key_id` (default `anonymous`; key_id recorded for requests without an authenticated api key — explicit empty falls back to `anonymous`). Cost is priced from `model_metadata[].cost` (USD per 1M tokens); the pricing 口径 follows the upstream wire format (OpenAI `prompt_tokens` includes cached tokens, Anthropic `input_tokens` excludes the cache counters) and is persisted per row as `usage_source`. Any usage failure degrades to logs + counters and never affects `/v1` forwarding |
 
 ### Model remapping behavior
 
@@ -82,7 +83,7 @@ upstream model name. The resolution logic is:
 > behavior only applies `default_tier` to models that exist in `model_remap` but
 > whose target tier has no upstream mapping.
 | `mcp_tools_json` | string | — | Optional path to tool-definitions JSON |
-| `model_metadata` | map | — | Per-model metadata returned by /v1/models: context_window, max_tokens, reasoning, input, cost, thinking_level_map, extra |
+| `model_metadata` | map | — | Per-model metadata returned by /v1/models: context_window, max_tokens, reasoning, input, cost, thinking_level_map, extra. `cost` unit is USD per 1M tokens (e.g. `input: 0.6` = $0.6 per 1M input tokens) |
 | `probe_model` | string | `deepseek-chat` | Startup/probe model id |
 
 ### `wire_api`
@@ -109,6 +110,7 @@ upstream model name. The resolution logic is:
 | `/v1/responses` | POST | Responses path |
 | `/v1/models` | GET | Virtual models |
 | `/health` | GET | `ok` |
+| `/admin/usage/summary` | GET | Aggregated token usage/cost summary (when `usage.enabled`). Auth: `PRISM_ADMIN_TOKEN` Bearer token, or localhost is allowed; mounted before the global api_keys gate (like `/metrics`). Query params: `from`/`to` (unix seconds), `group_by` (`model`,`provider`,`account`,`key_id`,`stream`,`success`,`hour`,`day`), filters `model`/`provider`/`account`/`key_id`/`stream`/`success`, `limit` (default 100, max 1000). Returns 503 `store_unavailable` when usage is disabled or the store failed |
 
 ### Codex
 
@@ -140,6 +142,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-08** — v0.13.0 — feat: token usage recording (internal/usage SQLite store + batched recorder) wired into the request lifecycle and config: new `usage` config section (opt-in, default disabled; `db_path` not hot-reloadable), per-request usage/cost persisted at `EmitAudit` via an injected minimal recorder interface (middleware stays decoupled from internal/usage), cost priced per request from `model_metadata[].cost` (USD per 1M tokens, no conversion), admin endpoint `GET /admin/usage/summary` (PRISM_ADMIN_TOKEN Bearer auth or localhost, mounted before the global api_keys gate). Hard degradation guarantee: every usage failure (store open/migrate, disk full, SQLITE_BUSY, full queue, pricing) is logged + counted only, never returned, never panics, never blocks request finalization or /v1 forwarding. Also tightened `Authenticate` to require the `Bearer ` prefix (bare tokens are now rejected, matching legacy `CheckAuth`)
 
 - **2026-08-08** — v0.12.0 — feat: new `default_provider` config option; requests missing the X-Prism-Provider header now route through the configured default provider when set, otherwise return HTTP 400 (missing X-Prism-Provider header) instead of falling back to whole-pool account selection, which could previously hit an account of a different provider (e.g. deepseek-v4-flash landing on agentrouter-ant-2, gpt-5.6-sol landing on agentrouter-ant-1); explicit `max_concurrent_per_account` example added so per-model concurrency is configured instead of falling back to the built-in default with an "unknown model" warning
 

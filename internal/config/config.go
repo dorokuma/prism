@@ -43,6 +43,74 @@ type ModelMetadataMap map[string]ModelMetadata
 // of the log level via ReloadConfig.
 var LogLevelHook func(level string)
 
+// maxAPIKeyTokenBytes is the longest API key token the constant-time auth
+// comparison supports (must match middleware.authPadLen). Tokens longer than
+// this would be truncated by the fixed-length pad, which could let a prefix
+// match pass; LoadConfig rejects them.
+const maxAPIKeyTokenBytes = 256
+
+// UsageConfig mirrors internal/usage.Config for the yaml `usage` section.
+// The mapping to internal/usage.Config happens in the wiring stage
+// (cmd/prism); internal/usage deliberately does not depend on this package.
+//
+// enabled defaults to false: token usage recording is opt-in so existing
+// deployments behave exactly as before until they configure it.
+// db_path defaults to /var/lib/prism/usage.db, next to the model cache
+// directory. db_path is NOT hot-reloadable: changing it requires a restart
+// (ReloadConfig warns).
+//
+// Costing note: prices come from model_metadata[].cost (USD per 1M tokens)
+// and are resolved per request by the wiring stage; no conversion is done
+// here.
+//
+// Defaults applied in LoadConfig: enabled=false, db_path=/var/lib/prism/usage.db,
+// retention_days=30 (only when the field is ABSENT — an explicit 0 is kept
+// and means "never delete"; see UnmarshalYAML), channel_size=4096,
+// batch_size=50, batch_flush_ms=200, default_key_id="anonymous" (an empty
+// value — absent or explicit "" — falls back to "anonymous"). Other
+// zero-valued fields are replaced by these defaults (LoadConfig style).
+type UsageConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	DBPath        string `yaml:"db_path"`
+	RetentionDays int    `yaml:"retention_days"`
+	ChannelSize   int    `yaml:"channel_size"`
+	BatchSize     int    `yaml:"batch_size"`
+	BatchFlushMS  int    `yaml:"batch_flush_ms"`
+
+	// DefaultKeyID is the key_id recorded for requests that were not
+	// authenticated with a named api_keys entry (auth disabled, or the
+	// request was rejected before key attribution). Defaults to
+	// "anonymous". prism deliberately does not hard-code any client name:
+	// a deployment that wants its single client attributed under a
+	// specific label sets this explicitly.
+	DefaultKeyID string `yaml:"default_key_id"`
+
+	// retentionDaysSet records whether the yaml contained an explicit
+	// retention_days key. yaml unmarshalling cannot distinguish "0" from
+	// "absent" on a plain int, but the two must behave differently: absent
+	// → default 30, explicit 0 → "keep forever, disable cleanup".
+	retentionDaysSet bool
+}
+
+// UnmarshalYAML decodes the usage section and remembers whether
+// retention_days was explicitly present, so LoadConfig can tell "user
+// configured 0" apart from "user did not configure the field".
+func (u *UsageConfig) UnmarshalYAML(value *yaml.Node) error {
+	type plain UsageConfig // avoids recursion into this method
+	if err := value.Decode((*plain)(u)); err != nil {
+		return err
+	}
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "retention_days" {
+				u.retentionDaysSet = true
+				break
+			}
+		}
+	}
+	return nil
+}
+
 // AccountConfig holds configuration for a single upstream API account.
 type AccountConfig struct {
 	Name     string `yaml:"name"`
@@ -77,6 +145,14 @@ type AccountConfig struct {
 	SkipPISync bool `yaml:"skip_pi_sync,omitempty"`
 }
 
+// APIKey defines a single client authentication credential for prism's
+// /v1/* endpoints. Name is the human-readable key identifier recorded in
+// audit logs; Token is the secret itself and must never be logged.
+type APIKey struct {
+	Name  string `yaml:"name"`
+	Token string `yaml:"token"`
+}
+
 // Config holds the top-level application configuration loaded from a YAML file.
 type Config struct {
 	Listen                   string                      `yaml:"listen"`
@@ -91,6 +167,7 @@ type Config struct {
 	Debug                    bool                        `yaml:"debug"`
 	MCPToolsJSON             string                      `yaml:"mcp_tools_json"`
 	AuthToken                string                      `yaml:"auth_token,omitempty"`
+	APIKeys                  []APIKey                    `yaml:"api_keys,omitempty"`
 	TLSCertFile              string                      `yaml:"tls_cert_file,omitempty"`
 	TLSKeyFile               string                      `yaml:"tls_key_file,omitempty"`
 	TrustedProxies           []string                    `yaml:"trusted_proxies,omitempty"`
@@ -104,6 +181,9 @@ type Config struct {
 	// requests with HTTP 400 instead of falling back to whole-pool selection
 	// (which could route an account to the wrong provider).
 	DefaultProvider string `yaml:"default_provider"`
+
+	// Usage is the optional token-usage recording section (see UsageConfig).
+	Usage UsageConfig `yaml:"usage"`
 
 	// providerSchema maps a provider name to its effort schema ("ollama" or
 	// empty for opencode). Precomputed from account base_url hosts at load time.
@@ -136,6 +216,31 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
+	}
+	// Usage section defaults. Recording is opt-in (enabled=false): an
+	// existing deployment without a usage section behaves exactly as before
+	// and only the defaults below are filled in (harmless while disabled).
+	// db_path sits next to the model cache directory (/var/lib/prism).
+	// retention_days defaults to 30 ONLY when the field was absent: an
+	// explicit 0 is preserved and means "keep forever, disable cleanup"
+	// (internal/usage disables the cleanup loop for RetentionDays <= 0).
+	if cfg.Usage.DBPath == "" {
+		cfg.Usage.DBPath = "/var/lib/prism/usage.db"
+	}
+	if !cfg.Usage.retentionDaysSet && cfg.Usage.RetentionDays == 0 {
+		cfg.Usage.RetentionDays = 30
+	}
+	if cfg.Usage.ChannelSize == 0 {
+		cfg.Usage.ChannelSize = 4096
+	}
+	if cfg.Usage.BatchSize == 0 {
+		cfg.Usage.BatchSize = 50
+	}
+	if cfg.Usage.BatchFlushMS == 0 {
+		cfg.Usage.BatchFlushMS = 200
+	}
+	if cfg.Usage.DefaultKeyID == "" {
+		cfg.Usage.DefaultKeyID = "anonymous"
 	}
 	if _, err := ParseWireAPIMode(cfg.WireAPI); err != nil {
 		return nil, err
@@ -186,9 +291,55 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.AuthToken == "" {
 		cfg.AuthToken = os.Getenv("PRISM_AUTH_TOKEN")
 	}
-	// Reject non-loopback listen without auth token
-	if !isLoopbackListen(cfg.Listen) && cfg.AuthToken == "" {
-		return nil, fmt.Errorf("non-loopback listen address %q requires auth_token or PRISM_AUTH_TOKEN", cfg.Listen)
+	// Backward-compatible expansion of the legacy single auth_token into the
+	// api_keys set:
+	//   - api_keys empty + auth_token set  → inject {name: "default", token: auth_token}
+	//   - both set                         → merge; if auth_token's value already
+	//     appears in an api_keys entry, that entry's name wins and NO extra
+	//     "default" entry is injected (avoids duplicate-token ambiguity).
+	//   - api_keys set + auth_token empty  → api_keys used as-is.
+	if len(cfg.APIKeys) == 0 && cfg.AuthToken != "" {
+		cfg.APIKeys = []APIKey{{Name: "default", Token: cfg.AuthToken}}
+	} else if len(cfg.APIKeys) > 0 && cfg.AuthToken != "" {
+		dup := false
+		for _, k := range cfg.APIKeys {
+			if k.Token == cfg.AuthToken {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			cfg.APIKeys = append(cfg.APIKeys, APIKey{Name: "default", Token: cfg.AuthToken})
+		}
+	}
+	// Reject duplicate tokens within api_keys. The auth loop deliberately
+	// keeps the LAST matching name (no early return, constant-time scan), so
+	// a duplicated token would silently attribute every request — and every
+	// usage row and audit line — to the last key name. The error names the
+	// two conflicting keys but never echoes the token itself. This runs
+	// AFTER the auth_token expansion above, which already deduplicates the
+	// legacy auth_token against api_keys (an auth_token equal to an
+	// api_keys token is the known-good "same key, two spellings" case and
+	// never reaches this check as a duplicate).
+	seenTokens := make(map[string]string, len(cfg.APIKeys))
+	for _, k := range cfg.APIKeys {
+		if prev, ok := seenTokens[k.Token]; ok {
+			return nil, fmt.Errorf("api_keys: keys %q and %q use the same token; every key must have a unique token", prev, k.Name)
+		}
+		seenTokens[k.Token] = k.Name
+	}
+	// API key tokens are compared with a fixed-length constant-time pad in
+	// the auth middleware (middleware.authPadLen = 256): a token longer than
+	// the pad would be truncated and a prefix match could pass. Reject such
+	// configurations outright instead of silently weakening auth.
+	for _, k := range cfg.APIKeys {
+		if len(k.Token) > maxAPIKeyTokenBytes {
+			return nil, fmt.Errorf("api key %q: token longer than %d bytes is not supported (constant-time auth compares a fixed %d-byte pad)", k.Name, maxAPIKeyTokenBytes, maxAPIKeyTokenBytes)
+		}
+	}
+	// Reject non-loopback listen without any credential (checked post-expansion).
+	if !isLoopbackListen(cfg.Listen) && len(cfg.APIKeys) == 0 {
+		return nil, fmt.Errorf("non-loopback listen address %q requires auth_token, PRISM_AUTH_TOKEN, or api_keys", cfg.Listen)
 	}
 	// TLS cert/key fallback to env vars
 	if cfg.TLSCertFile == "" {
@@ -435,9 +586,10 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 			"listen changed from %q to %q: restart required to take effect",
 			oldCfg.Listen, newCfg.Listen))
 	}
-	if oldCfg.AuthToken != newCfg.AuthToken {
-		warnings = append(warnings, "auth_token changed: restart required to take effect")
-	}
+	// api_keys / auth_token are hot-reloadable: the ConfigHolder atomic pointer
+	// swap below publishes the new credential set and the auth middleware reads
+	// it per request, so a change takes effect immediately. No restart warning
+	// is emitted (the account pool is not rebuilt by this change).
 	if !accountsEqual(oldCfg.Accounts, newCfg.Accounts) {
 		warnings = append(warnings, "accounts changed: restart required to take effect")
 	}
@@ -455,6 +607,18 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	}
 	if oldCfg.Debug != newCfg.Debug {
 		warnings = append(warnings, "debug changed: restart required to take effect")
+	}
+	// The usage store + recorder are built once at startup; db_path (which
+	// database file) and enabled (whether recording is on at all) cannot be
+	// hot-reloaded. Other usage fields are tuning knobs that also only apply
+	// at startup; they are not warned about to keep reload output focused.
+	if oldCfg.Usage.DBPath != newCfg.Usage.DBPath {
+		warnings = append(warnings, fmt.Sprintf(
+			"usage.db_path changed from %q to %q: restart required to take effect",
+			oldCfg.Usage.DBPath, newCfg.Usage.DBPath))
+	}
+	if oldCfg.Usage.Enabled != newCfg.Usage.Enabled {
+		warnings = append(warnings, "usage.enabled changed: restart required to take effect")
 	}
 	if oldCfg.LogLevel != newCfg.LogLevel {
 		if LogLevelHook != nil {

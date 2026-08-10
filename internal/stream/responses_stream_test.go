@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/dorokuma/prism/internal/middleware"
 )
 
 // sseEvent represents a single SSE event from the Responses API stream.
@@ -561,6 +563,70 @@ data: [DONE]
 				t.Fatalf("usage.total_tokens = %d, want 30", totalTok)
 			}
 		}
+	}
+}
+
+func TestTranslateStream_AuditUsageFields(t *testing.T) {
+	// The responses-streaming translation must fill the full audit usage
+	// field set (legacy aliases + v2 fields) from the OpenAI usage chunk,
+	// with cached falling back to prompt_tokens_details.cached_tokens.
+	input := `data: {"choices":[{"delta":{"content":"hi"}}]}
+
+data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":200,"completion_tokens":50,"total_tokens":250,"prompt_cache_hit_tokens":100,"prompt_tokens_details":{"cached_tokens":100},"completion_tokens_details":{"reasoning_tokens":30}}}
+
+data: [DONE]
+`
+	a := &middleware.RequestAudit{}
+	ctx := context.WithValue(context.Background(), middleware.AuditKey{}, a)
+	rec := httptest.NewRecorder()
+	if err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, ctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if a.TokensIn != 200 || a.PromptTokens != 200 {
+		t.Errorf("TokensIn/PromptTokens = %d/%d, want 200", a.TokensIn, a.PromptTokens)
+	}
+	if a.TokensOut != 50 || a.CompletionTokens != 50 {
+		t.Errorf("TokensOut/CompletionTokens = %d/%d, want 50", a.TokensOut, a.CompletionTokens)
+	}
+	if a.TotalTokens != 250 {
+		t.Errorf("TotalTokens = %d, want 250", a.TotalTokens)
+	}
+	if a.CachedTokens != 100 {
+		t.Errorf("CachedTokens = %d, want 100", a.CachedTokens)
+	}
+	if a.ReasoningTokens != 30 {
+		t.Errorf("ReasoningTokens = %d, want 30", a.ReasoningTokens)
+	}
+}
+
+func TestTranslateStream_AuditUsageNoMath(t *testing.T) {
+	// reasoning (100) stays inside completion (500) and cached (200) stays
+	// inside prompt (1000): the audit must record raw upstream numbers.
+	input := `data: {"choices":[{"delta":{"content":"hi"}}]}
+
+data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":1000,"completion_tokens":500,"total_tokens":1500,"prompt_cache_hit_tokens":200,"completion_tokens_details":{"reasoning_tokens":100}}}
+
+data: [DONE]
+`
+	a := &middleware.RequestAudit{}
+	ctx := context.WithValue(context.Background(), middleware.AuditKey{}, a)
+	rec := httptest.NewRecorder()
+	if err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, ctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if a.CompletionTokens != 500 {
+		t.Errorf("CompletionTokens = %d, want 500 (reasoning must not be subtracted)", a.CompletionTokens)
+	}
+	if a.ReasoningTokens != 100 {
+		t.Errorf("ReasoningTokens = %d, want 100", a.ReasoningTokens)
+	}
+	if a.PromptTokens != 1000 {
+		t.Errorf("PromptTokens = %d, want 1000 (cached must not be subtracted)", a.PromptTokens)
+	}
+	if a.CachedTokens != 200 {
+		t.Errorf("CachedTokens = %d, want 200", a.CachedTokens)
 	}
 }
 
