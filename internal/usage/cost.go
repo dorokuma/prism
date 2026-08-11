@@ -62,6 +62,25 @@ func ComputeCost(promptTokens, completionTokens, cachedTokens, cacheWriteTokens 
 	if price == nil {
 		return nil, CostStatusMissingPrice
 	}
+	// Entry clamp: every token count is non-negative by definition, so a
+	// broken upstream report (or a programmatically built event) with
+	// negative tokens is normalized to 0 before any arithmetic — a negative
+	// count can never generate a negative cost term. The OpenAI branch
+	// additionally caps cached into [0, prompt] below; the Anthropic branch
+	// only clamps non-negative and keeps its formula semantics (input billed
+	// in full, cache counters priced separately).
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
+	if completionTokens < 0 {
+		completionTokens = 0
+	}
+	if cachedTokens < 0 {
+		cachedTokens = 0
+	}
+	if cacheWriteTokens < 0 {
+		cacheWriteTokens = 0
+	}
 	if promptTokens == 0 && completionTokens == 0 && cachedTokens == 0 && cacheWriteTokens == 0 {
 		zero := 0.0
 		return &zero, CostStatusNoUsage
@@ -76,9 +95,20 @@ func ComputeCost(promptTokens, completionTokens, cachedTokens, cacheWriteTokens 
 			float64(cachedTokens)/1e6*price.CacheRead
 	} else {
 		// OpenAI prompt_tokens includes cached tokens: price the cached
-		// portion at CacheRead and the rest at Input.
-		promptTerm = float64(promptTokens-cachedTokens)/1e6*price.Input +
-			float64(cachedTokens)/1e6*price.CacheRead
+		// portion at CacheRead and the rest at Input. Cached is clamped into
+		// [0, prompt] (defense in depth: the parsers already normalize, but
+		// callers may build token counts programmatically) so a broken
+		// report can never produce a negative prompt term or a negative
+		// cost.
+		cached := cachedTokens
+		if cached < 0 {
+			cached = 0
+		}
+		if cached > promptTokens {
+			cached = promptTokens
+		}
+		promptTerm = float64(promptTokens-cached)/1e6*price.Input +
+			float64(cached)/1e6*price.CacheRead
 	}
 	cost := promptTerm +
 		float64(cacheWriteTokens)/1e6*price.CacheWrite +

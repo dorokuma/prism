@@ -85,11 +85,15 @@ func Authenticate(r *http.Request, keys []config.APIKey) (keyName string, ok boo
 	matched := false
 	matchedName := ""
 	for _, k := range keys {
+		// Keys with an empty or whitespace-only token are skipped
+		// defensively (config loading rejects them, but programmatically
+		// built key sets must not let an empty token authenticate every
+		// "Bearer " request through the all-zero padded comparison).
 		// Keys longer than the pad would be truncated by the copy below and
 		// could match on a prefix; config loading rejects them, this guard
 		// keeps programmatically built key sets safe too. The loop still
 		// scans every key (no early return), preserving the timing profile.
-		if len(k.Token) > authPadLen {
+		if strings.TrimSpace(k.Token) == "" || len(k.Token) > authPadLen {
 			continue
 		}
 		eb := make([]byte, authPadLen)
@@ -119,6 +123,16 @@ func WithAPIKey(ctx context.Context, name string) context.Context {
 func APIKeyFromContext(ctx context.Context) string {
 	name, _ := ctx.Value(apiKeyCtxKey{}).(string)
 	return name
+}
+
+// HasForwardedHeaders reports whether the request carries a forwarding
+// header (X-Forwarded-For or X-Real-IP). A same-machine reverse proxy
+// presents a loopback RemoteAddr AND adds one of these headers, so loopback
+// status alone cannot distinguish a direct local client from a proxied one.
+// Endpoints that allow loopback without a token (/metrics,
+// /admin/usage/summary) must require the token when this reports true.
+func HasForwardedHeaders(r *http.Request) bool {
+	return r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("X-Real-IP") != ""
 }
 
 // IsLocalhost returns true if the request's RemoteAddr is a loopback address.

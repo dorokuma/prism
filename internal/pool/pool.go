@@ -54,30 +54,40 @@ func NewPool(cfgs []config.AccountConfig) *Pool {
 	}
 }
 
+// wakeWaiterFor scans the wait queue from the front and wakes the first
+// waiter that can use a slot freed on acc: a waiter whose provider matches
+// acc's provider, or a provider="" waiter (which can use any slot). Waking
+// a non-matching waiter would consume the wakeup and lose it (the woken
+// waiter would fail to select and re-queue at the back while the freed slot
+// sits idle), so only the first matching waiter is removed and closed —
+// exactly once. FIFO is preserved within the matching set because the scan
+// starts at the queue front. Must be called with p.mu held.
+func (p *Pool) wakeWaiterFor(acc *Account) {
+	prov := acc.Provider()
+	for elem := p.waiters.Front(); elem != nil; elem = elem.Next() {
+		w := elem.Value.(*waiter)
+		if w.provider != "" && w.provider != prov {
+			continue
+		}
+		p.waiters.Remove(elem)
+		w.active = false
+		close(w.ch)
+		return
+	}
+}
+
 func (p *Pool) Release(a *Account) {
 	a.Release()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.waiters.Len() > 0 {
-		elem := p.waiters.Front()
-		p.waiters.Remove(elem)
-		w := elem.Value.(*waiter)
-		w.active = false
-		close(w.ch)
-	}
+	p.wakeWaiterFor(a)
 }
 
 func (p *Pool) MarkHealthy(a *Account) {
 	a.MarkHealthy()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.waiters.Len() > 0 {
-		elem := p.waiters.Front()
-		p.waiters.Remove(elem)
-		w := elem.Value.(*waiter)
-		w.active = false
-		close(w.ch)
-	}
+	p.wakeWaiterFor(a)
 }
 
 func (p *Pool) removeWaiterAndTransfer(elem *list.Element) {
@@ -164,8 +174,9 @@ func (p *Pool) Select(ctx context.Context, maxConcurrent int) (*Account, error) 
 		}
 
 		w := &waiter{
-			ch:     make(chan struct{}),
-			active: true,
+			ch:       make(chan struct{}),
+			active:   true,
+			provider: "",
 		}
 		elem := p.waiters.PushBack(w)
 		p.mu.Unlock()
@@ -314,8 +325,9 @@ func (p *Pool) SelectByProvider(ctx context.Context, maxConcurrent int, provider
 		}
 
 		w := &waiter{
-			ch:     make(chan struct{}),
-			active: true,
+			ch:       make(chan struct{}),
+			active:   true,
+			provider: provider,
 		}
 		elem := p.waiters.PushBack(w)
 		p.mu.Unlock()

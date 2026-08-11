@@ -202,7 +202,10 @@ func ApplyAccountHeaders(dst http.Header, acc *Account) {
 }
 
 // waiter represents a goroutine waiting for an available account in the pool.
+// provider is the provider the waiter's SelectByProvider asked for; empty
+// means the waiter can use any provider's slot (the global Select path).
 type waiter struct {
-	ch     chan struct{}
-	active bool
+	ch       chan struct{}
+	active   bool
+	provider string
 }

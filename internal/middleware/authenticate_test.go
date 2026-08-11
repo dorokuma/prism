@@ -182,3 +182,38 @@ func TestAPIKeyContextRoundtrip(t *testing.T) {
 		t.Errorf("APIKeyFromContext on bare ctx = %q, want empty", got)
 	}
 }
+
+// TestAuthenticate_EmptyTokenKeySkipped guards the defensive empty-token
+// skip: a key whose token is empty or whitespace-only (programmatically
+// built key sets; config loading rejects them) must never authenticate a
+// "Bearer " request through the all-zero padded comparison, and must not
+// break matching of the other keys in the set.
+func TestAuthenticate_EmptyTokenKeySkipped(t *testing.T) {
+	keys := []config.APIKey{
+		{Name: "bad-empty", Token: ""},
+		{Name: "bad-space", Token: "   "},
+		{Name: "ci-bot", Token: "sk-ci-111"},
+	}
+
+	// "Bearer " with nothing after it must NOT match the empty-token key.
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Authorization", "Bearer ")
+	if name, ok := middleware.Authenticate(r, keys); ok {
+		t.Fatalf("empty token key authenticated a prefix-only request as %q", name)
+	}
+
+	// "Bearer  " (single space) must NOT match the whitespace-only key.
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.Header.Set("Authorization", "Bearer  ")
+	if name, ok := middleware.Authenticate(r2, keys); ok {
+		t.Fatalf("whitespace token key authenticated a whitespace request as %q", name)
+	}
+
+	// A real key in the same set still authenticates.
+	r3 := httptest.NewRequest("GET", "/", nil)
+	r3.Header.Set("Authorization", "Bearer sk-ci-111")
+	name, ok := middleware.Authenticate(r3, keys)
+	if !ok || name != "ci-bot" {
+		t.Errorf("real key next to empty-token keys: (%q, %v), want (ci-bot, true)", name, ok)
+	}
+}

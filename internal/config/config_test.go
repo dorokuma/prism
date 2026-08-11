@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -1436,5 +1437,152 @@ accounts:
 		if strings.Contains(w, "usage") {
 			t.Errorf("unexpected usage warning for tuning-knob change: %q", w)
 		}
+	}
+}
+
+// loadConfigFrom writes content to a temp file and runs LoadConfig on it.
+func loadConfigFrom(t *testing.T, content string) (*Config, error) {
+	t.Helper()
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	return LoadConfig(f.Name())
+}
+
+// TestLoadConfig_EmptyAPIKeyTokenRejected guards the empty/whitespace token
+// hole: a key with an empty or whitespace-only token would let every
+// "Bearer " request authenticate through the all-zero padded comparison.
+func TestLoadConfig_EmptyAPIKeyTokenRejected(t *testing.T) {
+	base := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	for name, keys := range map[string]string{
+		"empty token": `api_keys:
+  - name: bad
+    token: ""`,
+		"whitespace": `api_keys:
+  - name: bad
+    token: "   "`,
+		"whitespace auth_token": `auth_token: "  "`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := loadConfigFrom(t, base+"\n"+keys)
+			if err == nil {
+				t.Fatal("LoadConfig must reject an empty/whitespace-only api key token")
+			}
+			if !strings.Contains(err.Error(), "token is empty") {
+				t.Errorf("error = %q, want it to mention the empty token", err)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_ValidAPIKeyTokenAccepted guards the happy path: a normal
+// token still loads.
+func TestLoadConfig_ValidAPIKeyTokenAccepted(t *testing.T) {
+	content := `
+api_keys:
+  - name: ci-bot
+    token: "sk-ci-111"
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	cfg, err := loadConfigFrom(t, content)
+	if err != nil {
+		t.Fatalf("LoadConfig with a valid key: %v", err)
+	}
+	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0].Token != "sk-ci-111" {
+		t.Fatalf("api_keys = %+v, want the single valid key", cfg.APIKeys)
+	}
+}
+
+// TestLoadConfig_MaxUpstreamResponseBytes covers the max_upstream_response_bytes
+// field: absent → default 32 MiB, explicit → honored, negative → load error.
+// TestResolveFetchConcurrency pins the model-cache fetch concurrency rule:
+// "*" wins when configured; otherwise the smallest positive per-model value
+// is used (a fetch holds a slot on the same account as business requests, so
+// it must respect every configured model cap); no positive values → the
+// built-in default. Non-positive entries are ignored, never treated as a
+// zero limit.
+func TestResolveFetchConcurrency(t *testing.T) {
+	defaultFallback := DeepseekV4ProConcurrency * DefaultConcurrencyRatio / 100
+	tests := []struct {
+		name string
+		m    map[string]int
+		want int
+	}{
+		{"nil map → default", nil, defaultFallback},
+		{"empty map → default", map[string]int{}, defaultFallback},
+		{"wildcard wins", map[string]int{"*": 3, "m-a": 1, "m-b": 2}, 3},
+		{"specific-only → min of positives", map[string]int{"m-a": 5, "m-b": 2}, 2},
+		{"min ignores non-positive entries", map[string]int{"m-a": 0, "m-b": -4, "m-c": 7}, 7},
+		{"only non-positive entries → default", map[string]int{"m-a": 0, "m-b": -4}, defaultFallback},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{MaxConcurrentPerAccount: tc.m}
+			if got := ResolveFetchConcurrency(cfg); got != tc.want {
+				t.Errorf("ResolveFetchConcurrency(%v) = %d, want %d", tc.m, got, tc.want)
+			}
+		})
+	}
+	// nil config → default (matches ResolveMaxConcurrent's nil-safety).
+	if got := ResolveFetchConcurrency(nil); got != defaultFallback {
+		t.Errorf("ResolveFetchConcurrency(nil) = %d, want %d", got, defaultFallback)
+	}
+}
+
+func TestLoadConfig_MaxUpstreamResponseBytes(t *testing.T) {
+	base := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	cfg, err := loadConfigFrom(t, base)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.MaxUpstreamResponseBytes != MaxUpstreamResponseBytesDefault {
+		t.Errorf("default max_upstream_response_bytes = %d, want %d", cfg.MaxUpstreamResponseBytes, MaxUpstreamResponseBytesDefault)
+	}
+
+	cfg, err = loadConfigFrom(t, base+"\nmax_upstream_response_bytes: 1048576\n")
+	if err != nil {
+		t.Fatalf("LoadConfig with explicit cap: %v", err)
+	}
+	if cfg.MaxUpstreamResponseBytes != 1048576 {
+		t.Errorf("explicit max_upstream_response_bytes = %d, want 1048576", cfg.MaxUpstreamResponseBytes)
+	}
+
+	if _, err := loadConfigFrom(t, base+"\nmax_upstream_response_bytes: -1\n"); err == nil {
+		t.Fatal("LoadConfig must reject a negative max_upstream_response_bytes")
+	}
+
+	// Values above the hard cap (256 MiB) are a load error: they would
+	// defeat the memory bound and sit dangerously close to the int64
+	// overflow of the read helper's max+1 probe.
+	if _, err := loadConfigFrom(t, fmt.Sprintf("%s\nmax_upstream_response_bytes: %d\n", base, MaxUpstreamResponseBytesLimit+1)); err == nil {
+		t.Fatal("LoadConfig must reject max_upstream_response_bytes above MaxUpstreamResponseBytesLimit")
+	}
+
+	// Exactly at the cap is accepted.
+	cfg, err = loadConfigFrom(t, fmt.Sprintf("%s\nmax_upstream_response_bytes: %d\n", base, MaxUpstreamResponseBytesLimit))
+	if err != nil {
+		t.Fatalf("LoadConfig must accept exactly MaxUpstreamResponseBytesLimit: %v", err)
+	}
+	if cfg.MaxUpstreamResponseBytes != MaxUpstreamResponseBytesLimit {
+		t.Errorf("max_upstream_response_bytes at cap = %d, want %d", cfg.MaxUpstreamResponseBytes, MaxUpstreamResponseBytesLimit)
 	}
 }

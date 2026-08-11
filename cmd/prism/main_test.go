@@ -730,3 +730,121 @@ func TestUsageAdapter_MissingPriceLogAndDBNil(t *testing.T) {
 		t.Errorf("audit log cost_usd = %v, want 0 for a missing price; log:\n%s", parsed.CostUSD, logBuf.String())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// /metrics loopback auth (fail-closed): with METRICS_TOKEN configured every
+// request must present it, loopback included; only when it is unset does a
+// direct loopback request (no X-Forwarded-For / X-Real-IP) pass without a
+// token.
+// ---------------------------------------------------------------------------
+
+func TestHTTPHandler_MetricsRequiresTokenBehindForwardHeaders(t *testing.T) {
+	t.Setenv("METRICS_TOKEN", "metrics-sekret")
+	cfg := testConfig(t, nil)
+	h := newHTTPHandler(config.NewConfigHolder(cfg), &fakeProxy{status: http.StatusOK}, nil, nil, usage.NewSummaryHandler(nil))
+
+	// Fail-closed: direct loopback without forwarding headers and WITHOUT a
+	// token is 401 once METRICS_TOKEN is configured.
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("direct loopback /metrics without token: status = %d, want 401 (fail-closed when METRICS_TOKEN is set)", rr.Code)
+	}
+
+	// The same direct loopback request WITH the token is allowed.
+	reqOK := httptest.NewRequest("GET", "/metrics", nil)
+	reqOK.RemoteAddr = "127.0.0.1:12345"
+	reqOK.Header.Set("Authorization", "Bearer metrics-sekret")
+	rrOK := httptest.NewRecorder()
+	h.ServeHTTP(rrOK, reqOK)
+	if rrOK.Code != http.StatusOK {
+		t.Errorf("direct loopback /metrics with token: status = %d, want 200", rrOK.Code)
+	}
+
+	// Loopback + X-Forwarded-For (same-machine reverse proxy): token required.
+	for name, hdr := range map[string]string{"X-Forwarded-For": "10.0.0.9", "X-Real-IP": "10.0.0.9"} {
+		req2 := httptest.NewRequest("GET", "/metrics", nil)
+		req2.RemoteAddr = "127.0.0.1:12345"
+		req2.Header.Set(name, hdr)
+		rr2 := httptest.NewRecorder()
+		h.ServeHTTP(rr2, req2)
+		if rr2.Code != http.StatusUnauthorized {
+			t.Errorf("loopback /metrics with %s and no token: status = %d, want 401", name, rr2.Code)
+		}
+
+		// Same request with the token: allowed.
+		req3 := httptest.NewRequest("GET", "/metrics", nil)
+		req3.RemoteAddr = "127.0.0.1:12345"
+		req3.Header.Set(name, hdr)
+		req3.Header.Set("Authorization", "Bearer metrics-sekret")
+		rr3 := httptest.NewRecorder()
+		h.ServeHTTP(rr3, req3)
+		if rr3.Code != http.StatusOK {
+			t.Errorf("loopback /metrics with %s and token: status = %d, want 200", name, rr3.Code)
+		}
+	}
+}
+
+// TestHTTPHandler_MetricsLoopbackNoTokenNoHeader401 pins the exact
+// acceptance case from the fail-closed review: loopback RemoteAddr +
+// METRICS_TOKEN configured + no forwarding headers + no auth => 401.
+func TestHTTPHandler_MetricsLoopbackNoTokenNoHeader401(t *testing.T) {
+	t.Setenv("METRICS_TOKEN", "metrics-sekret")
+	cfg := testConfig(t, nil)
+	h := newHTTPHandler(config.NewConfigHolder(cfg), &fakeProxy{status: http.StatusOK}, nil, nil, usage.NewSummaryHandler(nil))
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	req.RemoteAddr = "127.0.0.1:12345" // loopback, no X-Forwarded-For / X-Real-IP
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("loopback + METRICS_TOKEN configured + no header + no auth: status = %d, want 401", rr.Code)
+	}
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil || body.Error.Code != "unauthorized" {
+		t.Errorf("body must be the standard unauthorized envelope, got %q", rr.Body.String())
+	}
+}
+
+// TestHTTPHandler_MetricsRemoteNoTokenDenied guards the fail-closed side:
+// a remote /metrics request without METRICS_TOKEN is 401 even with no
+// forwarding headers, while a direct loopback request still passes (auth
+// disabled) and a loopback request carrying a forwarding header is denied.
+func TestHTTPHandler_MetricsRemoteNoTokenDenied(t *testing.T) {
+	t.Setenv("METRICS_TOKEN", "")
+	cfg := testConfig(t, nil)
+	h := newHTTPHandler(config.NewConfigHolder(cfg), &fakeProxy{status: http.StatusOK}, nil, nil, usage.NewSummaryHandler(nil))
+
+	req := httptest.NewRequest("GET", "/metrics", nil) // RemoteAddr is non-loopback by default
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("remote /metrics without token: status = %d, want 401", rr.Code)
+	}
+
+	// Token unset + direct loopback: allowed (the only token-free path).
+	reqLoop := httptest.NewRequest("GET", "/metrics", nil)
+	reqLoop.RemoteAddr = "127.0.0.1:12345"
+	rrLoop := httptest.NewRecorder()
+	h.ServeHTTP(rrLoop, reqLoop)
+	if rrLoop.Code != http.StatusOK {
+		t.Errorf("direct loopback /metrics with unset token: status = %d, want 200", rrLoop.Code)
+	}
+
+	// Token unset + loopback with a forwarding header: denied (proxied
+	// request cannot be distinguished from remote without a token).
+	reqFwd := httptest.NewRequest("GET", "/metrics", nil)
+	reqFwd.RemoteAddr = "127.0.0.1:12345"
+	reqFwd.Header.Set("X-Forwarded-For", "10.0.0.9")
+	rrFwd := httptest.NewRecorder()
+	h.ServeHTTP(rrFwd, reqFwd)
+	if rrFwd.Code != http.StatusUnauthorized {
+		t.Errorf("loopback /metrics with forwarding header and unset token: status = %d, want 401", rrFwd.Code)
+	}
+}

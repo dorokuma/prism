@@ -32,6 +32,12 @@ func NewProxyHandler(pp *pool.Pool, wire config.WireAPIMode, holder *config.Conf
 			return
 		}
 		if r.URL.Path == "/v1/chat/completions" {
+			if r.Method != http.MethodPost {
+				util.WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{
+					"error": map[string]any{"message": "method not allowed", "code": "method_not_allowed"},
+				})
+				return
+			}
 			if !wire.AllowsLegacy() {
 				util.WriteJSON(w, http.StatusNotFound, map[string]any{
 					"error": map[string]any{"message": "wire_api=responses: /v1/chat/completions disabled", "code": "disabled"},
@@ -42,6 +48,12 @@ func NewProxyHandler(pp *pool.Pool, wire config.WireAPIMode, holder *config.Conf
 			return
 		}
 		if r.URL.Path == "/v1/responses" {
+			if r.Method != http.MethodPost {
+				util.WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{
+					"error": map[string]any{"message": "method not allowed", "code": "method_not_allowed"},
+				})
+				return
+			}
 			if !wire.AllowsResponses() {
 				util.WriteJSON(w, http.StatusNotFound, map[string]any{
 					"error": map[string]any{"message": "wire_api=legacy: /v1/responses disabled", "code": "disabled"},

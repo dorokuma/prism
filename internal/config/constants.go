@@ -50,6 +50,26 @@ const (
 	// MaxErrorBodyBytes is the maximum bytes to read from an error response body.
 	MaxErrorBodyBytes = 1 << 20
 
+	// MaxUpstreamResponseBytesDefault is the default cap for a non-streaming
+	// upstream response body (32 MiB). Responses larger than this are
+	// rejected with HTTP 502 response_too_large instead of being buffered
+	// whole into memory. Configurable via max_upstream_response_bytes.
+	MaxUpstreamResponseBytesDefault = 32 << 20
+
+	// MaxUpstreamResponseBytesLimit is the hard upper bound for
+	// max_upstream_response_bytes (256 MiB). LoadConfig rejects values above
+	// it. The cap exists so the read helper's max+1 probe can never overflow
+	// int64 (values beyond math.MaxInt64-1 would wrap the LimitReader limit
+	// into a negative number and silently return an empty body); production
+	// values are bounded by this constant, and readResponseBodyLimited also
+	// defends the boundary itself.
+	MaxUpstreamResponseBytesLimit = 256 << 20
+
+	// RateLimitMaxBuckets is the production default cap on rate-limiter
+	// buckets (distinct client IPs). At the cap the bucket with the oldest
+	// lastCheck is evicted to make room for a new IP.
+	RateLimitMaxBuckets = 100000
+
 	// RedactJSONMaxDepth is the maximum depth for JSON redaction.
 	RedactJSONMaxDepth = 20
 

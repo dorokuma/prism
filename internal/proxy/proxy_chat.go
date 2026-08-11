@@ -3,10 +3,10 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/dorokuma/prism/internal/config"
@@ -28,6 +28,12 @@ type ChatForwardOpts struct {
 	// UpstreamPath is the upstream POST path; empty means
 	// "/chat/completions" (backward compatible with all existing callers).
 	UpstreamPath string
+
+	// MaxResponseBytes caps the non-streaming upstream response body size
+	// (both the legacy chat path and the responses translation path). Zero
+	// → config default 32 MiB (see config.MaxUpstreamResponseBytes).
+	// proxyChatWithBody fills it from cfg.
+	MaxResponseBytes int64
 
 	// SkipSanitize skips sanitize.TransformRequestBodyForProvider. It must be
 	// true for the anthropic /v1/messages surface whose body is NOT a chat
@@ -125,7 +131,10 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		return
 	}
 	maxAttempts := p.AccountCount() * 2
-	maxConcurrent := resolveMaxConcurrent(opts.Model, cfg)
+	maxConcurrent := config.ResolveMaxConcurrent(opts.Model, cfg)
+	if opts.MaxResponseBytes == 0 {
+		opts.MaxResponseBytes = cfg.MaxUpstreamResponseBytes
+	}
 	slog.Debug("proxy request start", "request_id", requestID, "path", r.URL.Path, "stream", opts.Stream, "responses_out", opts.ResponsesOut, "start", start.Format(time.RFC3339Nano), "max_concurrent", maxConcurrent)
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
@@ -133,7 +142,11 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 			time.Sleep(config.UpstreamRetryDelay)
 		}
 
-		selectCtx, cancel := context.WithTimeout(context.Background(), config.AccountSelectTimeout)
+		// The select timeout is bound to r.Context(): a client disconnect
+		// cancels the wait immediately (client_canceled) instead of parking
+		// the request until the fixed select timeout expires, while the
+		// timeout still applies for clients that stay connected.
+		selectCtx, cancel := context.WithTimeout(r.Context(), config.AccountSelectTimeout)
 		selectStart := time.Now()
 		acc, err := p.SelectByProvider(selectCtx, maxConcurrent, provider)
 		selectDuration := time.Since(selectStart).Milliseconds()
@@ -147,15 +160,26 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 			slog.Error("select account failed", "error", err)
 			util.RecordError()
 			aud.Error = err.Error()
-			if err == pool.ErrNoHealthyAccounts {
+			// Classify select failures with errors.Is (wrapping-safe) into
+			// four distinct response codes — no_healthy / select_timeout /
+			// client_canceled / select_failed — while the HTTP status stays
+			// 503. This replaces the old single "no_accounts" code for the
+			// select path (README records the compat change).
+			code := "select_failed"
+			aud.ErrorType = "select_failed"
+			switch {
+			case errors.Is(err, pool.ErrNoHealthyAccounts):
+				code = "no_healthy"
 				aud.ErrorType = "no_healthy"
-			} else if err == pool.ErrSelectTimeout {
+			case errors.Is(err, pool.ErrSelectTimeout) || errors.Is(err, context.DeadlineExceeded):
+				code = "select_timeout"
 				aud.ErrorType = "select_timeout"
-			} else {
-				aud.ErrorType = "select_failed"
+			case errors.Is(err, context.Canceled):
+				code = "client_canceled"
+				aud.ErrorType = "client_canceled"
 			}
 			util.WriteJSON(sc, 503, map[string]any{
-				"error": map[string]any{"message": "No healthy accounts available", "code": "no_accounts"},
+				"error": map[string]any{"message": "No healthy accounts available", "code": code},
 			})
 			return
 		}
@@ -203,33 +227,9 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 	})
 }
 
-// resolveMaxConcurrent returns the maximum concurrent requests per account
-// for the given model. Resolution order:
-//  1. cfg.MaxConcurrentPerAccount[model]  (exact match)
-//  2. cfg.MaxConcurrentPerAccount["*"]   (wildcard default)
-//  3. model name contains "flash" → deepseekV4FlashConcurrency * defaultConcurrencyRatio / 100
-//  4. model name contains "pro"   → deepseekV4ProConcurrency * defaultConcurrencyRatio / 100
-//  5. fallback: deepseekV4ProConcurrency * defaultConcurrencyRatio / 100 + warn
-func resolveMaxConcurrent(model string, cfg *config.Config) int {
-	if cfg.MaxConcurrentPerAccount != nil {
-		if v, ok := cfg.MaxConcurrentPerAccount[model]; ok && v > 0 {
-			return v
-		}
-		if v, ok := cfg.MaxConcurrentPerAccount["*"]; ok && v > 0 {
-			return v
-		}
-	}
-	modelLower := strings.ToLower(model)
-	if strings.Contains(modelLower, "flash") {
-		return config.DeepseekV4FlashConcurrency * config.DefaultConcurrencyRatio / 100
-	}
-	if strings.Contains(modelLower, "pro") {
-		return config.DeepseekV4ProConcurrency * config.DefaultConcurrencyRatio / 100
-	}
-	// Default for unknown models
-	slog.Warn("unknown model, using default concurrency", "model", model)
-	return config.DeepseekV4ProConcurrency * config.DefaultConcurrencyRatio / 100
-}
+// resolveMaxConcurrent moved to config.ResolveMaxConcurrent — the single
+// concurrency-resolution implementation shared with the model cache fetch
+// path (cache cannot import proxy). See internal/config/config.go.
 
 // parseUsageFromChatCompletion extracts input/output token counts from a raw
 // chat completion response body (non-streaming). Returns 0, 0 when the body

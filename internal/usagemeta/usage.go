@@ -118,18 +118,50 @@ func ParseOpenAI(data []byte) Usage {
 	if json.Unmarshal(obj, &u) != nil {
 		return Usage{}
 	}
+	// Entry clamps (defense in depth on top of the ComputeCost clamp): the
+	// four cost-relevant counts are non-negative by definition, so a broken
+	// upstream report with negative values is normalized to 0 before it can
+	// reach cost accounting. Well-formed payloads are recorded as-is.
+	prompt := u.PromptTokens
+	if prompt < 0 {
+		prompt = 0
+	}
+	completion := u.CompletionTokens
+	if completion < 0 {
+		completion = 0
+	}
+	// OpenAI chat completions usage has no cache-write counter (that is an
+	// Anthropic field); CacheWrite stays 0. prompt_cache_miss_tokens is the
+	// non-cached portion of prompt_tokens and must NOT be treated as a
+	// cache write — it is already priced inside prompt.
+	total := u.TotalTokens
+	if total < 0 {
+		total = 0
+	}
 	cached := u.PromptCacheHitTokens
 	if cached == 0 && u.PromptTokensDetails != nil {
 		cached = u.PromptTokensDetails.CachedTokens
+	}
+	// Defensive normalization of a broken upstream report: in the OpenAI
+	// wire format Cached is a subset of Prompt, so clamp it into [0, prompt]
+	// before it can reach cost accounting (a cached > prompt would make the
+	// OpenAI cost formula's prompt-cached term negative). The "record as-is"
+	// rule still holds for every well-formed payload — this only repairs
+	// impossible values.
+	if cached < 0 {
+		cached = 0
+	}
+	if cached > prompt {
+		cached = prompt
 	}
 	var reasoning int
 	if u.CompletionTokensDetails != nil {
 		reasoning = u.CompletionTokensDetails.ReasoningTokens
 	}
 	out := Usage{
-		Prompt:     u.PromptTokens,
-		Completion: u.CompletionTokens,
-		Total:      u.TotalTokens,
+		Prompt:     prompt,
+		Completion: completion,
+		Total:      total,
 		Cached:     cached,
 		Reasoning:  reasoning,
 	}
@@ -176,16 +208,41 @@ func ParseAnthropic(data []byte) Usage {
 	if json.Unmarshal(obj, &u) != nil {
 		return Usage{}
 	}
+	// Entry clamps (defense in depth on top of the ComputeCost clamp): the
+	// four cost-relevant counts are non-negative by definition, so a broken
+	// upstream report with negative values is normalized to 0. Anthropic
+	// semantics are preserved: input_tokens is billed in full and the cache
+	// counters are separate — nothing is ever subtracted, only negatives
+	// clamped. Well-formed payloads are recorded as-is.
+	prompt := u.InputTokens
+	if prompt < 0 {
+		prompt = 0
+	}
+	completion := u.OutputTokens
+	if completion < 0 {
+		completion = 0
+	}
+	cached := u.CacheReadTokens
+	if cached < 0 {
+		cached = 0
+	}
+	cacheWrite := u.CacheCreationTokens
+	if cacheWrite < 0 {
+		cacheWrite = 0
+	}
 	total := u.TotalTokens
+	if total < 0 {
+		total = 0
+	}
 	if total == 0 {
-		total = u.InputTokens + u.OutputTokens
+		total = prompt + completion
 	}
 	out := Usage{
-		Prompt:     u.InputTokens,
-		Completion: u.OutputTokens,
+		Prompt:     prompt,
+		Completion: completion,
 		Total:      total,
-		Cached:     u.CacheReadTokens,
-		CacheWrite: u.CacheCreationTokens,
+		Cached:     cached,
+		CacheWrite: cacheWrite,
 	}
 	if out.Prompt == 0 && out.Completion == 0 && out.Cached == 0 && out.CacheWrite == 0 {
 		return Usage{}

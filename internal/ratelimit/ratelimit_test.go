@@ -94,3 +94,90 @@ func TestRateLimit_HitLogsWarn(t *testing.T) {
 		t.Fatal("second Allow should fail")
 	}
 }
+
+// TestGetClientIP_MultiHopXFF verifies the right-to-left trusted-proxy walk:
+// every trusted hop in the X-Forwarded-For chain is skipped, and the first
+// untrusted valid IP is the client. Regression for the bug where the
+// rightmost XFF entry (the innermost proxy) was returned even when trusted.
+func TestGetClientIP_MultiHopXFF(t *testing.T) {
+	_, proxyCIDR, _ := net.ParseCIDR("10.0.0.0/8")
+	trusted := []*net.IPNet{proxyCIDR}
+
+	// client → proxy1 (10.0.0.1) → proxy2 (10.0.0.2) → prism.
+	// RemoteAddr = proxy2 (trusted); XFF = "203.0.113.7, 10.0.0.1".
+	// Right-to-left: 10.0.0.1 trusted → skip; 203.0.113.7 untrusted → client.
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
+	r.RemoteAddr = "10.0.0.2:34567"
+	if ip := ratelimit.GetClientIP(r, trusted); ip != "203.0.113.7" {
+		t.Errorf("two-hop chain: got %q, want 203.0.113.7 (client, not the innermost trusted proxy)", ip)
+	}
+
+	// Three hops: client → proxy1 → proxy2 → proxy3 → prism.
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.Header.Set("X-Forwarded-For", "198.51.100.9, 10.0.0.1, 10.0.0.2")
+	r2.RemoteAddr = "10.0.0.3:34567"
+	if ip := ratelimit.GetClientIP(r2, trusted); ip != "198.51.100.9" {
+		t.Errorf("three-hop chain: got %q, want 198.51.100.9", ip)
+	}
+
+	// One hop: RemoteAddr is the trusted proxy, XFF has the client only.
+	r3 := httptest.NewRequest("GET", "/", nil)
+	r3.Header.Set("X-Forwarded-For", "203.0.113.8")
+	r3.RemoteAddr = "10.0.0.1:34567"
+	if ip := ratelimit.GetClientIP(r3, trusted); ip != "203.0.113.8" {
+		t.Errorf("one-hop chain: got %q, want 203.0.113.8", ip)
+	}
+
+	// All XFF hops trusted and no untrusted IP: fall back to X-Real-IP.
+	r4 := httptest.NewRequest("GET", "/", nil)
+	r4.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
+	r4.Header.Set("X-Real-IP", "203.0.113.9")
+	r4.RemoteAddr = "10.0.0.3:34567"
+	if ip := ratelimit.GetClientIP(r4, trusted); ip != "203.0.113.9" {
+		t.Errorf("all-trusted XFF: got %q, want 203.0.113.9 (X-Real-IP fallback)", ip)
+	}
+
+	// Untrusted RemoteAddr: XFF ignored entirely (spoofing guard).
+	r5 := httptest.NewRequest("GET", "/", nil)
+	r5.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
+	r5.RemoteAddr = "100.64.0.1:34567"
+	if ip := ratelimit.GetClientIP(r5, trusted); ip != "100.64.0.1" {
+		t.Errorf("untrusted remote: got %q, want 100.64.0.1 (XFF ignored)", ip)
+	}
+}
+
+// TestRateLimiterBucketCapEvictsOldest verifies the deterministic bucket cap:
+// with a cap of 2, inserting a third distinct IP evicts the bucket with the
+// oldest lastCheck (the first IP). The evicted IP's next request starts with
+// a fresh burst, proving it was evicted (rate 0: no refill, so a surviving
+// bucket with 4 tokens left could never serve 5 more requests).
+func TestRateLimiterBucketCapEvictsOldest(t *testing.T) {
+	rl := ratelimit.NewRateLimiterWithMaxBuckets(0, 5, 2)
+
+	if !rl.Allow("10.0.0.1") {
+		t.Fatal("first IP must be allowed")
+	}
+	if !rl.Allow("10.0.0.2") {
+		t.Fatal("second IP must be allowed")
+	}
+	// Third IP: cap reached → evict the oldest (10.0.0.1, created first).
+	if !rl.Allow("10.0.0.3") {
+		t.Fatal("third IP must be allowed (evicting the oldest bucket)")
+	}
+
+	// 10.0.0.1 was evicted: its bucket is recreated with a full burst of 5.
+	for i := 0; i < 5; i++ {
+		if !rl.Allow("10.0.0.1") {
+			t.Fatalf("evicted IP request %d denied: bucket was not recreated with a fresh burst", i+1)
+		}
+	}
+	if rl.Allow("10.0.0.1") {
+		t.Error("6th request of the recreated bucket must be denied (fresh burst exhausted)")
+	}
+
+	// 10.0.0.2 survived the eviction: it still has 4 tokens (1 consumed).
+	if !rl.Allow("10.0.0.2") {
+		t.Error("10.0.0.2 must keep its bucket across the eviction")
+	}
+}

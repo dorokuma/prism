@@ -47,11 +47,17 @@ func TestIsQuotaError(t *testing.T) {
 	if !IsQuotaError([]byte(`{"error":{"code":"insufficient_quota"}}`)) {
 		t.Error("IsQuotaError(insufficient_quota) = false, want true")
 	}
-	if !IsQuotaError([]byte(`quota exceeded`)) {
-		t.Error("IsQuotaError('quota exceeded') = false, want true")
+	// Broad body-substring matching was removed: plain-text quota messages
+	// are NOT structured permanent quota errors — a 429 carrying one is a
+	// temporary rate limit and must go to cooldown, not exhaustion.
+	if IsQuotaError([]byte(`quota exceeded`)) {
+		t.Error("IsQuotaError('quota exceeded') = true, want false (substring matching removed)")
 	}
-	if !IsQuotaError([]byte(`usage limit`)) {
-		t.Error("IsQuotaError('usage limit') = false, want true")
+	if IsQuotaError([]byte(`usage limit`)) {
+		t.Error("IsQuotaError('usage limit') = true, want false (substring matching removed)")
+	}
+	if IsQuotaError([]byte(`monthly usage limit reached`)) {
+		t.Error("IsQuotaError('monthly usage limit reached') = true, want false (substring matching removed)")
 	}
 	if IsQuotaError([]byte(`{"error":{"code":"invalid_api_key"}}`)) {
 		t.Error("IsQuotaError(invalid_api_key) = true, want false")
@@ -1153,7 +1159,8 @@ func TestHeaderRequestStillWinsOverDefaultProvider(t *testing.T) {
 
 // TestResolveMaxConcurrentExactMatchNoWarn verifies that an exact
 // max_concurrent_per_account entry is used and no "unknown model" warning is
-// logged.
+// logged. The resolution now lives in config.ResolveMaxConcurrent (shared
+// with the model cache fetch path).
 func TestResolveMaxConcurrentExactMatchNoWarn(t *testing.T) {
 	cfg := &config.Config{MaxConcurrentPerAccount: map[string]int{
 		"claude-opus-5": 8,
@@ -1164,11 +1171,11 @@ func TestResolveMaxConcurrentExactMatchNoWarn(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	defer slog.SetDefault(oldDefault)
 
-	if got := resolveMaxConcurrent("claude-opus-5", cfg); got != 8 {
-		t.Errorf("resolveMaxConcurrent(claude-opus-5) = %d, want 8", got)
+	if got := config.ResolveMaxConcurrent("claude-opus-5", cfg); got != 8 {
+		t.Errorf("ResolveMaxConcurrent(claude-opus-5) = %d, want 8", got)
 	}
-	if got := resolveMaxConcurrent("any-unknown-model", cfg); got != 100 {
-		t.Errorf("resolveMaxConcurrent(unknown with wildcard) = %d, want 100", got)
+	if got := config.ResolveMaxConcurrent("any-unknown-model", cfg); got != 100 {
+		t.Errorf("ResolveMaxConcurrent(unknown with wildcard) = %d, want 100", got)
 	}
 	if buf.Len() != 0 {
 		t.Errorf("unexpected warn logged: %s", buf.String())

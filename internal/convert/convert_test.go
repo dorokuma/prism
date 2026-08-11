@@ -452,3 +452,29 @@ func TestResponsesToChat_StoreTrueWarns(t *testing.T) {
 		t.Fatal("expected non-nil chat body")
 	}
 }
+
+// TestChatCompletionToResponse_CachedClampedToPrompt guards the conversion
+// usage mapping: prompt_cache_hit_tokens > prompt_tokens (broken upstream)
+// is clamped to prompt and the derived miss (prompt - hit) can never go
+// negative.
+func TestChatCompletionToResponse_CachedClampedToPrompt(t *testing.T) {
+	body := []byte(`{"model":"m","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_cache_hit_tokens":100}}`)
+	out, err := ChatCompletionToResponse(body, "m", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	usage, ok := resp["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("usage missing: %v", resp)
+	}
+	if hit := usage["prompt_cache_hit_tokens"]; hit != float64(10) {
+		t.Errorf("prompt_cache_hit_tokens = %v, want 10 (clamped to prompt)", hit)
+	}
+	if miss := usage["prompt_cache_miss_tokens"]; miss != float64(0) {
+		t.Errorf("prompt_cache_miss_tokens = %v, want 0 (derived miss must not go negative)", miss)
+	}
+}

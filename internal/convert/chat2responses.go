@@ -66,15 +66,45 @@ func ChatCompletionToResponse(body []byte, model string, reqTools json.RawMessag
 		if hit == 0 && comp.Usage.PromptTokensDetails != nil {
 			hit = comp.Usage.PromptTokensDetails.CachedTokens
 		}
-		if miss == 0 && hit > 0 && comp.Usage.PromptTokens > hit {
-			miss = comp.Usage.PromptTokens - hit
+		// Clamp cached hits into [0, prompt]: the OpenAI wire format
+		// guarantees prompt_tokens includes the cached tokens, and the
+		// derived miss below is prompt - hit — both would go negative (and
+		// the cost formula with them) if a broken upstream reported
+		// hit > prompt.
+		if hit < 0 {
+			hit = 0
+		}
+		if hit > comp.Usage.PromptTokens {
+			hit = comp.Usage.PromptTokens
+		}
+		// Defensive negative clamps on the counters passed into the
+		// translated body: token counts are non-negative by definition, so a
+		// broken upstream report cannot propagate negative values to the
+		// client (mirrors the parser-level clamps in usagemeta).
+		prompt := comp.Usage.PromptTokens
+		if prompt < 0 {
+			prompt = 0
+		}
+		completion := comp.Usage.CompletionTokens
+		if completion < 0 {
+			completion = 0
+		}
+		total := comp.Usage.TotalTokens
+		if total < 0 {
+			total = 0
+		}
+		if miss == 0 && hit > 0 && prompt > hit {
+			miss = prompt - hit
+		}
+		if miss < 0 {
+			miss = 0
 		}
 		usage = map[string]any{
-			"input_tokens": comp.Usage.PromptTokens, "output_tokens": comp.Usage.CompletionTokens,
-			"total_tokens": comp.Usage.TotalTokens,
-			"prompt_tokens": comp.Usage.PromptTokens,
-			"completion_tokens": comp.Usage.CompletionTokens,
-			"prompt_cache_hit_tokens": hit,
+			"input_tokens": prompt, "output_tokens": completion,
+			"total_tokens":             total,
+			"prompt_tokens":            prompt,
+			"completion_tokens":        completion,
+			"prompt_cache_hit_tokens":  hit,
 			"prompt_cache_miss_tokens": miss,
 		}
 		if comp.Usage.CompletionTokensDetails != nil {
@@ -123,12 +153,12 @@ type ChatCompletionResponse struct {
 		} `json:"message"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens            int `json:"prompt_tokens"`
-		CompletionTokens        int `json:"completion_tokens"`
-		TotalTokens             int `json:"total_tokens"`
-		PromptCacheHitTokens    int `json:"prompt_cache_hit_tokens"`
-		PromptCacheMissTokens   int `json:"prompt_cache_miss_tokens"`
-		PromptTokensDetails     *struct {
+		PromptTokens          int `json:"prompt_tokens"`
+		CompletionTokens      int `json:"completion_tokens"`
+		TotalTokens           int `json:"total_tokens"`
+		PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+		PromptTokensDetails   *struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
 		CompletionTokensDetails *struct {

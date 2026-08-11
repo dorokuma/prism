@@ -19,10 +19,13 @@ import (
 // SummaryHandler serves GET /admin/usage/summary. It is defined here but not
 // registered; the wiring stage registers it on the admin mux.
 //
-// Auth: requests from localhost are allowed unconditionally; all other
-// clients must present the PRISM_ADMIN_TOKEN as a Bearer token (compared in
-// constant time). METRICS_TOKEN and business API keys are deliberately not
-// accepted.
+// Auth (fail-closed): when PRISM_ADMIN_TOKEN is configured, EVERY request —
+// loopback included — must present it as a Bearer token (compared in
+// constant time). Only when NO token is configured is a direct local request
+// (loopback RemoteAddr without X-Forwarded-For / X-Real-IP) allowed without
+// one; a loopback request carrying a forwarding header (same-machine reverse
+// proxy) and all other clients are denied. METRICS_TOKEN and business API
+// keys are deliberately not accepted.
 type SummaryHandler struct {
 	Store Store
 	token string
@@ -140,37 +143,39 @@ func writeSummaryError(w http.ResponseWriter, err error) {
 // it is rejected outright.
 const adminTokenPadLen = 256
 
-// authorized allows loopback clients; everyone else must present a valid
-// Bearer token, compared in constant time. Loopback is decided by
+// authorized decides admin access. Fail-closed: a configured
+// PRISM_ADMIN_TOKEN means loopback is NOT trusted and every request must
+// present the correct Bearer token. Loopback is decided by
 // middleware.IsLocalhost — the same single implementation the business auth
 // and /metrics paths use (any 127.0.0.0/8 or ::1 address); there is no
-// second, divergent loopback check here. An unset PRISM_ADMIN_TOKEN means
-// remote access is denied entirely.
+// second, divergent loopback check here. Only when the token is unset does
+// the loopback shortcut apply, and even then only for DIRECT local
+// requests: a same-machine reverse proxy also presents a loopback RemoteAddr
+// but adds X-Forwarded-For / X-Real-IP, so a loopback request carrying a
+// forwarding header is denied (mirrors the /metrics rule). An unset
+// PRISM_ADMIN_TOKEN means remote access is denied entirely.
 func (h *SummaryHandler) authorized(r *http.Request) bool {
-	if middleware.IsLocalhost(r) {
-		return true
+	if h.token != "" {
+		const prefix = "Bearer "
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, prefix) {
+			return false
+		}
+		got := strings.TrimSpace(auth[len(prefix):])
+		// Fixed-length pad comparison, identical to middleware.Authenticate:
+		// unequal lengths must not short-circuit the comparison and leak the
+		// expected length via timing. Length-based rejection leaks only the
+		// input's own length class, never anything about the configured token.
+		if len(got) > adminTokenPadLen || len(h.token) > adminTokenPadLen {
+			return false
+		}
+		pb := make([]byte, adminTokenPadLen)
+		eb := make([]byte, adminTokenPadLen)
+		copy(pb, got)
+		copy(eb, h.token)
+		return subtle.ConstantTimeCompare(pb, eb) == 1
 	}
-	if h.token == "" {
-		return false
-	}
-	const prefix = "Bearer "
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, prefix) {
-		return false
-	}
-	got := strings.TrimSpace(auth[len(prefix):])
-	// Fixed-length pad comparison, identical to middleware.Authenticate:
-	// unequal lengths must not short-circuit the comparison and leak the
-	// expected length via timing. Length-based rejection leaks only the
-	// input's own length class, never anything about the configured token.
-	if len(got) > adminTokenPadLen || len(h.token) > adminTokenPadLen {
-		return false
-	}
-	pb := make([]byte, adminTokenPadLen)
-	eb := make([]byte, adminTokenPadLen)
-	copy(pb, got)
-	copy(eb, h.token)
-	return subtle.ConstantTimeCompare(pb, eb) == 1
+	return middleware.IsLocalhost(r) && !middleware.HasForwardedHeaders(r)
 }
 
 // parseSummaryQuery reads and validates the query parameters. All validation

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -83,7 +85,12 @@ func IsPermanentCredentialError(body []byte) bool {
 	return false
 }
 
-// IsQuotaError checks if the response body indicates a quota/rate-limit error.
+// IsQuotaError checks if the response body indicates a permanent quota
+// error via the structured OpenAI error envelope only: error.code
+// "insufficient_quota" or error.type "gousagelimiterror". Broad
+// substring matching was deliberately removed — a plain-text "quota
+// exceeded" message on a 429 is a temporary rate limit and must go to
+// cooldown, not exhaustion.
 func IsQuotaError(body []byte) bool {
 	if len(body) == 0 {
 		return false
@@ -103,13 +110,110 @@ func IsQuotaError(body []byte) bool {
 			return true
 		}
 	}
-	bodyLower := strings.ToLower(string(body))
-	if strings.Contains(bodyLower, "quota exceeded") ||
-		strings.Contains(bodyLower, "usage limit") ||
-		strings.Contains(bodyLower, "monthly usage limit") {
-		return true
-	}
 	return false
+}
+
+// UpstreamErrorClass classifies an upstream HTTP error for account-state
+// decisions. It is the single classification point shared by the runtime
+// error handler (handleUpstreamError) and the startup health check in
+// cmd/prism, so the two paths cannot diverge again.
+type UpstreamErrorClass int
+
+const (
+	// UpstreamErrorTemporary: transient failure — cooldown, never exhaustion.
+	UpstreamErrorTemporary UpstreamErrorClass = iota
+	// UpstreamErrorPermanentCredential: 401/402 by status, or a recognized
+	// structured permanent credential error (invalid_api_key / revoked /
+	// account_deactivated) — mark the account exhausted.
+	UpstreamErrorPermanentCredential
+	// UpstreamErrorPermanentQuota: recognized structured quota exhaustion
+	// (insufficient_quota / gousagelimiterror) — mark the account exhausted.
+	UpstreamErrorPermanentQuota
+)
+
+// ClassifyUpstreamError is the single classification point for how an
+// upstream HTTP error affects account state: only the statuses 401/402 or a
+// recognized structured permanent error body (credential or quota) mark an
+// account exhausted; a bare 403 (no recognized envelope) is deliberately NOT
+// permanent and classifies as temporary. Consumers apply that class
+// differently, matching the real code:
+//   - Runtime (handleUpstreamResponse 4xx branch): a bare 403 is passed
+//     through to the client with its original status and redacted body —
+//     no cooldown, no retry. Only a 403 carrying a recognized structured
+//     permanent credential/quota body exhausts the account, and even then
+//     the original status/body still pass through unchanged.
+//   - Startup probe (cmd/prism initial health check): a bare 403 is treated
+//     as a temporary failure and the account is cooled down (5 minutes, or
+//     2 minutes for 429) without being exhausted.
+func ClassifyUpstreamError(statusCode int, body []byte) UpstreamErrorClass {
+	switch {
+	case statusCode == 401 || statusCode == 402:
+		return UpstreamErrorPermanentCredential
+	case IsPermanentCredentialError(body):
+		return UpstreamErrorPermanentCredential
+	case IsQuotaError(body):
+		return UpstreamErrorPermanentQuota
+	default:
+		return UpstreamErrorTemporary
+	}
+}
+
+// ErrUpstreamResponseTooLarge is returned by readResponseBodyLimited when
+// the upstream response body exceeds the configured cap
+// (max_upstream_response_bytes, default 32 MiB). Callers map it to HTTP 502
+// with code response_too_large.
+var ErrUpstreamResponseTooLarge = errors.New("upstream response exceeds max_upstream_response_bytes")
+
+// ErrInvalidResponseCap is returned by readResponseBodyLimited for an
+// invalid maxBytes (<= 0, or math.MaxInt64 where the max+1 over-limit probe
+// would overflow int64). The read is rejected outright instead of degrading
+// to an unbounded io.ReadAll. It is a programmatic-caller guard: production
+// always passes the configured cap (LoadConfig bounds
+// max_upstream_response_bytes to the default..256 MiB range), and unlike
+// ErrUpstreamResponseTooLarge it is not mapped to HTTP 502
+// response_too_large.
+var ErrInvalidResponseCap = errors.New("invalid response cap: maxBytes must be > 0 and < math.MaxInt64")
+
+// readResponseBodyLimited reads from body with a hard cap of maxBytes: it
+// reads maxBytes+1 bytes so an over-limit body is detected instead of being
+// silently truncated, and returns ErrUpstreamResponseTooLarge in that case.
+// Invalid caps are rejected with ErrInvalidResponseCap — never an unbounded
+// read:
+//   - maxBytes <= 0 would otherwise mean "no cap"; the unbounded io.ReadAll
+//     fallback is deliberately gone, so misuse cannot silently bypass the
+//     memory bound;
+//   - maxBytes == math.MaxInt64 is the overflow boundary — maxBytes+1 would
+//     wrap int64 and io.LimitReader's limit would go negative, reading
+//     NOTHING and silently reporting an empty body instead of the real
+//     content.
+//
+// The valid range [1, MaxUpstreamResponseBytesLimit] is unchanged: the
+// config cap keeps production far from these boundaries; the guards only
+// close the edges for any programmatic caller.
+func readResponseBodyLimited(body io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 || maxBytes == math.MaxInt64 {
+		return nil, ErrInvalidResponseCap
+	}
+	b, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, ErrUpstreamResponseTooLarge
+	}
+	return b, nil
+}
+
+// responseBodyCap returns the non-streaming response body cap for opts: the
+// caller-set cap when present, otherwise the configured default (32 MiB).
+// proxyChatWithBody fills opts.MaxResponseBytes from cfg, so production
+// always uses the configured value; the fallback only guards direct test
+// construction of ChatForwardOpts.
+func responseBodyCap(opts ChatForwardOpts) int64 {
+	if opts.MaxResponseBytes > 0 {
+		return opts.MaxResponseBytes
+	}
+	return config.MaxUpstreamResponseBytesDefault
 }
 
 func parseRetryAfter(resp *http.Response) time.Duration {
@@ -138,44 +242,32 @@ func handleUpstreamError(acc *pool.Account, resp *http.Response, requestID strin
 
 	baseAttrs := []any{"req", requestID, "model", model, "account", acc.Name(), "status", resp.StatusCode}
 
-	if resp.StatusCode == 401 || resp.StatusCode == 402 {
-		acc.MarkExhausted()
-		slog.Error("upstream permanent error, marking exhausted", append(baseAttrs, "body", util.RedactBody(bodyBytes), "error_type", "auth_failed")...)
-		return
-	}
-
-	if IsPermanentCredentialError(bodyBytes) {
+	switch ClassifyUpstreamError(resp.StatusCode, bodyBytes) {
+	case UpstreamErrorPermanentCredential:
 		acc.MarkExhausted()
 		slog.Error("upstream permanent credential error, marking exhausted", append(baseAttrs, "body", util.RedactBody(bodyBytes), "error_type", "auth_failed")...)
 		return
-	}
-
-	if resp.StatusCode == 429 {
-		if IsQuotaError(bodyBytes) {
-			acc.MarkExhausted()
-			slog.Error("upstream 429+quota exhaustion, marking exhausted", append(baseAttrs, "body", util.RedactBody(bodyBytes), "error_type", "upstream_ratelimited")...)
-			return
-		}
-		cd := parseRetryAfter(resp)
-		if cd <= 0 {
-			cd = upstreamCooldown
-		}
-		if cd > 5*time.Minute {
-			cd = 5 * time.Minute
-		}
-		acc.SetCooldown(cd)
-		slog.Warn("upstream rate-limited 429", append(baseAttrs, "cooldown", cd.String(), "body", util.RedactBody(bodyBytes), "error_type", "upstream_ratelimited")...)
-		return
-	}
-
-	if IsQuotaError(bodyBytes) {
+	case UpstreamErrorPermanentQuota:
 		acc.MarkExhausted()
-		slog.Error("upstream insufficient_quota, marking exhausted", append(baseAttrs, "body", util.RedactBody(bodyBytes), "error_type", "upstream_ratelimited")...)
+		slog.Error("upstream permanent quota error, marking exhausted", append(baseAttrs, "body", util.RedactBody(bodyBytes), "error_type", "upstream_ratelimited")...)
 		return
 	}
 
-	acc.SetCooldown(upstreamCooldown)
-	slog.Warn("upstream temporary error, cooling down", append(baseAttrs, "body", util.RedactBody(bodyBytes), "error_type", "upstream_5xx")...)
+	// Temporary: 429 honors Retry-After (capped at 5 minutes), every other
+	// status uses the standard upstream cooldown. The account stays healthy.
+	cd := upstreamCooldown
+	errorType := "upstream_5xx"
+	if resp.StatusCode == 429 {
+		errorType = "upstream_ratelimited"
+		if ra := parseRetryAfter(resp); ra > 0 {
+			cd = ra
+		}
+	}
+	if cd > 5*time.Minute {
+		cd = 5 * time.Minute
+	}
+	acc.SetCooldown(cd)
+	slog.Warn("upstream temporary error, cooling down", append(baseAttrs, "cooldown", cd.String(), "body", util.RedactBody(bodyBytes), "error_type", errorType)...)
 }
 
 // upstreamErrorType classifies an upstream connection error into a short category
@@ -334,10 +426,27 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		// 4xx client error (other than 401/402/429 handled above, plus
 		// 403 which is a permission error not helped by retry).
-		// Pass through with redacted body, no cooldown, no retry.
+		// Pass through with redacted body, no cooldown, no retry. The body
+		// is read exactly ONCE and reused for both classification and the
+		// passthrough below.
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, config.MaxErrorBodyBytes))
 		if readErr != nil {
 			slog.Warn("failed to read upstream 4xx body", "req", requestID, "error", readErr)
+		}
+		// Shared classification (ClassifyUpstreamError, the same point
+		// handleUpstreamError and the startup probe use): a 403 whose body
+		// is a recognized structured permanent credential/quota error
+		// exhausts the account — but the original status and (redacted)
+		// body are still passed through unchanged, because the client's
+		// error is its own, not the gateway's. A bare 403 (no recognized
+		// envelope) stays temporary and does NOT exhaust.
+		switch ClassifyUpstreamError(resp.StatusCode, errBody) {
+		case UpstreamErrorPermanentCredential:
+			acc.MarkExhausted()
+			slog.Error("upstream 4xx permanent credential error, marking exhausted", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", util.RedactBody(errBody), "error_type", "auth_failed")
+		case UpstreamErrorPermanentQuota:
+			acc.MarkExhausted()
+			slog.Error("upstream 4xx permanent quota error, marking exhausted", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", util.RedactBody(errBody), "error_type", "upstream_ratelimited")
 		}
 		errStr := string(util.RedactBody(errBody))
 		slog.Warn("upstream 4xx", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", errStr, "error_type", "upstream_4xx")
@@ -405,9 +514,23 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 
 	if opts.ResponsesOut && !opts.Stream {
 		bodyReadStart := time.Now()
-		rawBody, err := io.ReadAll(resp.Body)
+		rawBody, err := readResponseBodyLimited(resp.Body, responseBodyCap(opts))
 		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 		if err != nil {
+			if errors.Is(err, ErrUpstreamResponseTooLarge) {
+				slog.Error("responses_json body too large", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "max_bytes", responseBodyCap(opts), "elapsed", time.Since(start), "error_type", "response_too_large")
+				util.RecordError()
+				util.WriteJSON(w, http.StatusBadGateway, map[string]any{
+					"error": map[string]any{"message": "upstream response too large", "code": "response_too_large"},
+				})
+				if a := middleware.AuditFromCtx(r.Context()); a != nil {
+					a.Status = http.StatusBadGateway
+					a.Account = acc.Name()
+					a.ErrorType = "response_too_large"
+					a.Error = err.Error()
+				}
+				return true, nil
+			}
 			slog.Warn("responses_json body read error", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			if a := middleware.AuditFromCtx(r.Context()); a != nil {
 				a.Account = acc.Name()
@@ -491,9 +614,23 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 
 	// Non-streaming legacy: read full body, capture token usage, write to client.
 	bodyReadStart := time.Now()
-	rawBody, err := io.ReadAll(resp.Body)
+	rawBody, err := readResponseBodyLimited(resp.Body, responseBodyCap(opts))
 	bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 	if err != nil {
+		if errors.Is(err, ErrUpstreamResponseTooLarge) {
+			slog.Error("legacy_nonstream body too large", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "max_bytes", responseBodyCap(opts), "elapsed", time.Since(start), "error_type", "response_too_large")
+			util.RecordError()
+			util.WriteJSON(w, http.StatusBadGateway, map[string]any{
+				"error": map[string]any{"message": "upstream response too large", "code": "response_too_large"},
+			})
+			if a := middleware.AuditFromCtx(r.Context()); a != nil {
+				a.Status = http.StatusBadGateway
+				a.Account = acc.Name()
+				a.ErrorType = "response_too_large"
+				a.Error = err.Error()
+			}
+			return true, nil
+		}
 		slog.Warn("legacy_nonstream body read error", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 		util.RecordError()
 		if a := middleware.AuditFromCtx(r.Context()); a != nil {

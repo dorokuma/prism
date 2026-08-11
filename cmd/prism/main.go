@@ -178,7 +178,15 @@ func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *
 	return middleware.RequestIDMiddleware(ratelimit.RateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" {
 			token := os.Getenv("METRICS_TOKEN")
-			allowed := (token != "" && middleware.CheckAuth(r, token)) || middleware.IsLocalhost(r)
+			// Fail-closed admin auth: when METRICS_TOKEN is configured, EVERY
+			// request must present it as a Bearer token — loopback does not
+			// bypass (a same-machine reverse proxy also presents a loopback
+			// RemoteAddr and can add or strip forwarding headers, so
+			// X-Forwarded-For/X-Real-IP presence is not a trust boundary).
+			// Only when NO token is configured is a direct local request
+			// (loopback RemoteAddr without forwarding headers) allowed.
+			allowed := (token != "" && middleware.CheckAuth(r, token)) ||
+				(token == "" && middleware.IsLocalhost(r) && !middleware.HasForwardedHeaders(r))
 			if !allowed {
 				util.WriteJSON(w, http.StatusUnauthorized, map[string]any{
 					"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
@@ -190,8 +198,9 @@ func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *
 			return
 		}
 		// /admin/usage/summary carries its own PRISM_ADMIN_TOKEN Bearer auth
-		// (plus localhost allow) and is deliberately mounted BEFORE the
-		// global api_keys gate, mirroring the /metrics precedent.
+		// (fail-closed; token-free direct loopback only when the token is
+		// unset) and is deliberately mounted BEFORE the global api_keys gate,
+		// mirroring the /metrics precedent.
 		if r.URL.Path == "/admin/usage/summary" {
 			summaryHandler.ServeHTTP(w, r)
 			return
@@ -312,15 +321,26 @@ func main() {
 			}
 			if statusCode == 200 {
 				slog.Info("startup check OK", "account", a.Name(), "status", 200)
-			} else if statusCode == 401 || statusCode == 402 || statusCode == 403 || proxy.IsPermanentCredentialError(bodyBytes) || proxy.IsQuotaError(bodyBytes) {
-				slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", statusCode, "body", util.RedactBody(bodyBytes))
-				a.MarkExhausted()
-			} else if statusCode == 429 {
-				slog.Warn("startup check temporary quota error, cooling down", "account", a.Name(), "status", 429, "body", util.RedactBody(bodyBytes))
-				a.SetCooldown(2 * time.Minute)
 			} else {
-				slog.Warn("startup check temporary error, cooling down", "account", a.Name(), "status", statusCode, "body", util.RedactBody(bodyBytes))
-				a.SetCooldown(5 * time.Minute)
+				// Shared classification (proxy.ClassifyUpstreamError): only
+				// 401/402 or a recognized structured permanent error body
+				// (credential or quota) marks the account exhausted. A bare
+				// 403 is NOT permanent — it cools down like any other
+				// temporary failure instead of waiting for the probe loop to
+				// recover the account.
+				switch proxy.ClassifyUpstreamError(statusCode, bodyBytes) {
+				case proxy.UpstreamErrorPermanentCredential, proxy.UpstreamErrorPermanentQuota:
+					slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", statusCode, "body", util.RedactBody(bodyBytes))
+					a.MarkExhausted()
+				default:
+					if statusCode == 429 {
+						slog.Warn("startup check temporary quota error, cooling down", "account", a.Name(), "status", 429, "body", util.RedactBody(bodyBytes))
+						a.SetCooldown(2 * time.Minute)
+					} else {
+						slog.Warn("startup check temporary error, cooling down", "account", a.Name(), "status", statusCode, "body", util.RedactBody(bodyBytes))
+						a.SetCooldown(5 * time.Minute)
+					}
+				}
 			}
 		}(acc)
 	}

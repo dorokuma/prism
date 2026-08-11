@@ -163,3 +163,67 @@ func TestParseOpenAI_DoesNotReadAnthropicFields(t *testing.T) {
 		t.Errorf("ParseOpenAI on Anthropic body = %+v, want zero Usage", u)
 	}
 }
+
+// TestParseOpenAI_CachedClampedToPrompt guards the cached ⊆ prompt invariant
+// of the OpenAI wire format: a broken upstream report with cached tokens
+// exceeding prompt_tokens is clamped to prompt so cost accounting can never
+// go negative.
+func TestParseOpenAI_CachedClampedToPrompt(t *testing.T) {
+	// prompt_cache_hit_tokens > prompt_tokens
+	u := ParseOpenAI([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_cache_hit_tokens":100}}`))
+	if u.Cached != 10 {
+		t.Errorf("cached = %d, want 10 (clamped to prompt)", u.Cached)
+	}
+	if u.Prompt != 10 {
+		t.Errorf("prompt = %d, want 10", u.Prompt)
+	}
+
+	// negative cached clamped to 0
+	u2 := ParseOpenAI([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_cache_hit_tokens":-3}}`))
+	if u2.Cached != 0 {
+		t.Errorf("cached = %d, want 0 (negative clamped)", u2.Cached)
+	}
+
+	// well-formed payload unchanged (as-is recording)
+	u3 := ParseOpenAI([]byte(`{"usage":{"prompt_tokens":100,"completion_tokens":50,"prompt_cache_hit_tokens":30}}`))
+	if u3.Cached != 30 || u3.Prompt != 100 {
+		t.Errorf("well-formed: cached=%d prompt=%d, want 30/100 (record as-is)", u3.Cached, u3.Prompt)
+	}
+}
+
+// TestParseOpenAI_NegativeTokensClamped guards the entry clamp: a broken
+// upstream report with negative token counts is normalized to 0 (never a
+// negative cost input). All-negative payloads collapse to the zero Usage
+// (same as an empty payload); mixed payloads keep only the positive counts.
+func TestParseOpenAI_NegativeTokensClamped(t *testing.T) {
+	u := ParseOpenAI([]byte(`{"usage":{"prompt_tokens":-10,"completion_tokens":-5,"total_tokens":-15,"prompt_cache_hit_tokens":-3}}`))
+	if u != (Usage{}) {
+		t.Errorf("all-negative OpenAI payload = %+v, want zero Usage (clamped to zero)", u)
+	}
+
+	u2 := ParseOpenAI([]byte(`{"usage":{"prompt_tokens":-10,"completion_tokens":50,"total_tokens":40,"prompt_cache_hit_tokens":-3}}`))
+	if u2.Prompt != 0 || u2.Completion != 50 || u2.Cached != 0 || u2.Total != 40 {
+		t.Errorf("mixed OpenAI payload = %+v, want Prompt=0 Completion=50 Cached=0 Total=40 (negatives clamped)", u2)
+	}
+	if u2.Source != SourceOpenAI {
+		t.Errorf("mixed payload Source = %q, want openai (positive counts keep it a real record)", u2.Source)
+	}
+}
+
+// TestParseAnthropic_NegativeTokensClamped guards the same entry clamp for
+// the Anthropic form: negatives normalized to 0, formula semantics intact
+// (nothing subtracted, only negatives dropped).
+func TestParseAnthropic_NegativeTokensClamped(t *testing.T) {
+	u := ParseAnthropic([]byte(`{"usage":{"input_tokens":-10,"output_tokens":-5,"cache_read_input_tokens":-3,"cache_creation_input_tokens":-2}}`))
+	if u != (Usage{}) {
+		t.Errorf("all-negative Anthropic payload = %+v, want zero Usage (clamped to zero)", u)
+	}
+
+	u2 := ParseAnthropic([]byte(`{"usage":{"input_tokens":-10,"output_tokens":40,"cache_read_input_tokens":-3,"cache_creation_input_tokens":-2}}`))
+	if u2.Prompt != 0 || u2.Completion != 40 || u2.Cached != 0 || u2.CacheWrite != 0 || u2.Total != 40 {
+		t.Errorf("mixed Anthropic payload = %+v, want Prompt=0 Completion=40 Cached=0 CacheWrite=0 Total=40 (negatives clamped, total=prompt+completion)", u2)
+	}
+	if u2.Source != SourceAnthropic {
+		t.Errorf("mixed payload Source = %q, want anthropic", u2.Source)
+	}
+}

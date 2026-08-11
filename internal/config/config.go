@@ -176,6 +176,14 @@ type Config struct {
 	ModelMetadataPerProvider map[string]ModelMetadataMap `yaml:"model_metadata_per_provider,omitempty"`
 	LogLevel                 string                      `yaml:"log_level"`
 	MaxConcurrentPerAccount  map[string]int              `yaml:"max_concurrent_per_account"`
+	// MaxUpstreamResponseBytes caps the size of a non-streaming upstream
+	// response body (both the legacy chat path and the responses translation
+	// path). Bodies larger than the cap are rejected with HTTP 502
+	// response_too_large instead of being buffered whole into memory. Zero
+	// (absent) → default 32 MiB; negative or above
+	// MaxUpstreamResponseBytesLimit (256 MiB) is a load error.
+	// Hot-reloadable.
+	MaxUpstreamResponseBytes int64 `yaml:"max_upstream_response_bytes,omitempty"`
 	// DefaultProvider is the fallback provider used when a request arrives
 	// without the X-Prism-Provider header. Empty (default) = reject such
 	// requests with HTTP 400 instead of falling back to whole-pool selection
@@ -213,6 +221,20 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.WireAPI == "" {
 		cfg.WireAPI = "both"
+	}
+	if cfg.MaxUpstreamResponseBytes < 0 {
+		return nil, fmt.Errorf("max_upstream_response_bytes must be >= 0, got %d", cfg.MaxUpstreamResponseBytes)
+	}
+	if cfg.MaxUpstreamResponseBytes == 0 {
+		cfg.MaxUpstreamResponseBytes = MaxUpstreamResponseBytesDefault
+	}
+	// Hard upper bound: values above 256 MiB are rejected at load time. The
+	// bound exists so the read helper's max+1 probe can never overflow
+	// int64 (see MaxUpstreamResponseBytesLimit); it also keeps a mis-typed
+	// value (e.g. bytes intended as MiB) from silently buffering unbounded
+	// responses into memory.
+	if cfg.MaxUpstreamResponseBytes > MaxUpstreamResponseBytesLimit {
+		return nil, fmt.Errorf("max_upstream_response_bytes %d exceeds the maximum supported %d (%d MiB)", cfg.MaxUpstreamResponseBytes, MaxUpstreamResponseBytesLimit, MaxUpstreamResponseBytesLimit>>20)
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
@@ -310,6 +332,16 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		if !dup {
 			cfg.APIKeys = append(cfg.APIKeys, APIKey{Name: "default", Token: cfg.AuthToken})
+		}
+	}
+	// Reject keys with empty or whitespace-only tokens: the fixed-length
+	// padded comparison in the auth middleware treats an empty expected
+	// value as an all-zero pad, so a key with an empty token would let
+	// every "Bearer " request authenticate. The error names the key but
+	// never echoes any token.
+	for _, k := range cfg.APIKeys {
+		if strings.TrimSpace(k.Token) == "" {
+			return nil, fmt.Errorf("api key %q: token is empty (empty or whitespace-only tokens are rejected)", k.Name)
 		}
 	}
 	// Reject duplicate tokens within api_keys. The auth loop deliberately
@@ -516,6 +548,78 @@ func (c *Config) VirtualModels() []string {
 		models = append(models, k)
 	}
 	return models
+}
+
+// ResolveMaxConcurrent returns the maximum concurrent requests per account
+// for the given model. Resolution order:
+//  1. cfg.MaxConcurrentPerAccount[model]  (exact match)
+//  2. cfg.MaxConcurrentPerAccount["*"]   (wildcard default)
+//  3. model name contains "flash" → deepseekV4FlashConcurrency * defaultConcurrencyRatio / 100
+//  4. model name contains "pro"   → deepseekV4ProConcurrency * defaultConcurrencyRatio / 100
+//  5. fallback: deepseekV4ProConcurrency * defaultConcurrencyRatio / 100
+//
+// An unknown non-empty model logs a warning (the fallback is a guess); an
+// empty model is the internal no-model case (model cache fetches) and
+// silently returns the fallback so background fetches do not spam the log.
+// It is the single concurrency-resolution implementation shared by the
+// proxy request path and the model cache fetch path (cache cannot import
+// proxy, so the function lives here to avoid a circular dependency).
+func ResolveMaxConcurrent(model string, cfg *Config) int {
+	if cfg != nil && cfg.MaxConcurrentPerAccount != nil {
+		if v, ok := cfg.MaxConcurrentPerAccount[model]; ok && v > 0 {
+			return v
+		}
+		if v, ok := cfg.MaxConcurrentPerAccount["*"]; ok && v > 0 {
+			return v
+		}
+	}
+	modelLower := strings.ToLower(model)
+	if strings.Contains(modelLower, "flash") {
+		return DeepseekV4FlashConcurrency * DefaultConcurrencyRatio / 100
+	}
+	if strings.Contains(modelLower, "pro") {
+		return DeepseekV4ProConcurrency * DefaultConcurrencyRatio / 100
+	}
+	// Default for unknown models
+	if model != "" {
+		slog.Warn("unknown model, using default concurrency", "model", model)
+	}
+	return DeepseekV4ProConcurrency * DefaultConcurrencyRatio / 100
+}
+
+// ResolveFetchConcurrency returns the concurrency cap for model-cache
+// fetches (internal/cache). A Fetch is not tied to a single business model,
+// so the per-model max_concurrent_per_account entries cannot be resolved by
+// exact match. The rule is deliberately conservative and explainable:
+//  1. a configured "*" wildcard wins — it is the operator's explicit global
+//     default for every model;
+//  2. otherwise the SMALLEST positive per-model value is used: a fetch
+//     holds a concurrency slot on the same account as business requests,
+//     and any specific model cap must be respected by a fetch that may run
+//     alongside that model's traffic (taking the minimum is the only choice
+//     that cannot oversubscribe any configured model);
+//  3. no positive values → the same built-in default as the empty-model
+//     business resolution (DeepseekV4ProConcurrency *
+//     DefaultConcurrencyRatio / 100).
+//
+// Non-positive entries (0 or negative) are ignored in every branch: they
+// mean "no explicit limit", never "limit to zero".
+func ResolveFetchConcurrency(cfg *Config) int {
+	if cfg != nil && cfg.MaxConcurrentPerAccount != nil {
+		if v, ok := cfg.MaxConcurrentPerAccount["*"]; ok && v > 0 {
+			return v
+		}
+		min := 0
+		for _, v := range cfg.MaxConcurrentPerAccount {
+			if v > 0 && (min == 0 || v < min) {
+				min = v
+			}
+		}
+		if min > 0 {
+			return min
+		}
+	}
+	return DeepseekV4ProConcurrency * DefaultConcurrencyRatio / 100
 }
 
 // getCredential reads a credential file from the systemd LoadCredential

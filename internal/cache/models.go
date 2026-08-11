@@ -187,6 +187,20 @@ func (mc *ModelCache) Fetch(provider string) error {
 	if account == nil {
 		return fmt.Errorf("no healthy account for provider %q", provider)
 	}
+	// Model fetches count against the same per-account concurrency limit as
+	// business requests: the fetch holds one slot for its whole duration
+	// (including the ollama /api/show fan-out). Because a Fetch is not tied
+	// to a single business model, the cap comes from
+	// config.ResolveFetchConcurrency (wildcard "*" if configured, otherwise
+	// the smallest positive per-model value, otherwise the built-in default)
+	// rather than an exact model match. When the account is at its
+	// concurrency cap the fetch fails fast instead of parking on the
+	// 30-second request timeout.
+	maxConcurrent := config.ResolveFetchConcurrency(mc.cfg)
+	if !account.TryAcquire(maxConcurrent) {
+		return fmt.Errorf("model cache fetch for provider %q: account %s saturated (%d in flight)", provider, account.Name(), account.InFlightCount())
+	}
+	defer account.Release()
 
 	url := util.JoinURLPath(account.BaseURL(), "/v1/models")
 	req, err := http.NewRequest("GET", url, nil)
@@ -217,7 +231,10 @@ func (mc *ModelCache) Fetch(provider string) error {
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("upstream returned %d: %s", resp.StatusCode, string(body))
+		// Redact the body before it enters the error/log path: an upstream
+		// may echo the credential it received (or other secrets) back in
+		// the error payload.
+		return fmt.Errorf("upstream returned %d: %s", resp.StatusCode, util.RedactBody(body))
 	}
 
 	var upstream upstreamModelsResponse
@@ -574,7 +591,9 @@ func (mc *ModelCache) fetchOllamaShow(acc *pool.Account, id string) (ModelMeta, 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return ModelMeta{}, fmt.Errorf("api/show returned %d: %s", resp.StatusCode, string(b))
+		// Redact the body before it enters the error/log path (an upstream
+		// may echo the credential back in the error payload).
+		return ModelMeta{}, fmt.Errorf("api/show returned %d: %s", resp.StatusCode, util.RedactBody(b))
 	}
 
 	var show struct {

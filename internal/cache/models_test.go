@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -835,5 +836,215 @@ func TestFetchAllAsync_SkipPISync(t *testing.T) {
 	}
 	if len(ant.Models) != 1 || ant.Models[0]["contextWindow"] == nil {
 		t.Errorf("agentrouter-anthropic models should be preserved untouched, got %v", ant.Models)
+	}
+}
+
+// TestFetch_Non200BodyRedacted guards the models error path: a non-200 body
+// that echoes the account credential (or any sk- token) must be redacted by
+// the existing redaction tool before it enters the returned error (which is
+// logged by callers).
+func TestFetch_Non200BodyRedacted(t *testing.T) {
+	const key = "sk-super-secret-987654321"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid key ` + key + `","code":"invalid_api_key"}}`))
+	}))
+	defer srv.Close()
+
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: key},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	err := mc.Fetch("p")
+	if err == nil {
+		t.Fatal("Fetch over a 401 upstream must return an error")
+	}
+	if strings.Contains(err.Error(), key) {
+		t.Errorf("error must not leak the account key: %v", err)
+	}
+	if !strings.Contains(err.Error(), "sk-***") {
+		t.Errorf("error should carry the redacted token marker: %v", err)
+	}
+}
+
+// TestFetchOllamaShow_Non200BodyRedacted guards the same redaction on the
+// ollama /api/show error path.
+func TestFetchOllamaShow_Non200BodyRedacted(t *testing.T) {
+	const key = "sk-ollama-secret-12345678"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`boom ` + key + ` failed`))
+	}))
+	defer srv.Close()
+
+	mc := &ModelCache{
+		dir: t.TempDir(),
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: key},
+		}),
+	}
+	account := mc.pool.AllAccounts()[0]
+
+	_, err := mc.fetchOllamaShow(account, "m1")
+	if err == nil {
+		t.Fatal("api/show over a 500 upstream must return an error")
+	}
+	if strings.Contains(err.Error(), key) {
+		t.Errorf("error must not leak the account key: %v", err)
+	}
+}
+
+// TestFetch_TryAcquireSaturatedFailsFast guards the models concurrency
+// accounting: a Fetch counts against the same per-account concurrency limit
+// as business requests (config.ResolveMaxConcurrent with the wildcard
+// default). When the account is saturated the fetch fails immediately with a
+// saturation error instead of parking on the 30s request timeout, and it
+// never touches the upstream.
+func TestFetch_TryAcquireSaturatedFailsFast(t *testing.T) {
+	hit := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	// Occupy the account's single slot (the wildcard limit of 1).
+	acc := mc.pool.AllAccounts()[0]
+	if !acc.TryAcquire(1) {
+		t.Fatal("test setup: TryAcquire(1) failed")
+	}
+
+	start := time.Now()
+	err := mc.Fetch("p")
+	elapsed := time.Since(start)
+	acc.Release()
+
+	if err == nil {
+		t.Fatal("Fetch must fail when the account is saturated")
+	}
+	if !strings.Contains(err.Error(), "saturated") {
+		t.Errorf("error = %v, want a saturation error", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("saturated fetch took %v, want fail-fast (no 30s wait)", elapsed)
+	}
+	select {
+	case <-hit:
+		t.Error("saturated fetch must not send any upstream request")
+	default:
+	}
+	if acc.InFlightCount() != 0 {
+		t.Errorf("in-flight after fetch = %d, want 0 (slot released)", acc.InFlightCount())
+	}
+}
+
+// TestFetch_TryAcquireUsesMinOfSpecificModels guards the should-fix rule: a
+// Fetch must NOT look only at the "*" wildcard. With only specific per-model
+// limits configured (no "*"), the fetch cap is the smallest positive value
+// (config.ResolveFetchConcurrency) — here 1 — so a saturated account makes
+// the fetch fail fast exactly like the wildcard case.
+func TestFetch_TryAcquireUsesMinOfSpecificModels(t *testing.T) {
+	hit := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer srv.Close()
+
+	// No "*" entry: only two specific model caps (min = 1).
+	cfg := &config.Config{
+		MaxConcurrentPerAccount: map[string]int{"deepseek-v4-pro": 5, "deepseek-v4-flash": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	// Occupy the single slot (the fetch cap must be the min, 1 — not the
+	// built-in default of 450).
+	acc := mc.pool.AllAccounts()[0]
+	if !acc.TryAcquire(1) {
+		t.Fatal("test setup: TryAcquire(1) failed")
+	}
+
+	start := time.Now()
+	err := mc.Fetch("p")
+	elapsed := time.Since(start)
+	acc.Release()
+
+	if err == nil {
+		t.Fatal("Fetch must fail when the account is saturated at the min-of-specific-models cap")
+	}
+	if !strings.Contains(err.Error(), "saturated") {
+		t.Errorf("error = %v, want a saturation error", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("saturated fetch took %v, want fail-fast (no 30s wait)", elapsed)
+	}
+	select {
+	case <-hit:
+		t.Error("saturated fetch must not send any upstream request")
+	default:
+	}
+}
+
+// TestFetch_TryAcquireReleasesSlot verifies a successful Fetch holds and
+// releases exactly one concurrency slot: in-flight returns to 0 and the
+// fetch succeeds.
+func TestFetch_TryAcquireReleasesSlot(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	if err := mc.Fetch("p"); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	acc := mc.pool.AllAccounts()[0]
+	if got := acc.InFlightCount(); got != 0 {
+		t.Errorf("in-flight after successful fetch = %d, want 0", got)
+	}
+	models := mc.GetModels("p")
+	if len(models) != 1 || models[0].ID != "m1" {
+		t.Errorf("fetched models = %+v, want [m1]", models)
 	}
 }

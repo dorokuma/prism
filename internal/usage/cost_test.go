@@ -145,3 +145,115 @@ func TestCostUnknownSourceDefaultsToOpenAIFormula(t *testing.T) {
 		t.Fatalf("cost with empty source = %v, want 7.26 (OpenAI formula preserved)", *cost)
 	}
 }
+
+// TestComputeCost_CachedClampedToPrompt guards the negative-cost hole: a
+// broken upstream report with cached > prompt must be clamped to [0, prompt]
+// so the OpenAI prompt-cached term can never go negative. Negative cached is
+// clamped to 0.
+func TestComputeCost_CachedClampedToPrompt(t *testing.T) {
+	price := &Price{Input: 1.0, Output: 1.0, CacheRead: 0.5, CacheWrite: 0.5}
+
+	// cached (100) > prompt (10): clamp to 10 → all prompt priced at
+	// CacheRead: 10/1e6*0.5 = 0.000005, never negative.
+	cost, status := ComputeCost(10, 0, 100, 0, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	want := 10.0 / 1e6 * 0.5
+	if math.Abs(*cost-want) > 1e-15 {
+		t.Errorf("cost = %v, want %v (cached must be clamped to prompt)", *cost, want)
+	}
+	if *cost < 0 {
+		t.Fatal("cost must never be negative")
+	}
+
+	// Negative cached: clamp to 0 → full prompt priced at Input.
+	cost, status = ComputeCost(10, 0, -5, 0, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	want = 10.0 / 1e6 * 1.0
+	if math.Abs(*cost-want) > 1e-15 {
+		t.Errorf("cost with negative cached = %v, want %v (clamped to 0)", *cost, want)
+	}
+
+	// Anthropic form never subtracts cached from prompt: unchanged.
+	cost, status = ComputeCost(10, 0, 100, 0, SourceAnthropic, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	want = 10.0/1e6*1.0 + 100.0/1e6*0.5
+	if math.Abs(*cost-want) > 1e-15 {
+		t.Errorf("anthropic cost = %v, want %v (no subtraction)", *cost, want)
+	}
+}
+
+// TestComputeCost_NegativeInputsClamped guards the entry clamp: every token
+// count is clamped to >= 0 before any arithmetic, so a broken upstream
+// report (or a programmatically built event) with negative values can never
+// produce a negative cost — in either formula. OpenAI keeps the cached ≤
+// prompt cap; Anthropic only clamps non-negative and keeps its formula
+// semantics.
+func TestComputeCost_NegativeInputsClamped(t *testing.T) {
+	price := &Price{Input: 1.0, Output: 2.0, CacheRead: 0.5, CacheWrite: 0.5}
+
+	// All four negative → clamped to zero → no_usage, cost 0.
+	cost, status := ComputeCost(-10, -5, -3, -2, SourceOpenAI, price)
+	if status != CostStatusNoUsage {
+		t.Errorf("all-negative OpenAI: status = %q, want no_usage", status)
+	}
+	if cost == nil || *cost != 0 {
+		t.Errorf("all-negative OpenAI: cost = %v, want 0", cost)
+	}
+
+	// Mixed: negative prompt/cached/cache_write with positive completion →
+	// only the positive completion is priced (2M at Output 2.0 = 4.0); the
+	// negative values must not leak into any term.
+	cost, status = ComputeCost(-100, 2_000_000, -50, -20, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Errorf("mixed OpenAI: status = %q, want ok", status)
+	}
+	if cost == nil || math.Abs(*cost-4.0) > 1e-12 {
+		t.Errorf("mixed OpenAI: cost = %v, want 4.0 (only completion priced)", cost)
+	}
+
+	// OpenAI: negative cached with positive prompt → cached clamped to 0,
+	// full prompt priced at Input (cached ≤ prompt still enforced).
+	cost, status = ComputeCost(10, 0, -5, 0, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Errorf("negative cached OpenAI: status = %q, want ok", status)
+	}
+	if cost == nil || math.Abs(*cost-10.0/1e6*1.0) > 1e-15 {
+		t.Errorf("negative cached OpenAI: cost = %v, want %v", cost, 10.0/1e6*1.0)
+	}
+
+	// Anthropic: same negative-input shape — clamped to zero, never
+	// negative; formula semantics unchanged for valid inputs.
+	cost, status = ComputeCost(-10, -5, -3, -2, SourceAnthropic, price)
+	if status != CostStatusNoUsage {
+		t.Errorf("all-negative Anthropic: status = %q, want no_usage", status)
+	}
+	if cost == nil || *cost != 0 {
+		t.Errorf("all-negative Anthropic: cost = %v, want 0", cost)
+	}
+	cost, status = ComputeCost(10, 0, -3, -2, SourceAnthropic, price)
+	if status != CostStatusOK {
+		t.Errorf("mixed Anthropic: status = %q, want ok", status)
+	}
+	if cost == nil || math.Abs(*cost-10.0/1e6*1.0) > 1e-15 {
+		t.Errorf("mixed Anthropic: cost = %v, want %v (prompt billed in full, negatives dropped)", cost, 10.0/1e6*1.0)
+	}
+
+	// Every result is non-negative across the whole negative-input space.
+	for _, src := range []string{SourceOpenAI, SourceAnthropic} {
+		for _, tc := range [][4]int64{
+			{-1, 0, 0, 0}, {0, -1, 0, 0}, {0, 0, -1, 0}, {0, 0, 0, -1},
+			{-5, -5, 0, 0}, {-5, 0, 100, 0}, {0, -5, 0, 100}, {-1, -1, -1, -1},
+		} {
+			c, _ := ComputeCost(tc[0], tc[1], tc[2], tc[3], src, price)
+			if c != nil && *c < 0 {
+				t.Errorf("ComputeCost(%v, %q) = %v, must never be negative", tc, src, *c)
+			}
+		}
+	}
+}

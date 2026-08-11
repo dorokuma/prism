@@ -26,12 +26,17 @@ func TestHandlerAuth(t *testing.T) {
 	s := openTestStore(t)
 	h := NewSummaryHandler(s)
 
-	// localhost (IPv4 loopback, any 127.0.0.0/8 address, and IPv6 ::1) is
-	// allowed without a token — the same IsLocalhost rule the business auth
-	// and /metrics paths use.
+	// Fail-closed: with PRISM_ADMIN_TOKEN configured, loopback does NOT
+	// bypass auth — a direct loopback request without the token is 401,
+	// exactly like any remote client (a same-machine reverse proxy also
+	// presents a loopback RemoteAddr, so loopback is not a trust boundary).
 	for _, addr := range []string{"127.0.0.1:5555", "127.0.0.2:5555", "[::1]:5555"} {
-		if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", addr, ""); rec.Code != http.StatusOK {
-			t.Fatalf("loopback %s without token: got %d, want 200", addr, rec.Code)
+		if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", addr, ""); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("loopback %s without token: got %d, want 401 (fail-closed when PRISM_ADMIN_TOKEN is set)", addr, rec.Code)
+		}
+		// The same loopback request WITH the correct token passes.
+		if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", addr, "Bearer sekret"); rec.Code != http.StatusOK {
+			t.Fatalf("loopback %s with token: got %d, want 200", addr, rec.Code)
 		}
 	}
 
@@ -80,6 +85,30 @@ func TestHandlerAuth(t *testing.T) {
 	}
 }
 
+// TestHandlerAuth_LoopbackNoTokenNoHeader401 pins the exact acceptance
+// case from the fail-closed review: loopback RemoteAddr + token configured
+// + no forwarding headers + no auth header => 401.
+func TestHandlerAuth_LoopbackNoTokenNoHeader401(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	h := NewSummaryHandler(openTestStore(t))
+	req := httptest.NewRequest(http.MethodGet, "/admin/usage/summary", nil)
+	req.RemoteAddr = "127.0.0.1:5555" // loopback, no X-Forwarded-For / X-Real-IP
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("loopback + token configured + no header + no auth: got %d, want 401", rec.Code)
+	}
+	// The same request with the correct Bearer token passes.
+	req2 := httptest.NewRequest(http.MethodGet, "/admin/usage/summary", nil)
+	req2.RemoteAddr = "127.0.0.1:5555"
+	req2.Header.Set("Authorization", "Bearer sekret")
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("loopback + token configured + correct bearer: got %d, want 200", rec2.Code)
+	}
+}
+
 func TestHandlerEmptyTokenDeniesRemote(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "")
 	s := openTestStore(t)
@@ -96,8 +125,8 @@ func TestHandlerEmptyTokenDeniesRemote(t *testing.T) {
 }
 
 func TestHandlerDBUnavailable(t *testing.T) {
-	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
-	h := NewSummaryHandler(nil) // no store: must 503, not panic
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
+	h := NewSummaryHandler(nil)       // no store: must 503, not panic
 	rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:1", "")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("nil store: got %d, want 503", rec.Code)
@@ -113,7 +142,7 @@ func TestHandlerDBUnavailable(t *testing.T) {
 }
 
 func TestHandlerInvalidGroupBy(t *testing.T) {
-	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	s := openTestStore(t)
 	ctx := context.Background()
 	if err := s.InsertBatch(ctx, []Event{testEvent(time.Now(), "a", nil)}); err != nil {
@@ -146,7 +175,7 @@ func TestHandlerInvalidGroupBy(t *testing.T) {
 }
 
 func TestHandlerMethodNotAllowed(t *testing.T) {
-	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	h := NewSummaryHandler(openTestStore(t))
 	rec := doRequest(h, http.MethodPost, "/admin/usage/summary", "127.0.0.1:1", "")
 	if rec.Code != http.StatusMethodNotAllowed {
@@ -155,7 +184,7 @@ func TestHandlerMethodNotAllowed(t *testing.T) {
 }
 
 func TestHandlerSummaryJSON(t *testing.T) {
-	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	s := openTestStore(t)
 	ctx := context.Background()
 	price := &Price{Input: 1, Output: 1}
@@ -238,7 +267,7 @@ func seedTableEvents(t *testing.T) *SummaryHandler {
 // request is warned about, the nil cost renders as a dash, and the JSON
 // default behavior is untouched (the existing JSON tests still pass).
 func TestHandlerTableFormat(t *testing.T) {
-	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	h := seedTableEvents(t)
 
 	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?group_by=model&format=table", "127.0.0.1:1", "")
@@ -271,7 +300,7 @@ func TestHandlerTableFormat(t *testing.T) {
 // → Overview splits → RenderUsageReport). It is the same renderer the CLI
 // uses, so the exact segment line here must match the CLI output.
 func TestHandlerTableFormatMixedSources(t *testing.T) {
-	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	s := openTestStore(t)
 	ctx := context.Background()
 	if err := s.InsertBatch(ctx, []Event{
@@ -315,7 +344,7 @@ func TestHandlerTableFormatMixedSources(t *testing.T) {
 }
 
 func TestHandlerTableNoData(t *testing.T) {
-	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	h := NewSummaryHandler(openTestStore(t))
 	// group_by=model on an empty store → zero rows → the table renders the
 	// no-data hint; the summary still renders from Overview.
@@ -336,7 +365,7 @@ func TestHandlerTableNoData(t *testing.T) {
 }
 
 func TestHandlerTableFormatValidation(t *testing.T) {
-	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	h := seedTableEvents(t)
 	// format=JSON (uppercase) is accepted case-insensitively
 	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary?format=JSON", "127.0.0.1:1", ""); rec.Code != http.StatusOK {
@@ -356,5 +385,46 @@ func TestHandlerTableFormatValidation(t *testing.T) {
 	// auth is unchanged for table output: remote without token → 401
 	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary?format=table", "10.1.2.3:9999", ""); rec.Code != http.StatusUnauthorized {
 		t.Errorf("table from remote without token: got %d, want 401", rec.Code)
+	}
+}
+
+// TestHandlerAuth_ForwardHeadersRequireToken guards the same-machine reverse
+// proxy case: a loopback RemoteAddr carrying X-Forwarded-For or X-Real-IP is
+// NOT a direct local client and must present PRISM_ADMIN_TOKEN (mirrors the
+// /metrics rule). With the token configured, auth is fail-closed: even a
+// direct loopback request WITHOUT forwarding headers must present it.
+func TestHandlerAuth_ForwardHeadersRequireToken(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	s := openTestStore(t)
+	h := NewSummaryHandler(s)
+
+	// Direct loopback without forwarding headers: fail-closed, the token is
+	// still required when PRISM_ADMIN_TOKEN is configured.
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:5555", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("direct loopback without token: got %d, want 401 (fail-closed)", rec.Code)
+	}
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:5555", "Bearer sekret"); rec.Code != http.StatusOK {
+		t.Fatalf("direct loopback with token: got %d, want 200", rec.Code)
+	}
+
+	for name, val := range map[string]string{"X-Forwarded-For": "10.0.0.9", "X-Real-IP": "10.0.0.9"} {
+		req := httptest.NewRequest(http.MethodGet, "/admin/usage/summary", nil)
+		req.RemoteAddr = "127.0.0.1:5555"
+		req.Header.Set(name, val)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("loopback with %s and no token: got %d, want 401", name, rec.Code)
+		}
+
+		req2 := httptest.NewRequest(http.MethodGet, "/admin/usage/summary", nil)
+		req2.RemoteAddr = "127.0.0.1:5555"
+		req2.Header.Set(name, val)
+		req2.Header.Set("Authorization", "Bearer sekret")
+		rec2 := httptest.NewRecorder()
+		h.ServeHTTP(rec2, req2)
+		if rec2.Code != http.StatusOK {
+			t.Errorf("loopback with %s and correct token: got %d, want 200", name, rec2.Code)
+		}
 	}
 }
