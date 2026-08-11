@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -115,7 +116,7 @@ func TestParseTimeArg(t *testing.T) {
 func TestParseUsageArgsPresets(t *testing.T) {
 	now := time.Now()
 	// bare `prism usage` → today, grouped by model
-	_, q, _, err := parseUsageArgs(nil, now)
+	_, q, _, _, err := parseUsageArgs(nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +143,7 @@ func TestParseUsageArgsPresets(t *testing.T) {
 		{"errors", []string{"model"}},
 	}
 	for _, p := range presets {
-		_, q, _, err := parseUsageArgs([]string{p.preset}, now)
+		_, q, _, _, err := parseUsageArgs([]string{p.preset}, now)
 		if err != nil {
 			t.Fatalf("preset %q: %v", p.preset, err)
 		}
@@ -151,17 +152,17 @@ func TestParseUsageArgsPresets(t *testing.T) {
 		}
 	}
 	// errors preset forces success=false
-	_, q, _, _ = parseUsageArgs([]string{"errors"}, now)
+	_, q, _, _, _ = parseUsageArgs([]string{"errors"}, now)
 	if q.Success == nil || *q.Success {
 		t.Errorf("errors preset must filter success=false, got %v", q.Success)
 	}
 	// default preset does not filter success
-	_, q, _, _ = parseUsageArgs(nil, now)
+	_, q, _, _, _ = parseUsageArgs(nil, now)
 	if q.Success != nil {
 		t.Errorf("default must not filter success, got %v", *q.Success)
 	}
 	// --by overrides the preset group_by; --failed forces success=false
-	_, q, _, err = parseUsageArgs([]string{"keys", "--by", "day,hour", "--failed", "--limit", "50"}, now)
+	_, q, _, _, err = parseUsageArgs([]string{"keys", "--by", "day,hour", "--failed", "--limit", "50"}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +176,7 @@ func TestParseUsageArgsPresets(t *testing.T) {
 		t.Errorf("limit = %d, want 50", q.Limit)
 	}
 	// flags may appear before the preset? No: preset must come first
-	if _, _, _, err := parseUsageArgs([]string{"--since", "7d", "models"}, now); err == nil {
+	if _, _, _, _, err := parseUsageArgs([]string{"--since", "7d", "models"}, now); err == nil {
 		t.Error("preset after flags must be rejected with a hint")
 	}
 }
@@ -194,23 +195,178 @@ func TestParseUsageArgsValidation(t *testing.T) {
 		{"models", "--until", "2026-13-40"}, // bad date
 	}
 	for _, args := range bad {
-		if _, _, _, err := parseUsageArgs(args, now); err == nil {
+		if _, _, _, _, err := parseUsageArgs(args, now); err == nil {
 			t.Errorf("parseUsageArgs(%v) must fail", args)
 		}
 	}
 	// limit above the package cap is clamped to 1000, like the HTTP path
-	_, q, _, err := parseUsageArgs([]string{"models", "--limit", "2000"}, now)
+	_, q, _, _, err := parseUsageArgs([]string{"models", "--limit", "2000"}, now)
 	if err != nil || q.Limit != 1000 {
 		t.Errorf("limit 2000 must clamp to 1000, got %d, %v", q.Limit, err)
 	}
 	// filters map to the query
-	_, q, _, err = parseUsageArgs([]string{"models", "--model", "m1", "--key", "k1", "--account", "a1", "--provider", "p1", "--since", "2026-08-01", "--until", "08-10"}, now)
+	_, q, _, _, err = parseUsageArgs([]string{"models", "--model", "m1", "--key", "k1", "--account", "a1", "--provider", "p1", "--since", "2026-08-01", "--until", "08-10"}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if q.Model != "m1" || q.KeyID != "k1" || q.Account != "a1" || q.Provider != "p1" {
 		t.Errorf("filters not mapped: %+v", q)
 	}
+}
+
+// writeUsageTestConfig writes a minimal valid prism config (one account with
+// a key, so LoadConfig passes validation) into dir/config.yaml with the given
+// usage db_path.
+func writeUsageTestConfig(t *testing.T, dir, dbPath string) {
+	t.Helper()
+	cfg := fmt.Sprintf("accounts:\n  - name: test\n    base_url: https://api.example.com/v1\n    provider: p\n    key: sk-test\nusage:\n  enabled: true\n  db_path: %s\n", dbPath)
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestUsageDBPathResolution covers the db_path lookup priority of
+// `prism usage`: --db > cwd config.yaml > fixed fallback config
+// (/var/lib/prism/config.yaml) > code default. The lookup locations are
+// injected via usageConfigDir / usageConfigFallbackPath, so no test touches
+// the real /var/lib/prism.
+func TestUsageDBPathResolution(t *testing.T) {
+	now := time.Now()
+	// withLookup redirects the cwd lookup and the fallback config path for
+	// the duration of the current subtest, and restores them afterwards.
+	withLookup := func(t *testing.T, cwd, fallbackCfg string) {
+		t.Helper()
+		oldDir, oldFallback := usageConfigDir, usageConfigFallbackPath
+		usageConfigDir = func() string { return cwd }
+		usageConfigFallbackPath = fallbackCfg
+		t.Cleanup(func() {
+			usageConfigDir, usageConfigFallbackPath = oldDir, oldFallback
+		})
+	}
+
+	t.Run("cwd has no config, fallback config exists", func(t *testing.T) {
+		cwd := t.TempDir() // deliberately no config.yaml here
+		fallbackDir := t.TempDir()
+		fallbackDB := filepath.Join(fallbackDir, "fallback.db")
+		fallbackCfg := filepath.Join(fallbackDir, "config.yaml")
+		writeUsageTestConfig(t, fallbackDir, fallbackDB)
+		withLookup(t, cwd, fallbackCfg)
+
+		_, _, dbPath, source, err := parseUsageArgs(nil, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dbPath != fallbackDB {
+			t.Errorf("dbPath = %q, want fallback config db_path %q", dbPath, fallbackDB)
+		}
+		if !strings.Contains(source, "回退配置") || !strings.Contains(source, fallbackCfg) {
+			t.Errorf("source = %q, want it to name the fallback config %q", source, fallbackCfg)
+		}
+	})
+
+	t.Run("cwd config wins over fallback config", func(t *testing.T) {
+		cwd := t.TempDir()
+		fallbackDir := t.TempDir()
+		cwdDB := filepath.Join(cwd, "cwd.db")
+		cwdCfg := filepath.Join(cwd, "config.yaml")
+		writeUsageTestConfig(t, cwd, cwdDB)
+		writeUsageTestConfig(t, fallbackDir, filepath.Join(fallbackDir, "fallback.db"))
+		withLookup(t, cwd, filepath.Join(fallbackDir, "config.yaml"))
+
+		_, _, dbPath, source, err := parseUsageArgs(nil, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dbPath != cwdDB {
+			t.Errorf("dbPath = %q, want cwd config db_path %q (old behavior must not change)", dbPath, cwdDB)
+		}
+		if !strings.Contains(source, "当前目录配置") || !strings.Contains(source, cwdCfg) {
+			t.Errorf("source = %q, want it to name the cwd config %q", source, cwdCfg)
+		}
+	})
+
+	t.Run("neither config exists → code default", func(t *testing.T) {
+		withLookup(t, t.TempDir(), filepath.Join(t.TempDir(), "config.yaml"))
+
+		_, _, dbPath, source, err := parseUsageArgs(nil, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dbPath != defaultUsageDBPath {
+			t.Errorf("dbPath = %q, want code default %q", dbPath, defaultUsageDBPath)
+		}
+		if !strings.Contains(source, "代码默认值") {
+			t.Errorf("source = %q, want it to name the code default", source)
+		}
+	})
+
+	t.Run("--db wins over both configs", func(t *testing.T) {
+		cwd := t.TempDir()
+		fallbackDir := t.TempDir()
+		writeUsageTestConfig(t, cwd, filepath.Join(cwd, "cwd.db"))
+		writeUsageTestConfig(t, fallbackDir, filepath.Join(fallbackDir, "fallback.db"))
+		withLookup(t, cwd, filepath.Join(fallbackDir, "config.yaml"))
+		explicit := filepath.Join(t.TempDir(), "explicit.db")
+
+		_, _, dbPath, source, err := parseUsageArgs([]string{"--db", explicit}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dbPath != explicit {
+			t.Errorf("dbPath = %q, want --db path %q", dbPath, explicit)
+		}
+		if !strings.Contains(source, "--db") {
+			t.Errorf("source = %q, want it to name the --db flag", source)
+		}
+	})
+
+	t.Run("cwd config with no accounts falls through to fallback config", func(t *testing.T) {
+		cwd := t.TempDir()
+		fallbackDir := t.TempDir()
+		fallbackDB := filepath.Join(fallbackDir, "fallback.db")
+		// cwd config.yaml exists but LoadConfig rejects it (no accounts →
+		// "no accounts configured"). The CLI only needs db_path, so it
+		// must not die on a broken/unrelated same-named file in cwd: it
+		// continues to the fallback config.
+		if err := os.WriteFile(filepath.Join(cwd, "config.yaml"), []byte("usage:\n  enabled: true\n  db_path: /tmp/should-not-be-used.db\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeUsageTestConfig(t, fallbackDir, fallbackDB)
+		withLookup(t, cwd, filepath.Join(fallbackDir, "config.yaml"))
+
+		_, _, dbPath, source, err := parseUsageArgs(nil, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dbPath != fallbackDB {
+			t.Errorf("dbPath = %q, want fallback db_path %q after cwd config failed to load", dbPath, fallbackDB)
+		}
+		if !strings.Contains(source, "回退配置") {
+			t.Errorf("source = %q, want it to name the fallback config", source)
+		}
+	})
+
+	t.Run("invalid yaml in cwd config falls through to fallback config", func(t *testing.T) {
+		cwd := t.TempDir()
+		fallbackDir := t.TempDir()
+		fallbackDB := filepath.Join(fallbackDir, "fallback.db")
+		if err := os.WriteFile(filepath.Join(cwd, "config.yaml"), []byte("accounts: [\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeUsageTestConfig(t, fallbackDir, fallbackDB)
+		withLookup(t, cwd, filepath.Join(fallbackDir, "config.yaml"))
+
+		_, _, dbPath, source, err := parseUsageArgs(nil, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dbPath != fallbackDB {
+			t.Errorf("dbPath = %q, want fallback db_path %q after cwd config failed to parse", dbPath, fallbackDB)
+		}
+		if !strings.Contains(source, "回退配置") {
+			t.Errorf("source = %q, want it to name the fallback config", source)
+		}
+	})
 }
 
 func TestRunUsageJSON(t *testing.T) {
@@ -332,13 +488,26 @@ func TestRunUsageLimitAndFilters(t *testing.T) {
 
 func TestRunUsageMissingDBFriendlyError(t *testing.T) {
 	var buf bytes.Buffer
-	err := runUsageWith([]string{"--db", filepath.Join(t.TempDir(), "nope", "usage.db")}, &buf, time.Now())
+	missing := filepath.Join(t.TempDir(), "nope", "usage.db")
+	err := runUsageWith([]string{"--db", missing}, &buf, time.Now())
 	if err == nil {
 		t.Fatal("missing DB must fail")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "usage.enabled") || !strings.Contains(msg, "重启") {
-		t.Errorf("friendly hint missing in %q", msg)
+	// the message must name the actual path it tried and where the path
+	// came from (here: the --db flag), so the user can tell whether the
+	// CLI looked in the wrong place
+	if !strings.Contains(msg, missing) {
+		t.Errorf("message must contain the attempted db path %q: %q", missing, msg)
+	}
+	if !strings.Contains(msg, "--db") || !strings.Contains(msg, "显式指定") {
+		t.Errorf("message must contain the --db escape hint: %q", msg)
+	}
+	// "not enabled" may appear only as one possible cause, never as an
+	// assertion — the CLI only checks os.IsNotExist and cannot know the
+	// feature state
+	if strings.Contains(msg, "该功能尚未开启") {
+		t.Errorf("message must not assert the feature was never enabled: %q", msg)
 	}
 	if strings.Contains(msg, "runtime") || strings.Contains(msg, ".go:") {
 		t.Errorf("raw Go error leaked into %q", msg)
@@ -364,8 +533,15 @@ func TestUsageMainMissingDBExitCode(t *testing.T) {
 	if ee.ExitCode() != 1 {
 		t.Fatalf("exit code = %d, want 1; output=%s", ee.ExitCode(), out)
 	}
-	if !strings.Contains(string(out), "usage.enabled") {
-		t.Errorf("friendly hint missing in output:\n%s", out)
+	outStr := string(out)
+	if !strings.Contains(outStr, "/nonexistent/prism/usage.db") {
+		t.Errorf("output must contain the attempted db path:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "--db") {
+		t.Errorf("output must contain the --db hint:\n%s", outStr)
+	}
+	if strings.Contains(outStr, "该功能尚未开启") {
+		t.Errorf("output must not assert the feature was never enabled:\n%s", outStr)
 	}
 }
 

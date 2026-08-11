@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -52,8 +53,54 @@ type usageOptions struct {
 	noColor  bool
 }
 
-// defaultUsageDBPath is used when neither --db nor the config yield a path.
+// defaultUsageDBPath is used when neither --db nor any config yields a path.
 const defaultUsageDBPath = "/var/lib/prism/usage.db"
+
+// usageConfigDir returns the directory in which the cwd-level config.yaml
+// is looked up by `prism usage`. It is a package-level variable so tests
+// can redirect the lookup to a temp dir; changing the real process cwd
+// (os.Chdir) would race with other tests in this package.
+var usageConfigDir = func() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return wd
+}
+
+// usageConfigFallbackPath is the fixed production config path tried after
+// the cwd config.yaml; it matches the systemd unit's
+// WorkingDirectory=/var/lib/prism. It is a package-level variable so tests
+// can point it at a temp dir instead of depending on the real
+// /var/lib/prism.
+var usageConfigFallbackPath = "/var/lib/prism/config.yaml"
+
+// resolveUsageDBPath picks the usage database path for `prism usage`, in
+// priority order:
+//
+//  1. the --db flag (explicit; the config is not read at all)
+//  2. config.yaml in the current working directory (existing behavior)
+//  3. the fixed fallback config (usageConfigFallbackPath)
+//  4. the code default (defaultUsageDBPath)
+//
+// The second return value describes where the path came from, for error
+// messages. A cwd config.yaml that exists but fails to load (invalid
+// content, no accounts, ...) is skipped in favor of the fallback: the CLI
+// only needs db_path, and the cwd may hold an unrelated same-named file
+// (e.g. another project's config.yaml in the user's home directory).
+func resolveUsageDBPath(explicit string) (dbPath, source string) {
+	if explicit != "" {
+		return explicit, "--db 显式指定"
+	}
+	cwdCfg := filepath.Join(usageConfigDir(), "config.yaml")
+	if cfg, err := config.LoadConfig(cwdCfg); err == nil && cfg.Usage.DBPath != "" {
+		return cfg.Usage.DBPath, fmt.Sprintf("当前目录配置 %s 的 db_path", cwdCfg)
+	}
+	if cfg, err := config.LoadConfig(usageConfigFallbackPath); err == nil && cfg.Usage.DBPath != "" {
+		return cfg.Usage.DBPath, fmt.Sprintf("回退配置 %s 的 db_path", usageConfigFallbackPath)
+	}
+	return defaultUsageDBPath, "代码默认值"
+}
 
 // runUsage implements `prism usage [preset] [flags]`. main dispatches to it
 // the same way it dispatches `prism setup`: a hardcoded os.Args[1] branch
@@ -68,7 +115,7 @@ func runUsage(args []string) error {
 // runUsageWith is runUsage with injectable output and clock; the CLI entry
 // uses os.Stdout / time.Now, tests use a buffer and a fixed time.
 func runUsageWith(args []string, out io.Writer, now time.Time) error {
-	o, q, dbPath, err := parseUsageArgs(args, now)
+	o, q, dbPath, dbSource, err := parseUsageArgs(args, now)
 	if err != nil {
 		// -h/--help: the flag package already printed the usage; treat it as
 		// a successful invocation, not an error.
@@ -77,11 +124,14 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 		}
 		return err
 	}
-	// Friendly hint instead of a raw Go error when usage was never enabled:
-	// a missing file is the normal first-run state, not a crash.
+	// Friendly hint instead of a raw Go error when the database file is
+	// missing: a missing file is the normal first-run state, not a crash.
+	// The message names the actual path and where it came from, and lists
+	// "usage not enabled" only as one possible cause among several — the
+	// CLI has no way to assert the feature state.
 	if _, err := os.Stat(dbPath); err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("usage 数据库不存在: %s\n该功能尚未开启——请在 config.yaml 中把 usage.enabled 设为 true 并重启 prism 服务（或使用 --db 指定已有数据库）", dbPath)
+			return fmt.Errorf("usage 数据库不存在: %s（路径来自：%s）\n可能原因：usage 记录功能尚未开启（config.yaml 的 usage.enabled 为 false）、数据库路径配置有误、或该数据库文件尚未生成。\n请核对上述配置后重试，也可以使用 --db 显式指定已有数据库的路径", dbPath, dbSource)
 		}
 		return fmt.Errorf("无法访问 usage 数据库 %s: %v", dbPath, err)
 	}
@@ -131,9 +181,10 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 }
 
 // parseUsageArgs parses the preset and flags into a SummaryQuery, resolving
-// times, the group_by list and the database path. It is separated from
-// runUsageWith so tests can drive it directly.
-func parseUsageArgs(args []string, now time.Time) (usageOptions, usage.SummaryQuery, string, error) {
+// times, the group_by list, the database path and a description of where
+// that path came from. It is separated from runUsageWith so tests can drive
+// it directly.
+func parseUsageArgs(args []string, now time.Time) (usageOptions, usage.SummaryQuery, string, string, error) {
 	var o usageOptions
 	preset := ""
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -155,18 +206,18 @@ func parseUsageArgs(args []string, now time.Time) (usageOptions, usage.SummaryQu
 	fs.IntVar(&o.limit, "limit", 20, "明细最多显示行数（上限 1000）")
 	fs.BoolVar(&o.json, "json", false, "输出原始 JSON 而不是表格")
 	fs.StringVar(&o.watch, "watch", "", "定时重绘间隔，如 5s、1m（清屏后重画）")
-	fs.StringVar(&o.db, "db", "", "数据库路径（默认从配置读，读不到用 /var/lib/prism/usage.db）")
+	fs.StringVar(&o.db, "db", "", "数据库路径（默认依次尝试当前目录 config.yaml、/var/lib/prism/config.yaml，都没有则用 /var/lib/prism/usage.db）")
 	fs.BoolVar(&o.noColor, "no-color", false, "强制关闭颜色")
 	fs.Usage = func() { printUsageHelp(fs) }
 	if err := fs.Parse(args); err != nil {
-		return o, usage.SummaryQuery{}, "", err
+		return o, usage.SummaryQuery{}, "", "", err
 	}
 	if fs.NArg() > 0 {
-		return o, usage.SummaryQuery{}, "", fmt.Errorf("无法识别的参数 %q（preset 请放在 flags 之前，如: prism usage models --since 7d）", fs.Arg(0))
+		return o, usage.SummaryQuery{}, "", "", fmt.Errorf("无法识别的参数 %q（preset 请放在 flags 之前，如: prism usage models --since 7d）", fs.Arg(0))
 	}
 	spec, ok := usagePresets[preset]
 	if !ok {
-		return o, usage.SummaryQuery{}, "", fmt.Errorf("未知的 usage 子命令 %q，支持: models / keys / accounts / providers / days / hours / errors", preset)
+		return o, usage.SummaryQuery{}, "", "", fmt.Errorf("未知的 usage 子命令 %q，支持: models / keys / accounts / providers / days / hours / errors", preset)
 	}
 	groupBy := spec.groupBy
 	if o.by != "" {
@@ -177,16 +228,16 @@ func parseUsageArgs(args []string, now time.Time) (usageOptions, usage.SummaryQu
 				continue
 			}
 			if !usage.ValidGroupBy(g) {
-				return o, usage.SummaryQuery{}, "", fmt.Errorf("无效的 --by 分组 %q，可用: model/provider/account/key_id/stream/success/hour/day", g)
+				return o, usage.SummaryQuery{}, "", "", fmt.Errorf("无效的 --by 分组 %q，可用: model/provider/account/key_id/stream/success/hour/day", g)
 			}
 			groupBy = append(groupBy, g)
 		}
 		if len(groupBy) == 0 {
-			return o, usage.SummaryQuery{}, "", fmt.Errorf("--by 为空")
+			return o, usage.SummaryQuery{}, "", "", fmt.Errorf("--by 为空")
 		}
 	}
 	if o.limit < 1 {
-		return o, usage.SummaryQuery{}, "", fmt.Errorf("--limit 必须大于 0")
+		return o, usage.SummaryQuery{}, "", "", fmt.Errorf("--limit 必须大于 0")
 	}
 	// Values above 1000 are clamped to the usage package cap, matching the
 	// HTTP path: Summary itself clamps limit > summaryMaxLimit to 1000.
@@ -194,11 +245,11 @@ func parseUsageArgs(args []string, now time.Time) (usageOptions, usage.SummaryQu
 		o.limit = 1000
 	}
 	if o.json && o.watch != "" {
-		return o, usage.SummaryQuery{}, "", fmt.Errorf("--json 与 --watch 不能同时使用")
+		return o, usage.SummaryQuery{}, "", "", fmt.Errorf("--json 与 --watch 不能同时使用")
 	}
 	if o.watch != "" {
 		if iv, err := time.ParseDuration(o.watch); err != nil || iv <= 0 {
-			return o, usage.SummaryQuery{}, "", fmt.Errorf("无效的 --watch 间隔 %q（如 5s、1m）", o.watch)
+			return o, usage.SummaryQuery{}, "", "", fmt.Errorf("无效的 --watch 间隔 %q（如 5s、1m）", o.watch)
 		}
 	}
 
@@ -211,7 +262,7 @@ func parseUsageArgs(args []string, now time.Time) (usageOptions, usage.SummaryQu
 		var err error
 		from, err = parseTimeArg(o.since, now)
 		if err != nil {
-			return o, usage.SummaryQuery{}, "", err
+			return o, usage.SummaryQuery{}, "", "", err
 		}
 	}
 	to := now
@@ -219,11 +270,11 @@ func parseUsageArgs(args []string, now time.Time) (usageOptions, usage.SummaryQu
 		var err error
 		to, err = parseTimeArg(o.until, now)
 		if err != nil {
-			return o, usage.SummaryQuery{}, "", err
+			return o, usage.SummaryQuery{}, "", "", err
 		}
 	}
 	if from.After(to) {
-		return o, usage.SummaryQuery{}, "", fmt.Errorf("--since (%s) 晚于 --until (%s)", formatTimeArg(from), formatTimeArg(to))
+		return o, usage.SummaryQuery{}, "", "", fmt.Errorf("--since (%s) 晚于 --until (%s)", formatTimeArg(from), formatTimeArg(to))
 	}
 
 	var failed *bool
@@ -243,15 +294,8 @@ func parseUsageArgs(args []string, now time.Time) (usageOptions, usage.SummaryQu
 		Limit:    o.limit,
 	}
 
-	dbPath := o.db
-	if dbPath == "" {
-		if cfg, err := config.LoadConfig("config.yaml"); err == nil && cfg.Usage.DBPath != "" {
-			dbPath = cfg.Usage.DBPath
-		} else {
-			dbPath = defaultUsageDBPath
-		}
-	}
-	return o, q, dbPath, nil
+	dbPath, dbSource := resolveUsageDBPath(o.db)
+	return o, q, dbPath, dbSource, nil
 }
 
 // writeUsageJSON emits the raw report as JSON. The output contains ONLY the

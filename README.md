@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.13.0  Date: 2026-08-10  Status: living document
+> Version: v0.13.1  Date: 2026-08-11  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -142,6 +142,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-11** — v0.13.1 — fix: `prism usage` CLI config lookup now walks a fallback chain (`--db` > `config.yaml` in the current directory > `/var/lib/prism/config.yaml` > built-in default), so running the command outside `/var/lib/prism` no longer silently falls back to the wrong default path `/var/lib/prism/usage.db` while the real database lives at `/var/lib/prism/usage/usage.db`; the missing-database error no longer asserts "usage not enabled" but reports the actual path, where it came from, and a `--db` hint
 
 - **2026-08-08** — v0.13.0 — feat: token usage recording (internal/usage SQLite store + batched recorder) wired into the request lifecycle and config: new `usage` config section (opt-in, default disabled; `db_path` not hot-reloadable), per-request usage/cost persisted at `EmitAudit` via an injected minimal recorder interface (middleware stays decoupled from internal/usage), cost priced per request from `model_metadata[].cost` (USD per 1M tokens, no conversion), admin endpoint `GET /admin/usage/summary` (PRISM_ADMIN_TOKEN Bearer auth or localhost, mounted before the global api_keys gate). Hard degradation guarantee: every usage failure (store open/migrate, disk full, SQLITE_BUSY, full queue, pricing) is logged + counted only, never returned, never panics, never blocks request finalization or /v1 forwarding. Also tightened `Authenticate` to require the `Bearer ` prefix (bare tokens are now rejected, matching legacy `CheckAuth`)
 
