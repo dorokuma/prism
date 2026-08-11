@@ -184,15 +184,15 @@ func TestParseUsageArgsPresets(t *testing.T) {
 func TestParseUsageArgsValidation(t *testing.T) {
 	now := time.Now()
 	bad := [][]string{
-		{"bogus"},                          // unknown preset
-		{"models", "--by", "model,nope"}, // unknown group_by
-		{"models", "--by", ","},         // empty --by
-		{"models", "--limit", "0"},      // limit below 1
-		{"models", "--json", "--watch", "5s"}, // json + watch conflict
-		{"models", "--watch", "abc"},    // bad watch interval
+		{"bogus"},                                    // unknown preset
+		{"models", "--by", "model,nope"},             // unknown group_by
+		{"models", "--by", ","},                      // empty --by
+		{"models", "--limit", "0"},                   // limit below 1
+		{"models", "--json", "--watch", "5s"},        // json + watch conflict
+		{"models", "--watch", "abc"},                 // bad watch interval
 		{"models", "--since", "6d", "--until", "7d"}, // since after until
-		{"models", "--since", "banana"}, // bad time
-		{"models", "--until", "2026-13-40"}, // bad date
+		{"models", "--since", "banana"},              // bad time
+		{"models", "--until", "2026-13-40"},          // bad date
 	}
 	for _, args := range bad {
 		if _, _, _, _, err := parseUsageArgs(args, now); err == nil {
@@ -383,12 +383,12 @@ func TestRunUsageJSON(t *testing.T) {
 		t.Fatalf("--json output is not valid JSON:\n%s", buf.String())
 	}
 	var doc struct {
-		Period   string              `json:"period"`
-		From     int64               `json:"from"`
-		To       int64               `json:"to"`
-		GroupBy  []string            `json:"group_by"`
-		Overview *usage.Overview     `json:"overview"`
-		Rows     []usage.SummaryRow  `json:"rows"`
+		Period   string             `json:"period"`
+		From     int64              `json:"from"`
+		To       int64              `json:"to"`
+		GroupBy  []string           `json:"group_by"`
+		Overview *usage.Overview    `json:"overview"`
+		Rows     []usage.SummaryRow `json:"rows"`
 	}
 	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
 		t.Fatal(err)
@@ -475,7 +475,7 @@ func TestRunUsageLimitAndFilters(t *testing.T) {
 		t.Fatal(err)
 	}
 	var doc struct {
-		Overview *usage.Overview `json:"overview"`
+		Overview *usage.Overview    `json:"overview"`
 		Rows     []usage.SummaryRow `json:"rows"`
 	}
 	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
@@ -683,5 +683,78 @@ func TestWantColor(t *testing.T) {
 	defer w.Close()
 	if wantColor(w, false) {
 		t.Error("a pipe must not be colored (ModeCharDevice check)")
+	}
+}
+
+// TestRunUsageSplitCacheSegments drives the two-segment cache summary
+// through the CLI: the table shows the openai and anthropic segments side by
+// side with their own denominators (never above 100%), the legacy
+// empty-source row joins the openai bucket (the same partition ComputeCost
+// applies), and the --json overview keeps every pre-existing field while
+// adding the split ones.
+func TestRunUsageSplitCacheSegments(t *testing.T) {
+	base := time.Date(2026, 3, 10, 15, 4, 5, 0, time.Local)
+	path := filepath.Join(t.TempDir(), "usage.db")
+	s := usage.NewSQLiteStore(path)
+	if err := s.Open(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertBatch(ctx, []usage.Event{
+		{Ts: base, RequestID: "o1", Model: "gpt", Source: usage.SourceOpenAI,
+			PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100, CachedTokens: 900},
+		{Ts: base, RequestID: "a1", Model: "claude", Source: usage.SourceAnthropic,
+			PromptTokens: 1, CompletionTokens: 50, TotalTokens: 51, CachedTokens: 500},
+		{Ts: base, RequestID: "legacy", Model: "old", Source: "",
+			PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110, CachedTokens: 80},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	var buf bytes.Buffer
+	if err := runUsageWith([]string{"--db", path}, &buf, base); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	// openai bucket = openai row + NULL legacy row: (900+80)/(1000+100) =
+	// 980/1100 = 89.1%; anthropic bucket: 500/(1+500+0) = 99.8%.
+	if !strings.Contains(out, "缓存命中(openai) 980 (89.1%)   缓存命中(anthropic) 500 (99.8%)") {
+		t.Errorf("split cache segments missing or wrong:\n%s", out)
+	}
+	// The old single-segment format must be gone.
+	if strings.Contains(out, "缓存命中 980 (") || strings.Contains(out, "缓存命中 500 (") {
+		t.Errorf("old single-segment format still present:\n%s", out)
+	}
+
+	// --json: the overview keeps every pre-existing field and adds the
+	// per-source split without renaming or retyping anything.
+	buf.Reset()
+	if err := runUsageWith([]string{"--db", path, "--json"}, &buf, base); err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Overview *usage.Overview `json:"overview"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	ov := doc.Overview
+	if ov == nil {
+		t.Fatal("missing overview in --json output")
+	}
+	// pre-existing fields untouched
+	if ov.Requests != 3 || ov.PromptTokens != 1101 || ov.CachedTokens != 1480 {
+		t.Errorf("overview totals broken: %+v", ov)
+	}
+	// new split fields
+	if ov.OpenAIRequests != 2 || ov.OpenAIPromptTokens != 1100 || ov.OpenAICachedTokens != 980 {
+		t.Errorf("openai split = %+v, want 2/1100/980", ov)
+	}
+	if ov.AnthropicRequests != 1 || ov.AnthropicPromptTokens != 1 || ov.AnthropicCachedTokens != 500 || ov.AnthropicCacheWriteTokens != 0 {
+		t.Errorf("anthropic split = %+v, want 1/1/500/0", ov)
 	}
 }

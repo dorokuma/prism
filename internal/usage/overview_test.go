@@ -2,6 +2,8 @@ package usage
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
 	"testing"
@@ -124,6 +126,14 @@ func TestOverviewMatchesSummaryTotals(t *testing.T) {
 	if o.FailedRequests != 1 || o.StreamingRequests != 2 {
 		t.Fatalf("overview failed=%d streamed=%d, want 1/2", o.FailedRequests, o.StreamingRequests)
 	}
+	// All three events carry an empty Source → stored as NULL → the whole
+	// range belongs to the OpenAI bucket (legacy-row fallback).
+	if o.OpenAIRequests != 3 || o.OpenAIPromptTokens != 600 || o.OpenAICachedTokens != 0 {
+		t.Fatalf("openai split = %d/%d/%d, want 3 requests / 600 prompt / 0 cached", o.OpenAIRequests, o.OpenAIPromptTokens, o.OpenAICachedTokens)
+	}
+	if o.AnthropicRequests != 0 || o.AnthropicPromptTokens != 0 || o.AnthropicCachedTokens != 0 || o.AnthropicCacheWriteTokens != 0 {
+		t.Fatalf("anthropic split must be zero, got %d/%d/%d/%d", o.AnthropicRequests, o.AnthropicPromptTokens, o.AnthropicCachedTokens, o.AnthropicCacheWriteTokens)
+	}
 
 	// ungrouped Summary must agree field-for-field
 	rows, err := s.Summary(ctx, SummaryQuery{})
@@ -224,9 +234,9 @@ func TestOverviewNoData(t *testing.T) {
 	ctx := context.Background()
 
 	for name, q := range map[string]SummaryQuery{
-		"empty-table":     {},
+		"empty-table":       {},
 		"empty-time-window": {From: 1, To: 2},
-		"no-model-match":  {Model: "nope"},
+		"no-model-match":    {Model: "nope"},
 	} {
 		o, err := s.Overview(ctx, q)
 		if err != nil {
@@ -237,6 +247,11 @@ func TestOverviewNoData(t *testing.T) {
 			o.CacheWriteTokens != 0 || o.CostMissingRequests != 0 ||
 			o.FailedRequests != 0 || o.StreamingRequests != 0 {
 			t.Errorf("%s: nonzero fields: %+v", name, o)
+		}
+		if o.OpenAIRequests != 0 || o.OpenAIPromptTokens != 0 || o.OpenAICachedTokens != 0 ||
+			o.AnthropicRequests != 0 || o.AnthropicPromptTokens != 0 ||
+			o.AnthropicCachedTokens != 0 || o.AnthropicCacheWriteTokens != 0 {
+			t.Errorf("%s: nonzero source-split fields: %+v", name, o)
 		}
 		if o.TotalCost != nil {
 			t.Errorf("%s: TotalCost = %v, want nil (no rows priced)", name, *o.TotalCost)
@@ -427,5 +442,146 @@ func TestOverviewPlaceholderBinding(t *testing.T) {
 	}
 	if o.Requests != 1 {
 		t.Fatalf("data damaged by injection attempts: %d rows, want 1", o.Requests)
+	}
+}
+
+// TestOverviewSourceSplit is the acceptance test for the per-source cache
+// statistics behind the two summary segments: usage_source='openai', NULL
+// (pre-v2 legacy) and ” (no parsed usage payload) rows all land in the
+// OpenAI bucket — the same partition ComputeCost prices with the OpenAI
+// formula — while usage_source='anthropic' rows land in the Anthropic
+// bucket, each with its own prompt/cached/cache_write sums. The Anthropic
+// denominator is NOT assembled here — the renderer adds
+// prompt + cached + cache_write — so the three sums must be reported raw.
+func TestOverviewSourceSplit(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: now, RequestID: "o1", Model: "gpt", Source: SourceOpenAI,
+			PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100, CachedTokens: 900},
+		{Ts: now, RequestID: "a1", Model: "claude", Source: SourceAnthropic,
+			PromptTokens: 1, CompletionTokens: 50, TotalTokens: 51, CachedTokens: 500, CacheWriteTokens: 0},
+		// Post-v2 row built without a parsed usage payload: Source stays ""
+		// and is stored as the empty string, not NULL.
+		{Ts: now, RequestID: "legacy-empty", Model: "old", Source: "",
+			PromptTokens: 200, CompletionTokens: 20, TotalTokens: 220, CachedTokens: 150},
+		{Ts: now, RequestID: "a2", Model: "claude", Source: SourceAnthropic,
+			PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, CachedTokens: 50, CacheWriteTokens: 40},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-v2 legacy row: InsertBatch always writes a string, so write a real
+	// NULL usage_source directly, exactly as a v1-era row looks after the v2
+	// migration added the column.
+	db, err := sql.Open("sqlite", dsn(s.path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO usage_events
+		(ts_unix, request_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, usage_source)
+		VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+		now.Unix(), "legacy-null", "old", 100, 10, 110, 80); err != nil {
+		t.Fatal(err)
+	}
+
+	o, err := s.Overview(ctx, SummaryQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// OpenAI bucket: the explicit openai row + the NULL legacy row + the
+	// empty-string legacy row.
+	if o.OpenAIRequests != 3 {
+		t.Errorf("openai_requests = %d, want 3 (openai + NULL + empty-string)", o.OpenAIRequests)
+	}
+	if o.OpenAIPromptTokens != 1300 {
+		t.Errorf("openai_prompt_tokens = %d, want 1300 (1000 + 100 + 200)", o.OpenAIPromptTokens)
+	}
+	if o.OpenAICachedTokens != 1130 {
+		t.Errorf("openai_cached_tokens = %d, want 1130 (900 + 80 + 150)", o.OpenAICachedTokens)
+	}
+	// Anthropic bucket: both anthropic rows.
+	if o.AnthropicRequests != 2 {
+		t.Errorf("anthropic_requests = %d, want 2", o.AnthropicRequests)
+	}
+	if o.AnthropicPromptTokens != 101 {
+		t.Errorf("anthropic_prompt_tokens = %d, want 101 (1 + 100)", o.AnthropicPromptTokens)
+	}
+	if o.AnthropicCachedTokens != 550 {
+		t.Errorf("anthropic_cached_tokens = %d, want 550 (500 + 50)", o.AnthropicCachedTokens)
+	}
+	if o.AnthropicCacheWriteTokens != 40 {
+		t.Errorf("anthropic_cache_write_tokens = %d, want 40", o.AnthropicCacheWriteTokens)
+	}
+	// Cross-checks against the global totals: the buckets partition the rows.
+	if o.OpenAIRequests+o.AnthropicRequests != o.Requests {
+		t.Errorf("request splits %d+%d != requests %d", o.OpenAIRequests, o.AnthropicRequests, o.Requests)
+	}
+	if o.OpenAIPromptTokens+o.AnthropicPromptTokens != o.PromptTokens {
+		t.Errorf("prompt splits %d+%d != prompt %d", o.OpenAIPromptTokens, o.AnthropicPromptTokens, o.PromptTokens)
+	}
+	if o.OpenAICachedTokens+o.AnthropicCachedTokens != o.CachedTokens {
+		t.Errorf("cached splits %d+%d != cached %d", o.OpenAICachedTokens, o.AnthropicCachedTokens, o.CachedTokens)
+	}
+
+	// A model filter narrows the splits to the matching rows only: both
+	// claude rows are anthropic, so the openai bucket must be empty.
+	o, err = s.Overview(ctx, SummaryQuery{Model: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.OpenAIRequests != 0 || o.OpenAIPromptTokens != 0 || o.OpenAICachedTokens != 0 {
+		t.Errorf("filtered openai bucket = %+v, want all-zero", o)
+	}
+	if o.AnthropicRequests != 2 || o.AnthropicPromptTokens != 101 || o.AnthropicCachedTokens != 550 || o.AnthropicCacheWriteTokens != 40 {
+		t.Errorf("filtered anthropic bucket = %+v, want 2/101/550/40", o)
+	}
+}
+
+// TestOverviewJSONFields guards the JSON contract: the per-source fields are
+// ADDITIVE — every pre-existing key must keep its name and type, and the new
+// split keys must be present. Consumers (jq pipelines, the CLI --json path)
+// rely on the old keys never changing meaning.
+func TestOverviewJSONFields(t *testing.T) {
+	ov := &Overview{
+		Requests: 3, PromptTokens: 1101, CompletionTokens: 210, TotalTokens: 1311,
+		CachedTokens: 1480, ReasoningTokens: 0, CacheWriteTokens: 40,
+		TotalCost: ptr64(0.5), CostMissingRequests: 0,
+		FailedRequests: 1, StreamingRequests: 2,
+		OpenAIRequests: 2, OpenAIPromptTokens: 1100, OpenAICachedTokens: 980,
+		AnthropicRequests: 1, AnthropicPromptTokens: 1, AnthropicCachedTokens: 500, AnthropicCacheWriteTokens: 40,
+	}
+	b, err := json.Marshal(ov)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	// Every key must exist and be a JSON number (int64 marshals as number).
+	for _, k := range []string{
+		"requests", "prompt_tokens", "completion_tokens", "total_tokens",
+		"cached_tokens", "reasoning_tokens", "cache_write_tokens",
+		"total_cost", "cost_missing_requests", "failed_requests", "streaming_requests",
+		"openai_requests", "openai_prompt_tokens", "openai_cached_tokens",
+		"anthropic_requests", "anthropic_prompt_tokens", "anthropic_cached_tokens",
+		"anthropic_cache_write_tokens",
+	} {
+		v, ok := m[k]
+		if !ok {
+			t.Errorf("json key %q missing: %s", k, b)
+			continue
+		}
+		if _, isNum := v.(float64); !isNum {
+			t.Errorf("json key %q has type %T, want number", k, v)
+		}
+	}
+	if m["total_cost"].(float64) != 0.5 {
+		t.Errorf("total_cost = %v, want 0.5", m["total_cost"])
+	}
+	if m["openai_prompt_tokens"].(float64) != 1100 || m["anthropic_cached_tokens"].(float64) != 500 {
+		t.Errorf("split values wrong: %s", b)
 	}
 }

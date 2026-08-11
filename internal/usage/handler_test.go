@@ -249,7 +249,7 @@ func TestHandlerTableFormat(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
 	want := "  全部时间  ·  2 请求  ·  300 token  ·  $0.150\n" +
-		"  流式 2 (100.0%)   缓存命中 0 (0.0%)\n" +
+		"  流式 2 (100.0%)   缓存命中(openai) 0 (0.0%)\n" +
 		"  ⚠ 有 1 个请求未算出金额（模型未配置单价），总费用可能偏低\n" +
 		"\n" +
 		"  model   请求   Prompt   Completion   Total   缓存     费用   未计价\n" +
@@ -263,6 +263,54 @@ func TestHandlerTableFormat(t *testing.T) {
 	// counts come from Overview (not from the LIMIT-truncated rows).
 	if !strings.Contains(rec.Body.String(), "2 请求  ·  300 token") {
 		t.Errorf("table summary must come from Overview:\n%s", rec.Body.String())
+	}
+}
+
+// TestHandlerTableFormatMixedSources drives the two-segment cache summary
+// through the full HTTP format=table path (InsertBatch persists usage_source
+// → Overview splits → RenderUsageReport). It is the same renderer the CLI
+// uses, so the exact segment line here must match the CLI output.
+func TestHandlerTableFormatMixedSources(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: time.Now(), RequestID: "r1", Model: "a", Source: SourceOpenAI,
+			PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100, CachedTokens: 900},
+		{Ts: time.Now(), RequestID: "r2", Model: "b", Source: SourceAnthropic,
+			PromptTokens: 1, CompletionTokens: 50, TotalTokens: 51, CachedTokens: 500},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewSummaryHandler(s)
+	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?format=table", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("table: got %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// openai 900/1000 = 90.0%; anthropic 500/(1+500+0) = 99.8% — both
+	// independent, neither above 100%.
+	if !strings.Contains(body, "缓存命中(openai) 900 (90.0%)   缓存命中(anthropic) 500 (99.8%)") {
+		t.Errorf("split cache segments missing or wrong:\n%s", body)
+	}
+	// JSON default is untouched: the same dataset via the default format
+	// still serves the pre-existing row fields (ungrouped → one aggregate
+	// row).
+	rec = doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("json: got %d", rec.Code)
+	}
+	var body2 struct {
+		Rows []SummaryRow `json:"rows"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body2); err != nil {
+		t.Fatal(err)
+	}
+	if len(body2.Rows) != 1 {
+		t.Fatalf("json rows = %d, want 1 ungrouped aggregate", len(body2.Rows))
+	}
+	if body2.Rows[0].Requests != 2 || body2.Rows[0].PromptTokens != 1001 || body2.Rows[0].CachedTokens != 1400 {
+		t.Errorf("json aggregate broken by the split: %+v", body2.Rows[0])
 	}
 }
 

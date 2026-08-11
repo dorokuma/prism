@@ -82,14 +82,24 @@ type ReportOptions struct {
 func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts ReportOptions) string {
 	var b strings.Builder
 	b.WriteString(render.RenderSummary(render.Summary{
-		Period:      opts.Period,
-		Requests:    ov.Requests,
-		Tokens:      ov.TotalTokens,
-		Cost:        ov.TotalCost,
-		Failures:    ov.FailedRequests,
-		Streaming:   ov.StreamingRequests,
-		CacheHits:   ov.CachedTokens,
-		InputTokens: ov.PromptTokens,
+		Period:    opts.Period,
+		Requests:  ov.Requests,
+		Tokens:    ov.TotalTokens,
+		Cost:      ov.TotalCost,
+		Failures:  ov.FailedRequests,
+		Streaming: ov.StreamingRequests,
+		// Cache-hit segments are split by usage_source with per-family
+		// denominators: OpenAI-form rows (usage_source = 'openai', legacy
+		// NULL rows and empty-string rows — everything ComputeCost prices
+		// with the OpenAI formula) count cached/prompt — cached is a subset
+		// of prompt there. Anthropic-form rows count cache_read against the
+		// assembled total input (input + cache_read + cache_creation),
+		// because Anthropic input_tokens excludes the cache counters; that
+		// keeps the ratio ≤ 100% and matches the upstream billing basis. A
+		// source family with zero requests gets no segment at all.
+		OpenAI: segment(ov.OpenAIRequests, ov.OpenAICachedTokens, ov.OpenAIPromptTokens),
+		Anthropic: segment(ov.AnthropicRequests, ov.AnthropicCachedTokens,
+			ov.AnthropicPromptTokens+ov.AnthropicCachedTokens+ov.AnthropicCacheWriteTokens),
 	}))
 	if ov.CostMissingRequests > 0 {
 		fmt.Fprintf(&b, "  ⚠ 有 %s 个请求未算出金额（模型未配置单价），总费用可能偏低\n",
@@ -98,6 +108,18 @@ func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts R
 	b.WriteByte('\n')
 	b.WriteString(renderUsageTable(rows, groupBy, opts.Color))
 	return b.String()
+}
+
+// segment builds a render.CacheStats for one source family, or nil when that
+// family had no requests in range (the renderer then omits the segment
+// entirely instead of showing "0 (0.0%)"). Hits and input are already the
+// family-specific numbers; the Anthropic caller passes the assembled total
+// input as input.
+func segment(requests, hits, input int64) *render.CacheStats {
+	if requests == 0 {
+		return nil
+	}
+	return &render.CacheStats{Hits: hits, Input: input}
 }
 
 // renderUsageTable builds the aligned detail table: one column per group_by

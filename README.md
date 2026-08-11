@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.13.1  Date: 2026-08-11  Status: living document
+> Version: v0.13.2  Date: 2026-08-11  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -142,6 +142,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-11** — v0.13.2 — fix: `prism usage` summary line now splits the cache-hit figure into two independent segments by `usage_source` (OpenAI vs Anthropic), each computed with its own 口径: the OpenAI segment is `cached/prompt_tokens` (OpenAI `prompt_tokens` includes cached tokens), the Anthropic segment uses `cache_read/(input_tokens+cache_read+cache_creation)` (Anthropic `input_tokens` excludes the cache counters, `cache_read` is a sibling field) and can never exceed 100%; previously the two wire formats were mixed into one ratio with numerator and denominator from different bases, which produced hit rates over 100% whenever Anthropic `cache_read` dwarfed its tiny `input_tokens` (e.g. the claude-opus-5 batch). `usage_source` values `'openai'`, empty string and NULL all bucket into the OpenAI segment, matching the pricing partition in cost.go; a segment with no rows is omitted from the summary, and the per-row detail table keeps its original per-row cache column
 
 - **2026-08-11** — v0.13.1 — fix: `prism usage` CLI config lookup now walks a fallback chain (`--db` > `config.yaml` in the current directory > `/var/lib/prism/config.yaml` > built-in default), so running the command outside `/var/lib/prism` no longer silently falls back to the wrong default path `/var/lib/prism/usage.db` while the real database lives at `/var/lib/prism/usage/usage.db`; the missing-database error no longer asserts "usage not enabled" but reports the actual path, where it came from, and a `--db` hint
 

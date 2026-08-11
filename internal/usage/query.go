@@ -240,6 +240,21 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 // "zero dollars"); when only some rows were priced, TotalCost is the sum of
 // the priced ones and CostMissingRequests reports how many rows could not be
 // priced so callers can flag the number as partial.
+//
+// The OpenAI*/Anthropic* fields split the cache-relevant counters by
+// usage_source so the renderer can compute two independent cache-hit ratios
+// with their own denominators. The OpenAI bucket takes everything that is
+// NOT priced with the Anthropic formula — usage_source = 'openai', plus the
+// two legacy/unknown forms: NULL (rows written before the v2 migration) and
+// the empty string (events built without a parsed usage payload). This
+// mirrors ComputeCost's branch (source == SourceAnthropic vs everything
+// else) exactly, so the cache segments and the cost accounting can never
+// disagree about which rows use which semantics. Anthropic-form rows carry
+// cache_read/cache_creation as separate top-level counters excluded from
+// input_tokens. Each split sums over the same WHERE clause as the totals;
+// the two prompt splits sum to PromptTokens, the two cached splits sum to
+// CachedTokens, and the two request splits sum to Requests exactly (every
+// row falls into exactly one bucket).
 type Overview struct {
 	Requests            int64    `json:"requests"`
 	PromptTokens        int64    `json:"prompt_tokens"`
@@ -252,6 +267,21 @@ type Overview struct {
 	CostMissingRequests int64    `json:"cost_missing_requests"`
 	FailedRequests      int64    `json:"failed_requests"`
 	StreamingRequests   int64    `json:"streaming_requests"`
+	// OpenAI-form bucket: everything not priced with the Anthropic formula
+	// (usage_source = 'openai', legacy NULL rows, and empty-string rows
+	// from events without a parsed usage payload) — the same partition
+	// ComputeCost applies.
+	OpenAIRequests     int64 `json:"openai_requests"`
+	OpenAIPromptTokens int64 `json:"openai_prompt_tokens"`
+	OpenAICachedTokens int64 `json:"openai_cached_tokens"`
+	// Anthropic-form bucket (usage_source = 'anthropic'). The cache-hit
+	// denominator for this bucket is assembled by the renderer as
+	// AnthropicPromptTokens + AnthropicCachedTokens + AnthropicCacheWriteTokens,
+	// because Anthropic input_tokens excludes the cache counters.
+	AnthropicRequests         int64 `json:"anthropic_requests"`
+	AnthropicPromptTokens     int64 `json:"anthropic_prompt_tokens"`
+	AnthropicCachedTokens     int64 `json:"anthropic_cached_tokens"`
+	AnthropicCacheWriteTokens int64 `json:"anthropic_cache_write_tokens"`
 }
 
 // Overview runs the global aggregation on the read pool. GroupBy and Limit in
@@ -273,15 +303,24 @@ func (s *SQLiteStore) Overview(ctx context.Context, q SummaryQuery) (*Overview, 
 		SUM(cost_usd),
 		SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END),
 		SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END),
-		SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END)
+		SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END),
+		SUM(CASE WHEN usage_source = 'openai' OR usage_source = '' OR usage_source IS NULL THEN 1 ELSE 0 END),
+		SUM(CASE WHEN usage_source = 'openai' OR usage_source = '' OR usage_source IS NULL THEN prompt_tokens ELSE 0 END),
+		SUM(CASE WHEN usage_source = 'openai' OR usage_source = '' OR usage_source IS NULL THEN cached_tokens ELSE 0 END),
+		SUM(CASE WHEN usage_source = 'anthropic' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN usage_source = 'anthropic' THEN prompt_tokens ELSE 0 END),
+		SUM(CASE WHEN usage_source = 'anthropic' THEN cached_tokens ELSE 0 END),
+		SUM(CASE WHEN usage_source = 'anthropic' THEN cache_write_tokens ELSE 0 END)
 	FROM usage_events` + where
 
 	var o Overview
 	var requests int64
 	var pt, ct, tt, cached, rt, cwt, missing, failed, streamed sql.NullInt64
+	var oaiReq, oaiPt, oaiCached, antReq, antPt, antCached, antCwt sql.NullInt64
 	var costSum sql.NullFloat64
 	if err := db.QueryRowContext(ctx, query, args...).Scan(
 		&requests, &pt, &ct, &tt, &cached, &rt, &cwt, &costSum, &missing, &failed, &streamed,
+		&oaiReq, &oaiPt, &oaiCached, &antReq, &antPt, &antCached, &antCwt,
 	); err != nil {
 		return nil, err
 	}
@@ -299,5 +338,12 @@ func (s *SQLiteStore) Overview(ctx context.Context, q SummaryQuery) (*Overview, 
 	o.CostMissingRequests = missing.Int64
 	o.FailedRequests = failed.Int64
 	o.StreamingRequests = streamed.Int64
+	o.OpenAIRequests = oaiReq.Int64
+	o.OpenAIPromptTokens = oaiPt.Int64
+	o.OpenAICachedTokens = oaiCached.Int64
+	o.AnthropicRequests = antReq.Int64
+	o.AnthropicPromptTokens = antPt.Int64
+	o.AnthropicCachedTokens = antCached.Int64
+	o.AnthropicCacheWriteTokens = antCwt.Int64
 	return &o, nil
 }
