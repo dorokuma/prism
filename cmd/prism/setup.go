@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // builtinProviders lists the providers that prism ships with.
@@ -39,6 +41,90 @@ type accountConfig struct {
 type detectedTool struct {
 	Name string
 	Path string
+}
+
+// serviceUserName is the account the generated unit runs prism as; tool
+// config files (models.json) are normalized to this owner during setup so
+// the service can rewrite them without CAP_CHOWN (the unit runs with an
+// empty CapabilityBoundingSet and prism is deliberately never granted
+// CAP_CHOWN — see scripts/prism.service.example).
+const serviceUserName = "prism"
+
+// serviceGroupName is the group tool config files are normalized to when it
+// exists (prism is a member, so group-write lets it atomically replace the
+// file without owning it). When the group is absent the current group is
+// kept — the owner normalization alone already makes the atomic replace
+// work (the temp-file chown becomes a uid no-op).
+const serviceGroupName = "pi-sync"
+
+// minToolConfigMode is the minimum mode for tool config files: group must
+// be able to read+write (prism writes through the group) and others must be
+// able to read (pi reads the file as the invoking user). Missing bits are
+// added, existing bits (e.g. extra read bits) are never removed.
+const minToolConfigMode = os.FileMode(0664)
+
+// fixToolConfigOwnership normalizes an existing tool config file so the
+// prism service user can atomically rewrite it without CAP_CHOWN:
+//   - owner → wantUser (serviceUserName): syncPIModelsJSON preserves the
+//     deployed owner via chown on the temp file; when the temp file (created
+//     by the prism process) is chowned to its OWN uid the chown is a uid
+//     no-op and needs no privilege, so a prism-owned models.json syncs
+//     cleanly under the unit's empty CapabilityBoundingSet, while a
+//     root-owned one would abort with EPERM.
+//   - group → wantGroup IF the group exists (otherwise the current group is
+//     kept).
+//   - mode → at least minToolConfigMode (missing bits added, nothing
+//     removed).
+//
+// A non-existent file is NOT an error: the first sync creates it as a temp
+// file owned by the prism process, so there is nothing to normalize.
+// chown/chmod only run when something actually differs; failures return an
+// explicit error and setup aborts (the file is left as-is — the failed
+// syscall is atomic). Setup runs as root (it writes /etc, /var/lib/prism
+// and the unit), so chown succeeds; it grants no capability anywhere.
+func fixToolConfigOwnership(path, wantUser, wantGroup string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("stat %s: owner info unavailable", path)
+	}
+	curUID, curGID := int(st.Uid), int(st.Gid)
+
+	u, err := user.Lookup(wantUser)
+	if err != nil {
+		return fmt.Errorf("service user %q not found (cannot normalize %s owner): %w", wantUser, path, err)
+	}
+	wantUID, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return fmt.Errorf("service user %q uid %q not numeric: %w", wantUser, u.Uid, err)
+	}
+	wantGID := curGID // group normalization is best-effort: keep current group when wantGroup is absent
+	if g, err := user.LookupGroup(wantGroup); err == nil {
+		if gid, err := strconv.Atoi(g.Gid); err == nil {
+			wantGID = gid
+		}
+	}
+
+	if curUID != wantUID || curGID != wantGID {
+		if err := os.Chown(path, wantUID, wantGID); err != nil {
+			return fmt.Errorf("chown %s to %s:%s (uid/gid %d/%d): %w", path, wantUser, wantGroup, wantUID, wantGID, err)
+		}
+	}
+
+	perm := fi.Mode().Perm()
+	if perm&minToolConfigMode != minToolConfigMode {
+		newMode := perm | minToolConfigMode
+		if err := os.Chmod(path, newMode); err != nil {
+			return fmt.Errorf("chmod %s to %04o: %w", path, newMode, err)
+		}
+	}
+	return nil
 }
 
 func runSetup() error {
@@ -112,6 +198,15 @@ func runSetup() error {
 		if _, err := os.Stat(parentDir); err == nil {
 			fmt.Printf("    %-12s ✓  %s\n", toolName+".", fullPath)
 			tools = append(tools, detectedTool{Name: toolName, Path: fullPath})
+			// 安装期所有权归一化：已存在的 models.json 改为 prism 服务用户
+			// 所有、pi-sync 组（组存在时）、mode ≥ 0664，使服务在无
+			// CAP_CHOWN 下也能原子重写；失败则中止 setup（明确报错，
+			// 不静默降级）。文件不存在时跳过（首次同步由 prism 进程
+			// 创建，owner 天然正确）。
+			if err := fixToolConfigOwnership(fullPath, serviceUserName, serviceGroupName); err != nil {
+				return fmt.Errorf("归一化 %s 所有权/权限: %w", fullPath, err)
+			}
+			fmt.Printf("      owner=%s group=%s mode≥0664（未授予 CAP_CHOWN）\n", serviceUserName, serviceGroupName)
 		} else {
 			fmt.Printf("    %-12s ✗  （未检测到）\n", toolName+".")
 		}
@@ -133,6 +228,11 @@ func runSetup() error {
 	fmt.Println("  /var/lib/prism/config.yaml                    新")
 	fmt.Println("  /var/lib/prism/model_cache/                   新目录")
 	fmt.Println("  /etc/systemd/system/prism.service            新")
+	fmt.Println()
+	fmt.Println("  提示：工具 models.json（如 ~/.pi/agent/models.json）由 setup 归一化为")
+	fmt.Println("  prism 服务用户所有、pi-sync 组（组存在时）、mode ≥ 0664；服务在")
+	fmt.Println("  无 CAP_CHOWN（unit 的 CapabilityBoundingSet 为空）下也能原子重写。")
+	fmt.Println("  文件尚不存在时由 prism 首次同步创建（owner 天然为 prism）。")
 	fmt.Println()
 	confirm := promptDefault(reader, "确认？", "Y")
 	if !strings.HasPrefix(strings.ToUpper(confirm), "Y") {
@@ -293,6 +393,129 @@ func generateConfigYAML(listen string, providers []providerConfig, tools []detec
 	return sb.String()
 }
 
+// modelCacheDir is the on-disk model cache directory used by main.go; the
+// generated unit must make it writable (ReadWritePaths) under
+// ProtectSystem=strict.
+const modelCacheDir = "/var/lib/prism/model_cache"
+
+// unitWorkingDir is the unit's WorkingDirectory; relative ReadWritePaths
+// entries are resolved against it.
+const unitWorkingDir = "/var/lib/prism"
+
+// unitUsageDBPath is the usage database default path (see internal/config);
+// its parent directory must be writable for usage recording.
+const unitUsageDBPath = "/var/lib/prism/usage.db"
+
+// unitSecurityHardening lists the security hardening directives emitted by
+// the generated unit. scripts/prism.service.example mirrors the same set (a
+// test pins the two in sync) — keep both in lockstep when changing.
+var unitSecurityHardening = []string{
+	"NoNewPrivileges=true",
+	"ProtectSystem=strict",
+	"ProtectHome=true",
+	"PrivateTmp=true",
+	"ProtectKernelTunables=true",
+	"ProtectKernelModules=true",
+	"ProtectControlGroups=true",
+	"LockPersonality=true",
+	"RestrictSUIDSGID=true",
+	"RestrictNamespaces=true",
+	"SystemCallArchitectures=native",
+	"CapabilityBoundingSet=",
+	"AmbientCapabilities=",
+	"RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
+	"MemoryMax=1G",
+	"TasksMax=256",
+}
+
+// unitReadOnlyPaths lists the read-only base paths hardened on top of
+// ProtectSystem=strict; the ReadWritePaths entries below take precedence for
+// the specific writable subtrees.
+var unitReadOnlyPaths = []string{
+	"/var/lib/prism",
+}
+
+// readWritePathList builds the deduplicated ReadWritePaths list: the model
+// cache dir, the usage.db parent dir, and every tool config parent dir.
+// Relative entries are resolved against the unit working directory,
+// filepath.Clean is applied to every entry, and exact duplicates are
+// removed.
+//
+// Safety gate (final review): a broken usage/tools configuration must never
+// widen ReadWritePaths to "/" — that would make the ENTIRE root filesystem
+// writable and silently defeat ProtectSystem=strict. Dangerous inputs are
+// rejected by SKIPPING the entry (the rest of the unit is generated
+// unchanged, so one bad tool path cannot fail the whole setup):
+//   - empty tool paths: filepath.Dir("") is "." and would silently mark the
+//     working directory writable;
+//   - anything resolving to "/": an absolute root tool path ("/"), a
+//     nested path that climbs to the root ("/var/lib/prism/../../../.."),
+//     or a relative path that escapes to the root ("../../.." →
+//     /var/lib/prism/../../.. → "/");
+//   - escape outside the working directory: a relative path whose
+//     resolution leaves it (".." → /var/lib, "../escape" → /var/lib), and
+//     an ABSOLUTE path containing ".." segments whose Dir result leaves it
+//     ("/var/lib/prism/../.." → Dir "/var/lib"). Explicit absolute tool
+//     paths WITHOUT ".." segments (e.g. /root/.pi/agent) are configuration
+//     intent and stay.
+func readWritePathList(tools []detectedTool) []string {
+	paths := []string{modelCacheDir, filepath.Dir(unitUsageDBPath)}
+	for _, t := range tools {
+		if t.Path == "" {
+			continue // 危险空路径：跳过，绝不把工作目录悄悄变成可写区
+		}
+		dir := filepath.Dir(t.Path)
+		// 绝对路径含 ".." 段（异常配置）：filepath.Dir 返回前已按 Clean
+		// 语义解析，逃逸在此处已经发生 —— Dir 结果必须落在工作目录内，
+		// 否则跳过（"/var/lib/prism/../.." → /var/lib 逃逸）。无 ".." 段
+		// 的绝对路径（/root/.pi/agent）是显式意图，保留。
+		if filepath.IsAbs(t.Path) && containsDotDot(t.Path) && dir != unitWorkingDir && !strings.HasPrefix(dir, unitWorkingDir+"/") {
+			continue
+		}
+		paths = append(paths, dir)
+	}
+	seen := make(map[string]bool, len(paths))
+	var out []string
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		rel := !filepath.IsAbs(p)
+		if rel {
+			// 相对路径：以工作目录为基准解析（Join 内部已 Clean，所以
+			// "../escape" 在解析时就已得到 /var/lib 这样的逃逸结果）。
+			p = filepath.Join(unitWorkingDir, p)
+		}
+		// 安全门 1：根路径（含相对路径逃逸到根 "../../.." → /）→ 跳过
+		if p == "/" {
+			continue
+		}
+		// 安全门 2：相对路径的解析结果必须落在工作目录内，逃逸 → 跳过。
+		if rel && p != unitWorkingDir && !strings.HasPrefix(p, unitWorkingDir+"/") {
+			continue
+		}
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+// containsDotDot reports whether a path contains a ".." segment — the
+// marker of a potentially escaping path. The RAW path is inspected (NOT
+// Clean-ed first: Clean would resolve the ".." segments away and hide the
+// escape).
+func containsDotDot(p string) bool {
+	for _, seg := range strings.Split(p, string(filepath.Separator)) {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func generateSystemdUnit(providers []providerConfig, tools []detectedTool) string {
 	var sb strings.Builder
 	sb.WriteString("# Prism systemd unit — generated by `prism setup`\n")
@@ -301,27 +524,25 @@ func generateSystemdUnit(providers []providerConfig, tools []detectedTool) strin
 	sb.WriteString("After=network-online.target\n")
 	sb.WriteString("Wants=network-online.target\n\n")
 	sb.WriteString("[Service]\n")
+	sb.WriteString("Type=simple\n")
 	sb.WriteString("User=prism\n")
 	sb.WriteString("Group=prism\n")
-	sb.WriteString("WorkingDirectory=/var/lib/prism\n")
+	sb.WriteString("WorkingDirectory=" + unitWorkingDir + "\n")
 	sb.WriteString("ExecStart=/usr/local/bin/prism\n")
 	sb.WriteString("ExecReload=/bin/kill -HUP $MAINPID\n")
 	sb.WriteString("Restart=always\n")
-	sb.WriteString("RestartSec=3\n\n")
-	sb.WriteString("# 安全加固\n")
-	sb.WriteString("ProtectSystem=strict\n")
-	sb.WriteString("ProtectHome=true\n")
-	sb.WriteString("PrivateTmp=true\n")
-	sb.WriteString("CapabilityBoundingSet=\n")
-	sb.WriteString("MemoryMax=1G\n")
-	sb.WriteString("TasksMax=256\n\n")
-	sb.WriteString("# 写入权限\n")
-	sb.WriteString("ReadWritePaths=/var/lib/prism/model_cache\n")
-	for _, t := range tools {
-		parentDir := filepath.Dir(t.Path)
-		sb.WriteString(fmt.Sprintf("ReadWritePaths=%s\n", parentDir))
+	sb.WriteString("RestartSec=3\n")
+	sb.WriteString("TimeoutStopSec=35\n")
+	sb.WriteString("KillMode=mixed\n\n")
+	sb.WriteString("# 安全加固（与 scripts/prism.service.example 保持一致）\n")
+	for _, d := range unitSecurityHardening {
+		sb.WriteString(d + "\n")
 	}
-	// Avoid duplicates for tools sharing parent dirs
+	sb.WriteString("ReadOnlyPaths=" + strings.Join(unitReadOnlyPaths, " ") + "\n\n")
+	sb.WriteString("# 写入权限：model cache、usage.db 父目录、工具配置目录（相对路径以 WorkingDirectory 为基准，已 Clean + 去重）\n")
+	for _, p := range readWritePathList(tools) {
+		sb.WriteString("ReadWritePaths=" + p + "\n")
+	}
 	sb.WriteString("\n# Credential 注入\n")
 	for _, pv := range providers {
 		for _, acct := range pv.Accounts {

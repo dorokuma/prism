@@ -18,7 +18,7 @@ import (
 func proxyMessages(p *pool.Pool, w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 	start := time.Now()
 	defer r.Body.Close()
-	bodyBytes, ok := readRequestBody(w, r, "messages")
+	bodyBytes, ok := readRequestBody(w, r, start, "messages")
 	if !ok {
 		return
 	}

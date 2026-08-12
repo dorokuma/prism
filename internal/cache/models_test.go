@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2125,16 +2126,18 @@ func TestSyncPIModelsJSON_PreservesExistingMode(t *testing.T) {
 	}
 }
 
-// TestSyncPIModelsJSON_ChownFailFallsBackInPlace verifies the
-// owner-preservation degradation: when chown on the temp file fails (EPERM
-// for a non-root process), the sync must NOT rename — the original inode,
-// owner/group and mode are all preserved — and the new content must be
-// complete. The chown failure is injected via chownFile, so the test is
-// deterministic and independent of the test runner's privileges.
-func TestSyncPIModelsJSON_ChownFailFallsBackInPlace(t *testing.T) {
+// TestSyncPIModelsJSON_ChownFailAborts pins the item-4 guarantee: when the
+// temp file's owner cannot be preserved (chown fails, e.g. EPERM for a
+// non-root process under NoNewPrivileges), syncPIModelsJSON must ABORT with
+// an error — there is no in-place fallback anymore. The original file, its
+// inode, owner/group, mode and CONTENT stay untouched (byte-for-byte), and
+// the aborted temp file leaves no litter. The chown failure is injected via
+// chownFile, so the test is deterministic and independent of the test
+// runner's privileges.
+func TestSyncPIModelsJSON_ChownFailAborts(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "models.json")
-	writePIModelsJSON(t, path, map[string]any{})
+	old, ino0 := modelsJSONFixture(t, path)
 	if err := os.Chmod(path, 0664); err != nil {
 		t.Fatal(err)
 	}
@@ -2144,7 +2147,7 @@ func TestSyncPIModelsJSON_ChownFailFallsBackInPlace(t *testing.T) {
 		t.Fatal(err)
 	}
 	st0 := fi0.Sys().(*syscall.Stat_t)
-	ino0, uid0, gid0 := st0.Ino, st0.Uid, st0.Gid
+	uid0, gid0 := st0.Uid, st0.Gid
 
 	cfg := &config.Config{
 		Accounts: []config.AccountConfig{{Name: "a", Provider: "p", BaseURL: "http://127.0.0.1:1/v1"}},
@@ -2153,27 +2156,25 @@ func TestSyncPIModelsJSON_ChownFailFallsBackInPlace(t *testing.T) {
 		"p": {Models: []ModelEntry{{ID: "m1", Object: "model", Created: 1, OwnedBy: "x"}}},
 	})
 	mc.chownFile = func(name string, uid, gid int) error { return syscall.EPERM }
-	if err := mc.syncPIModelsJSON(path, "http://127.0.0.1:18790/v1", cfg); err != nil {
-		t.Fatalf("syncPIModelsJSON: %v", err)
+	err = mc.syncPIModelsJSON(path, "http://127.0.0.1:18790/v1", cfg)
+	if err == nil {
+		t.Fatal("syncPIModelsJSON must return an error when the temp chown fails")
 	}
 
+	// The old file is byte-for-byte intact on the SAME inode.
+	assertFileUntouched(t, path, old, ino0)
 	fi1, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	st1 := fi1.Sys().(*syscall.Stat_t)
-	if st1.Ino != ino0 {
-		t.Errorf("inode changed (%d → %d): the file was renamed despite chown failure", ino0, st1.Ino)
-	}
 	if st1.Uid != uid0 || st1.Gid != gid0 {
 		t.Errorf("owner changed (uid/gid %d/%d → %d/%d): a chown-failed rename must never happen", uid0, gid0, st1.Uid, st1.Gid)
 	}
 	if perm := fi1.Mode().Perm(); perm != 0664 {
-		t.Errorf("mode after in-place fallback = %o, want 0664", perm)
+		t.Errorf("mode after aborted sync = %o, want 0664", perm)
 	}
-	// Content must be complete: the new provider entry is parseable.
-	readPIModel(t, path, "p", "m1")
-	// The aborted temp-file path must leave no litter.
+	// No temp litter from the aborted rename path.
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -2183,12 +2184,11 @@ func TestSyncPIModelsJSON_ChownFailFallsBackInPlace(t *testing.T) {
 	}
 }
 
-// TestSyncPIModelsJSON_ChownFailInPlaceWriteError verifies the in-place
-// fallback surfaces an error when the overwrite itself fails: with chown
-// injected to fail and the target being a DIRECTORY (the pre-read of the
-// old content fails with EISDIR), syncPIModelsJSON must return an error
-// instead of silently losing the update.
-func TestSyncPIModelsJSON_ChownFailInPlaceWriteError(t *testing.T) {
+// TestSyncPIModelsJSON_ChownFailOnDirectoryAborts covers the same abort
+// when the target path is a directory: the sync must fail (chown injected
+// to fail) and leave the directory untouched with no temp litter — it must
+// not attempt any in-place overwrite of a directory.
+func TestSyncPIModelsJSON_ChownFailOnDirectoryAborts(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "models.json")
 	if err := os.Mkdir(path, 0755); err != nil {
@@ -2203,9 +2203,15 @@ func TestSyncPIModelsJSON_ChownFailInPlaceWriteError(t *testing.T) {
 	})
 	mc.chownFile = func(name string, uid, gid int) error { return syscall.EPERM }
 	if err := mc.syncPIModelsJSON(path, "http://127.0.0.1:18790/v1", cfg); err == nil {
-		t.Fatal("syncPIModelsJSON must return an error when the in-place fallback write fails")
+		t.Fatal("syncPIModelsJSON must return an error when the temp chown fails")
 	}
-	// No temp litter from the aborted rename path.
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.IsDir() {
+		t.Fatalf("target %s is no longer a directory after the aborted sync", path)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -2215,10 +2221,10 @@ func TestSyncPIModelsJSON_ChownFailInPlaceWriteError(t *testing.T) {
 	}
 }
 
-// writeInPlaceFixture writes an old models.json (a JSON document with a
+// modelsJSONFixture writes an old models.json (a JSON document with a
 // hand-edited "name" key, so the old content is distinguishable from any
 // prism output) and returns its exact bytes plus the original inode.
-func writeInPlaceFixture(t *testing.T, path string) (old []byte, ino0 uint64) {
+func modelsJSONFixture(t *testing.T, path string) (old []byte, ino0 uint64) {
 	t.Helper()
 	oldJSON := `{"providers":{"p":{"baseUrl":"http://old","api":"openai-completions","models":[{"id":"m1","name":"hand-edited"}]}}}`
 	if err := os.WriteFile(path, []byte(oldJSON), 0644); err != nil {
@@ -2235,171 +2241,23 @@ func writeInPlaceFixture(t *testing.T, path string) (old []byte, ino0 uint64) {
 	return old, fi.Sys().(*syscall.Stat_t).Ino
 }
 
-// assertFileRestored checks that path holds exactly old bytes on the same
-// inode (in-place restore must preserve owner/group/mode via the inode).
-func assertFileRestored(t *testing.T, path string, old []byte, ino0 uint64) {
+// assertFileUntouched checks that path holds exactly old bytes on the same
+// inode (an aborted sync must leave the deployed file untouched).
+func assertFileUntouched(t *testing.T, path string, old []byte, ino0 uint64) {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read file after failed write: %v", err)
+		t.Fatalf("read file after aborted sync: %v", err)
 	}
 	if !bytes.Equal(data, old) {
-		t.Fatalf("file after failed write = %q, want old content %q (restore must be byte-exact)", data, old)
+		t.Fatalf("file after aborted sync = %q, want old content %q (must be byte-exact)", data, old)
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ino := fi.Sys().(*syscall.Stat_t).Ino; ino != ino0 {
-		t.Errorf("inode changed (%d → %d): restore must keep the original inode", ino0, ino)
-	}
-}
-
-// TestWriteInPlace_PartialWriteFailureRestoresOldJSON pins the core
-// in-place rollback requirement: after a successful open, a PARTIAL write
-// (some bytes written, then an error) must restore the complete old JSON —
-// the file must never be left half-written (new prefix over old tail). The
-// write failure is injected via the inPlaceWrite seam (writes half the
-// payload, then fails), so the scenario is deterministic. The returned
-// error is non-nil and the old bytes are restored byte-exactly on the same
-// inode.
-func TestWriteInPlace_PartialWriteFailureRestoresOldJSON(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "models.json")
-	old, ino0 := writeInPlaceFixture(t, path)
-
-	mc := &ModelCache{}
-	mc.inPlaceWrite = func(f *os.File, p []byte) (int, error) {
-		n := len(p) / 2
-		if n == 0 {
-			n = 1
-		}
-		if _, err := f.Write(p[:n]); err != nil {
-			return 0, err
-		}
-		return n, errors.New("injected partial write failure")
-	}
-
-	newData := []byte(`{"providers":{"p":{"models":[{"id":"m2"}]}}}`)
-	if err := mc.writeInPlace(path, newData); err == nil {
-		t.Fatal("writeInPlace must return an error when the write fails")
-	}
-	assertFileRestored(t, path, old, ino0)
-}
-
-// TestWriteInPlace_TruncateFailureRestoresOldJSON: a failure of the
-// post-write truncate must also restore the old content (the write itself
-// succeeded, so without the restore the file would hold the new data — or
-// new data plus stale trailing bytes). The truncate failure is injected via
-// the inPlaceTruncate seam.
-func TestWriteInPlace_TruncateFailureRestoresOldJSON(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "models.json")
-	old, ino0 := writeInPlaceFixture(t, path)
-
-	mc := &ModelCache{}
-	mc.inPlaceTruncate = func(f *os.File, size int64) error {
-		return errors.New("injected truncate failure")
-	}
-
-	newData := []byte(`{"providers":{"p":{"models":[{"id":"m2"}]}}}`)
-	if err := mc.writeInPlace(path, newData); err == nil {
-		t.Fatal("writeInPlace must return an error when the truncate fails")
-	}
-	assertFileRestored(t, path, old, ino0)
-}
-
-// TestWriteInPlace_CloseFailureRestoresOldJSON: a failure of the final
-// close must ALSO restore the old content — a fully-written new file must
-// not be published when the write cannot be completed cleanly. The close
-// failure is injected via the inPlaceClose seam.
-func TestWriteInPlace_CloseFailureRestoresOldJSON(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "models.json")
-	old, ino0 := writeInPlaceFixture(t, path)
-
-	mc := &ModelCache{}
-	mc.inPlaceClose = func(f *os.File) error {
-		return errors.New("injected close failure")
-	}
-
-	newData := []byte(`{"providers":{"p":{"models":[{"id":"m2"}]}}}`)
-	if err := mc.writeInPlace(path, newData); err == nil {
-		t.Fatal("writeInPlace must return an error when the close fails")
-	}
-	assertFileRestored(t, path, old, ino0)
-}
-
-// TestWriteInPlace_SuccessTruncatesToNewLength: on success with new data
-// SHORTER than the old content, the file must hold exactly the new bytes —
-// no O_TRUNC means the trailing old bytes would survive without the
-// post-write truncate. The inode is unchanged (in-place write keeps
-// owner/group/mode).
-func TestWriteInPlace_SuccessTruncatesToNewLength(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "models.json")
-	_, ino0 := writeInPlaceFixture(t, path)
-
-	mc := &ModelCache{}
-	newData := []byte(`{"providers":{}}`)
-	if err := mc.writeInPlace(path, newData); err != nil {
-		t.Fatalf("writeInPlace: %v", err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(data, newData) {
-		t.Fatalf("file after successful in-place write = %q, want exactly %q (no stale trailing bytes)", data, newData)
-	}
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ino := fi.Sys().(*syscall.Stat_t).Ino; ino != ino0 {
-		t.Errorf("inode changed (%d → %d): in-place write must keep the original inode", ino0, ino)
-	}
-}
-
-// TestSyncPIModelsJSON_InPlaceWriteFailureRestoresOldContent is the
-// integration-level rollback test: chown fails (forcing the in-place
-// fallback) AND the in-place write fails — syncPIModelsJSON must return an
-// error and the deployed models.json must hold the ORIGINAL bytes
-// byte-for-byte (no empty/partial file, no silent success). The old file
-// carries a hand-edited "name" key that the restore must preserve.
-func TestSyncPIModelsJSON_InPlaceWriteFailureRestoresOldContent(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "models.json")
-	old, ino0 := writeInPlaceFixture(t, path)
-
-	cfg := &config.Config{
-		Accounts: []config.AccountConfig{{Name: "a", Provider: "p", BaseURL: "http://127.0.0.1:1/v1"}},
-	}
-	mc := NewForTest(map[string]*providerCache{
-		"p": {Models: []ModelEntry{{ID: "m1", Object: "model", Created: 1, OwnedBy: "x"}}},
-	})
-	mc.chownFile = func(name string, uid, gid int) error { return syscall.EPERM }
-	mc.inPlaceWrite = func(f *os.File, p []byte) (int, error) {
-		n := len(p) / 2
-		if n == 0 {
-			n = 1
-		}
-		if _, err := f.Write(p[:n]); err != nil {
-			return 0, err
-		}
-		return n, errors.New("injected partial write failure")
-	}
-	if err := mc.syncPIModelsJSON(path, "http://127.0.0.1:18790/v1", cfg); err == nil {
-		t.Fatal("syncPIModelsJSON must return an error when the in-place fallback write fails")
-	}
-	assertFileRestored(t, path, old, ino0)
-	// No temp litter from the aborted rename path.
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 || entries[0].Name() != "models.json" {
-		t.Fatalf("sync dir = %v, want exactly [models.json]", entries)
+		t.Errorf("inode changed (%d → %d): aborted sync must keep the original inode", ino0, ino)
 	}
 }
 
@@ -2978,5 +2836,1028 @@ func TestRefreshLoop_StopWaitsForLoopExit(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if after := atomic.LoadInt32(&hits); after != before {
 		t.Errorf("upstream hits after Stop = %d, want frozen at %d (loop still alive)", after, before)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Round-3 audit: multi-account failover, same-provider fetch merging,
+// RefreshAll scheduler, safe connection errors
+// ---------------------------------------------------------------------------
+
+// TestFetch_FailoverFirstSaturatedSecondSucceeds is the item-1 core: with
+// two healthy accounts for the provider, the FIRST account saturated (its
+// concurrency slot occupied by a business request), the fetch must move to
+// the second account instead of failing with ErrFetchSaturated. The first
+// account's upstream must never be touched, and every acquired slot is
+// released exactly once (both accounts back to in-flight 0).
+func TestFetch_FailoverFirstSaturatedSecondSucceeds(t *testing.T) {
+	hits1 := make(chan struct{}, 1)
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits1 <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer srv1.Close()
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srv2.Close()
+
+	cfg := &config.Config{
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv1.URL, Key: "k"},
+			{Name: "a2", Provider: "p", BaseURL: srv2.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	accs := mc.pool.AllAccounts()
+	// Occupy the first account's single slot: the fetch must fail over to a2.
+	if !accs[0].TryAcquire(1) {
+		t.Fatal("test setup: TryAcquire(1) on a1 failed")
+	}
+
+	err := mc.Fetch("p")
+	accs[0].Release()
+
+	if err != nil {
+		t.Fatalf("Fetch must fail over to the second account, got: %v", err)
+	}
+	models := mc.GetModels("p")
+	if len(models) != 1 || models[0].ID != "m1" {
+		t.Errorf("fetched models = %+v, want [m1] (from account 2)", models)
+	}
+	select {
+	case <-hits1:
+		t.Error("saturated first account must never be touched by the fetch")
+	default:
+	}
+	if got := accs[0].InFlightCount(); got != 0 {
+		t.Errorf("a1 in-flight after fetch = %d, want 0", got)
+	}
+	if got := accs[1].InFlightCount(); got != 0 {
+		t.Errorf("a2 in-flight after fetch = %d, want 0 (exactly one release)", got)
+	}
+}
+
+// TestFetch_FailoverAllSaturated: when EVERY healthy account is at its
+// concurrency cap the fetch returns ErrFetchSaturated (mapped by
+// internal/proxy to 503 model_fetch_saturated) and no upstream is touched.
+func TestFetch_FailoverAllSaturated(t *testing.T) {
+	hits := make(chan struct{}, 2)
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer srv1.Close()
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer srv2.Close()
+
+	cfg := &config.Config{
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv1.URL, Key: "k"},
+			{Name: "a2", Provider: "p", BaseURL: srv2.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	accs := mc.pool.AllAccounts()
+	if !accs[0].TryAcquire(1) || !accs[1].TryAcquire(1) {
+		t.Fatal("test setup: TryAcquire(1) failed")
+	}
+
+	err := mc.Fetch("p")
+	accs[0].Release()
+	accs[1].Release()
+
+	if !errors.Is(err, ErrFetchSaturated) {
+		t.Fatalf("Fetch error = %v, want ErrFetchSaturated", err)
+	}
+	select {
+	case <-hits:
+		t.Error("all-saturated fetch must not send any upstream request")
+	default:
+	}
+	if got := accs[0].InFlightCount(); got != 0 {
+		t.Errorf("a1 in-flight = %d, want 0", got)
+	}
+	if got := accs[1].InFlightCount(); got != 0 {
+		t.Errorf("a2 in-flight = %d, want 0", got)
+	}
+}
+
+// TestFetch_FailoverAcquiredThenSaturated pins the final-review error
+// classification: account A is ACQUIRED and its upstream fetch fails (500),
+// account B is saturated (slot occupied). The fetch must return A's real
+// upstream error — NEVER ErrFetchSaturated — because a fetch that actually
+// reached an upstream and failed must surface as 502 model_fetch_failed,
+// not as a misleading "saturated" (503). Saturated is reserved for the case
+// where NO account could be acquired at all. A's slot must still be
+// released exactly once.
+func TestFetch_FailoverAcquiredThenSaturated(t *testing.T) {
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
+	}))
+	defer srv1.Close()
+
+	cfg := &config.Config{
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv1.URL, Key: "k"},
+			{Name: "a2", Provider: "p", BaseURL: "http://127.0.0.1:1", Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	accs := mc.pool.AllAccounts()
+	// Occupy a2's single slot: a1 will be acquired and fail, a2 stays
+	// saturated — the exact mixed-failure shape that must NOT report
+	// saturated.
+	if !accs[1].TryAcquire(1) {
+		t.Fatal("test setup: TryAcquire(1) on a2 failed")
+	}
+
+	err := mc.Fetch("p")
+	accs[1].Release()
+
+	if err == nil {
+		t.Fatal("Fetch must fail (a1 upstream 500, a2 saturated)")
+	}
+	if errors.Is(err, ErrFetchSaturated) {
+		t.Fatalf("Fetch error = %v: an acquired-then-failed fetch must NEVER report saturated", err)
+	}
+	if errors.Is(err, ErrNoHealthyAccount) {
+		t.Fatalf("Fetch error = %v: accounts are healthy, must not report no_healthy", err)
+	}
+	if !strings.Contains(err.Error(), "upstream returned 500") {
+		t.Errorf("Fetch error = %v, want a1's real upstream error (upstream returned 500)", err)
+	}
+	// a1's acquired slot must be released exactly once.
+	if got := accs[0].InFlightCount(); got != 0 {
+		t.Errorf("a1 in-flight after fetch = %d, want 0 (acquired slot must be released)", got)
+	}
+	if got := accs[1].InFlightCount(); got != 0 {
+		t.Errorf("a2 in-flight after fetch = %d, want 0", got)
+	}
+}
+
+// TestFetch_FailoverFirstUpstreamFailsSecondSucceeds: a temporary upstream
+// failure (500) on the first account must fail over to the second account,
+// which succeeds — the fetch as a whole returns nil and the cache is
+// populated. Both accounts are attempted exactly once and every slot is
+// released.
+func TestFetch_FailoverFirstUpstreamFailsSecondSucceeds(t *testing.T) {
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
+	}))
+	defer srv1.Close()
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m2","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srv2.Close()
+
+	cfg := &config.Config{
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv1.URL, Key: "k"},
+			{Name: "a2", Provider: "p", BaseURL: srv2.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	if err := mc.Fetch("p"); err != nil {
+		t.Fatalf("Fetch must fail over after the first account's 500, got: %v", err)
+	}
+	models := mc.GetModels("p")
+	if len(models) != 1 || models[0].ID != "m2" {
+		t.Errorf("fetched models = %+v, want [m2] (from account 2)", models)
+	}
+	for i, acc := range mc.pool.AllAccounts() {
+		if got := acc.InFlightCount(); got != 0 {
+			t.Errorf("account %d in-flight after fetch = %d, want 0", i, got)
+		}
+	}
+}
+
+// TestFetch_FailoverNoHealthyAccount: no healthy account at all still maps
+// to ErrNoHealthyAccount (not a confusing aggregate error).
+func TestFetch_FailoverNoHealthyAccount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer srv.Close()
+
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    &config.Config{MaxConcurrentPerAccount: map[string]int{"*": 1}},
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	acc := mc.pool.AllAccounts()[0]
+	acc.MarkExhausted()
+
+	err := mc.Fetch("p")
+	if !errors.Is(err, ErrNoHealthyAccount) {
+		t.Fatalf("Fetch error = %v, want ErrNoHealthyAccount", err)
+	}
+}
+
+// TestFetch_ConcurrentSameProviderSingleUpstream is the item-2 core: 20
+// concurrent Fetch calls for the SAME provider collapse into exactly ONE
+// upstream request. The leader blocks in the upstream handler while all 20
+// goroutines are provably launched, so every one of them either leads or
+// joins the in-flight fetch — the hit count proves the merge.
+func TestFetch_ConcurrentSameProviderSingleUpstream(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	const n = 20
+	var started int32
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			atomic.AddInt32(&started, 1)
+			errs[idx] = mc.Fetch("p")
+		}(i)
+	}
+
+	// The leader is provably blocked at the upstream; wait until all 20
+	// goroutines are launched (they can only lead or join — the leader
+	// cannot finish before release), then release the upstream.
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader never reached the upstream")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt32(&started) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d goroutines launched", atomic.LoadInt32(&started), n)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	close(release)
+
+	wg.Wait()
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("upstream hits = %d, want exactly 1 (20 same-provider fetches merged)", got)
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("fetch %d failed: %v", i, err)
+		}
+	}
+	models := mc.GetModels("p")
+	if len(models) != 1 || models[0].ID != "m1" {
+		t.Errorf("fetched models = %+v, want [m1]", models)
+	}
+}
+
+// TestFetch_DifferentProvidersParallel: fetches for DIFFERENT providers
+// must run concurrently — each upstream is entered while the other fetch is
+// still blocked, which a global (or per-provider) serialization would make
+// impossible.
+func TestFetch_DifferentProvidersParallel(t *testing.T) {
+	enteredA := make(chan struct{})
+	enteredB := make(chan struct{})
+	release := make(chan struct{})
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-enteredA:
+		default:
+			close(enteredA)
+		}
+		<-release
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"mA","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-enteredB:
+		default:
+			close(enteredB)
+		}
+		<-release
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"mB","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srvB.Close()
+
+	cfg := &config.Config{
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "aA", Provider: "pA", BaseURL: srvA.URL, Key: "k"},
+			{Name: "aB", Provider: "pB", BaseURL: srvB.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- mc.Fetch("pA") }()
+	go func() { errCh <- mc.Fetch("pB") }()
+
+	select {
+	case <-enteredA:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pA fetch never reached its upstream")
+	}
+	select {
+	case <-enteredB:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pB fetch never reached its upstream while pA was still blocked (different providers must run in parallel)")
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Errorf("parallel fetch failed: %v", err)
+		}
+	}
+}
+
+// TestFetch_FollowerCancelIndependent: a follower whose own context is
+// cancelled returns its cancellation immediately WITHOUT cancelling the
+// leader — the leader stays blocked at the upstream, completes, and
+// publishes the cache. Exactly one upstream request is made.
+func TestFetch_FollowerCancelIndependent(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	leaderDone := make(chan error, 1)
+	go func() { leaderDone <- mc.fetchWithContext(context.Background(), "p") }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader never reached the upstream")
+	}
+
+	// Follower with an ALREADY-cancelled context: must return immediately
+	// with context.Canceled and must NOT cancel the leader.
+	fctx, fcancel := context.WithCancel(context.Background())
+	fcancel()
+	fstart := time.Now()
+	err := mc.fetchWithContext(fctx, "p")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("follower error = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(fstart); elapsed > 2*time.Second {
+		t.Errorf("follower cancellation took %v, want immediate return", elapsed)
+	}
+
+	// The leader must still be alive (its own context is untouched).
+	select {
+	case <-leaderDone:
+		t.Fatal("leader finished when only the follower was cancelled")
+	default:
+	}
+	close(release)
+	select {
+	case lerr := <-leaderDone:
+		if lerr != nil {
+			t.Errorf("leader failed: %v", lerr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("leader never completed after release")
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("upstream hits = %d, want 1", got)
+	}
+	models := mc.GetModels("p")
+	if len(models) != 1 || models[0].ID != "m1" {
+		t.Errorf("fetched models = %+v, want [m1]", models)
+	}
+}
+
+// TestFetch_LeaderPanicCleansInflightEntry pins the final-review item 1: a
+// same-provider fetch leader that dies abnormally (panic inside
+// fetchLeader, forced via the test-only fetchLeaderHook) must clean up its
+// in-flight entry on the way out:
+//   - followers parked on the leader's done channel finish with a SAFE
+//     generic error (ErrFetchAborted) — never the panic value — instead of
+//     waiting forever;
+//   - the fetches map entry is removed, so a later same-provider Fetch
+//     becomes the leader again and completes normally;
+//   - the panic itself keeps propagating (the cleanup is a defer state
+//     machine, not a recover that swallows the panic).
+//
+// The follower outcome has two defined shapes: it either parks on done and
+// receives ErrFetchAborted (the regression this pins) or — if it arrives
+// after the cleanup removed the entry — it becomes the leader itself and
+// completes the upstream round. Both finish; the assertion set accepts
+// both and the permanent-wait bug fails the deadline either way.
+func TestFetch_LeaderPanicCleansInflightEntry(t *testing.T) {
+	entered := make(chan struct{})
+	goPanic := make(chan struct{})
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srv.Close()
+
+	// Fake "credential-looking" panic value: it must never reach the
+	// follower error or any log line.
+	const panicSecret = "test-panic-secret-7f3a"
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg: &config.Config{
+			MaxConcurrentPerAccount: map[string]int{"*": 1},
+		},
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+		fetchLeaderHook: func() {
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-goPanic
+			panic(panicSecret)
+		},
+	}
+
+	// Leader: registers the in-flight entry, then panics inside fetchLeader
+	// (the hook is called at the top of fetchLeader, before any upstream
+	// work). The wrapper recovers the propagated panic for the test.
+	leaderPanic := make(chan any, 1)
+	leaderDone := make(chan error, 1)
+	go func() {
+		defer func() { leaderPanic <- recover() }()
+		leaderDone <- mc.fetchWithContext(context.Background(), "p")
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader never entered fetchLeader")
+	}
+
+	// Follower joins while the leader is still parked in the hook: the
+	// entry exists, so it MUST join (it cannot become the leader yet) and
+	// park on done.
+	followerStarted := make(chan struct{})
+	followerErrCh := make(chan error, 1)
+	go func() {
+		close(followerStarted)
+		followerErrCh <- mc.fetchWithContext(context.Background(), "p")
+	}()
+
+	select {
+	case <-followerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("follower never started")
+	}
+	close(goPanic)
+
+	// The panic must propagate out of fetchWithContext (cleanup is not a
+	// recover) and reach the test wrapper's recover with its original value.
+	select {
+	case v := <-leaderPanic:
+		if v != panicSecret {
+			t.Fatalf("leader panic value = %v, want the injected panic (must propagate, not be swallowed)", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader panic never propagated to the caller")
+	}
+	select {
+	case <-leaderDone:
+		t.Fatal("panicking leader returned a value")
+	default:
+	}
+
+	// The follower must finish: parked followers must never wait forever
+	// after the leader dies. The error must be the safe sentinel — and even
+	// the "arrived after cleanup and became leader" shape must not leak the
+	// panic value.
+	select {
+	case err := <-followerErrCh:
+		if err != nil {
+			if !errors.Is(err, ErrFetchAborted) {
+				t.Fatalf("follower error = %v, want ErrFetchAborted", err)
+			}
+			if strings.Contains(err.Error(), panicSecret) {
+				t.Fatalf("follower error leaks the panic value: %v", err)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follower never finished after the leader panicked (permanent wait)")
+	}
+
+	// No dead entry may be left behind for the provider.
+	mc.fetchMu.Lock()
+	left := len(mc.fetches)
+	mc.fetchMu.Unlock()
+	if left != 0 {
+		t.Fatalf("fetches map has %d leftover entries after leader panic, want 0", left)
+	}
+
+	// A subsequent same-provider Fetch must become the leader again and
+	// complete normally with a fresh upstream round. The test hook must be
+	// removed first: it is a fetchLeader injection, so a still-installed
+	// hook would panic the new leader too.
+	mc.fetchLeaderHook = nil
+	if err := mc.Fetch("p"); err != nil {
+		t.Fatalf("subsequent Fetch after leader panic failed: %v", err)
+	}
+	models := mc.GetModels("p")
+	if len(models) != 1 || models[0].ID != "m1" {
+		t.Errorf("fetched models = %+v, want [m1]", models)
+	}
+	if got := atomic.LoadInt32(&hits); got == 0 {
+		t.Error("subsequent fetch never reached the upstream (must have become the leader)")
+	}
+}
+
+// TestFetch_LeaderErrorSharedWithFollower pins the final-review must-fix: a
+// same-provider follower that joined an in-flight leader fetch must receive
+// the leader's REAL failure (non-nil, identical, recognizable) on the
+// normal-failure paths — upstream 5xx and parse failure — never the
+// zero-value nil (a nil follower error makes the proxy answer 200 with an
+// empty model list) and never ErrFetchAborted (the proxy classifies
+// 502/503 from the real error).
+//
+// Determinism: the leader is provably blocked at the upstream (entered)
+// while the follower starts, so the in-flight entry is still registered and
+// the follower MUST join it. Release happens only after the follower is
+// launched, and the upstream adds a slow tail after release (200ms before
+// the failure response), so the leader cannot close done before the
+// follower has parked — the hits == 1 assertion proves the join: a follower
+// that missed the entry would have become a second leader and issued a
+// second upstream request.
+func TestFetch_LeaderErrorSharedWithFollower(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		body string
+		want string // recognizable fragment of the real upstream error
+	}{
+		{name: "upstream500", code: http.StatusInternalServerError, body: `boom`, want: "500"},
+		{name: "parseFailure", code: http.StatusOK, body: `not json at all`, want: "decode response"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				select {
+				case <-entered:
+				default:
+					close(entered)
+				}
+				<-release
+				time.Sleep(200 * time.Millisecond) // slow tail: see the comment above
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			mc := &ModelCache{
+				dir:    t.TempDir(),
+				caches: map[string]*providerCache{},
+				cfg: &config.Config{
+					MaxConcurrentPerAccount: map[string]int{"*": 1},
+				},
+				pool: pool.NewPool([]config.AccountConfig{
+					{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+				}),
+				stop: make(chan struct{}),
+			}
+
+			// Leader: registers the in-flight entry and blocks at the
+			// upstream until release.
+			leaderErrCh := make(chan error, 1)
+			go func() { leaderErrCh <- mc.fetchWithContext(context.Background(), "p") }()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("leader never reached the upstream")
+			}
+
+			// Follower: the leader's entry is still registered (it cannot
+			// finish before release), so the follower MUST join it.
+			followerStarted := make(chan struct{})
+			followerErrCh := make(chan error, 1)
+			go func() {
+				close(followerStarted)
+				followerErrCh <- mc.fetchWithContext(context.Background(), "p")
+			}()
+			select {
+			case <-followerStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("follower never started")
+			}
+			close(release)
+
+			var leaderErr, followerErr error
+			select {
+			case leaderErr = <-leaderErrCh:
+			case <-time.After(10 * time.Second):
+				t.Fatal("leader never finished")
+			}
+			select {
+			case followerErr = <-followerErrCh:
+			case <-time.After(10 * time.Second):
+				t.Fatal("follower never finished")
+			}
+
+			// The regression: the follower must fail with the leader's real
+			// error — never nil.
+			if leaderErr == nil {
+				t.Fatal("leader error = nil, want a non-nil upstream failure")
+			}
+			if followerErr == nil {
+				t.Fatalf("follower error = nil, want the shared leader error %v", leaderErr)
+			}
+			if !strings.Contains(leaderErr.Error(), tc.want) {
+				t.Errorf("leader error = %v, want a recognizable upstream error containing %q", leaderErr, tc.want)
+			}
+			if followerErr.Error() != leaderErr.Error() {
+				t.Errorf("follower error = %v, want the leader's identical error %v", followerErr, leaderErr)
+			}
+			if errors.Is(followerErr, ErrFetchAborted) {
+				t.Errorf("follower error = %v, want the real upstream error, not ErrFetchAborted (proxy 502/503 classification depends on it)", followerErr)
+			}
+			// Exactly one upstream request: the follower must have joined,
+			// not become a second leader.
+			if got := atomic.LoadInt32(&hits); got != 1 {
+				t.Errorf("upstream hits = %d, want 1 (follower must join the leader, not refetch)", got)
+			}
+		})
+	}
+}
+
+// TestFetch_FailoverSharedBudget pins the final-review item 2: N accounts
+// that fail slowly in sequence must respect ONE total budget for the whole
+// failover round — never N × budget. The test injects a short fetchBudget
+// (no real 30s wait) and controlled per-attempt upstream delays, then
+// proves the round stops when the shared budget expires mid-attempt:
+// account 1 and 2 each burn a full delay, account 3's attempt is cut by
+// the budget, and the total stays ~one budget instead of three.
+func TestFetch_FailoverSharedBudget(t *testing.T) {
+	const perAttempt = 100 * time.Millisecond // controlled slow failure per account
+	const budget = 280 * time.Millisecond     // one shared round budget (injected)
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		time.Sleep(perAttempt) // consume budget, then fail
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"slow failure"}}`))
+	}))
+	defer srv.Close()
+
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg: &config.Config{
+			MaxConcurrentPerAccount: map[string]int{"*": 1},
+		},
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+			{Name: "a2", Provider: "p", BaseURL: srv.URL, Key: "k"},
+			{Name: "a3", Provider: "p", BaseURL: srv.URL, Key: "k"},
+		}),
+		stop:        make(chan struct{}),
+		fetchBudget: budget,
+	}
+
+	start := time.Now()
+	err := mc.Fetch("p")
+	elapsed := time.Since(start)
+
+	// Every account must have been attempted (the failover really walked
+	// the list) before the shared budget cut the round short. Attempt 3's
+	// request is sent ~200ms in and the budget expires ~80ms later, so the
+	// delivery window is ample.
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Fatalf("upstream hits = %d, want 3 (every account attempted before the budget expired)", got)
+	}
+	// The round must end at ~ONE budget, never N × budget: a per-account
+	// timeout would take >= 3×budget = 840ms, far above the threshold.
+	if elapsed >= 2*budget {
+		t.Errorf("failover took %v, want < %v (one shared budget, not per-account)", elapsed, 2*budget)
+	}
+	// The two full attempts put a real floor under the elapsed time: a
+	// result far below means the accounts were not exercised sequentially
+	// (or the budget fired before any attempt, i.e. the loop was skipped).
+	if elapsed < 2*perAttempt-50*time.Millisecond {
+		t.Errorf("failover took %v, want >= ~%v (sequential attempts consumed real time)", elapsed, 2*perAttempt-50*time.Millisecond)
+	}
+	// The budget firing mid-attempt surfaces as the classified timeout.
+	if err == nil || !strings.Contains(err.Error(), "upstream_timeout") {
+		t.Fatalf("Fetch error = %v, want the shared-budget upstream_timeout", err)
+	}
+	// Every acquired slot is released exactly once.
+	for i, acc := range mc.pool.AllAccounts() {
+		if got := acc.InFlightCount(); got != 0 {
+			t.Errorf("account %d in-flight after fetch = %d, want 0", i, got)
+		}
+	}
+}
+
+// TestRefreshAll_SchedulerInterleave pins item 9: RefreshAll runs as a
+// SYNCHRONOUS manual round through the shared scheduler. While it is in
+// flight, a second RefreshAll is REFUSED (returns immediately — the running
+// manual round already subsumes its work), and a RefreshAllAsync request is
+// coalesced into exactly one pending round that runs when the first
+// finishes.
+func TestRefreshAll_SchedulerInterleave(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		if n == 1 {
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			select {
+			case <-release:
+			case <-done:
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer srv.Close()
+	defer close(done) // runs before srv.Close: unblocks the handler if the test fails early
+
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+		},
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool:   pool.NewPool(cfg.Accounts),
+		stop:   make(chan struct{}),
+	}
+	defer mc.Stop()
+
+	refreshAllDone := make(chan struct{})
+	go func() {
+		mc.RefreshAll()
+		close(refreshAllDone)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RefreshAll round never reached the upstream")
+	}
+
+	// A second synchronous RefreshAll while a round is live must be refused
+	// immediately (the running manual round subsumes it).
+	refusedStart := time.Now()
+	mc.RefreshAll()
+	if elapsed := time.Since(refusedStart); elapsed > time.Second {
+		t.Errorf("second RefreshAll took %v, want immediate refusal while a round is in flight", elapsed)
+	}
+
+	// An Async request during the round is coalesced into one pending round.
+	onDoneCh := make(chan struct{}, 1)
+	mc.RefreshAllAsync(func() { onDoneCh <- struct{}{} })
+
+	close(release)
+	select {
+	case <-refreshAllDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("first RefreshAll round never completed")
+	}
+	// The pending async round runs exactly once more (hits == 2), then the
+	// onDone callback fires.
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt32(&hits) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("pending async round never ran (hits = %d)", atomic.LoadInt32(&hits))
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	select {
+	case <-onDoneCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pending round's onDone never fired")
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("upstream hits = %d, want 2 (manual round + one coalesced pending round)", got)
+	}
+}
+
+// TestRefreshAll_StopCancels pins item 9's Stop semantics: an in-flight
+// synchronous RefreshAll is aborted by Stop (the shared lifecycle context
+// is cancelled) and both RefreshAll and Stop return — no deadlock, no cache
+// file published after shutdown began.
+func TestRefreshAll_StopCancels(t *testing.T) {
+	entered := make(chan struct{})
+	blockForever := make(chan struct{})
+	done := make(chan struct{})
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		select {
+		case <-blockForever:
+		case <-done:
+			return
+		}
+	}))
+	defer srv.Close()
+	defer close(done) // runs before srv.Close: unblocks the handler if the test fails early
+
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
+		},
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool:   pool.NewPool(cfg.Accounts),
+		stop:   make(chan struct{}),
+	}
+
+	refreshAllDone := make(chan struct{})
+	go func() {
+		mc.RefreshAll()
+		close(refreshAllDone)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RefreshAll round never reached the upstream")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		mc.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-refreshAllDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RefreshAll did not return after Stop cancelled the round")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return after the round exited")
+	}
+	// The cancelled round must not have published a cache file.
+	if _, err := os.Stat(mc.filePath("p")); err == nil {
+		t.Error("cache file published after Stop cancelled the round")
+	}
+}
+
+// TestFetch_ConnErrorNoURLLeak pins item 10 for the cache path: a
+// connection error (url.Error) must never leak the upstream URL — including
+// a base URL that embeds credentials — or any query text into the returned
+// error (which runRefresh / RefreshAll / proxyModels log verbatim). Only the
+// safe classification survives.
+func TestFetch_ConnErrorNoURLLeak(t *testing.T) {
+	// Grab a port, then close the listener so the fetch hits "connection
+	// refused" with a real *url.Error.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadURL := "http://user:sekrit-query-value@" + ln.Addr().String()
+	ln.Close()
+
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    &config.Config{MaxConcurrentPerAccount: map[string]int{"*": 1}},
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: deadURL, Key: "k"},
+		}),
+		stop: make(chan struct{}),
+	}
+
+	err = mc.Fetch("p")
+	if err == nil {
+		t.Fatal("Fetch over a refused connection must return an error")
+	}
+	msg := err.Error()
+	for _, leak := range []string{deadURL, ln.Addr().String(), "sekrit-query-value", "user@"} {
+		if strings.Contains(msg, leak) {
+			t.Errorf("fetch error leaks %q: %v", leak, msg)
+		}
+	}
+	if !strings.Contains(msg, "upstream_refused") {
+		t.Errorf("fetch error = %q, want the safe upstream_refused classification", msg)
 	}
 }

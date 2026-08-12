@@ -704,3 +704,163 @@ func TestEmitAudit_RealKeyIDNotOverridden(t *testing.T) {
 		t.Fatalf("event key_id = %q, want ci-bot (real key name must win over the default)", evs[0].KeyID)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Round-3 audit: StatusCapture implicit-200 recording (item 8)
+// ---------------------------------------------------------------------------
+
+// TestStatusCapture_WriteRecordsImplicit200: a handler that only writes the
+// body (no explicit WriteHeader) must record 200 BEFORE the write, exactly
+// like net/http's implicit WriteHeader(200) semantics.
+func TestStatusCapture_WriteRecordsImplicit200(t *testing.T) {
+	inner := httptest.NewRecorder()
+	sc := &StatusCapture{ResponseWriter: inner}
+
+	if sc.Code != 0 {
+		t.Fatalf("Code before any write = %d, want 0", sc.Code)
+	}
+	n, err := sc.Write([]byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Errorf("written = %d, want 5", n)
+	}
+	if sc.Code != http.StatusOK {
+		t.Errorf("Code after implicit write = %d, want 200", sc.Code)
+	}
+	if inner.Code != http.StatusOK {
+		t.Errorf("inner recorder code = %d, want 200", inner.Code)
+	}
+	if inner.Body.String() != "hello" {
+		t.Errorf("body = %q, want hello", inner.Body.String())
+	}
+}
+
+// TestStatusCapture_ExplicitStatusNotOverwritten: an explicit WriteHeader
+// (including a non-2xx) must never be overwritten by a later Write.
+func TestStatusCapture_ExplicitStatusNotOverwritten(t *testing.T) {
+	inner := httptest.NewRecorder()
+	sc := &StatusCapture{ResponseWriter: inner}
+
+	sc.WriteHeader(http.StatusBadGateway)
+	if sc.Code != http.StatusBadGateway {
+		t.Fatalf("Code after WriteHeader = %d, want 502", sc.Code)
+	}
+	_, _ = sc.Write([]byte("boom"))
+	if sc.Code != http.StatusBadGateway {
+		t.Errorf("Code after write = %d, want 502 (explicit status must win)", sc.Code)
+	}
+	if inner.Code != http.StatusBadGateway {
+		t.Errorf("inner recorder code = %d, want 502", inner.Code)
+	}
+}
+
+// TestStatusCapture_FirstStatusWins: the first recorded status — implicit or
+// explicit — wins; a later WriteHeader is forwarded but never overwrites the
+// captured code.
+func TestStatusCapture_FirstStatusWins(t *testing.T) {
+	inner := httptest.NewRecorder()
+	sc := &StatusCapture{ResponseWriter: inner}
+
+	_, _ = sc.Write([]byte("a")) // implicit 200
+	sc.WriteHeader(http.StatusCreated)
+	if sc.Code != http.StatusOK {
+		t.Errorf("Code = %d, want 200 (implicit 200 recorded first)", sc.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Final-review: StatusCapture Flush / Unwrap / ResponseController compat
+// ---------------------------------------------------------------------------
+
+// flushCountingRecorder is an httptest.ResponseRecorder that also counts
+// Flush calls, standing in for a real streaming ResponseWriter.
+type flushCountingRecorder struct {
+	*httptest.ResponseRecorder
+	flushes int
+}
+
+func (f *flushCountingRecorder) Flush() { f.flushes++ }
+
+// TestStatusCapture_FlushForwards: Flush must be transparently forwarded to
+// an inner writer implementing http.Flusher — SSE streaming depends on it
+// (without the explicit Flush method the promoted interface does not expose
+// it to type-assertion callers).
+func TestStatusCapture_FlushForwards(t *testing.T) {
+	inner := &flushCountingRecorder{ResponseRecorder: httptest.NewRecorder()}
+	sc := &StatusCapture{ResponseWriter: inner}
+
+	// Compile-time assertion: StatusCapture must implement http.Flusher
+	// (the whole point of the explicit method — interface promotion alone
+	// would not expose it to type-assertion callers).
+	var _ http.Flusher = sc
+	fl := http.Flusher(sc)
+	fl.Flush()
+	fl.Flush()
+	if inner.flushes != 2 {
+		t.Errorf("inner flushes = %d, want 2 (Flush must reach the inner writer)", inner.flushes)
+	}
+}
+
+// nonFlusherWriter is a bare ResponseWriter WITHOUT Flush — it models an
+// inner writer that does not support streaming.
+type nonFlusherWriter struct {
+	code int
+}
+
+func (w *nonFlusherWriter) Header() http.Header         { return http.Header{} }
+func (w *nonFlusherWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (w *nonFlusherWriter) WriteHeader(code int)        { w.code = code }
+
+// TestStatusCapture_FlushWithoutFlusher: Flush on an inner writer that does
+// NOT implement http.Flusher must be a safe no-op (no panic, no nil
+// dereference).
+func TestStatusCapture_FlushWithoutFlusher(t *testing.T) {
+	inner := &nonFlusherWriter{}
+	sc := &StatusCapture{ResponseWriter: inner}
+
+	var _ http.Flusher = sc // must still implement http.Flusher even when the inner writer does not
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("Flush panicked on a non-flusher inner writer: %v", r)
+		}
+	}()
+	sc.Flush() // must not panic
+}
+
+// TestStatusCapture_Unwrap: Unwrap must return the inner ResponseWriter so
+// controller-style wrappers (http.NewResponseController) can reach the
+// original writer.
+func TestStatusCapture_Unwrap(t *testing.T) {
+	inner := httptest.NewRecorder()
+	sc := &StatusCapture{ResponseWriter: inner}
+
+	if sc.Unwrap() != inner {
+		t.Errorf("Unwrap() = %v, want the inner recorder", sc.Unwrap())
+	}
+}
+
+// TestStatusCapture_ResponseController: http.NewResponseController must
+// resolve Flush through StatusCapture's Unwrap chain (Go 1.20+ ResponseWriter
+// unwrapping) so standard-library streaming helpers keep working.
+func TestStatusCapture_ResponseController(t *testing.T) {
+	inner := &flushCountingRecorder{ResponseRecorder: httptest.NewRecorder()}
+	sc := &StatusCapture{ResponseWriter: inner}
+
+	ctrl := http.NewResponseController(sc)
+	if err := ctrl.Flush(); err != nil {
+		t.Errorf("ResponseController.Flush through StatusCapture: %v", err)
+	}
+	if inner.flushes != 1 {
+		t.Errorf("inner flushes = %d, want 1 (controller must reach the flusher via Unwrap)", inner.flushes)
+	}
+
+	// The controller must correctly resolve an unsupported capability
+	// through the wrapper chain (the inner recorder is not a Hijacker):
+	// the error must be the not-supported error, not a panic or a nil
+	// success.
+	if _, _, err := http.NewResponseController(sc).Hijack(); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Errorf("ResponseController.Hijack = %v, want a not-supported error (resolved through Unwrap)", err)
+	}
+}

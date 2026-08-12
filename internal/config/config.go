@@ -709,9 +709,11 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	if !equalStringSlices(oldCfg.TrustedProxies, newCfg.TrustedProxies) {
 		warnings = append(warnings, "trusted_proxies changed: restart required to take effect")
 	}
-	if oldCfg.Debug != newCfg.Debug {
-		warnings = append(warnings, "debug changed: restart required to take effect")
-	}
+	// debug IS hot-reloadable: the SIGHUP flow in cmd/prism re-applies it
+	// by setting util.DebugMode directly from the reloaded config — this
+	// ReloadConfig never touches util.DebugMode itself, and LogLevelHook
+	// (the logger level only) is unrelated to debug, so a debug change
+	// takes effect immediately — no restart warning is emitted.
 	// The usage store + recorder are built once at startup; db_path (which
 	// database file) and enabled (whether recording is on at all) cannot be
 	// hot-reloaded. Other usage fields are tuning knobs that also only apply

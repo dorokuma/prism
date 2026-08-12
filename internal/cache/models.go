@@ -32,6 +32,14 @@ var ErrNoHealthyAccount = errors.New("no healthy account for provider")
 // model_fetch_saturated on the /v1/models cache-miss path.
 var ErrFetchSaturated = errors.New("model cache fetch saturated")
 
+// ErrFetchAborted is returned to same-provider followers when the in-flight
+// leader fetch exits abnormally (panic / goroutine exit) before publishing a
+// result. It is deliberately generic: the abnormal-exit value is never
+// propagated to followers, because it may embed credentials or internal
+// state. The abnormal exit itself is NOT recovered — it keeps unwinding up
+// the leader's stack; fetchWithContext only guarantees the cleanup.
+var ErrFetchAborted = errors.New("model fetch leader aborted")
+
 // ModelCache manages per-provider model list caches persisted to disk.
 type ModelCache struct {
 	dir    string
@@ -89,28 +97,45 @@ type ModelCache struct {
 	// chownFile preserves uid/gid on the models.json temp file before the
 	// atomic rename. It is a field so tests can inject a deterministic
 	// failure (a non-root process gets EPERM) instead of depending on the
-	// test runner's privileges. nil means os.Chown.
+	// test runner's privileges. nil means os.Chown. A chown failure ABORTS
+	// the sync with an error: renaming would silently change the deployed
+	// file's owner, and there is deliberately no in-place fallback (a
+	// non-atomic overwrite could leave a half-written file on a crash and
+	// would hide the ownership misconfiguration instead of surfacing it).
 	chownFile func(name string, uid, gid int) error
-
-	// inPlaceWrite/inPlaceTruncate/inPlaceClose are test seams for the
-	// in-place fallback (writeInPlace): nil means the os.File method.
-	// Tests inject deterministic failures (e.g. fail the first write after
-	// a successful open) to verify the old content is restored on every
-	// failure step. The restore path (restoreInPlace) deliberately never
-	// goes through the seams.
-	inPlaceWrite    func(f *os.File, p []byte) (int, error)
-	inPlaceTruncate func(f *os.File, size int64) error
-	inPlaceClose    func(f *os.File) error
 
 	// toolsMu serializes SyncTools callers (the onDone/onRefresh callbacks
 	// wired in cmd/prism). Combined with the atomic temp-file+chmod+
 	// close+rename write in syncPIModelsJSON this guarantees two SyncTools
 	// calls can never interleave writes into a corrupt models.json, even if
-	// a future caller skips the scheduler entirely. It is also what makes
-	// the owner-preservation fallback safe: when chown fails,
-	// syncPIModelsJSON degrades to an in-place overwrite of the original
-	// file, which is only sound with a single writer at a time.
+	// a future caller skips the scheduler entirely.
 	toolsMu sync.Mutex
+
+	// fetchMu guards the per-provider inflight fetch map (fetches). It is
+	// held only for map registration/lookup/removal, NEVER across the wait
+	// for a shared fetch: followers park on the leader's done channel
+	// outside the lock, so a slow upstream can never serialize different
+	// providers (or the cache lock) behind the merge.
+	fetchMu sync.Mutex
+
+	// fetches tracks the in-flight upstream model fetch per provider (see
+	// fetchWithContext): at most one leader per provider, all concurrent
+	// same-provider callers share its result. Lazily initialized on first
+	// use (tests construct ModelCache literals without New).
+	fetches map[string]*inflightFetch
+
+	// fetchLeaderHook is a test-only injection point called at the top of
+	// fetchLeader, before any upstream work. Tests use it to force an
+	// abnormal leader exit (panic) so the inflight-entry cleanup in
+	// fetchWithContext can be pinned deterministically; nil means no hook
+	// (production).
+	fetchLeaderHook func()
+
+	// fetchBudget overrides the ONE total failover timeout applied to a
+	// whole provider fetch round (see fetchLeader). 0 means the production
+	// default of 30s. Tests inject a short budget to pin the shared-budget
+	// failover behavior without real 30-second waits.
+	fetchBudget time.Duration
 
 	// loopWG tracks the StartRefreshLoop goroutine: Stop waits for it, so
 	// no ticker goroutine outlives Stop. Add happens under refreshMu (and
@@ -346,39 +371,207 @@ func (mc *ModelCache) Fetch(provider string) error {
 }
 
 // fetchWithContext is Fetch with a cancellable context. It snapshots mc.cfg
-// once (no race with UpdateConfig) and releases the acquired concurrency
-// slot through the pool (mc.pool.Release, not the bare account.Release): the
-// pool wakeup is what lets a provider waiter parked in SelectByProvider
-// proceed with the freed slot — releasing the slot without the wakeup would
-// strand waiters until some business request happened to release the same
-// account.
-func (mc *ModelCache) fetchWithContext(ctx context.Context, provider string) error {
-	cfg := mc.snapshotConfig()
+// once (no race with UpdateConfig) and merges concurrent same-provider
+// fetches: at most one leader per provider performs the upstream round, and
+// every concurrent caller for the same provider — /v1/models cache misses,
+// background refresh rounds, manual RefreshAll — shares the leader's result
+// or error instead of issuing its own upstream call (see inflightFetch).
+// Different providers always run in parallel: the merge lock is never held
+// across the wait.
+//
+// The leader's upstream round is fetchLeader: multi-account failover across
+// all healthy, non-cooldown accounts of the provider, sharing ONE 30-second
+// total context budget. Every concurrency slot acquired by the round is
+// released exactly once through the pool (mc.pool.Release, never the bare
+// account.Release): the pool wakeup is what lets a provider waiter parked in
+// SelectByProvider proceed with the freed slot — releasing the slot without
+// the wakeup would strand waiters until some business request happened to
+// release the same account.
+func (mc *ModelCache) fetchWithContext(ctx context.Context, provider string) (err error) {
+	// Join an in-flight same-provider fetch when one exists. A follower
+	// waits on the leader's done channel OUTSIDE fetchMu (the lock never
+	// spans the wait) and can cancel its OWN context independently: a
+	// follower cancellation returns immediately and never cancels the
+	// leader, which only observes its own context.
+	mc.fetchMu.Lock()
+	if f, ok := mc.fetches[provider]; ok {
+		mc.fetchMu.Unlock()
+		select {
+		case <-f.done:
+			return f.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if mc.fetches == nil {
+		mc.fetches = make(map[string]*inflightFetch)
+	}
+	f := &inflightFetch{done: make(chan struct{})}
+	mc.fetches[provider] = f
+	mc.fetchMu.Unlock()
 
-	// Find the first healthy account for this provider
-	account := mc.selectAccount(provider)
-	if account == nil {
+	// Leader lifecycle state machine (deferred, so it runs on EVERY exit
+	// path — the normal return AND panic/Goexit unwinding): remove the map
+	// entry, publish the final error, and close(done). A leader that dies
+	// abnormally must never leave followers parked on done forever (their
+	// own context may be Background, so they would wait forever) or leave a
+	// dead entry that makes the next same-provider Fetch join a fetch that
+	// will never finish. On the abnormal path the published error is a fixed
+	// safe sentinel (ErrFetchAborted): the panic value is deliberately NOT
+	// captured, logged or propagated to followers — it may embed
+	// credentials or internal state. The abnormal exit itself is NOT
+	// swallowed: this is cleanup only, the panic/Goexit keeps unwinding up
+	// the leader's stack.
+	//
+	// The published error is the leader's FINAL outcome on EVERY path:
+	// normal success publishes nil, a normal failure publishes the real
+	// upstream error UNMODIFIED (never ErrFetchAborted — the proxy
+	// classifies 502/503 from it), a context-cancelled leader publishes
+	// ctx.Err, and only an abnormal exit is replaced by ErrFetchAborted.
+	// f.err is written BEFORE close(done), so every follower that receives
+	// from done observes the final value — never a zero-value nil after a
+	// failed leader (a nil follower error would make the proxy answer 200
+	// with an empty model list).
+	//
+	// The entry is removed under fetchMu BEFORE close(done): a caller
+	// arriving after the removal starts its own round (correct — no fetch
+	// is live), while a caller registered before it still receives the
+	// result. The in-memory cache is already updated by fetchLeader before
+	// it returns, so followers unblocked by close(done) observe the fresh
+	// cache.
+	normalExit := false
+	defer func() {
+		mc.fetchMu.Lock()
+		delete(mc.fetches, provider)
+		mc.fetchMu.Unlock()
+		if !normalExit {
+			slog.Error("model cache fetch leader exited abnormally; in-flight fetch entry cleaned up", "provider", provider)
+			err = fmt.Errorf("%w: provider %q", ErrFetchAborted, provider)
+		}
+		// Publish the leader's final outcome on every exit path (normal
+		// success, normal failure, context cancel, abnormal exit) before
+		// close(done), so a follower that receives from done always reads
+		// the final error.
+		f.err = err
+		close(f.done)
+	}()
+
+	err = mc.fetchLeader(ctx, provider)
+	normalExit = true
+	return err
+}
+
+// inflightFetch tracks one in-flight upstream model fetch for a single
+// provider. The leader performs the upstream work and publishes the outcome
+// by closing done (err is written before the close, so every follower that
+// receives from done observes the final value).
+type inflightFetch struct {
+	done chan struct{}
+	err  error
+}
+
+// fetchLeader runs the upstream model fetch for one provider with
+// multi-account failover:
+//   - candidates are every healthy, non-cooldown account of the provider, in
+//     pool order;
+//   - each candidate is TryAcquire'd at config.ResolveFetchConcurrency
+//     (wildcard "*" if configured, otherwise the smallest positive per-model
+//     value, otherwise the built-in default) — a saturated candidate is
+//     skipped and the next candidate is tried;
+//   - network / 5xx / auth / parse failures also move to the next candidate;
+//   - no healthy candidate → ErrNoHealthyAccount;
+//   - EVERY candidate saturated (none could be acquired, at least one
+//     healthy candidate exists) → ErrFetchSaturated;
+//   - otherwise (at least one account WAS acquired and every attempt
+//     failed) the last attempt's error is returned — NEVER ErrFetchSaturated:
+//     a fetch that actually reached an upstream and failed (network / 5xx /
+//     parse / write) must surface that failure (proxy maps it to 502
+//     model_fetch_failed), not a misleading "saturated" that would make the
+//     client think the provider is merely busy.
+//
+// The whole failover shares ONE total context budget (30s by default,
+// overridable via mc.fetchBudget for tests): the timeout wraps the attempt
+// loop, so N accounts never multiply into N×30s — the budget spent by an
+// earlier account is simply unavailable to later accounts. Every successful
+// Acquire is released exactly once via mc.pool.Release; the release is
+// deferred so a panic inside fetchFromAccount can never leak the concurrency
+// slot (deferred calls run during panic unwinding).
+func (mc *ModelCache) fetchLeader(ctx context.Context, provider string) error {
+	if mc.fetchLeaderHook != nil {
+		mc.fetchLeaderHook()
+	}
+	cfg := mc.snapshotConfig()
+	accounts := mc.selectAccounts(provider)
+	if len(accounts) == 0 {
 		return fmt.Errorf("%w %q", ErrNoHealthyAccount, provider)
 	}
-	// Model fetches count against the same per-account concurrency limit as
-	// business requests: the fetch holds one slot for its whole duration
-	// (including the ollama /api/show fan-out). Because a Fetch is not tied
-	// to a single business model, the cap comes from
-	// config.ResolveFetchConcurrency (wildcard "*" if configured, otherwise
-	// the smallest positive per-model value, otherwise the built-in default)
-	// rather than an exact model match. When the account is at its
-	// concurrency cap the fetch fails fast instead of parking on the
-	// 30-second request timeout.
-	maxConcurrent := config.ResolveFetchConcurrency(cfg)
-	if !account.TryAcquire(maxConcurrent) {
-		return fmt.Errorf("%w: provider %q account %s saturated (%d in flight)", ErrFetchSaturated, provider, account.Name(), account.InFlightCount())
-	}
-	defer mc.pool.Release(account)
 
+	// The budget is created ONCE for the whole failover loop and shared by
+	// every account attempt (never one timeout per account). 0 means the
+	// default 30s; tests inject a short budget via mc.fetchBudget.
+	budget := mc.fetchBudget
+	if budget <= 0 {
+		budget = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	maxConcurrent := config.ResolveFetchConcurrency(cfg)
+	var lastErr error      // last real attempt error (acquire succeeded, fetch failed)
+	var saturatedErr error // last saturated-candidate error (only returned when NOTHING was acquired)
+	acquired := false
+	for _, account := range accounts {
+		if !account.TryAcquire(maxConcurrent) {
+			saturatedErr = fmt.Errorf("%w: provider %q account %s saturated (%d in flight)", ErrFetchSaturated, provider, account.Name(), account.InFlightCount())
+			continue
+		}
+		acquired = true
+		err := func() error {
+			// Deferred release: covers every normal error path AND a panic
+			// inside fetchFromAccount (defer runs during unwinding), so a
+			// concurrency slot can never leak out of the fetch round.
+			defer mc.pool.Release(account)
+			return mc.fetchFromAccount(ctx, account, provider, cfg)
+		}()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			// Cancelled (Stop / shared budget exhausted): failover must not
+			// continue — the budget is spent or shutdown began.
+			return err
+		}
+	}
+	if !acquired {
+		if saturatedErr != nil {
+			return saturatedErr
+		}
+		return fmt.Errorf("%w %q", ErrNoHealthyAccount, provider)
+	}
+	return lastErr
+}
+
+// fetchFromAccount performs the complete upstream round for ONE account:
+// GET /v1/models with account headers and credential, redacted non-200
+// handling, bounded success read, parse, the ollama /api/show metadata
+// fan-out, and the atomic cache write (temp file + rename; a cancelled
+// fetch never publishes a cache file and never leaves temp litter). It
+// returns an error on any failure so the failover loop (fetchLeader) can
+// try the next account. The caller owns the concurrency slot lifecycle
+// (TryAcquire before, defer mc.pool.Release after — the deferred release
+// also covers a panic inside this function).
+//
+// Transport errors are returned SAFE for logging: the raw *url.Error is
+// never included because it embeds the full upstream URL — query parameters
+// and any credentials in the base URL — which must not reach logs or
+// client-visible error text; only a short classification (upstream_timeout /
+// upstream_refused / ...) is kept (util.ClassifyConnError).
+func (mc *ModelCache) fetchFromAccount(ctx context.Context, account *pool.Account, provider string, cfg *config.Config) error {
 	url := util.JoinURLPath(account.BaseURL(), "/v1/models")
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create request failed: %s", util.ClassifyConnError(err))
 	}
 	// Header semantics identical to doUpstreamRequest: account-level headers
 	// (Set, override same-named defaults) → account credential (Bearer, or
@@ -392,13 +585,9 @@ func (mc *ModelCache) fetchWithContext(ctx context.Context, provider string) err
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
 	resp, err := account.Client().Do(req)
 	if err != nil {
-		return fmt.Errorf("request: %w", err)
+		return fmt.Errorf("request failed: %s", util.ClassifyConnError(err))
 	}
 	defer resp.Body.Close()
 
@@ -536,19 +725,33 @@ func (mc *ModelCache) RefreshStale() {
 }
 
 // RefreshAll fetches model lists for all providers, ignoring cache state.
-// It runs synchronously on the caller's goroutine; the SIGHUP path must use
-// RefreshAllAsync instead so the signal loop never blocks.
+// It runs SYNCHRONOUSLY on the caller's goroutine through the same
+// scheduler as every other background refresh — it must never bypass it:
+// the round is tracked in the refresh WaitGroup, runs on the shared
+// cancellable lifecycle context (Stop aborts it and waits for it), and is
+// refused (returns immediately) while another round is in flight or once
+// Stop has begun, so it can never refresh a provider concurrently with
+// another round. The SIGHUP path must use RefreshAllAsync instead so the
+// signal loop never blocks.
 func (mc *ModelCache) RefreshAll() {
-	cfg := mc.snapshotConfig()
-	for _, acc := range cfg.Accounts {
-		provider := acc.Provider
-		if provider == "" {
-			continue
-		}
-		if err := mc.Fetch(provider); err != nil {
-			slog.Warn("refresh all failed", "provider", provider, "error", err)
-		}
+	mc.refreshMu.Lock()
+	if mc.stopped || mc.refreshing {
+		mc.refreshMu.Unlock()
+		return
 	}
+	mc.refreshing = true
+	mc.pending = false
+	mc.pendingKind = roundManual
+	mc.pendingOnDone = nil
+	ctx := mc.ensureLifecycleLocked()
+	// Add under refreshMu: Stop takes refreshMu before Wait, so the counter
+	// is guaranteed to be >= 1 by the time Stop waits.
+	mc.refreshWG.Add(1)
+	mc.refreshMu.Unlock()
+	// Run the round synchronously. refreshing stays true for the whole
+	// pass, so a concurrent RefreshAllAsync/FetchAllAsync queues pending
+	// and is handed over to exactly one more round when this one finishes.
+	mc.runRefresh(ctx, roundManual, nil)
 }
 
 // RefreshAllAsync triggers a controlled background refresh of every provider
@@ -811,15 +1014,18 @@ func (mc *ModelCache) UpdateConfig(cfg *config.Config) {
 	mc.cfg = cfg
 }
 
-// selectAccount finds any healthy account for the given provider.
-// Must not hold mc.mu when calling (calls pool methods).
-func (mc *ModelCache) selectAccount(provider string) *pool.Account {
+// selectAccounts returns every healthy, non-cooldown account for the given
+// provider, in pool order. The full candidate set drives the multi-account
+// failover in fetchLeader. Must not hold mc.mu when calling (calls pool
+// methods).
+func (mc *ModelCache) selectAccounts(provider string) []*pool.Account {
+	var out []*pool.Account
 	for _, acc := range mc.pool.AllAccounts() {
 		if acc.Provider() == provider && acc.IsHealthy() && !acc.IsInCooldown() {
-			return acc
+			out = append(out, acc)
 		}
 	}
-	return nil
+	return out
 }
 
 // SyncTools writes model configuration to each tool's config file
@@ -1013,15 +1219,17 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 	// config). To keep that working we preserve the previous file's mode
 	// and its uid/gid via Chown on the temp file. If the Chown fails (EPERM
 	// with NoNewPrivileges and an empty CapabilityBoundingSet when the
-	// process is not root — or any other error) we must NEVER rename: the
-	// replacement would silently change the file's owner. Instead we fall
-	// back to an in-place controlled overwrite of the ORIGINAL file
-	// (O_WRONLY|O_TRUNC, inode/owner/group/mode preserved by the
-	// filesystem), guarded by toolsMu (held by SyncTools, so no concurrent
-	// writer can interleave), and loudly Warn about the degradation. An
-	// in-place write failure is returned as an error. When the file does
-	// not exist yet there is no owner to preserve: the normal atomic rename
-	// path applies.
+	// process is not root — or any other error) the sync ABORTS with an
+	// error: the rename must NEVER proceed (the replacement would silently
+	// change the file's owner), and there is deliberately no in-place
+	// fallback — a non-atomic overwrite could publish a half-written file
+	// on a crash, and a silently degraded sync would hide the ownership
+	// misconfiguration instead of surfacing it. The old file, its inode and
+	// its content stay untouched, and the temp file is removed. When the
+	// file does not exist yet there is no owner to preserve: the normal
+	// atomic rename path applies (install-time models.json should be owned
+	// by the service user, or prism must be allowed to preserve the
+	// existing owner — see README).
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -1047,9 +1255,9 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 	}
 	if preserveOwner {
 		if err := mc.preserveOwnerOnTemp(tmpName, uid, gid); err != nil {
-			abort(nil)
-			slog.Warn("could not preserve models.json owner, falling back to in-place overwrite", "path", path, "error", err)
-			return mc.writeInPlace(path, data)
+			// Abort, never fall back: see the ownership comment above. The
+			// old file/inode/content stay untouched; abort removes the temp.
+			return abort(fmt.Errorf("preserve models.json owner (uid/gid %d/%d): %w", uid, gid, err))
 		}
 	}
 	if err := tmp.Chmod(mode); err != nil {
@@ -1070,121 +1278,13 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 
 // preserveOwnerOnTemp applies the original file's uid/gid to the temp file
 // before the atomic rename. The injected chownFile (tests) is used when set;
-// otherwise os.Chown. A failure means the rename must NOT proceed — the
-// caller falls back to an in-place overwrite.
+// otherwise os.Chown. A failure ABORTS the sync (see syncPIModelsJSON): the
+// rename must NOT proceed.
 func (mc *ModelCache) preserveOwnerOnTemp(name string, uid, gid int) error {
 	if mc.chownFile != nil {
 		return mc.chownFile(name, uid, gid)
 	}
 	return os.Chown(name, uid, gid)
-}
-
-// writeInPlace overwrites path in place with data (O_WRONLY, NO O_TRUNC:
-// truncation happens only after the full write), which keeps the existing
-// inode: owner, group and mode are preserved by the filesystem. It is the
-// degraded fallback used only when the temp-file owner preservation failed
-// (see syncPIModelsJSON); callers must hold toolsMu (SyncTools does) so no
-// concurrent writer can interleave — this path is intentionally NOT atomic
-// against concurrent readers.
-//
-// Every step after the open is failure-atomic: the complete old content is
-// read BEFORE the file is touched, and a failure of the write, the
-// truncate or the close restores the old bytes via restoreInPlace (the
-// file is never left empty or half-written). The returned error combines
-// the original failure with the restore outcome. Only a fully written,
-// truncated and closed file counts as success.
-func (mc *ModelCache) writeInPlace(path string, data []byte) error {
-	// Capture the old content while the file is still intact: every failure
-	// path below restores these exact bytes.
-	old, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read models.json for in-place write: %w", err)
-	}
-
-	// No O_TRUNC: the file is never exposed empty or truncated; the old
-	// content stays in place until the new data has fully overwritten it.
-	f, err := os.OpenFile(path, os.O_WRONLY, 0)
-	if err != nil {
-		return fmt.Errorf("open models.json for in-place write: %w", err)
-	}
-
-	// fail restores the old content and returns the combined error: the
-	// original failure plus the restore outcome if the restore itself
-	// failed (e.g. disk full — the file may then be partially restored).
-	fail := func(cause error) error {
-		if rerr := mc.restoreInPlace(f, path, old); rerr != nil {
-			return fmt.Errorf("%v (restore failed: %w)", cause, rerr)
-		}
-		return cause
-	}
-
-	write := func(f *os.File, p []byte) (int, error) {
-		if mc.inPlaceWrite != nil {
-			return mc.inPlaceWrite(f, p)
-		}
-		return f.Write(p)
-	}
-	truncate := func(f *os.File, size int64) error {
-		if mc.inPlaceTruncate != nil {
-			return mc.inPlaceTruncate(f, size)
-		}
-		return f.Truncate(size)
-	}
-	closeFile := func(f *os.File) error {
-		if mc.inPlaceClose != nil {
-			return mc.inPlaceClose(f)
-		}
-		return f.Close()
-	}
-
-	for off := 0; off < len(data); {
-		n, werr := write(f, data[off:])
-		off += n
-		if werr != nil {
-			return fail(fmt.Errorf("in-place write models.json: %w", werr))
-		}
-	}
-	// Truncate to the new length: without O_TRUNC a shorter new file would
-	// keep stale trailing bytes from the old content.
-	if terr := truncate(f, int64(len(data))); terr != nil {
-		return fail(fmt.Errorf("truncate models.json after in-place write: %w", terr))
-	}
-	if cerr := closeFile(f); cerr != nil {
-		return fail(fmt.Errorf("close models.json after in-place write: %w", cerr))
-	}
-	return nil
-}
-
-// restoreInPlace rewrites path's previous content after a failed in-place
-// overwrite. It closes the (possibly broken) failed fd and reopens the file
-// fresh, writes the old bytes fully, truncates to the old length and closes
-// — the file (same inode, so owner/group/mode survive) holds exactly the
-// old content again. It deliberately uses the real os.File operations, not
-// the injected inPlace* seams: the restore must be reliable even when the
-// injected failures are unconditional. A restore failure (e.g. disk full)
-// is returned so the caller can surface the combined error.
-func (mc *ModelCache) restoreInPlace(f *os.File, path string, old []byte) error {
-	f.Close() // best effort: the fd may be unusable after the failed step
-	rf, err := os.OpenFile(path, os.O_WRONLY, 0)
-	if err != nil {
-		return fmt.Errorf("reopen for restore: %w", err)
-	}
-	for off := 0; off < len(old); {
-		n, werr := rf.Write(old[off:])
-		off += n
-		if werr != nil {
-			rf.Close()
-			return fmt.Errorf("rewrite old content: %w", werr)
-		}
-	}
-	if err := rf.Truncate(int64(len(old))); err != nil {
-		rf.Close()
-		return fmt.Errorf("truncate after restore: %w", err)
-	}
-	if err := rf.Close(); err != nil {
-		return fmt.Errorf("close after restore: %w", err)
-	}
-	return nil
 }
 
 // rootURL strips the trailing "/v1" (and any trailing slash) from a base URL
@@ -1240,7 +1340,9 @@ func (mc *ModelCache) fetchOllamaShow(ctx context.Context, acc *pool.Account, id
 	url := rootURL(acc.BaseURL()) + "/api/show"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return ModelMeta{}, fmt.Errorf("create show request: %w", err)
+		// Safe classification: the raw error may embed the URL (parse
+		// errors) and must never reach logs.
+		return ModelMeta{}, fmt.Errorf("create show request failed: %s", util.ClassifyConnError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// Account-level headers + credential, same semantics as doUpstreamRequest:
@@ -1252,7 +1354,9 @@ func (mc *ModelCache) fetchOllamaShow(ctx context.Context, acc *pool.Account, id
 
 	resp, err := acc.Client().Do(req)
 	if err != nil {
-		return ModelMeta{}, fmt.Errorf("show request: %w", err)
+		// Safe classification: the raw *url.Error embeds the full upstream
+		// URL (query parameters, credentials) and must never reach logs.
+		return ModelMeta{}, fmt.Errorf("show request failed: %s", util.ClassifyConnError(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

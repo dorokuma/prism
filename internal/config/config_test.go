@@ -751,6 +751,60 @@ func SetProviderSchemaForTest(c *Config, schema map[string]string) {
 	c.providerSchema = schema
 }
 
+// TestReloadConfig_DebugChangedNoWarning pins item 5: debug is
+// hot-reloadable (the SIGHUP main flow re-applies it via util.DebugMode;
+// LogLevelHook only adjusts the logger level), so a debug change must NOT
+// emit the old "restart required" warning.
+func TestReloadConfig_DebugChangedNoWarning(t *testing.T) {
+	content1 := `
+debug: false
+accounts:
+  - name: acc1
+    key: key1
+    base_url: https://api1.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	content2 := `
+debug: true
+accounts:
+  - name: acc1
+    key: key1
+    base_url: https://api1.example.com
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	for _, w := range warnings {
+		if strings.Contains(w, "debug") {
+			t.Errorf("unexpected debug restart warning after hot-reloadable change: %q", w)
+		}
+	}
+	// The new value is live in the holder.
+	if got := holder.Load().Debug; !got {
+		t.Error("Debug = false after reload, want true (hot-reloadable)")
+	}
+}
+
 func TestLookupModelMetadata_FallbackToDefault(t *testing.T) {
 	cfg := &Config{
 		ModelMetadata: ModelMetadataMap{

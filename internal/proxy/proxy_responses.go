@@ -16,7 +16,7 @@ import (
 func proxyResponses(p *pool.Pool, w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 	start := time.Now()
 	defer r.Body.Close()
-	bodyBytes, ok := readRequestBody(w, r, "responses")
+	bodyBytes, ok := readRequestBody(w, r, start, "responses")
 	if !ok {
 		return
 	}
@@ -33,19 +33,21 @@ func proxyResponses(p *pool.Pool, w http.ResponseWriter, r *http.Request, cfg *c
 	util.DumpDebugChatBody(chatBody)
 	if err != nil {
 		slog.Error("responses convert error", "error", err)
-		// Rejection logging: classify known rejection reasons.
+		// Rejection logging + audit: classify known rejection reasons. The
+		// audit (exactly one request.complete line — the forwarding path is
+		// never reached) carries the real model, the HTTP status, the reason
+		// as error_type and the request id.
 		errStr := err.Error()
-		if strings.Contains(errStr, "image") ||
-			strings.Contains(errStr, "previous_response_id") ||
-			strings.Contains(errStr, "not supported") {
-			reason := "unsupported_input"
-			if strings.Contains(errStr, "image") {
-				reason = "multimodal_input"
-			} else if strings.Contains(errStr, "previous_response_id") {
-				reason = "previous_response_id"
-			}
-			slog.Warn("request_rejected", "req", requestID, "reason", reason, "model", virtualModel)
+		reason := "invalid_request"
+		if strings.Contains(errStr, "image") {
+			reason = "multimodal_input"
+		} else if strings.Contains(errStr, "previous_response_id") {
+			reason = "previous_response_id"
+		} else if strings.Contains(errStr, "not supported") {
+			reason = "unsupported_input"
 		}
+		slog.Warn("request_rejected", "req", requestID, "reason", reason, "model", virtualModel)
+		rejectAudit(r, start, http.StatusBadRequest, reason, virtualModel, errStr)
 		errBody, marshalErr := json.Marshal(map[string]any{
 			"error": map[string]any{"message": err.Error(), "code": "invalid_request"},
 		})

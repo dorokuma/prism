@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
@@ -318,6 +320,43 @@ func TestProxyModels_FetchSaturated503(t *testing.T) {
 	}
 }
 
+// TestProxyModels_FetchAcquiredThenSaturated502 pins the final-review
+// classification end-to-end: account A is acquired and its upstream fetch
+// fails (500), account B is saturated. The mixed failure must answer 502
+// model_fetch_failed (the fetch really reached an upstream and failed) —
+// NOT 503 model_fetch_saturated, which is reserved for the case where no
+// account could be acquired at all.
+func TestProxyModels_FetchAcquiredThenSaturated502(t *testing.T) {
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`boom`))
+	}))
+	defer srv1.Close()
+
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "p", BaseURL: srv1.URL, Key: "k"},
+			{Name: "a2", Provider: "p", BaseURL: "http://127.0.0.1:1", Key: "k"},
+		},
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	p := pool.NewPool(cfg.Accounts)
+	// Occupy a2's single slot so only a1 can be acquired (and then fails).
+	if !p.AllAccounts()[1].TryAcquire(1) {
+		t.Fatal("test setup: TryAcquire failed")
+	}
+	defer p.AllAccounts()[1].Release()
+	mc := emptyCacheMC(t, p, cfg)
+
+	status, code := getModelsError(t, mc, cfg)
+	if status != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (acquired-then-failed must not be saturated)", status)
+	}
+	if code != "model_fetch_failed" {
+		t.Errorf("error code = %q, want model_fetch_failed", code)
+	}
+}
+
 // TestProxyModels_FetchUpstreamError502: a cache miss whose upstream fetch
 // fails (5xx here) must answer 502 model_fetch_failed.
 func TestProxyModels_FetchUpstreamError502(t *testing.T) {
@@ -419,5 +458,106 @@ func TestProxyModels_FetchSucceedsOnMiss(t *testing.T) {
 	}
 	if len(resp.Data) != 1 || resp.Data[0]["id"] != "m1" {
 		t.Errorf("data = %v, want [m1]", resp.Data)
+	}
+}
+
+// TestProxyModels_FetchFailureConcurrentMissNo200Empty pins the final-review
+// must-fix end-to-end: two concurrent /v1/models cache misses for the same
+// provider collapse into ONE leader fetch (the second request joins the
+// in-flight entry). When the upstream fails (500 here), BOTH requests must
+// answer 502 model_fetch_failed — never 200 with data=[] (a client would
+// cache "no models" forever). Before the fix the leader's normal failure
+// was never published to followers, so the joined request read a nil error
+// and answered 200 with an empty list.
+//
+// Determinism: the leader request is provably blocked at the upstream
+// (entered) while the second request starts, so the in-flight entry is
+// still registered and the second request MUST join it. Release happens
+// only after the second request is launched, and the upstream adds a slow
+// tail after release (200ms before the 500), so the leader cannot finish
+// before the follower has parked — the hits == 1 assertion proves the join.
+func TestProxyModels_FetchFailureConcurrentMissNo200Empty(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var hits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+		time.Sleep(200 * time.Millisecond) // slow tail: see the comment above
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`boom`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "a1", Provider: "p", BaseURL: upstream.URL, Key: "k"}}}
+	p := pool.NewPool(cfg.Accounts)
+	mc := emptyCacheMC(t, p, cfg)
+
+	type result struct {
+		status int
+		code   string
+		body   string
+	}
+	doRequest := func() result {
+		r := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		r.Header.Set("X-Prism-Provider", "p")
+		w := httptest.NewRecorder()
+		proxyModels(mc, w, r, cfg)
+		return result{status: w.Code, code: decodeErrorCode(t, w.Body.String()), body: w.Body.String()}
+	}
+
+	// First request (leader): provably blocked at the upstream.
+	firstCh := make(chan result, 1)
+	go func() { firstCh <- doRequest() }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader request never reached the upstream")
+	}
+
+	// Second request: the cache is still empty and the leader's in-flight
+	// entry is registered, so it MUST join and share the leader's failure.
+	secondStarted := make(chan struct{})
+	secondCh := make(chan result, 1)
+	go func() {
+		close(secondStarted)
+		secondCh <- doRequest()
+	}()
+	select {
+	case <-secondStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second request never started")
+	}
+	close(release)
+
+	var r1, r2 result
+	select {
+	case r1 = <-firstCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("first request never completed")
+	}
+	select {
+	case r2 = <-secondCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("second request never completed")
+	}
+
+	if r1.status != http.StatusBadGateway || r1.code != "model_fetch_failed" {
+		t.Errorf("leader response = %d code %q, want 502 model_fetch_failed", r1.status, r1.code)
+	}
+	// The regression: the follower request must NOT answer 200 data=[] — a
+	// cache-miss fetch failure must never look like a successful empty list.
+	if r2.status != http.StatusBadGateway || r2.code != "model_fetch_failed" {
+		t.Errorf("follower response = %d code %q body %q, want 502 model_fetch_failed (never 200 with an empty list)", r2.status, r2.code, r2.body)
+	}
+	// Exactly one upstream request: the second request must have joined the
+	// leader, not issued its own fetch.
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("upstream hits = %d, want 1 (the second request must join the leader, not refetch)", got)
 	}
 }

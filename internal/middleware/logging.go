@@ -351,6 +351,18 @@ func (s *StatusCapture) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// Write implements http.ResponseWriter and records the implicit 200 status
+// BEFORE the first write when no explicit WriteHeader happened (item 8). An
+// explicit status written earlier is never overwritten: the first recorded
+// code wins, mirroring net/http's "first WriteHeader (or implicit 200)
+// wins" contract.
+func (s *StatusCapture) Write(b []byte) (int, error) {
+	if s.Code == 0 {
+		s.Code = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
+}
+
 // Flush implements http.Flusher by forwarding to the inner ResponseWriter
 // when it also implements http.Flusher.  Without this explicit method the
 // embedded interface promotion does not expose Flush to type-assertion

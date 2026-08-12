@@ -52,6 +52,15 @@ var sensitiveClientHeaders = map[string]bool{
 	http.CanonicalHeaderKey("X-Auth-Token"): true,
 }
 
+// spoofableClientHeaders are client-supplied forwarding headers that must
+// NEVER reach the upstream: a downstream gateway or the upstream itself
+// would trust them (or echo them back), letting a client fake its origin IP
+// or routing. Normal business headers still pass through.
+var spoofableClientHeaders = map[string]bool{
+	http.CanonicalHeaderKey("Forwarded"): true,
+	http.CanonicalHeaderKey("X-Real-IP"): true,
+}
+
 func isHopByHop(key string) bool {
 	return hopByHopHeaders[http.CanonicalHeaderKey(key)]
 }
@@ -248,28 +257,6 @@ func handleUpstreamError(acc *pool.Account, resp *http.Response, requestID strin
 	slog.Warn("upstream temporary error, cooling down", append(baseAttrs, "cooldown", cd.String(), "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{acc.Key()})), "error_type", errorType)...)
 }
 
-// upstreamErrorType classifies an upstream connection error into a short category
-// string for structured logging and future metrics/audit.
-func upstreamErrorType(err error) string {
-	if err == nil {
-		return ""
-	}
-	s := err.Error()
-	if strings.Contains(s, "context deadline exceeded") {
-		return "upstream_timeout"
-	}
-	if strings.Contains(s, "connection refused") {
-		return "upstream_refused"
-	}
-	if strings.Contains(s, "EOF") {
-		return "upstream_refused"
-	}
-	if strings.Contains(s, "context canceled") {
-		return "client_disconnect"
-	}
-	return "upstream_refused"
-}
-
 // upstreamContext creates a context for upstream requests.
 // For streaming requests, it applies a wide streamMaxDuration timeout on top of
 // r.Context() so that long-lived inference connections propagate client
@@ -295,6 +282,12 @@ func copyClientHeaders(dst http.Header, src http.Header) {
 			continue
 		}
 		if sensitiveClientHeaders[ck] {
+			continue
+		}
+		// Forwarded / X-Forwarded-* / X-Real-IP are client-spoofable
+		// forwarding headers: dropping them (item 7) keeps the upstream from
+		// trusting a client-supplied origin IP or route.
+		if spoofableClientHeaders[ck] || strings.HasPrefix(ck, "X-Forwarded-") {
 			continue
 		}
 		for _, v := range vs {
@@ -352,7 +345,9 @@ func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opt
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		cancel()
-		slog.Error("failed to create upstream request", "req", requestID, "model", opts.Model, "account", acc.Name(), "error", err)
+		// Safe fields only: the raw error may embed the target URL (parse
+		// errors) and must never reach logs.
+		slog.Error("failed to create upstream request", "req", requestID, "model", opts.Model, "account", acc.Name(), "error_type", "invalid_upstream_url")
 		util.RecordUpstreamRetry()
 		return doUpstreamResult{retry: true}
 	}
@@ -380,7 +375,15 @@ func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opt
 			return doUpstreamResult{retry: false, fatalErr: fmt.Errorf("client disconnected: %w", r.Context().Err())}
 		}
 		acc.SetCooldown(upstreamCooldown)
-		slog.Warn("chat retry, upstream connection error", "req", requestID, "model", opts.Model, "account", acc.Name(), "error", err, "error_type", upstreamErrorType(err))
+		// Safe fields only (item 10): the raw *url.Error embeds the full
+		// upstream URL — including the query string (?key=secret) and any
+		// credentials in the base URL — and must never reach logs. The
+		// classification is the single shared one (util.ClassifyConnError):
+		// the same strings (upstream_timeout / upstream_refused /
+		// client_disconnect / upstream_error) are used by the model cache
+		// fetch, the probe and the startup check, so the log taxonomy cannot
+		// diverge between surfaces.
+		slog.Warn("chat retry, upstream connection error", "req", requestID, "model", opts.Model, "account", acc.Name(), "error_type", util.ClassifyConnError(err))
 		util.RecordUpstreamRetry()
 		return doUpstreamResult{retry: true}
 	}
@@ -476,7 +479,7 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 			if a := middleware.AuditFromCtx(r.Context()); a != nil {
 				a.Status = http.StatusOK
 				a.Account = acc.Name()
-				a.ErrorType = upstreamErrorType(err)
+				a.ErrorType = util.ClassifyConnError(err)
 				a.Error = err.Error()
 			}
 			return true, err
@@ -512,7 +515,7 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 			slog.Warn("responses_json body read error", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			if a := middleware.AuditFromCtx(r.Context()); a != nil {
 				a.Account = acc.Name()
-				a.ErrorType = upstreamErrorType(err)
+				a.ErrorType = util.ClassifyConnError(err)
 				a.Error = err.Error()
 			}
 			return true, err
@@ -572,7 +575,7 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 			if a := middleware.AuditFromCtx(r.Context()); a != nil {
 				a.Status = resp.StatusCode
 				a.Account = acc.Name()
-				a.ErrorType = upstreamErrorType(err)
+				a.ErrorType = util.ClassifyConnError(err)
 				a.Error = err.Error()
 			}
 			return true, err
@@ -614,7 +617,7 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 		if a := middleware.AuditFromCtx(r.Context()); a != nil {
 			a.Status = resp.StatusCode
 			a.Account = acc.Name()
-			a.ErrorType = upstreamErrorType(err)
+			a.ErrorType = util.ClassifyConnError(err)
 			a.Error = err.Error()
 		}
 		return true, err

@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.14.1  Date: 2026-08-12  Status: living document
+> Version: v0.15.0  Date: 2026-08-12  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -45,11 +45,13 @@ Hyphens in the account name become underscores in the credential/env name.
 
 ```bash
 cd /path/to/prism
-HEALTH_URL=http://127.0.0.1:18790/health ./deploy.sh   # HEALTH_URL 可覆盖，默认即此值
+./deploy.sh   # HEALTH_URL / HEALTH_TIMEOUT 可覆盖，默认即下值
 ```
 
 `deploy.sh` 编译 → 原子替换二进制 → `systemctl restart prism` → 健康验证 → 失败自动回退。
-健康检查地址默认 `http://127.0.0.1:18790/health`，可用环境变量 `HEALTH_URL` 覆盖（如非默认端口或远程探测）。
+
+- `HEALTH_URL`：健康检查地址，默认 `http://127.0.0.1:18790/health`（可用环境变量覆盖，如非默认端口或远程探测）。
+- `HEALTH_TIMEOUT`：健康等待窗口（秒），默认 `35`，必须为正整数（非法值在任何副作用发生前 `exit 3`，prism 不受影响）。restart 后每 1 秒轮询 `systemctl is-active` + `HEALTH_URL`，成功立即继续，窗口耗尽才回退；回退后的健康验证使用同一轮询。默认值覆盖 prism 启动时的首轮账号探测窗口（单账号最长 `ProbeTimeout=30s`，HTTP server 在该探测完成后才开始监听）。
 
 手动部署：
 
@@ -61,6 +63,35 @@ install -m 755 prism /usr/local/bin/prism
 systemctl restart prism   # only when you intend downtime / reload
 # or: systemctl kill -s HUP prism   # if process supports SIGHUP for partial reload
 ```
+
+### Tool config sync (`models.json`) ownership
+
+`prism` rewrites pi's `~/.pi/agent/models.json` after every model refresh
+(startup fill, 24h stale refresh, SIGHUP). The write is atomic (temp file +
+rename) and preserves the deployed file's mode and owner/group via `chown`
+on the temp file. Two consequences for installation:
+
+- `models.json` should be owned by the prism service user (or its group,
+  with group-write permissions), OR prism must be allowed to preserve the
+  existing owner (the process needs root / `CAP_CHOWN` for that).
+- If the owner cannot be preserved — e.g. `EPERM` under `NoNewPrivileges`
+  with an empty `CapabilityBoundingSet` — the sync ABORTS with an error:
+  it never renames a differently-owned file over the deployed one and
+  never falls back to a non-atomic in-place overwrite. The old file stays
+  byte-for-byte intact (same inode, owner, mode) and the failure is
+  visible in the logs, so the ownership misconfiguration is surfaced
+  instead of silently degrading.
+
+`prism setup` normalizes an existing tool config at install time: owner →
+the `prism` service user, group → `pi-sync` when that group exists
+(otherwise kept), mode → at least `0664` (missing bits added, none
+removed). A file that does not exist yet is left alone — the first sync
+creates it as the prism process (temp file + rename), so its owner is the
+service user by construction. Setup grants no capability anywhere (the
+unit's `CapabilityBoundingSet` stays empty — `CAP_CHOWN` is deliberately
+never granted; see `scripts/prism.service.example`). If the normalization
+cannot be applied (e.g. the `prism` user is missing, or `chown` is
+denied), setup fails with an explicit error.
 
 ## Configuration
 
@@ -154,6 +185,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-12** — v0.15.0 — audit round 3: 10 reliability/security fixes. Model cache fetch: multi-account failover across all healthy non-cooldown accounts (saturated → next account; network/5xx/auth/parse failure → next account; one shared 30s budget for the whole failover, never N×30s; all accounts unhealthy → `ErrNoHealthyAccount`, all saturated → `ErrFetchSaturated`, otherwise the last safe error; every acquired slot released exactly once via the pool). Same-provider fetches are merged: a hand-written per-provider inflight map keeps at most one leader per provider (all Fetch/refresh/cache-miss callers share the leader's result/error; a follower can cancel its own context without cancelling the leader; different providers stay parallel; the merge lock never spans the wait). `RefreshAll` no longer bypasses the scheduler: it runs as a synchronous manual round (refused while another round is in flight or after Stop, cancellable and waited by Stop). `/v1/models` fetch connection errors and `api/show` errors are classified (`upstream_timeout`/`upstream_refused`/…) instead of embedding the raw `*url.Error` (which carries the full URL + query); startup checks, probe-loop logs and upstream chat connection logs likewise log only `error_type` and safe fields — a `?key=secret` URL can never reach a log. `setup`'s generated systemd unit now matches `scripts/prism.service.example` security hardening (NoNewPrivileges, ProtectKernelTunables/Modules/ControlGroups, LockPersonality, RestrictSUIDSGID/Namespaces, SystemCallArchitectures, AmbientCapabilities, RestrictAddressFamilies, TimeoutStopSec, KillMode, ReadOnlyPaths) and `ReadWritePaths` covers the real model cache dir, the usage.db parent dir and tool config dirs (relative paths resolved against WorkingDirectory, `Clean`ed, deduplicated; example synced; pure-function tests + `systemd-analyze verify` of the generated text). `SyncTools` aborts with an error when the temp-file chown cannot preserve the existing uid/gid — the old in-place fallback is gone, the deployed file stays byte-for-byte intact and no temp litter remains. `ReloadConfig` no longer warns that `debug` needs a restart (it is hot-reloadable). `/v1/responses` early rejections (body read / conversion) now emit exactly one `request.complete` audit with the correct status/error_type/model/request_id — shared `readRequestBody` audits for all three POST surfaces, and the success path still audits exactly once. `copyClientHeaders` drops `Forwarded`, all `X-Forwarded-*` and `X-Real-IP` (client-spoofable forwarding headers) while normal business headers still pass through. `StatusCapture` implements `Write`: an implicit write records 200 before the first byte, an explicit status is never overwritten.
 
 - **2026-08-12** — v0.14.1 — audit round 2: 10 reliability/security fixes. Model cache: `Fetch` releases its concurrency slot through the pool (`mc.pool.Release`), so a completed fetch wakes a parked provider waiter (previously waiters could strand until an unrelated request freed the account); `/v1/models` and ollama `/api/show` SUCCESS responses are now read with the same bounded helper as chat responses (`max_upstream_response_bytes`, default 32 MiB, invalid caps never degrade to an unbounded read — helper moved to `internal/util` so cache and proxy share it without an import cycle); SIGHUP no longer blocks the signal loop on `RefreshAll`/`SyncTools` — a controlled background refresh (reentry-coalesced, internal cancellable context, `Stop()` aborts an in-flight refresh and waits for it, no cache file written after cancellation, config snapshotted to avoid races with `UpdateConfig`) runs the refresh + tools sync; `/v1/models` cache-miss fetch failures are classified instead of returning 200 empty lists — no healthy account → 503 `no_healthy`, saturated → 503 `model_fetch_saturated`, other upstream/parse/size errors → 502 `model_fetch_failed`. Upstream error handling: every 401/402/429/4xx/5xx log and audit error body (runtime, startup probe, probe loop) is redacted with `RedactBodyBytesWithKeys(..., acc.Key())`, closing the leak for account keys that are not `sk-`/Bearer shaped (custom `auth_header`). Request bodies: `/v1/chat/completions`, `/v1/responses`, `/v1/messages` bodies over 10 MiB return HTTP 413 `request_too_large` (JSON envelope), other read errors return HTTP 400 `invalid_request` — one shared helper instead of three divergent paths. Auth: the Bearer scheme is matched case-insensitively (`bearer`/`BEARER`/`BeArEr`) across `Authenticate`, `CheckAuth` and the usage admin auth, while the token bytes stay strictly compared (bare tokens and wrong tokens still rejected). Anthropic SSE wire-format detection parses the `data:` JSON `type` field (whitespace- and field-order-insensitive) instead of matching the exact byte string `"type":"message_start"`. `deploy.sh` health-check URL is now overridable via the `HEALTH_URL` environment variable (default unchanged). All round-1 guarantees kept: empty-token keys, fail-closed admin auth, cross-provider waiters, XFF multi-hop, 256 MiB cap, select error codes, cost clamping, bucket cap, 405.
 

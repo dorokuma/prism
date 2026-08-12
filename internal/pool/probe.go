@@ -132,7 +132,10 @@ func ProbeExhausted(pool *Pool) {
 						return true
 					}
 					if err != nil {
-						slog.Warn("probe request failed", "account", acc.Name(), "attempt", attempt, "max_attempts", maxProbeAttempts, "error", err)
+						// Safe fields only: the raw *url.Error embeds the probe
+						// URL (query parameters, credentials) and must never
+						// reach logs.
+						slog.Warn("probe request failed", "account", acc.Name(), "attempt", attempt, "max_attempts", maxProbeAttempts, "error_type", util.ClassifyConnError(err))
 						return false
 					}
 

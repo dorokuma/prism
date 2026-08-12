@@ -315,7 +315,9 @@ func main() {
 				return
 			}
 			if err != nil {
-				slog.Warn("startup check request failed", "account", a.Name(), "error", err)
+				// Safe fields only: the raw *url.Error embeds the probe URL
+				// (query parameters, credentials) and must never reach logs.
+				slog.Warn("startup check request failed", "account", a.Name(), "error_type", util.ClassifyConnError(err))
 				a.SetCooldown(5 * time.Minute)
 				return
 			}

@@ -47,6 +47,28 @@ type ChatForwardOpts struct {
 // buffered whole into memory.
 const maxRequestBodyBytes = 10 << 20
 
+// rejectAudit emits exactly ONE request.complete audit line for a request
+// rejected BEFORE the forwarding path (body read / conversion / validation
+// failures). It is the single early-rejection audit path shared by
+// proxyChat / proxyResponses / proxyMessages (via readRequestBody and the
+// responses conversion failure), so every surface records the same fields:
+// status, error_type, model (empty when the body could not be parsed) and
+// request_id. The forwarding path (proxyChatWithBody) emits its own audit in
+// a defer, so a request is audited exactly once — never zero, never twice.
+func rejectAudit(r *http.Request, start time.Time, status int, errorType, model, errMsg string) {
+	middleware.EmitAudit(&middleware.RequestAudit{
+		Req:        util.RequestIDFromCtx(r.Context()),
+		Method:     r.Method,
+		Path:       r.URL.Path,
+		Model:      model,
+		Status:     status,
+		Error:      errMsg,
+		ErrorType:  errorType,
+		Success:    false,
+		DurationMs: float64(time.Since(start).Milliseconds()),
+	})
+}
+
 // readRequestBody reads and validates the client request body. It is the
 // single implementation shared by proxyChat / proxyResponses / proxyMessages:
 //   - body over maxRequestBodyBytes → HTTP 413, Content-Type
@@ -55,9 +77,14 @@ const maxRequestBodyBytes = 10 << 20
 //   - any other read error → HTTP 400, Content-Type application/json,
 //     error.code invalid_request.
 //
-// On error it writes the JSON envelope and returns (nil, false); on success
-// it returns (body, true).
-func readRequestBody(w http.ResponseWriter, r *http.Request, what string) ([]byte, bool) {
+// On error it writes the JSON envelope, emits the request.complete audit for
+// the early rejection (exactly one, via rejectAudit) and returns (nil,
+// false); on success it returns (body, true) WITHOUT auditing — the
+// forwarding path owns the audit then. start is the request's real start
+// time (captured by the caller before the read): the rejection audit must
+// report the true duration (a slow body read is part of the request), not a
+// time.Now() taken at rejection time, which would always be ~0.
+func readRequestBody(w http.ResponseWriter, r *http.Request, start time.Time, what string) ([]byte, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -67,12 +94,14 @@ func readRequestBody(w http.ResponseWriter, r *http.Request, what string) ([]byt
 			util.WriteJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
 				"error": map[string]any{"message": "request body too large", "code": "request_too_large"},
 			})
+			rejectAudit(r, start, http.StatusRequestEntityTooLarge, "request_too_large", "", err.Error())
 			return nil, false
 		}
 		slog.Error(what+" body read error", "error", err)
 		util.WriteJSON(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]any{"message": "failed to read body", "code": "invalid_request"},
 		})
+		rejectAudit(r, start, http.StatusBadRequest, "invalid_request", "", err.Error())
 		return nil, false
 	}
 	return body, true
@@ -81,7 +110,7 @@ func readRequestBody(w http.ResponseWriter, r *http.Request, what string) ([]byt
 func proxyChat(p *pool.Pool, w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 	start := time.Now()
 	defer r.Body.Close()
-	bodyBytes, ok := readRequestBody(w, r, "chat")
+	bodyBytes, ok := readRequestBody(w, r, start, "chat")
 	if !ok {
 		return
 	}
