@@ -59,6 +59,13 @@ type responsesStreamTranslator struct {
 	// tool_search interception
 	searchToolCache []map[string]any
 	pendingSearchID string
+	// wroteAny records whether at least one SSE event has been successfully
+	// written to the client. It lets the failure paths distinguish a
+	// mid-stream failure (an event was already delivered; the protocol
+	// failure event response.failed must follow) from a pre-first-event
+	// failure (nothing was written yet; the caller can still return a real
+	// HTTP error instead of committing an empty 200).
+	wroteAny bool
 }
 
 func newResponsesStreamTranslator(model string, searchToolCache []map[string]any) *responsesStreamTranslator {
@@ -80,6 +87,9 @@ func (tr *responsesStreamTranslator) emit(w io.Writer, payload map[string]any) e
 		return err
 	}
 	_, err = fmt.Fprintf(w, "data: %s\n\n", b)
+	if err == nil {
+		tr.wroteAny = true
+	}
 	return err
 }
 

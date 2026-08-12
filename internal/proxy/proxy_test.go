@@ -402,8 +402,14 @@ func TestUpstream401Retry(t *testing.T) {
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
-	if rec.Code != 503 {
-		t.Errorf("expected status 503, got %d", rec.Code)
+	// Item 6: an all-accounts 401 exhaustion must NOT masquerade as a
+	// generic 503 — the gateway's own upstream credential is broken, so the
+	// terminal response is 502 upstream_auth_failed.
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected status 502 (upstream auth failure), got %d", rec.Code)
+	}
+	if code := decodeErrorCode(t, rec.Body.String()); code != "upstream_auth_failed" {
+		t.Errorf("error code = %q, want upstream_auth_failed", code)
 	}
 	accs := p.AllAccounts()
 	if accs[0].Status() != pool.StatusExhausted {

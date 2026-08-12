@@ -2,7 +2,10 @@ package convert
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
+
+	"github.com/dorokuma/prism/internal/sanitize"
 )
 
 func TestResponsesToChatCompletions(t *testing.T) {
@@ -476,5 +479,57 @@ func TestChatCompletionToResponse_CachedClampedToPrompt(t *testing.T) {
 	}
 	if miss := usage["prompt_cache_miss_tokens"]; miss != float64(0) {
 		t.Errorf("prompt_cache_miss_tokens = %v, want 0 (derived miss must not go negative)", miss)
+	}
+}
+
+// TestResponsesToChat_PreservesStreamOptions pins item 3 at the conversion
+// layer: the client's stream_options object survives the responses → chat
+// conversion field-for-field (the include_usage enforcement itself happens
+// in the proxy forwarding path).
+func TestResponsesToChat_PreservesStreamOptions(t *testing.T) {
+	body := []byte(`{"model":"m","input":"hi","stream":true,"stream_options":{"include_usage":false,"custom":"kept","n":3}}`)
+	chat, stream, _, err := ResponsesToChatCompletions(body, "tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stream {
+		t.Fatal("expected stream=true")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(chat, &m); err != nil {
+		t.Fatal(err)
+	}
+	so, ok := m["stream_options"].(map[string]any)
+	if !ok {
+		t.Fatalf("converted body lost stream_options: %s", chat)
+	}
+	if so["include_usage"] != false {
+		t.Errorf("include_usage = %v, want false (client value must survive conversion verbatim)", so["include_usage"])
+	}
+	if so["custom"] != "kept" || so["n"] != float64(3) {
+		t.Errorf("client stream_options fields lost: %v", so)
+	}
+}
+
+// TestResponsesToChat_DeepToolSchemaFails pins item 5 through the conversion
+// chain: a tool parameter schema deeper than the limit makes the whole
+// responses conversion fail with ErrSchemaTooDeep SURFACED THROUGH THE
+// CHAIN (convert → mcp sanitize → sanitize.SimplifyJSONSchemaLimited, still
+// errors.Is-matching — the proxy maps it to 400 invalid_request) — never a
+// silently accepted unsafe schema.
+func TestResponsesToChat_DeepToolSchemaFails(t *testing.T) {
+	deep := map[string]any{"type": "object"}
+	cur := deep
+	for i := 0; i < 64; i++ {
+		nested := map[string]any{"type": "object"}
+		cur["properties"] = map[string]any{"nested": nested}
+		cur = nested
+	}
+	paramsJSON, _ := json.Marshal(deep)
+	body := []byte(`{"model":"m","input":"hi","tools":[{"type":"function","name":"f","parameters":` + string(paramsJSON) + `}]}`)
+	if _, _, _, err := ResponsesToChatCompletions(body, "tenant"); err == nil {
+		t.Fatal("a too-deep tool schema must fail the conversion")
+	} else if !errors.Is(err, sanitize.ErrSchemaTooDeep) {
+		t.Fatalf("the conversion error must wrap ErrSchemaTooDeep (errors.Is chain), got: %v", err)
 	}
 }

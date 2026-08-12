@@ -466,21 +466,30 @@ data: [DONE]
 }
 
 func TestTranslateStream_EmptyInput(t *testing.T) {
+	// An empty upstream stream must NOT commit an empty 200: the translator
+	// returns ErrEmptyUpstreamStream WITHOUT writing any event, so the HTTP
+	// layer can still answer a real 502 (pre-first-event failure, item 8).
 	rec := httptest.NewRecorder()
 	err := TranslateChatStreamToResponses(rec, strings.NewReader(""), "gpt-5.5", nil, nil, context.Background())
 	if err != ErrEmptyUpstreamStream {
 		t.Fatalf("expected ErrEmptyUpstreamStream, got %v", err)
 	}
 
-	events := parseSSE(t, rec.Body.String())
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events (created + failed), got %d", len(events))
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected NO events to be written for an empty stream (the caller must return 502), got: %s", rec.Body.String())
 	}
-	if events[0].Type != "response.created" {
-		t.Fatalf("event[0].type = %q, want response.created", events[0].Type)
+}
+
+func TestTranslateStream_EmptyInputNoEventsWritten(t *testing.T) {
+	// Same guarantee for a stream that contains only non-data lines (nothing
+	// parseable): no event may be written before the error return.
+	rec := httptest.NewRecorder()
+	err := TranslateChatStreamToResponses(rec, strings.NewReader("ping\n\n: keep-alive\n\n"), "gpt-5.5", nil, nil, context.Background())
+	if err != ErrEmptyUpstreamStream {
+		t.Fatalf("expected ErrEmptyUpstreamStream, got %v", err)
 	}
-	if events[1].Type != "response.failed" {
-		t.Fatalf("event[1].type = %q, want response.failed", events[1].Type)
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected NO events to be written, got: %s", rec.Body.String())
 	}
 }
 

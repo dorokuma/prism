@@ -41,11 +41,19 @@ func LoadMCPTools(path string) {
 				fnObj["description"] = t.Description
 			}
 			if len(t.Parameters) > 0 {
-				fnObj["parameters"] = sanitize.SimplifyJSONSchema(t.Parameters)
+				// Depth-bounded schema simplification (mcp_tools.json is
+				// admin-provided, but a pathological file must fail this tool
+				// loudly — never cache the unsafe original).
+				params, err := sanitize.SimplifyJSONSchemaLimited(t.Parameters, sanitize.MaxJSONSchemaDepth)
+				if err != nil {
+					slog.Warn("mcp_inject tool schema too deep, skipping tool", "tool", ns.Namespace+"__"+t.Name, "error", err)
+					continue
+				}
+				fnObj["parameters"] = params
 			} else {
 				fnObj["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
 			}
-			cacheMCPTool("default", map[string]any{
+			cacheAdminTool(map[string]any{
 				"type":     "function",
 				"function": fnObj,
 			})

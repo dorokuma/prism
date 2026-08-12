@@ -82,10 +82,17 @@ type RequestAudit struct {
 	TokensOut   int     // completion/output tokens produced
 	Concurrency int     // in-flight count on the selected account at select time
 
-	Provider         string  `json:"provider,omitempty"`           // upstream provider name
-	KeyID            string  `json:"key_id,omitempty"`             // authenticated API key NAME (never the token)
-	Stream           bool    `json:"stream,omitempty"`             // streaming request
-	Success          bool    `json:"success,omitempty"`            // request completed without error
+	Provider string `json:"provider,omitempty"` // upstream provider name
+	KeyID    string `json:"key_id,omitempty"`   // authenticated API key NAME (never the token)
+	Stream   bool   `json:"stream,omitempty"`   // streaming request
+	Success  bool   `json:"success,omitempty"`  // request completed without error
+	// UpstreamModel is the model name actually sent to the upstream after
+	// model_remap resolution. It is set ONLY when remap changed the model
+	// (empty otherwise — remap disabled, or the model is not remapped), so
+	// an audit line without it carries the requested model in Model. The
+	// cost pricer prices the upstream model first, with a fallback to the
+	// requested model (see the wiring-stage Price).
+	UpstreamModel    string  `json:"upstream_model,omitempty"`     // resolved upstream model after model remap
 	PromptTokens     int     `json:"prompt_tokens,omitempty"`      // prompt/input tokens (v2 alias of TokensIn)
 	CompletionTokens int     `json:"completion_tokens,omitempty"`  // completion/output tokens (v2 alias of TokensOut)
 	TotalTokens      int     `json:"total_tokens,omitempty"`       // prompt + completion
@@ -115,7 +122,16 @@ func AuditFromCtx(ctx context.Context) *RequestAudit {
 // legacy TokensIn/TokensOut aliases in sync with the v2 fields. It is the
 // single fill point used by every capture path (non-streaming, streaming,
 // OpenAI form, Anthropic form) so the legacy and v2 fields cannot diverge.
+//
+// The gate accepts any usage carrying at least one non-zero token count —
+// including a usage with ONLY cache tokens (cache-only hits still consume
+// upstream quota and cost money). A fully zero usage (the parsers return
+// zero Usage for unparseable/empty payloads) is ignored: applying it would
+// clobber previously captured counts with zeros.
 func (a *RequestAudit) ApplyUsage(u usagemeta.Usage) {
+	if !u.HasTokens() {
+		return
+	}
 	a.TokensIn = u.Prompt
 	a.TokensOut = u.Completion
 	a.PromptTokens = u.Prompt
@@ -250,6 +266,7 @@ func EmitAudit(a *RequestAudit) {
 		"method", a.Method,
 		"path", a.Path,
 		"model", a.Model,
+		"upstream_model", a.UpstreamModel,
 		"account", a.Account,
 		"status", a.Status,
 		"duration_ms", a.DurationMs,
@@ -345,22 +362,47 @@ type StatusCapture struct {
 }
 
 func (s *StatusCapture) WriteHeader(code int) {
-	if s.Code == 0 {
-		s.Code = code
+	if s.Code != 0 {
+		// net/http semantics: only the FIRST WriteHeader (or implicit 200
+		// via the first Write) takes effect. Later calls are no-ops and must
+		// NOT be forwarded to the underlying writer — forwarding could
+		// overwrite an already-committed status on wrapped writers (e.g. a
+		// test recorder) and diverges from the standard library contract.
+		return
 	}
+	s.Code = code
 	s.ResponseWriter.WriteHeader(code)
 }
 
-// Write implements http.ResponseWriter and records the implicit 200 status
-// BEFORE the first write when no explicit WriteHeader happened (item 8). An
-// explicit status written earlier is never overwritten: the first recorded
-// code wins, mirroring net/http's "first WriteHeader (or implicit 200)
-// wins" contract.
+// StatusCommitter reports whether the response status has been committed
+// (headers written via WriteHeader, or an implicit status from a
+// successful/partial Write). Committed() == false means nothing reached the
+// client yet, so the handler may still choose a real error status (e.g. a
+// structured 502) instead of being locked into an empty 200. Handlers that
+// need to know the commit state must depend on this stable interface — not
+// on the concrete *StatusCapture type.
+type StatusCommitter interface {
+	Committed() bool
+}
+
+// Committed reports whether the status has been committed (see
+// StatusCommitter).
+func (s *StatusCapture) Committed() bool { return s.Code != 0 }
+
+// Write implements http.ResponseWriter and records the implicit 200 ONLY
+// when the underlying write actually commits bytes (n > 0). A first write
+// that fails with 0 bytes leaves the status uncommitted (Code == 0), so the
+// caller can still answer a real error status (e.g. 502) instead of being
+// locked into an empty 200 — a partial write (n > 0 with an error) IS
+// committed, mirroring net/http: once the first byte/header reached the
+// wire the status can never be changed. An explicit status written earlier
+// is never overwritten: the first recorded code wins.
 func (s *StatusCapture) Write(b []byte) (int, error) {
-	if s.Code == 0 {
+	n, err := s.ResponseWriter.Write(b)
+	if s.Code == 0 && n > 0 {
 		s.Code = http.StatusOK
 	}
-	return s.ResponseWriter.Write(b)
+	return n, err
 }
 
 // Flush implements http.Flusher by forwarding to the inner ResponseWriter

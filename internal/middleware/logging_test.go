@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dorokuma/prism/internal/usagemeta"
 	"github.com/dorokuma/prism/internal/util"
 )
 
@@ -757,8 +759,7 @@ func TestStatusCapture_ExplicitStatusNotOverwritten(t *testing.T) {
 }
 
 // TestStatusCapture_FirstStatusWins: the first recorded status — implicit or
-// explicit — wins; a later WriteHeader is forwarded but never overwrites the
-// captured code.
+// explicit — wins and is the ONLY one forwarded to the underlying writer.
 func TestStatusCapture_FirstStatusWins(t *testing.T) {
 	inner := httptest.NewRecorder()
 	sc := &StatusCapture{ResponseWriter: inner}
@@ -767,6 +768,204 @@ func TestStatusCapture_FirstStatusWins(t *testing.T) {
 	sc.WriteHeader(http.StatusCreated)
 	if sc.Code != http.StatusOK {
 		t.Errorf("Code = %d, want 200 (implicit 200 recorded first)", sc.Code)
+	}
+	if inner.Code != http.StatusOK {
+		t.Errorf("inner recorder code = %d, want 200 (second WriteHeader must not be forwarded)", inner.Code)
+	}
+}
+
+// TestStatusCapture_WriteHeaderFirstCallOnly pins item 14: WriteHeader
+// accepts ONLY the first call — later calls are no-ops and must NOT be
+// forwarded to the underlying writer (net/http's "first WriteHeader wins"
+// contract; forwarding a later call could overwrite an already-committed
+// status on wrapped writers).
+func TestStatusCapture_WriteHeaderFirstCallOnly(t *testing.T) {
+	inner := httptest.NewRecorder()
+	sc := &StatusCapture{ResponseWriter: inner}
+
+	sc.WriteHeader(http.StatusOK)
+	sc.WriteHeader(http.StatusBadGateway)
+	sc.WriteHeader(http.StatusServiceUnavailable)
+
+	if sc.Code != http.StatusOK {
+		t.Errorf("Code = %d, want 200 (first call recorded)", sc.Code)
+	}
+	if inner.Code != http.StatusOK {
+		t.Errorf("inner recorder code = %d, want 200 (later WriteHeader calls must not be forwarded; got overwritten to %d)", inner.Code, inner.Code)
+	}
+
+	// A Write after the explicit first WriteHeader must not change anything.
+	_, _ = sc.Write([]byte("body"))
+	if sc.Code != http.StatusOK {
+		t.Errorf("Code after write = %d, want 200", sc.Code)
+	}
+	if inner.Code != http.StatusOK {
+		t.Errorf("inner recorder code after write = %d, want 200", inner.Code)
+	}
+}
+
+// failWriteWriter fails the FIRST underlying Write (0 bytes, or `partial`
+// bytes before the error) and forwards every later call — the simulation of
+// a client connection that dies on the first event write.
+type failWriteWriter struct {
+	http.ResponseWriter
+	failed  bool
+	partial int
+}
+
+func (f *failWriteWriter) Write(p []byte) (int, error) {
+	if !f.failed {
+		f.failed = true
+		if f.partial > 0 {
+			return f.partial, errors.New("simulated partial write failure")
+		}
+		return 0, errors.New("simulated first-write failure")
+	}
+	return f.ResponseWriter.Write(p)
+}
+
+// TestStatusCapture_Write_ZeroByteFirstWriteFailureKeepsUncommitted pins
+// item 8 rework: when the FIRST underlying Write fails with 0 bytes, the
+// implicit 200 must NOT be recorded — the response is still uncommitted, so
+// the handler can answer a real error status (e.g. 502) and the audit is
+// not locked into an empty 200.
+func TestStatusCapture_Write_ZeroByteFirstWriteFailureKeepsUncommitted(t *testing.T) {
+	inner := httptest.NewRecorder()
+	sc := &StatusCapture{ResponseWriter: &failWriteWriter{ResponseWriter: inner}}
+
+	n, err := sc.Write([]byte("event"))
+	if err == nil {
+		t.Fatal("the failing underlying write must return its error")
+	}
+	if n != 0 {
+		t.Errorf("n = %d, want 0 (no bytes were delivered)", n)
+	}
+	if sc.Code != 0 {
+		t.Errorf("Code after a 0-byte failed first write = %d, want 0 (uncommitted)", sc.Code)
+	}
+	if sc.Committed() {
+		t.Error("Committed() must be false after a 0-byte failed first write")
+	}
+
+	// The status is still ours to choose: a later WriteHeader must take
+	// effect (the 502 path depends on this).
+	sc.WriteHeader(http.StatusBadGateway)
+	if sc.Code != http.StatusBadGateway {
+		t.Errorf("Code after WriteHeader = %d, want 502", sc.Code)
+	}
+	if inner.Code != http.StatusBadGateway {
+		t.Errorf("inner recorder code = %d, want 502 (the error status must reach the client)", inner.Code)
+	}
+}
+
+// TestStatusCapture_Write_PartialWriteFailureCommits200 pins the other half:
+// a first write that delivers SOME bytes and then fails IS committed — the
+// response is under way and net/http can never change the status afterwards.
+func TestStatusCapture_Write_PartialWriteFailureCommits200(t *testing.T) {
+	inner := httptest.NewRecorder()
+	sc := &StatusCapture{ResponseWriter: &failWriteWriter{ResponseWriter: inner, partial: 2}}
+
+	n, err := sc.Write([]byte("event"))
+	if err == nil {
+		t.Fatal("the partial-failing write must return its error")
+	}
+	if n != 2 {
+		t.Errorf("n = %d, want 2 (two bytes were delivered)", n)
+	}
+	if sc.Code != http.StatusOK {
+		t.Errorf("Code after a partial failed write = %d, want 200 (committed once bytes were delivered)", sc.Code)
+	}
+	if !sc.Committed() {
+		t.Error("Committed() must be true after a partial failed write")
+	}
+
+	// A later WriteHeader must NOT reach the underlying writer (the status
+	// is already committed; net/http ignores it too). The recorder's Code
+	// defaults to 200, so a forwarded WriteHeader(503) would be visible as
+	// 503.
+	sc.WriteHeader(http.StatusServiceUnavailable)
+	if sc.Code != http.StatusOK {
+		t.Errorf("Code = %d, want 200 (the committed status must win)", sc.Code)
+	}
+	if inner.Code != http.StatusOK {
+		t.Errorf("inner recorder code = %d, want 200 (later WriteHeader must not be forwarded after commit)", inner.Code)
+	}
+}
+
+// TestStatusCapture_Write_SuccessfulWriteCommits200 guards the happy path
+// after the rework: a successful write records the implicit 200 exactly once
+// and stays committed.
+func TestStatusCapture_Write_SuccessfulWriteCommits200(t *testing.T) {
+	inner := httptest.NewRecorder()
+	sc := &StatusCapture{ResponseWriter: inner}
+
+	n, err := sc.Write([]byte("hello"))
+	if err != nil || n != 5 {
+		t.Fatalf("Write = (%d, %v), want (5, nil)", n, err)
+	}
+	if sc.Code != http.StatusOK {
+		t.Errorf("Code = %d, want 200", sc.Code)
+	}
+	if !sc.Committed() {
+		t.Error("Committed() must be true after a successful write")
+	}
+	if inner.Body.String() != "hello" {
+		t.Errorf("body = %q, want hello", inner.Body.String())
+	}
+}
+
+// TestStatusCapture_Write_ZeroLengthWriteStaysUncommitted pins the empty-
+// write edge: a zero-length write that succeeds delivers no bytes, so the
+// status stays uncommitted.
+func TestStatusCapture_Write_ZeroLengthWriteStaysUncommitted(t *testing.T) {
+	inner := httptest.NewRecorder()
+	sc := &StatusCapture{ResponseWriter: inner}
+
+	n, err := sc.Write(nil)
+	if err != nil || n != 0 {
+		t.Fatalf("Write(nil) = (%d, %v), want (0, nil)", n, err)
+	}
+	if sc.Code != 0 {
+		t.Errorf("Code after a 0-byte write = %d, want 0 (nothing committed)", sc.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Round-4 audit: ApplyUsage gate consistency (item 13)
+// ---------------------------------------------------------------------------
+
+// TestApplyUsage_AcceptsCacheOnlyUsage pins item 13: a usage carrying ONLY
+// cache tokens (zero prompt/completion) must be applied — a cache-only hit
+// still consumes upstream quota and costs money.
+func TestApplyUsage_AcceptsCacheOnlyUsage(t *testing.T) {
+	a := &RequestAudit{}
+	a.ApplyUsage(usagemeta.Usage{Cached: 50, Source: usagemeta.SourceAnthropic})
+	if a.CachedTokens != 50 {
+		t.Errorf("CachedTokens = %d, want 50", a.CachedTokens)
+	}
+	if a.PromptTokens != 0 || a.CompletionTokens != 0 {
+		t.Errorf("cache-only usage must not fabricate prompt/completion tokens: prompt=%d completion=%d", a.PromptTokens, a.CompletionTokens)
+	}
+	if a.UsageSource != usagemeta.SourceAnthropic {
+		t.Errorf("UsageSource = %q, want anthropic", a.UsageSource)
+	}
+	// Legacy aliases stay in sync.
+	if a.TokensIn != 0 || a.TokensOut != 0 {
+		t.Errorf("legacy aliases out of sync: %+v", a)
+	}
+}
+
+// TestApplyUsage_IgnoresFullyZeroUsage pins the other half of the gate: a
+// fully zero usage (parsers return this for unparseable/empty payloads)
+// must not clobber already-captured counts.
+func TestApplyUsage_IgnoresFullyZeroUsage(t *testing.T) {
+	a := &RequestAudit{PromptTokens: 5, CachedTokens: 7, UsageSource: usagemeta.SourceOpenAI}
+	a.ApplyUsage(usagemeta.Usage{})
+	if a.PromptTokens != 5 || a.CachedTokens != 7 {
+		t.Errorf("zero usage must be ignored, got %+v", a)
+	}
+	if a.UsageSource != usagemeta.SourceOpenAI {
+		t.Errorf("zero usage must not clear UsageSource, got %q", a.UsageSource)
 	}
 }
 

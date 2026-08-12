@@ -227,3 +227,44 @@ func TestParseAnthropic_NegativeTokensClamped(t *testing.T) {
 		t.Errorf("mixed payload Source = %q, want anthropic", u2.Source)
 	}
 }
+
+// TestHasTokens pins item 13: HasTokens is the single "is this usage
+// non-empty" gate — a usage carrying ONLY cache tokens reports true, a
+// fully zero usage reports false.
+func TestHasTokens(t *testing.T) {
+	cases := []struct {
+		name  string
+		usage Usage
+		want  bool
+	}{
+		{"zero", Usage{}, false},
+		{"prompt only", Usage{Prompt: 1}, true},
+		{"completion only", Usage{Completion: 1}, true},
+		{"cache only", Usage{Cached: 50}, true},
+		{"cache write only", Usage{CacheWrite: 50}, true},
+		{"reasoning only is still completion", Usage{Reasoning: 1, Completion: 1}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.usage.HasTokens(); got != tc.want {
+				t.Errorf("HasTokens(%+v) = %v, want %v", tc.usage, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseAnthropic_CacheOnlySurvives pins item 13 at the parser level: an
+// Anthropic payload with ONLY cache_read_input_tokens is a real usage record
+// (cache-only hit) and must not be discarded as empty.
+func TestParseAnthropic_CacheOnlySurvives(t *testing.T) {
+	u := ParseAnthropic([]byte(`{"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":50,"cache_creation_input_tokens":0}}`))
+	if u.Cached != 50 || u.Prompt != 0 || u.Completion != 0 {
+		t.Errorf("cache-only Anthropic payload = %+v, want Cached=50 Prompt=0 Completion=0", u)
+	}
+	if !u.HasTokens() {
+		t.Error("cache-only usage must report HasTokens()=true")
+	}
+	if u.Source != SourceAnthropic {
+		t.Errorf("Source = %q, want anthropic", u.Source)
+	}
+}

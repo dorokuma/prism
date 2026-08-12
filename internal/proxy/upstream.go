@@ -143,8 +143,12 @@ const (
 // upstream HTTP error affects account state: only the statuses 401/402 or a
 // recognized structured permanent error body (credential or quota) mark an
 // account exhausted; a bare 403 (no recognized envelope) is deliberately NOT
-// permanent and classifies as temporary. Consumers apply that class
-// differently, matching the real code:
+// permanent and classifies as temporary. 401 is a credential (auth) failure
+// and 402 is a payment/balance failure — the two are kept distinct so the
+// terminal response can tell "upstream auth failed" (502
+// upstream_auth_failed) apart from "upstream quota/balance exhausted" (503
+// upstream_quota_exhausted). Consumers apply that class differently,
+// matching the real code:
 //   - Runtime (handleUpstreamResponse 4xx branch): a bare 403 is passed
 //     through to the client with its original status and redacted body —
 //     no cooldown, no retry. Only a 403 carrying a recognized structured
@@ -155,8 +159,12 @@ const (
 //     2 minutes for 429) without being exhausted.
 func ClassifyUpstreamError(statusCode int, body []byte) UpstreamErrorClass {
 	switch {
-	case statusCode == 401 || statusCode == 402:
+	case statusCode == 401:
 		return UpstreamErrorPermanentCredential
+	case statusCode == 402:
+		// Payment Required: the account's balance/payment is the problem,
+		// not the credential — classify as quota (money) exhaustion.
+		return UpstreamErrorPermanentQuota
 	case IsPermanentCredentialError(body):
 		return UpstreamErrorPermanentCredential
 	case IsQuotaError(body):
@@ -203,23 +211,63 @@ func responseBodyCap(opts ChatForwardOpts) int64 {
 	return config.MaxUpstreamResponseBytesDefault
 }
 
+// maxRetryAfterSeconds caps a delta-seconds Retry-After value before it is
+// converted to a time.Duration: the caller caps the final cooldown at 5
+// minutes anyway, and the cap keeps the duration arithmetic overflow-free
+// for arbitrarily large header values.
+const maxRetryAfterSeconds = 365 * 24 * 3600 // 1 year
+
+// parseRetryAfter extracts the Retry-After header as a wait duration.
+// Both formats defined by RFC 9110 are accepted:
+//   - delta-seconds ("120") — an integer number of seconds (capped at
+//     maxRetryAfterSeconds so the duration cannot overflow);
+//   - HTTP-date ("Sat, 01 Jan 2033 00:00:00 GMT") — the wait is the time
+//     until that date; a date in the past (or "now") yields 0, meaning
+//     "no wait" (the caller falls back to its default cooldown).
+//
+// Invalid, empty, negative and zero values yield 0.
 func parseRetryAfter(resp *http.Response) time.Duration {
 	if resp == nil {
 		return 0
 	}
-	ra := resp.Header.Get("Retry-After")
+	ra := strings.TrimSpace(resp.Header.Get("Retry-After"))
 	if ra == "" {
 		return 0
 	}
 	if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+		if secs > maxRetryAfterSeconds {
+			secs = maxRetryAfterSeconds
+		}
 		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(ra); err == nil {
+		d := time.Until(t)
+		if d <= 0 {
+			// The advertised date is already past: the wait has elapsed, so
+			// there is nothing to honor — the caller uses its default
+			// cooldown instead of an immediate retry storm.
+			return 0
+		}
+		// A far-future HTTP-date is capped like a huge delta-seconds value:
+		// the duration stays bounded (no overflow, no multi-century wait)
+		// and the caller's own 5-minute cooldown cap decides the final
+		// wait.
+		if d > maxRetryAfterSeconds*time.Second {
+			return maxRetryAfterSeconds * time.Second
+		}
+		return d
 	}
 	return 0
 }
 
-func handleUpstreamError(acc *pool.Account, resp *http.Response, requestID string, model string) {
+// handleUpstreamError classifies the upstream error response and updates the
+// account state (exhaustion for permanent credential/quota errors, cooldown
+// otherwise). It returns the classification so callers can report the real
+// cause to the client (item: 401/402 exhaustion must not masquerade as a
+// generic 503).
+func handleUpstreamError(acc *pool.Account, resp *http.Response, requestID string, model string) UpstreamErrorClass {
 	if resp == nil || resp.Body == nil {
-		return
+		return UpstreamErrorTemporary
 	}
 	limitReader := io.LimitReader(resp.Body, 4096)
 	bodyBytes, err := io.ReadAll(limitReader)
@@ -233,11 +281,11 @@ func handleUpstreamError(acc *pool.Account, resp *http.Response, requestID strin
 	case UpstreamErrorPermanentCredential:
 		acc.MarkExhausted()
 		slog.Error("upstream permanent credential error, marking exhausted", append(baseAttrs, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{acc.Key()})), "error_type", "auth_failed")...)
-		return
+		return UpstreamErrorPermanentCredential
 	case UpstreamErrorPermanentQuota:
 		acc.MarkExhausted()
 		slog.Error("upstream permanent quota error, marking exhausted", append(baseAttrs, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{acc.Key()})), "error_type", "upstream_ratelimited")...)
-		return
+		return UpstreamErrorPermanentQuota
 	}
 
 	// Temporary: 429 honors Retry-After (capped at 5 minutes), every other
@@ -255,6 +303,7 @@ func handleUpstreamError(acc *pool.Account, resp *http.Response, requestID strin
 	}
 	acc.SetCooldown(cd)
 	slog.Warn("upstream temporary error, cooling down", append(baseAttrs, "cooldown", cd.String(), "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{acc.Key()})), "error_type", errorType)...)
+	return UpstreamErrorTemporary
 }
 
 // upstreamContext creates a context for upstream requests.
@@ -338,9 +387,12 @@ func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opt
 		upPath = "/chat/completions"
 	}
 	targetURL := util.JoinURLPath(acc.BaseURL(), upPath)
-	if r.URL.RawQuery != "" {
-		targetURL += "?" + r.URL.RawQuery
-	}
+	// The client's RawQuery is deliberately NOT forwarded: a client-supplied
+	// query string would reach the upstream verbatim (letting a client
+	// append ?key=secret or routing parameters to the upstream URL) and no
+	// prism feature depends on it. The upstream URL is built solely from the
+	// account base URL and the fixed upstream path.
+	_ = r.URL.RawQuery
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -391,17 +443,34 @@ func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opt
 	return doUpstreamResult{resp: resp, ctx: ctx, cancel: cancel}
 }
 
+// responseCommitWriter is the writer contract for handleUpstreamResponse's
+// streaming branch: an http.ResponseWriter that ALSO reports whether the
+// response status has been committed (see middleware.StatusCommitter). The
+// commit source is EXPLICIT and stable — the caller always hands over a
+// writer with commit state (production passes the *middleware.StatusCapture
+// it owns in proxyChatWithBody), so the pre-first-event failure path never
+// has to guess "committed" for an unknown writer and can never turn a
+// failure into an empty 200. Direct test callers must provide a writer with
+// the same commit semantics (e.g. a StatusCapture-like wrapper).
+type responseCommitWriter interface {
+	http.ResponseWriter
+	middleware.StatusCommitter
+}
+
 // handleUpstreamResponse processes the upstream HTTP response and writes the
 // result to the client. It owns the lifecycle of ctx (via the provided cancel)
-// and resp.Body.
-func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Request, resp *http.Response, bodyBytes []byte, start time.Time, opts ChatForwardOpts, requestID string, ctx context.Context, cancel context.CancelFunc) (done bool, fatalErr error) {
+// and resp.Body. The third return value reports how the failure affected the
+// upstream account (UpstreamErrorClass): proxyChatWithBody uses it to answer
+// with a status that distinguishes upstream auth/balance exhaustion from a
+// generic all-exhausted 503 (item: 401/402 must not masquerade as 503).
+func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.Request, resp *http.Response, bodyBytes []byte, start time.Time, opts ChatForwardOpts, requestID string, ctx context.Context, cancel context.CancelFunc) (done bool, fatalErr error, upstreamClass UpstreamErrorClass) {
 	defer cancel()
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 429 || resp.StatusCode == 402 || resp.StatusCode == 401 {
-		handleUpstreamError(acc, resp, requestID, opts.Model)
+		class := handleUpstreamError(acc, resp, requestID, opts.Model)
 		util.RecordUpstreamRetry()
-		return false, nil
+		return false, nil, class
 	}
 
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
@@ -421,11 +490,14 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 		// body are still passed through unchanged, because the client's
 		// error is its own, not the gateway's. A bare 403 (no recognized
 		// envelope) stays temporary and does NOT exhaust.
+		var class UpstreamErrorClass
 		switch ClassifyUpstreamError(resp.StatusCode, errBody) {
 		case UpstreamErrorPermanentCredential:
+			class = UpstreamErrorPermanentCredential
 			acc.MarkExhausted()
 			slog.Error("upstream 4xx permanent credential error, marking exhausted", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", string(util.RedactBodyBytesWithKeys(errBody, []string{acc.Key()})), "error_type", "auth_failed")
 		case UpstreamErrorPermanentQuota:
+			class = UpstreamErrorPermanentQuota
 			acc.MarkExhausted()
 			slog.Error("upstream 4xx permanent quota error, marking exhausted", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", string(util.RedactBodyBytesWithKeys(errBody, []string{acc.Key()})), "error_type", "upstream_ratelimited")
 		}
@@ -450,7 +522,7 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 			a.ErrorType = "upstream_4xx"
 			a.Error = errStr
 		}
-		return true, nil
+		return true, nil, class
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// 5xx server error or other non-2xx: cooldown and retry.
@@ -461,14 +533,21 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 		acc.SetCooldown(upstreamCooldown)
 		slog.Warn("upstream 5xx error, cooling down", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", string(util.RedactBodyBytesWithKeys(errBody, []string{acc.Key()})), "error_type", "upstream_5xx")
 		util.RecordUpstreamRetry()
-		return false, nil
+		return false, nil, UpstreamErrorTemporary
 	}
 
 	if opts.ResponsesOut && opts.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
+		// The HTTP status is deliberately NOT committed here: it is delayed
+		// until the first event is written. A failure before the first event
+		// (empty upstream stream, upstream connection dying before any data)
+		// can therefore still answer a real HTTP 502 instead of committing
+		// an empty 200. Once the first event is written the 200 is committed
+		// and can never be changed (net/http semantics); mid-stream failures
+		// then use the protocol's own failure event (response.failed), which
+		// the translator emits when it can still write.
 		translateStart := time.Now()
 		slog.Debug("responses_stream translate start", "request_id", requestID, "account", acc.Name(), "translate_start", translateStart.Format(time.RFC3339Nano))
 		err := stream.TranslateChatStreamToResponses(w, resp.Body, opts.Model, opts.ReqTools, mcp.GetSearchToolCache(opts.TenantID), ctx)
@@ -476,13 +555,45 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 		if err != nil {
 			slog.Error("responses_stream translate error", "req", requestID, "model", opts.Model, "account", acc.Name(), "error", err, "translate_ms", translateElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			util.RecordError()
+			// Commit-state check via the explicit responseCommitWriter
+			// contract (the caller always passes a writer that reports
+			// commit state — production owns a *middleware.StatusCapture):
+			// the first successful/partial event write commits the 200 and
+			// the status can then never be changed (net/http semantics).
+			// Before the first event nothing reached the client and a real
+			// 502 is still ours to choose. There is no unknown-writer
+			// fallback: guessing "committed" for a writer without commit
+			// state could turn a pre-first-event failure into an empty 200.
+			// The state is captured ONCE, before any write below — after
+			// the 502 is written the same writer would report committed and
+			// the audit would misrecord the delivered status.
+			committed := w.Committed()
+			if !committed {
+				// Nothing was written to the client yet (pre-first-event
+				// failure): return a structured 502 instead of an empty 200.
+				// util.WriteJSON writes the status exactly once — the response
+				// is still uncommitted, so this is the first and only
+				// WriteHeader on the wire.
+				util.WriteJSON(w, http.StatusBadGateway, map[string]any{
+					"error": map[string]any{"message": "upstream stream failed before any event", "code": "upstream_stream_error"},
+				})
+			}
 			if a := middleware.AuditFromCtx(r.Context()); a != nil {
-				a.Status = http.StatusOK
+				// The audit status must match what was actually delivered:
+				// 502 when nothing was written, the committed 200 when the
+				// response was already under way (the translator emits the
+				// protocol failure event response.failed when it can still
+				// write).
+				if !committed {
+					a.Status = http.StatusBadGateway
+				} else {
+					a.Status = http.StatusOK
+				}
 				a.Account = acc.Name()
 				a.ErrorType = util.ClassifyConnError(err)
 				a.Error = err.Error()
 			}
-			return true, err
+			return true, err, UpstreamErrorTemporary
 		}
 		slog.Debug("responses_stream translate done", "request_id", requestID, "account", acc.Name(), "translate_ms", translateElapsed, "elapsed", time.Since(start))
 		util.RecordRequest(time.Since(start))
@@ -490,7 +601,7 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 			a.Status = http.StatusOK
 			a.Account = acc.Name()
 		}
-		return true, nil
+		return true, nil, UpstreamErrorTemporary
 	}
 
 	if opts.ResponsesOut && !opts.Stream {
@@ -510,15 +621,23 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 					a.ErrorType = "response_too_large"
 					a.Error = err.Error()
 				}
-				return true, nil
+				return true, nil, UpstreamErrorTemporary
 			}
+			// Any other read failure while the response is still uncommitted:
+			// return a structured 502 instead of an empty 200, and audit the
+			// real status.
 			slog.Warn("responses_json body read error", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
+			util.RecordError()
+			util.WriteJSON(w, http.StatusBadGateway, map[string]any{
+				"error": map[string]any{"message": "failed to read upstream response", "code": "upstream_error"},
+			})
 			if a := middleware.AuditFromCtx(r.Context()); a != nil {
+				a.Status = http.StatusBadGateway
 				a.Account = acc.Name()
 				a.ErrorType = util.ClassifyConnError(err)
 				a.Error = err.Error()
 			}
-			return true, err
+			return true, nil, UpstreamErrorTemporary
 		}
 		util.DumpDebugUpstreamResponse(rawBody, []string{acc.Key()})
 		translateStart := time.Now()
@@ -536,14 +655,16 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 				a.ErrorType = "upstream_5xx"
 				a.Error = err.Error()
 			}
-			return true, nil
+			return true, nil, UpstreamErrorTemporary
 		}
 		// Capture token usage from the response body for non-streaming audit.
 		// The parser is selected by the upstream path (see
 		// parseUsageForResponseBody): /v1/messages responses are Anthropic
-		// form (input_tokens/...), everything else is OpenAI form.
+		// form (input_tokens/...), everything else is OpenAI form. The gate
+		// accepts any non-empty usage, including cache-only usage (shared
+		// usagemeta.HasTokens).
 		if a := middleware.AuditFromCtx(r.Context()); a != nil {
-			if u := parseUsageForResponseBody(rawBody, opts); u.Prompt > 0 || u.Completion > 0 {
+			if u := parseUsageForResponseBody(rawBody, opts); u.HasTokens() {
 				a.ApplyUsage(u)
 			}
 		}
@@ -556,7 +677,7 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 			a.Status = http.StatusOK
 			a.Account = acc.Name()
 		}
-		return true, nil
+		return true, nil, UpstreamErrorTemporary
 	}
 
 	// Legacy chat path (no responses translation).
@@ -578,7 +699,7 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 				a.ErrorType = util.ClassifyConnError(err)
 				a.Error = err.Error()
 			}
-			return true, err
+			return true, err, UpstreamErrorTemporary
 		}
 		if cl := resp.Header.Get("Content-Length"); cl != "" {
 			slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "content_length", cl, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))
@@ -590,7 +711,7 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 			a.Status = resp.StatusCode
 			a.Account = acc.Name()
 		}
-		return true, nil
+		return true, nil, UpstreamErrorTemporary
 	}
 
 	// Non-streaming legacy: read full body, capture token usage, write to client.
@@ -610,17 +731,23 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 				a.ErrorType = "response_too_large"
 				a.Error = err.Error()
 			}
-			return true, nil
+			return true, nil, UpstreamErrorTemporary
 		}
+		// Any other read failure while the response is still uncommitted:
+		// return a structured 502 instead of an empty 200, and audit the
+		// real status.
 		slog.Warn("legacy_nonstream body read error", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 		util.RecordError()
+		util.WriteJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]any{"message": "failed to read upstream response", "code": "upstream_error"},
+		})
 		if a := middleware.AuditFromCtx(r.Context()); a != nil {
-			a.Status = resp.StatusCode
+			a.Status = http.StatusBadGateway
 			a.Account = acc.Name()
 			a.ErrorType = util.ClassifyConnError(err)
 			a.Error = err.Error()
 		}
-		return true, err
+		return true, nil, UpstreamErrorTemporary
 	}
 	util.DumpDebugUpstreamResponse(rawBody, []string{acc.Key()})
 	// Capture token usage from the response body for non-streaming audit.
@@ -629,9 +756,10 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 	// (input_tokens/...), everything else is OpenAI form. This is the path
 	// that fixes Anthropic usage being counted as zero: previously the
 	// OpenAI prompt_tokens/completion_tokens field names were looked up in
-	// an Anthropic body and always resolved to 0.
+	// an Anthropic body and always resolved to 0. The gate accepts any
+	// non-empty usage, including cache-only usage (shared usagemeta.HasTokens).
 	if a := middleware.AuditFromCtx(r.Context()); a != nil {
-		if u := parseUsageForResponseBody(rawBody, opts); u.Prompt > 0 || u.Completion > 0 {
+		if u := parseUsageForResponseBody(rawBody, opts); u.HasTokens() {
 			a.ApplyUsage(u)
 		}
 	}
@@ -644,5 +772,5 @@ func handleUpstreamResponse(acc *pool.Account, w http.ResponseWriter, r *http.Re
 		a.Status = resp.StatusCode
 		a.Account = acc.Name()
 	}
-	return true, nil
+	return true, nil, UpstreamErrorTemporary
 }

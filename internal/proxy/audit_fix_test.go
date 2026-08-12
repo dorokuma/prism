@@ -330,7 +330,7 @@ func TestClassifyUpstreamError(t *testing.T) {
 		want   UpstreamErrorClass
 	}{
 		{"401 bare", 401, nil, UpstreamErrorPermanentCredential},
-		{"402 bare", 402, nil, UpstreamErrorPermanentCredential},
+		{"402 bare (balance)", 402, nil, UpstreamErrorPermanentQuota},
 		{"403 bare", 403, nil, UpstreamErrorTemporary},
 		{"403 with structured invalid_api_key", 403, []byte(`{"error":{"code":"invalid_api_key"}}`), UpstreamErrorPermanentCredential},
 		{"403 with structured insufficient_quota", 403, []byte(`{"error":{"code":"insufficient_quota"}}`), UpstreamErrorPermanentQuota},

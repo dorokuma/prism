@@ -189,9 +189,17 @@ func ipTrusted(ip net.IP, trustedProxies []*net.IPNet) bool {
 }
 
 // RateLimitMiddleware returns an HTTP middleware that rate-limits per client IP.
+// /health is exempt: it is the liveness endpoint used by load balancers and
+// deploy checks, so it must stay reachable when business traffic is being
+// limited. No other path is exempted — /v1/*, /metrics and /admin/* remain
+// limited.
 func RateLimitMiddleware(next http.Handler, rl *RateLimiter, trustedProxies []*net.IPNet) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if rl != nil {
+			if r.URL.Path == "/health" {
+				next.ServeHTTP(w, r)
+				return
+			}
 			ip := GetClientIP(r, trustedProxies)
 			if !rl.Allow(ip) {
 				util.RecordRateLimited()

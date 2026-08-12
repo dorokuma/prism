@@ -110,7 +110,9 @@ func flattenToolEntry(item json.RawMessage, tenantID string) ([]map[string]any, 
 					}
 				}
 			}
-			if t := asFunctionTool(sm); t != nil {
+			if t, err := asFunctionTool(sm); err != nil {
+				return nil, err
+			} else if t != nil {
 				if bundleName != "" && subName != "" {
 					prefixed := bundleName + "__" + subName
 					if fnObj, ok := t["function"].(map[string]any); ok {
@@ -131,7 +133,15 @@ func flattenToolEntry(item json.RawMessage, tenantID string) ([]map[string]any, 
 			fnObj["description"] = desc
 		}
 		if len(m["parameters"]) > 0 && string(m["parameters"]) != "null" {
-			fnObj["parameters"] = sanitize.SimplifyJSONSchema(util.JSONRawToAny(m["parameters"]))
+			// Depth-bounded schema simplification: a pathological (too-deep)
+			// client schema fails fast with ErrSchemaTooDeep instead of
+			// recursing unbounded — the error propagates to the client as a
+			// clear 400 invalid_request.
+			params, err := sanitize.SimplifyJSONSchemaLimited(util.JSONRawToAny(m["parameters"]), sanitize.MaxJSONSchemaDepth)
+			if err != nil {
+				return nil, err
+			}
+			fnObj["parameters"] = params
 		} else {
 			fnObj["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
@@ -142,13 +152,18 @@ func flattenToolEntry(item json.RawMessage, tenantID string) ([]map[string]any, 
 		result = append(result, getTenantMCPTools(tenantID)...)
 		return result, nil
 	}
-	if t := asFunctionTool(m); t != nil {
+	if t, err := asFunctionTool(m); err != nil {
+		return nil, err
+	} else if t != nil {
 		return []map[string]any{t}, nil
 	}
 	return nil, nil
 }
 
-func asFunctionTool(m map[string]json.RawMessage) map[string]any {
+// asFunctionTool converts one raw tool entry into the chat-completions
+// function-tool shape. A schema that exceeds the depth limit fails with
+// ErrSchemaTooDeep (never silently simplified to the unsafe original).
+func asFunctionTool(m map[string]json.RawMessage) (map[string]any, error) {
 	var name, desc string
 	var params json.RawMessage
 
@@ -164,7 +179,7 @@ func asFunctionTool(m map[string]json.RawMessage) map[string]any {
 		var ok bool
 		name, ok = util.RawStringField(m, "name")
 		if !ok || name == "" {
-			return nil
+			return nil, nil
 		}
 	}
 	if desc == "" {
@@ -179,14 +194,21 @@ func asFunctionTool(m map[string]json.RawMessage) map[string]any {
 		fnObj["description"] = desc
 	}
 	if len(params) > 0 && string(params) != "null" {
-		fnObj["parameters"] = sanitize.SimplifyJSONSchema(util.JSONRawToAny(params))
+		// Depth-bounded schema simplification (see flattenToolEntry): a
+		// too-deep schema fails fast with ErrSchemaTooDeep instead of
+		// recursing unbounded on untrusted client input.
+		simplified, err := sanitize.SimplifyJSONSchemaLimited(util.JSONRawToAny(params), sanitize.MaxJSONSchemaDepth)
+		if err != nil {
+			return nil, err
+		}
+		fnObj["parameters"] = simplified
 	} else {
 		fnObj["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
 	}
 	return map[string]any{
 		"type":     "function",
 		"function": fnObj,
-	}
+	}, nil
 }
 
 // GetSearchToolCache returns a snapshot of cached MCP tools for tool_search interception.

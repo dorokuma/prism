@@ -186,7 +186,7 @@ func parseOpenAIStreamUsage(tail []byte) usagemeta.Usage {
 			continue
 		}
 		u := usagemeta.ParseOpenAI(chunk.Usage)
-		if u.Prompt > 0 || u.Completion > 0 {
+		if u.HasTokens() {
 			return u
 		}
 	}
@@ -256,10 +256,13 @@ func StreamResponseBody(w http.ResponseWriter, body io.ReadCloser, clientReq *ht
 
 	n, err := io.Copy(dst, teeReader)
 
-	// Capture token usage for audit (nil-safe; legacy streaming path).
+	// Capture token usage for audit (nil-safe; legacy streaming path). The
+	// gate accepts any usage with at least one non-zero token count —
+	// including a usage carrying ONLY cache tokens — via the shared
+	// usagemeta.HasTokens gate (item: ApplyUsage gate consistency).
 	if clientReq != nil {
 		if a := middleware.AuditFromCtx(clientReq.Context()); a != nil {
-			if u := parseStreamUsage(capture.headBytes(), capture.tailBytes()); u.Prompt > 0 || u.Completion > 0 {
+			if u := parseStreamUsage(capture.headBytes(), capture.tailBytes()); u.HasTokens() {
 				a.ApplyUsage(u)
 			}
 		}

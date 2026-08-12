@@ -322,6 +322,67 @@ accounts:
 	}
 }
 
+// writeConfig writes content to a temp yaml file and returns its path.
+func writeConfig(t *testing.T, content string) string {
+	t.Helper()
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(f.Name()) })
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	return f.Name()
+}
+
+// TestLoadConfig_RejectsUnsafeProviderNames pins item 10 at the config
+// stage: a provider name that would escape the model cache directory (path
+// separators, "..", absolute paths) fails configuration loading early.
+func TestLoadConfig_RejectsUnsafeProviderNames(t *testing.T) {
+	bad := []string{"../evil", "a/b", "a\\b", "/abs", "..", "."}
+	for _, name := range bad {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfig(t, "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n    provider: "+name+"\n")
+			if _, err := LoadConfig(path); err == nil {
+				t.Fatalf("provider %q must be rejected, got nil error", name)
+			}
+		})
+	}
+	// A normal provider name (and an empty provider) still loads.
+	path := writeConfig(t, "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n    provider: opencode-go\n")
+	if _, err := LoadConfig(path); err != nil {
+		t.Errorf("normal provider name must load: %v", err)
+	}
+	path = writeConfig(t, "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n")
+	if _, err := LoadConfig(path); err != nil {
+		t.Errorf("provider-less account must still load: %v", err)
+	}
+}
+
+// TestLoadConfig_MaxConcurrentUpperBound pins item 11: a
+// max_concurrent_per_account value above math.MaxInt32 would truncate in
+// the pool's int32 concurrency accounting and must fail configuration
+// loading clearly; the boundary value itself is accepted.
+func TestLoadConfig_MaxConcurrentUpperBound(t *testing.T) {
+	base := "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n    provider: p\n"
+	path := writeConfig(t, base+"max_concurrent_per_account:\n  gpt-4: 2147483648\n")
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("value above math.MaxInt32 must be rejected, got nil error")
+	}
+
+	path = writeConfig(t, base+"max_concurrent_per_account:\n  gpt-4: 2147483647\n")
+	if _, err := LoadConfig(path); err != nil {
+		t.Errorf("math.MaxInt32 boundary must load: %v", err)
+	}
+
+	path = writeConfig(t, base+"max_concurrent_per_account:\n  gpt-4: 100\n")
+	if _, err := LoadConfig(path); err != nil {
+		t.Errorf("a normal value must load: %v", err)
+	}
+}
+
 func TestParseTrustedProxies(t *testing.T) {
 	_, err := ParseTrustedProxies([]string{"10.0.0.0/8"})
 	if err != nil {
@@ -1559,6 +1620,97 @@ accounts:
 	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0].Token != "sk-ci-111" {
 		t.Fatalf("api_keys = %+v, want the single valid key", cfg.APIKeys)
 	}
+}
+
+// TestLoadConfig_APIKeyNameValidation pins the MCP admin-bucket isolation
+// contract (item 1): API key NAMEs are the MCP tool-cache identity, so
+// empty names, duplicate names and the reserved admin identity
+// (McpAdminIdentity) are explicit load errors. The legacy auth_token
+// expansion and an explicit name "default" remain valid — "default" is a
+// plain per-client bucket, NOT the admin bucket (only the reserved identity
+// is forbidden). The errors must name the key but never echo any token.
+func TestLoadConfig_APIKeyNameValidation(t *testing.T) {
+	base := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+	t.Run("empty name rejected", func(t *testing.T) {
+		_, err := loadConfigFrom(t, base+`
+api_keys:
+  - name: ""
+    token: "sk-1"`)
+		if err == nil {
+			t.Fatal("an empty api key name must be rejected")
+		}
+		if !strings.Contains(err.Error(), "name is empty") {
+			t.Errorf("error = %q, want it to mention the empty name", err)
+		}
+		if strings.Contains(err.Error(), "sk-1") {
+			t.Error("error must never echo the token")
+		}
+	})
+	t.Run("duplicate names rejected", func(t *testing.T) {
+		_, err := loadConfigFrom(t, base+`
+api_keys:
+  - name: dup
+    token: "sk-1"
+  - name: dup
+    token: "sk-2"`)
+		if err == nil {
+			t.Fatal("duplicate api key names must be rejected (they would share one MCP cache identity)")
+		}
+		if !strings.Contains(err.Error(), "duplicate key name") {
+			t.Errorf("error = %q, want it to mention the duplicate name", err)
+		}
+		if strings.Contains(err.Error(), "sk-1") || strings.Contains(err.Error(), "sk-2") {
+			t.Error("error must never echo any token")
+		}
+	})
+	t.Run("reserved admin identity rejected", func(t *testing.T) {
+		_, err := loadConfigFrom(t, base+`
+api_keys:
+  - name: `+McpAdminIdentity+`
+    token: "sk-1"`)
+		if err == nil {
+			t.Fatalf("the reserved admin identity %q must be rejected as a key name", McpAdminIdentity)
+		}
+		if !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("error = %q, want it to mention the reserved name", err)
+		}
+		if strings.Contains(err.Error(), "sk-1") {
+			t.Error("error must never echo the token")
+		}
+	})
+	t.Run("legacy auth_token still expands to name default", func(t *testing.T) {
+		cfg, err := loadConfigFrom(t, base+`
+auth_token: "legacy-secret"`)
+		if err != nil {
+			t.Fatalf("legacy auth_token must still load: %v", err)
+		}
+		if len(cfg.APIKeys) != 1 || cfg.APIKeys[0].Name != "default" || cfg.APIKeys[0].Token != "legacy-secret" {
+			t.Fatalf("auth_token expansion = %+v, want [{default legacy-secret}]", cfg.APIKeys)
+		}
+	})
+	t.Run("explicit name default is a plain client bucket", func(t *testing.T) {
+		if _, err := loadConfigFrom(t, base+`
+api_keys:
+  - name: default
+    token: "sk-1"`); err != nil {
+			t.Errorf("explicit name \"default\" must load (it is not the reserved admin identity): %v", err)
+		}
+	})
+	t.Run("distinct names still load", func(t *testing.T) {
+		if _, err := loadConfigFrom(t, base+`
+api_keys:
+  - name: ci-bot
+    token: "sk-1"
+  - name: ci-bot-2
+    token: "sk-2"`); err != nil {
+			t.Errorf("distinct key names must load: %v", err)
+		}
+	})
 }
 
 // TestLoadConfig_MaxUpstreamResponseBytes covers the max_upstream_response_bytes

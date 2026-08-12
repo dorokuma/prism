@@ -2,11 +2,55 @@ package ratelimit_test
 
 import (
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/dorokuma/prism/internal/ratelimit"
 )
+
+// TestRateLimitMiddleware_HealthExempt pins item 7: /health bypasses the
+// business-wide rate limiter (a liveness endpoint must stay reachable under
+// load) while every other path stays limited — the exemption is not widened.
+func TestRateLimitMiddleware_HealthExempt(t *testing.T) {
+	// rate 0 / burst 0: no tokens are ever granted — every non-exempt
+	// request is limited, so the test is deterministic.
+	rl := ratelimit.NewRateLimiter(0, 0)
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := ratelimit.RateLimitMiddleware(next, rl, nil)
+
+	// /health always passes, even from an IP whose bucket is exhausted.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("/health: status = %d, want 200 (must bypass the rate limiter)", rec.Code)
+	}
+
+	// Every other path stays limited (the exemption must not widen).
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/models", "/metrics", "/admin/usage/summary"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusTooManyRequests {
+			t.Errorf("%s: status = %d, want 429 (only /health is exempt)", path, rec.Code)
+		}
+	}
+}
+
+// TestRateLimitMiddleware_NilLimiterPassesThrough guards the nil-limiter
+// path: without a limiter every request passes, including /health.
+func TestRateLimitMiddleware_NilLimiterPassesThrough(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := ratelimit.RateLimitMiddleware(next, nil, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("nil limiter: status = %d, want 200", rec.Code)
+	}
+}
 
 func TestRateLimiterAllow(t *testing.T) {
 	rl := ratelimit.NewRateLimiter(10, 5) // 10 tokens/sec, burst of 5

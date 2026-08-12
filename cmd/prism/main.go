@@ -87,7 +87,17 @@ func (a *usageRecorderAdapter) Record(e middleware.UsageEvent) {
 // log amount and the persisted amount are identical. A nil result means the
 // model has no known price (cost persisted as NULL, status missing_price).
 func (a *usageRecorderAdapter) Price(audit *middleware.RequestAudit) (*float64, string) {
-	price := priceFor(a.holder.Load(), audit.Provider, audit.Model)
+	cfg := a.holder.Load()
+	// Pricing prefers the ACTUAL upstream model (after model_remap
+	// resolution): a virtual model name rarely carries its own price entry,
+	// and billing must follow what the upstream actually served. When the
+	// upstream model has no known price, fall back to the client-requested
+	// model so deployments that price their virtual model names keep
+	// working (compatibility fallback).
+	price := priceFor(cfg, audit.Provider, audit.UpstreamModel)
+	if price == nil {
+		price = priceFor(cfg, audit.Provider, audit.Model)
+	}
 	return usage.ComputeCost(
 		int64(audit.PromptTokens),
 		int64(audit.CompletionTokens),

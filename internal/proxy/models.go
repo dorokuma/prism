@@ -9,6 +9,7 @@ import (
 
 	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/util"
 )
 
@@ -150,9 +151,21 @@ func enrichModel(entry map[string]any, provider, modelID string, cfg *config.Con
 	return entry
 }
 
-// getTenantID returns the tenant identifier for the request.
-// Currently always returns "default" as multi-tenancy is not yet implemented.
-// TODO: implement per-tenant isolation when multi-tenant support is needed.
+// getTenantID returns the MCP tool-cache identity for the request: the
+// authenticated API key NAME from the auth middleware context (stable and
+// non-secret — never the raw token). The MCP cache is isolated per identity
+// so tools cached from one key's namespace bundles are never visible to
+// another key (dual-tenant isolation). The "default" fallback covers
+// requests that did not go through the auth middleware (direct handler
+// tests) and is a plain per-client bucket — it is NOT the admin bucket: the
+// shared admin-injected bucket (mcp_tools.json) uses an internal reserved
+// key (config.McpAdminIdentity) that config validation forbids for client
+// keys, and the request path can never write to it (see mcp.cacheMCPTool /
+// cacheAdminTool). It stays visible to every identity (see
+// mcp.getTenantMCPTools).
 func getTenantID(r *http.Request) string {
+	if id := middleware.APIKeyFromContext(r.Context()); id != "" {
+		return id
+	}
 	return "default"
 }

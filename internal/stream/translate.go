@@ -258,8 +258,15 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		if ctx.Err() != nil {
 			return err
 		}
-		// Real upstream stream error: emit a response.failed frame so the
-		// client sees an explicit error instead of a silent connection drop.
+		// Nothing was delivered to the client yet: the failure happened
+		// before the first event, so the caller can still return a real HTTP
+		// error (502) instead of committing an empty 200.
+		if !tr.wroteAny {
+			return err
+		}
+		// Real upstream stream error mid-stream: emit a response.failed
+		// frame so the client sees an explicit error instead of a silent
+		// connection drop.
 		_ = tr.ensureCreated(dst)
 		_ = tr.emit(dst, map[string]any{
 			"type": "response.failed",
@@ -274,10 +281,11 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		return err
 	}
 
-	if err := tr.ensureCreated(dst); err != nil {
-		return err
-	}
-
+	// The substantive-output check runs BEFORE the first write: an empty
+	// upstream stream (no content, no tool calls) must not commit an empty
+	// 200 — the caller returns a real HTTP error (502) instead. The
+	// response.created event is only emitted once there is at least one
+	// valid event to deliver.
 	hasSubstantive := tr.reasoningBuf.Len() > 0 || tr.hadMessageContent
 	if !hasSubstantive {
 		for _, st := range tr.tools {
@@ -290,21 +298,13 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 
 	if !hasSubstantive {
 		if util.DebugMode {
-			slog.Debug("stream empty upstream, emitting response.failed", "req", util.RequestIDFromCtx(ctx))
-		}
-		if err := tr.emit(dst, map[string]any{
-			"type": "response.failed",
-			"response": map[string]any{
-				"id": tr.respID, "object": "response", "status": "failed", "model": tr.model,
-				"error": map[string]any{
-					"code":    "empty_upstream_stream",
-					"message": "upstream chat completion stream contained no model output",
-				},
-			},
-		}); err != nil {
-			return err
+			slog.Debug("stream empty upstream, returning ErrEmptyUpstreamStream", "req", util.RequestIDFromCtx(ctx))
 		}
 		return ErrEmptyUpstreamStream
+	}
+
+	if err := tr.ensureCreated(dst); err != nil {
+		return err
 	}
 
 	// Clean EOF (sc.Err() == nil) with content but without a [DONE]
@@ -312,6 +312,11 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	if !completed {
 		if util.DebugMode {
 			slog.Debug("stream clean EOF without completion event", "req", util.RequestIDFromCtx(ctx))
+		}
+		// Nothing was delivered yet: the caller returns a real HTTP error
+		// instead of committing an empty 200.
+		if !tr.wroteAny {
+			return fmt.Errorf("upstream stream ended without completion event")
 		}
 		_ = tr.emit(dst, map[string]any{
 			"type": "response.failed",

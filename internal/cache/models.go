@@ -189,9 +189,39 @@ func New(dir string, p *pool.Pool, cfg *config.Config) (*ModelCache, error) {
 	}, nil
 }
 
-// filePath returns the path to the cache file for a provider.
-func (mc *ModelCache) filePath(provider string) string {
-	return filepath.Join(mc.dir, provider+".json")
+// providerCacheFileName validates a provider name for use as a cache file
+// name and returns "<provider>.json". It is the write-path defense behind
+// config load validation (LoadConfig already rejects path separators, "." /
+// ".." and absolute provider names): a programmatically built ModelCache
+// (tests, future callers) can still never read or write outside the cache
+// dir. An invalid name yields a non-nil error and no file name.
+func providerCacheFileName(provider string) (string, error) {
+	if provider == "" {
+		return "", fmt.Errorf("model cache: empty provider name")
+	}
+	if strings.ContainsAny(provider, `\/`) || strings.ContainsRune(provider, 0) {
+		return "", fmt.Errorf("model cache: provider name %q must not contain path separators", provider)
+	}
+	if provider == "." || provider == ".." || filepath.IsAbs(provider) {
+		return "", fmt.Errorf("model cache: provider name %q is not a valid cache file name", provider)
+	}
+	name := provider + ".json"
+	if filepath.Base(name) != name {
+		return "", fmt.Errorf("model cache: provider name %q escapes the cache directory", provider)
+	}
+	return name, nil
+}
+
+// filePath returns the path to the cache file for a provider. The provider
+// name is validated (see providerCacheFileName): an invalid name yields a
+// non-nil error, so callers fail instead of reading or writing outside the
+// cache dir.
+func (mc *ModelCache) filePath(provider string) (string, error) {
+	name, err := providerCacheFileName(provider)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(mc.dir, name), nil
 }
 
 // providerSkipPISync reports whether a provider is excluded from
@@ -223,7 +253,11 @@ func (mc *ModelCache) LoadFromDisk() {
 		if provider == "" {
 			continue
 		}
-		fp := mc.filePath(provider)
+		fp, err := mc.filePath(provider)
+		if err != nil {
+			slog.Warn("cache file path rejected, skipping provider", "provider", provider, "error", err)
+			continue
+		}
 		data, err := os.ReadFile(fp)
 		if err != nil {
 			slog.Debug("cache file not found, will fetch async", "provider", provider, "path", fp)
@@ -568,6 +602,13 @@ func (mc *ModelCache) fetchLeader(ctx context.Context, provider string) error {
 // client-visible error text; only a short classification (upstream_timeout /
 // upstream_refused / ...) is kept (util.ClassifyConnError).
 func (mc *ModelCache) fetchFromAccount(ctx context.Context, account *pool.Account, provider string, cfg *config.Config) error {
+	// Resolve and validate the cache file path up front (write-path defense
+	// for path traversal): an invalid provider name fails the fetch BEFORE
+	// any upstream work and never reaches os.Rename with an escaping path.
+	cachePath, err := mc.filePath(provider)
+	if err != nil {
+		return err
+	}
 	url := util.JoinURLPath(account.BaseURL(), "/v1/models")
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -670,7 +711,7 @@ func (mc *ModelCache) fetchFromAccount(ctx context.Context, account *pool.Accoun
 		os.Remove(tmpName)
 		return ctx.Err()
 	}
-	if err := os.Rename(tmpName, mc.filePath(provider)); err != nil {
+	if err := os.Rename(tmpName, cachePath); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("rename cache file: %w", err)
 	}

@@ -33,6 +33,82 @@ func NewForTest(caches map[string]*providerCache) *ModelCache {
 func intPtr(i int) *int    { return &i }
 func boolPtr(b bool) *bool { return &b }
 
+// TestProviderCacheFileName_RejectsTraversal pins item 10 at the write
+// path: provider names with path separators, "." / ".." / absolute paths
+// (and empty names) are rejected, so a cache file can never be read or
+// written outside the cache dir.
+func TestProviderCacheFileName_RejectsTraversal(t *testing.T) {
+	bad := []string{"", "../evil", "a/b", "a\\b", "/abs", "..", ".", "a/../../x"}
+	for _, name := range bad {
+		if _, err := providerCacheFileName(name); err == nil {
+			t.Errorf("provider name %q must be rejected, got nil error", name)
+		}
+	}
+	if name, err := providerCacheFileName("opencode-go"); err != nil || name != "opencode-go.json" {
+		t.Errorf("providerCacheFileName(opencode-go) = (%q, %v), want (opencode-go.json, nil)", name, err)
+	}
+}
+
+// TestModelCache_FilePathStaysInDir pins item 10 at the ModelCache level: a
+// valid provider resolves inside the cache dir; a traversal provider yields
+// an error, so the caller fails instead of escaping.
+func TestModelCache_FilePathStaysInDir(t *testing.T) {
+	dir := t.TempDir()
+	mc := &ModelCache{dir: dir}
+	fp, err := mc.filePath("p")
+	if err != nil {
+		t.Fatalf("filePath(p): %v", err)
+	}
+	if filepath.Dir(fp) != dir {
+		t.Errorf("filePath(p) = %q, want inside %q", fp, dir)
+	}
+	if filepath.Base(fp) != "p.json" {
+		t.Errorf("filePath(p) base = %q, want p.json", filepath.Base(fp))
+	}
+	if _, err := mc.filePath("../evil"); err == nil {
+		t.Error("filePath(../evil) must be rejected")
+	}
+}
+
+// TestFetch_ProviderPathTraversalFailsBeforeUpstream pins item 10
+// end-to-end on the fetch path: even a programmatically built ModelCache
+// (bypassing config validation) fails the fetch with a path error BEFORE
+// any upstream request is made — the traversal never reaches the disk
+// write.
+func TestFetch_ProviderPathTraversalFailsBeforeUpstream(t *testing.T) {
+	var upstreamCalls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: upstream.URL, Provider: "../evil"}}}
+	p := pool.NewPool(cfg.Accounts)
+	mc := &ModelCache{
+		dir:  t.TempDir(),
+		pool: p,
+		cfg:  cfg,
+	}
+
+	err := mc.Fetch("../evil")
+	if err == nil {
+		t.Fatal("fetch with a traversal provider must fail")
+	}
+	if !strings.Contains(err.Error(), "provider name") {
+		t.Errorf("error must name the rejected provider: %v", err)
+	}
+	if n := atomic.LoadInt32(&upstreamCalls); n != 0 {
+		t.Errorf("upstream was called %d times, want 0 (path validation must run before any request)", n)
+	}
+	// No file must have been written outside the cache dir.
+	if _, statErr := os.Stat(filepath.Join(filepath.Dir(mc.dir), "evil.json")); statErr == nil {
+		t.Error("traversal must not create a file outside the cache dir")
+	}
+}
+
 // writePIModelsJSON writes an initial pi models.json with the given providers.
 func writePIModelsJSON(t *testing.T, path string, providers map[string]any) {
 	t.Helper()
@@ -3817,8 +3893,10 @@ func TestRefreshAll_StopCancels(t *testing.T) {
 		t.Fatal("Stop did not return after the round exited")
 	}
 	// The cancelled round must not have published a cache file.
-	if _, err := os.Stat(mc.filePath("p")); err == nil {
-		t.Error("cache file published after Stop cancelled the round")
+	if fp, err := mc.filePath("p"); err == nil {
+		if _, statErr := os.Stat(fp); statErr == nil {
+			t.Error("cache file published after Stop cancelled the round")
+		}
 	}
 }
 

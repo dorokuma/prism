@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -153,6 +154,16 @@ type APIKey struct {
 	Token string `yaml:"token"`
 }
 
+// McpAdminIdentity is the reserved cache identity of the shared
+// admin-injected MCP tool bucket (mcp_tools.json, see internal/mcp
+// LoadMCPTools). It is deliberately NOT a usable API key name: LoadConfig
+// rejects any api_keys entry whose name equals this value with an explicit
+// error, so an authenticated request identity can never collide with the
+// admin bucket (the request path additionally refuses to write to it — see
+// internal/mcp cacheMCPTool). It is defined here (not in internal/mcp)
+// because mcp already imports config and config must not import mcp.
+const McpAdminIdentity = "__prism_admin__"
+
 // Config holds the top-level application configuration loaded from a YAML file.
 type Config struct {
 	Listen                   string                      `yaml:"listen"`
@@ -236,6 +247,18 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.MaxUpstreamResponseBytes > MaxUpstreamResponseBytesLimit {
 		return nil, fmt.Errorf("max_upstream_response_bytes %d exceeds the maximum supported %d (%d MiB)", cfg.MaxUpstreamResponseBytes, MaxUpstreamResponseBytesLimit, MaxUpstreamResponseBytesLimit>>20)
 	}
+	// Upper-bound validation for max_concurrent_per_account: the pool's
+	// concurrency accounting is int32 (Account.TryAcquire converts the limit
+	// with int32(max)), so a value above math.MaxInt32 would be silently
+	// truncated — a huge value can wrap to 0 (every request waits forever)
+	// or to a negative number (the cap disabled entirely). Misconfiguration
+	// must fail at load time instead of corrupting concurrency control at
+	// runtime.
+	for model, v := range cfg.MaxConcurrentPerAccount {
+		if v > math.MaxInt32 {
+			return nil, fmt.Errorf("max_concurrent_per_account[%q] = %d exceeds the maximum supported %d (int32 concurrency accounting)", model, v, math.MaxInt32)
+		}
+	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
@@ -283,6 +306,16 @@ func LoadConfig(path string) (*Config, error) {
 			}
 		}
 		cfg.Accounts = allAccounts
+	}
+	// Provider names become model-cache file names (provider + ".json" under
+	// the cache dir). Reject names that would escape the cache directory
+	// (path separators, "." / "..", absolute paths) at load time — a
+	// malicious or mis-typed provider could otherwise read or write cache
+	// files outside the cache dir.
+	for _, acc := range cfg.Accounts {
+		if err := validateProviderName(acc.Provider); err != nil {
+			return nil, err
+		}
 	}
 	if len(cfg.Accounts) == 0 {
 		return nil, fmt.Errorf("no accounts configured")
@@ -343,6 +376,30 @@ func LoadConfig(path string) (*Config, error) {
 		if strings.TrimSpace(k.Token) == "" {
 			return nil, fmt.Errorf("api key %q: token is empty (empty or whitespace-only tokens are rejected)", k.Name)
 		}
+	}
+	// API key NAMEs are the audit key_id AND the MCP tool-cache identity
+	// (internal/proxy getTenantID): they must be stable, non-empty and
+	// unique so that (a) per-key MCP cache isolation holds — two keys
+	// sharing a name would see each other's cached tools — and (b) an
+	// authenticated request identity can never collide with the shared
+	// admin-injected MCP bucket (config.McpAdminIdentity). All three
+	// violations fail loading with an explicit error. The legacy auth_token
+	// expansion above legitimately produces the name "default" (a plain
+	// per-client bucket, NOT the admin bucket — only the reserved identity
+	// is forbidden), and the errors name the offending key but never echo
+	// any token.
+	seenNames := make(map[string]bool, len(cfg.APIKeys))
+	for _, k := range cfg.APIKeys {
+		if strings.TrimSpace(k.Name) == "" {
+			return nil, fmt.Errorf("api key: name is empty; every key needs a non-empty name (it is the audit key_id and the MCP cache identity)")
+		}
+		if k.Name == McpAdminIdentity {
+			return nil, fmt.Errorf("api key name %q is reserved for the shared admin-injected MCP tool bucket; choose a different name", k.Name)
+		}
+		if seenNames[k.Name] {
+			return nil, fmt.Errorf("api_keys: duplicate key name %q; every key needs a unique name (it is the MCP cache identity and the audit key_id)", k.Name)
+		}
+		seenNames[k.Name] = true
 	}
 	// Reject duplicate tokens within api_keys. The auth loop deliberately
 	// keeps the LAST matching name (no early return, constant-time scan), so
@@ -406,6 +463,28 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// validateProviderName rejects provider names that cannot be used as a
+// model-cache file name: the cache joins provider+".json" under its cache
+// directory, so a name with path separators, "." / "..", or an absolute
+// path would escape the cache dir (path traversal). Empty is allowed: an
+// account without a provider is valid and is simply skipped by the model
+// cache (it only manages named providers).
+func validateProviderName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if strings.ContainsAny(name, `\/`) || strings.ContainsRune(name, 0) {
+		return fmt.Errorf("provider name %q must not contain path separators", name)
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("provider name %q is not allowed as a cache file name", name)
+	}
+	if filepath.IsAbs(name) {
+		return fmt.Errorf("provider name %q must not be an absolute path", name)
+	}
+	return nil
 }
 
 func buildProviderSchema(accs []AccountConfig) map[string]string {

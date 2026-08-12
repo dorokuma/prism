@@ -19,6 +19,7 @@ import (
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/pool"
 	"github.com/dorokuma/prism/internal/proxy"
+	"github.com/dorokuma/prism/internal/ratelimit"
 	"github.com/dorokuma/prism/internal/usage"
 	"github.com/dorokuma/prism/internal/usagemeta"
 )
@@ -846,5 +847,177 @@ func TestHTTPHandler_MetricsRemoteNoTokenDenied(t *testing.T) {
 	h.ServeHTTP(rrFwd, reqFwd)
 	if rrFwd.Code != http.StatusUnauthorized {
 		t.Errorf("loopback /metrics with forwarding header and unset token: status = %d, want 401", rrFwd.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Round-4 audit: remap pricing (item 9) and /health rate-limit bypass (item 7)
+// ---------------------------------------------------------------------------
+
+// TestPrice_PrefersUpstreamModelAfterRemap pins item 9: when model remap
+// resolves a virtual model to a real upstream model, pricing uses the UPSTREAM
+// model's price (billing follows what the upstream actually served), not the
+// virtual name's.
+func TestPrice_PrefersUpstreamModelAfterRemap(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"virtual-model": "tier1"},
+		ModelTiers:        map[string]string{"tier1": "real-upstream-model"},
+		ModelMetadata: config.ModelMetadataMap{
+			"real-upstream-model": {Cost: &config.ModelCost{Input: 2, Output: 4, CacheRead: 0.5, CacheWrite: 1}},
+			"virtual-model":       {Cost: &config.ModelCost{Input: 1, Output: 1, CacheRead: 1, CacheWrite: 1}},
+		},
+	}
+	adapter := &usageRecorderAdapter{holder: config.NewConfigHolder(cfg)}
+	audit := &middleware.RequestAudit{
+		Model:            "virtual-model",
+		UpstreamModel:    "real-upstream-model",
+		Provider:         "p",
+		PromptTokens:     1000,
+		CompletionTokens: 500,
+	}
+	cost, status := adapter.Price(audit)
+	if status != usage.CostStatusOK || cost == nil {
+		t.Fatalf("Price = (%v, %q), want a priced cost", cost, status)
+	}
+	// (1000/1e6 * 2) + (500/1e6 * 4) = 0.004; the virtual model's cheaper
+	// price (0.001+0.0005) must NOT be used.
+	want := 1000.0/1e6*2 + 500.0/1e6*4
+	if *cost != want {
+		t.Errorf("cost = %v, want %v (upstream model price must win)", *cost, want)
+	}
+}
+
+// TestPrice_FallsBackToVirtualModel pins the compatibility fallback of item
+// 9: when the upstream model has no known price but the virtual model does,
+// pricing falls back to the virtual model's price so deployments that price
+// their virtual names keep working.
+func TestPrice_FallsBackToVirtualModel(t *testing.T) {
+	cfg := &config.Config{
+		ModelRemapEnabled: true,
+		ModelRemap:        map[string]string{"virtual-model": "tier1"},
+		ModelTiers:        map[string]string{"tier1": "real-upstream-model"},
+		ModelMetadata: config.ModelMetadataMap{
+			"virtual-model": {Cost: &config.ModelCost{Input: 1, Output: 1, CacheRead: 1, CacheWrite: 1}},
+		},
+	}
+	adapter := &usageRecorderAdapter{holder: config.NewConfigHolder(cfg)}
+	audit := &middleware.RequestAudit{
+		Model:            "virtual-model",
+		UpstreamModel:    "real-upstream-model",
+		Provider:         "p",
+		PromptTokens:     1000,
+		CompletionTokens: 0,
+	}
+	cost, status := adapter.Price(audit)
+	if status != usage.CostStatusOK || cost == nil {
+		t.Fatalf("Price = (%v, %q), want a priced cost via the virtual-model fallback", cost, status)
+	}
+	want := 1000.0 / 1e6 * 1
+	if *cost != want {
+		t.Errorf("cost = %v, want %v (virtual model fallback)", *cost, want)
+	}
+}
+
+// TestPrice_NoRemapUsesRequestedModel pins item 9 for the no-remap case: an
+// audit without an UpstreamModel prices the requested model as before.
+func TestPrice_NoRemapUsesRequestedModel(t *testing.T) {
+	cfg := &config.Config{
+		ModelMetadata: config.ModelMetadataMap{
+			"m": {Cost: &config.ModelCost{Input: 3, Output: 3, CacheRead: 3, CacheWrite: 3}},
+		},
+	}
+	adapter := &usageRecorderAdapter{holder: config.NewConfigHolder(cfg)}
+	audit := &middleware.RequestAudit{Model: "m", Provider: "p", PromptTokens: 1000}
+	cost, status := adapter.Price(audit)
+	if status != usage.CostStatusOK || cost == nil {
+		t.Fatalf("Price = (%v, %q), want a priced cost", cost, status)
+	}
+	if want := 1000.0 / 1e6 * 3; *cost != want {
+		t.Errorf("cost = %v, want %v", *cost, want)
+	}
+}
+
+// TestHTTPHandler_HealthBypassesRateLimit pins item 7 through the full HTTP
+// wiring: /health is answered 200 even when the business rate limiter has no
+// tokens left, while a business path from the same IP stays 429 — the
+// exemption is not widened to other paths.
+func TestHTTPHandler_HealthBypassesRateLimit(t *testing.T) {
+	cfg := testConfig(t, nil)
+	holder := config.NewConfigHolder(cfg)
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Mirrors NewProxyHandler's /health answer.
+		if r.URL.Path == "/health" {
+			w.Write([]byte("ok"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	// rate 0 / burst 0: every non-exempt request is limited.
+	rl := ratelimit.NewRateLimiter(0, 0)
+	h := newHTTPHandler(holder, next, rl, nil, usage.NewSummaryHandler(nil))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("/health: status = %d, want 200 (health must bypass the business rate limit)", rec.Code)
+	}
+	if rec.Body.String() != "ok" {
+		t.Errorf("/health body = %q, want ok", rec.Body.String())
+	}
+
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`)))
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Errorf("/v1/chat/completions: status = %d, want 429 (only /health is exempt)", rec2.Code)
+	}
+}
+
+// TestHTTPHandler_ResponsesDeepSchema400InvalidRequest is the full-stack
+// end-to-end pin for the depth-bounded schema simplification: a too-deep
+// tool schema in a /v1/responses request travels the ENTIRE HTTP wiring
+// (auth gate → NewProxyHandler → proxyResponses → convert → mcp sanitize →
+// ErrSchemaTooDeep) and answers 400 invalid_request — never a 200 with an
+// unsafe schema, never a 500.
+func TestHTTPHandler_ResponsesDeepSchema400InvalidRequest(t *testing.T) {
+	cfg := testConfig(t, func(c *config.Config) {
+		c.Accounts = []config.AccountConfig{{Name: "t", Key: "k", BaseURL: "http://localhost:1", Provider: "t"}}
+		c.APIKeys = []config.APIKey{{Name: "ci-bot", Token: "sk-ci-111"}}
+	})
+	holder := config.NewConfigHolder(cfg)
+	p := pool.NewPool(cfg.Accounts)
+	h := newHTTPHandler(holder, proxy.NewProxyHandler(p, config.WireAPIBoth, holder, nil), nil, nil, usage.NewSummaryHandler(nil))
+
+	deep := map[string]any{"type": "object"}
+	cur := deep
+	for i := 0; i < 64; i++ {
+		nested := map[string]any{"type": "object"}
+		cur["properties"] = map[string]any{"nested": nested}
+		cur = nested
+	}
+	paramsJSON, _ := json.Marshal(deep)
+	body := `{"model":"gpt-4","input":"hi","tools":[{"type":"function","name":"deep_tool","parameters":` + string(paramsJSON) + `}]}`
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer sk-ci-111")
+	r.Header.Set("X-Prism-Provider", "t")
+	h.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 invalid_request (a too-deep schema must fail the request), body: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not a JSON envelope: %v (%q)", err, rec.Body.String())
+	}
+	if resp.Error.Code != "invalid_request" {
+		t.Errorf("error code = %q, want invalid_request", resp.Error.Code)
 	}
 }

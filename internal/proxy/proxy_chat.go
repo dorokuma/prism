@@ -47,6 +47,44 @@ type ChatForwardOpts struct {
 // buffered whole into memory.
 const maxRequestBodyBytes = 10 << 20
 
+// ensureStreamOptionsIncludeUsage returns body with
+// stream_options.include_usage=true, preserving every other client-supplied
+// stream_options field (OpenAI chat-completions semantics). It is a no-op
+// when the body is not valid JSON or already sets include_usage=true. A
+// client stream_options that is not a JSON object is replaced by the usage
+// request (the invalid value could not reach the upstream meaningfully
+// anyway). Usage recording is the only reason this runs: without it, an
+// OpenAI-compatible upstream stream would never report usage to the audit
+// and usage store.
+func ensureStreamOptionsIncludeUsage(body []byte) []byte {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return body
+	}
+	var so map[string]any
+	if v, ok := raw["stream_options"]; ok && len(v) > 0 && string(v) != "null" {
+		if err := json.Unmarshal(v, &so); err != nil || so == nil {
+			so = nil // non-object stream_options: replace below
+		} else if included, ok := so["include_usage"].(bool); ok && included {
+			return body // already ensured — keep the body byte-identical
+		}
+	}
+	if so == nil {
+		so = map[string]any{"include_usage": true}
+	} else {
+		so["include_usage"] = true
+	}
+	out, err := json.Marshal(so)
+	if err != nil {
+		return body
+	}
+	raw["stream_options"] = json.RawMessage(out)
+	if re, err := json.Marshal(raw); err == nil {
+		return re
+	}
+	return body
+}
+
 // rejectAudit emits exactly ONE request.complete audit line for a request
 // rejected BEFORE the forwarding path (body read / conversion / validation
 // failures). It is the single early-rejection audit path shared by
@@ -176,6 +214,20 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 	aud.Provider = provider
 	aud.Stream = opts.Stream
 	aud.KeyID = middleware.APIKeyFromContext(r.Context())
+	// Traceability for model remap: when remap actually resolves the model to
+	// a DIFFERENT upstream name, the audit keeps both the client-requested
+	// (virtual) model (Model) and the resolved upstream model
+	// (UpstreamModel), so per-model accounting and pricing (which prefers
+	// the upstream model — see the wiring-stage Price) never lose either
+	// side. When the model passes through unchanged (remap disabled, or the
+	// model is not in model_remap) UpstreamModel stays empty — the audit
+	// line then carries only the requested model, matching the field
+	// comment and the omitempty JSON tag.
+	if cfg.ModelRemapEnabled {
+		if resolved := cfg.RemapModel(opts.Model); resolved != opts.Model {
+			aud.UpstreamModel = resolved
+		}
+	}
 	// Transform normally runs for every request; model remap inside is still
 	// gated by cfg.ModelRemapEnabled (real model name passes through when
 	// disabled). The /v1/messages surface (anthropic body, not a chat
@@ -183,6 +235,15 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 	// byte-for-byte.
 	if !opts.SkipSanitize {
 		bodyBytes = sanitize.TransformRequestBodyForProvider(bodyBytes, cfg, provider)
+	}
+	// Usage-enabled OpenAI-compatible streaming: ensure the upstream reports
+	// usage in the stream (stream_options.include_usage=true) so the audit
+	// and usage store capture tokens. The client's other stream_options
+	// fields are preserved; the Anthropic /v1/messages surface
+	// (SkipSanitize) is never touched — stream_options is an OpenAI field
+	// and Anthropic must not be modified.
+	if opts.Stream && cfg.Usage.Enabled && !opts.SkipSanitize {
+		bodyBytes = ensureStreamOptionsIncludeUsage(bodyBytes)
 	}
 	if p.AccountCount() == 0 {
 		aud.Error = "no accounts configured"
@@ -198,6 +259,15 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		opts.MaxResponseBytes = cfg.MaxUpstreamResponseBytes
 	}
 	slog.Debug("proxy request start", "request_id", requestID, "path", r.URL.Path, "stream", opts.Stream, "responses_out", opts.ResponsesOut, "start", start.Format(time.RFC3339Nano), "max_concurrent", maxConcurrent)
+
+	// sawCredential / sawQuota ACCUMULATE the upstream permanent failure
+	// classes seen across ALL accounts during the retry loop (item: multi-
+	// account permanent errors must not record only the last class). When
+	// every account is exhausted, the terminal response must distinguish the
+	// real cause from a generic 503 all_exhausted: the gateway's own
+	// credentials or balance are broken — the operator, not the client,
+	// must fix them.
+	var sawCredential, sawQuota bool
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
 		if attempts > 0 {
@@ -221,6 +291,16 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		if err != nil {
 			slog.Error("select account failed", "error", err)
 			util.RecordError()
+			// When every account was permanently rejected by the upstream
+			// (401/402 or recognized credential/quota errors), a generic
+			// select failure (no_healthy) would masquerade the real cause:
+			// the gateway's own credentials or balance are broken. Report
+			// the upstream auth/balance failure instead. Other select
+			// failures (timeout, client cancel) are reported as before.
+			if errors.Is(err, pool.ErrNoHealthyAccounts) && (sawCredential || sawQuota) {
+				writeUpstreamExhausted(sc, aud, sawCredential, sawQuota)
+				return
+			}
 			aud.Error = err.Error()
 			// Classify select failures with errors.Is (wrapping-safe) into
 			// four distinct response codes — no_healthy / select_timeout /
@@ -258,11 +338,20 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 			defer p.Release(acc)
 			res := doUpstreamRequest(acc, r, bodyBytes, opts, requestID)
 			if res.resp != nil {
-				done, fatalErr := handleUpstreamResponse(acc, sc, r, res.resp, bodyBytes, start, opts, requestID, res.ctx, res.cancel)
+				done, fatalErr, upClass := handleUpstreamResponse(acc, sc, r, res.resp, bodyBytes, start, opts, requestID, res.ctx, res.cancel)
 				if done {
 					terminalDone = true
 					terminalFatalErr = fatalErr
 					return
+				}
+				// Retryable upstream failure: accumulate the permanent
+				// rejection classes (credential and quota tracked
+				// independently — the last account's class must not hide an
+				// earlier account's different failure).
+				if upClass == UpstreamErrorPermanentCredential {
+					sawCredential = true
+				} else if upClass == UpstreamErrorPermanentQuota {
+					sawQuota = true
 				}
 				return
 			}
@@ -282,11 +371,54 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 	}
 	slog.Error("all accounts exhausted after retries", "request_id", requestID, "attempts", maxAttempts, "elapsed", time.Since(start))
 	util.RecordError()
+	// Distinguish the real cause when upstreams PERMANENTLY rejected every
+	// account: a plain 503 all_exhausted would masquerade the gateway's own
+	// broken credential (502 upstream_auth_failed) or exhausted quota/balance
+	// (503 upstream_quota_exhausted) as a generic availability problem. The
+	// failover across accounts is unchanged; only the terminal response and
+	// audit classify the outcome.
+	if sawCredential || sawQuota {
+		writeUpstreamExhausted(sc, aud, sawCredential, sawQuota)
+		return
+	}
 	aud.Error = "all accounts exhausted after retries"
 	aud.ErrorType = "all_exhausted"
 	util.WriteJSON(sc, 503, map[string]any{
 		"error": map[string]any{"message": "All accounts exhausted after retries", "code": "all_exhausted"},
 	})
+}
+
+// writeUpstreamExhausted writes the terminal response and audit fields for
+// the case where every upstream account was permanently rejected. The
+// accumulated classes decide the outcome with a FIXED priority (independent
+// of account order):
+//   - credential failures win over quota exhaustion → 502 upstream_auth_failed.
+//     Auth is the most diagnostic signal: broken keys make every other fix
+//     (topping up quota, client retries) useless until the keys are replaced,
+//     and 502 keeps a gateway-side credential problem distinct from both
+//     client errors and availability issues.
+//   - otherwise quota/balance exhaustion (any 402 or recognized structured
+//     quota error) → 503 upstream_quota_exhausted.
+//
+// It is the single write point used by the select-failure path (all accounts
+// exhausted → no healthy account) and the retry-loop exhaustion path, and it
+// reuses the existing dedicated error codes — no new public error code is
+// introduced.
+func writeUpstreamExhausted(w http.ResponseWriter, aud *middleware.RequestAudit, sawCredential, sawQuota bool) {
+	switch {
+	case sawCredential:
+		aud.Error = "all upstream accounts failed authentication"
+		aud.ErrorType = "upstream_auth_failed"
+		util.WriteJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]any{"message": "All upstream accounts failed authentication", "code": "upstream_auth_failed"},
+		})
+	case sawQuota:
+		aud.Error = "all upstream accounts exhausted quota or balance"
+		aud.ErrorType = "upstream_quota_exhausted"
+		util.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]any{"message": "All upstream accounts exhausted quota or balance", "code": "upstream_quota_exhausted"},
+		})
+	}
 }
 
 // resolveMaxConcurrent moved to config.ResolveMaxConcurrent — the single

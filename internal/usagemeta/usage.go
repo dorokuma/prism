@@ -52,6 +52,16 @@ type Usage struct {
 	Source     string
 }
 
+// HasTokens reports whether the usage carries any token count worth
+// recording (prompt, completion, cached, or cache-write). It is the single
+// "is this usage non-empty" gate used by every audit capture point and by
+// the parsers' empty check, so a usage carrying ONLY cache tokens is
+// accepted everywhere (a cache-only hit still consumes upstream quota and
+// costs money).
+func (u Usage) HasTokens() bool {
+	return u.Prompt != 0 || u.Completion != 0 || u.Cached != 0 || u.CacheWrite != 0
+}
+
 // usageMember extracts the usage object from data. data may be a bare
 // usage object (stream chunk usage, extracted event usage) or a full
 // response body that nests the usage object under the top-level "usage"
@@ -168,7 +178,7 @@ func ParseOpenAI(data []byte) Usage {
 	// No token information at all (e.g. an Anthropic body mis-selected into
 	// this parser): return a fully zero Usage, marker included, so a
 	// mis-selected parse can never masquerade as a real OpenAI record.
-	if out.Prompt == 0 && out.Completion == 0 && out.Cached == 0 && out.CacheWrite == 0 {
+	if !out.HasTokens() {
 		return Usage{}
 	}
 	out.Source = SourceOpenAI
@@ -244,7 +254,7 @@ func ParseAnthropic(data []byte) Usage {
 		Cached:     cached,
 		CacheWrite: cacheWrite,
 	}
-	if out.Prompt == 0 && out.Completion == 0 && out.Cached == 0 && out.CacheWrite == 0 {
+	if !out.HasTokens() {
 		return Usage{}
 	}
 	out.Source = SourceAnthropic
