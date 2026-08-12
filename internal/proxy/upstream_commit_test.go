@@ -12,6 +12,7 @@ import (
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/pool"
+	"github.com/dorokuma/prism/internal/stream"
 )
 
 // commitTrackWriter is a deliberately NON-*StatusCapture StatusCommitter
@@ -154,5 +155,76 @@ func TestHandleUpstreamResponse_StreamPartialWriteKeepsCommittedStatus_NonConcre
 	}
 	if aud.Status != http.StatusOK {
 		t.Errorf("audit must keep the committed 200 after a partial write, got %d", aud.Status)
+	}
+}
+
+// TestHandleUpstreamResponse_StreamPreFirstEventTooLarge502 pins the
+// pre-first-event mapping of ErrResponsesStreamTooLarge through the
+// production handler path: when the accumulation cap is exceeded before any
+// event was delivered, the proxy answers a structured 502 with the SAME
+// diagnosable code the translator uses mid-stream (response_too_large), not
+// the generic upstream_stream_error, and the audit records the code as the
+// error_type.
+func TestHandleUpstreamResponse_StreamPreFirstEventTooLarge502(t *testing.T) {
+	h := &capturingHandler{}
+	restore := stashSlog(h)
+	defer restore()
+
+	// Production limits are 16 MiB per buffer / 32 MiB total — a pre-first
+	// event overrun cannot be triggered with them (a single SSE line is
+	// capped at 4 MiB), so the test shrinks the caps via the stream test
+	// hook. The first (and only) delta already exceeds the TOTAL cap while
+	// staying under the per-buffer cap.
+	t.Cleanup(stream.SetResponsesStreamLimitsForTest(1<<20, 1000))
+
+	rec := httptest.NewRecorder()
+	w := &commitTrackWriter{inner: rec}
+
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"" + strings.Repeat("x", 2000) + "\"}}]}\n\n"
+	aud := directResponsesStream(t, body, w)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (pre-first-event too-large must not become an empty 200)", rec.Code)
+	}
+	if code, _ := decodeErrorBody(t, rec.Body.String()); code != "response_too_large" {
+		t.Errorf("error code = %q, want response_too_large (same code as the mid-stream frame)", code)
+	}
+	if aud.Status != http.StatusBadGateway {
+		t.Errorf("audit status = %d, want 502", aud.Status)
+	}
+	if aud.ErrorType != "response_too_large" {
+		t.Errorf("audit error_type = %q, want response_too_large", aud.ErrorType)
+	}
+}
+
+// TestHandleUpstreamResponse_StreamPreFirstEventLineTooLong502 pins the
+// pre-first-event mapping of a single SSE line over the scanner cap through
+// the production handler path: the proxy answers a structured 502 with the
+// same diagnosable code the translator uses mid-stream
+// (stream_line_too_long), not the generic upstream_stream_error.
+func TestHandleUpstreamResponse_StreamPreFirstEventLineTooLong502(t *testing.T) {
+	h := &capturingHandler{}
+	restore := stashSlog(h)
+	defer restore()
+
+	// One single line strictly over the production 4 MiB scanner cap; the
+	// scanner fails on the very first line, so no event was delivered.
+	body := "data: " + strings.Repeat("x", config.StreamScannerMaxBuf+1) + "\n\n"
+	rec := httptest.NewRecorder()
+	w := &commitTrackWriter{inner: rec}
+
+	aud := directResponsesStream(t, body, w)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (pre-first-event line-too-long must not become an empty 200)", rec.Code)
+	}
+	if code, _ := decodeErrorBody(t, rec.Body.String()); code != "stream_line_too_long" {
+		t.Errorf("error code = %q, want stream_line_too_long (same code as the mid-stream frame)", code)
+	}
+	if aud.Status != http.StatusBadGateway {
+		t.Errorf("audit status = %d, want 502", aud.Status)
+	}
+	if aud.ErrorType != "stream_line_too_long" {
+		t.Errorf("audit error_type = %q, want stream_line_too_long", aud.ErrorType)
 	}
 }

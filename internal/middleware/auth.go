@@ -152,6 +152,29 @@ func APIKeyFromContext(ctx context.Context) string {
 	return name
 }
 
+// authStatusCtxKey is the unexported context key for the authentication
+// STATUS (whether the request was authenticated against a real api_keys
+// set). It is distinct from the key NAME: when auth is disabled the
+// middleware still installs the configured default key name (for usage
+// attribution), and consumers that need to know whether a REAL credential
+// was presented must ask IsAuthenticated instead of checking the name.
+type authStatusCtxKey struct{}
+
+// WithAuthenticated returns a copy of ctx carrying the authentication
+// status (true = the request passed a real api_keys credential check;
+// false = auth disabled or the request bypassed the auth middleware).
+func WithAuthenticated(ctx context.Context, authed bool) context.Context {
+	return context.WithValue(ctx, authStatusCtxKey{}, authed)
+}
+
+// IsAuthenticated reports whether the request was authenticated against a
+// configured api_keys set. It is false for auth-disabled deployments and
+// for requests that never went through the auth middleware.
+func IsAuthenticated(ctx context.Context) bool {
+	v, _ := ctx.Value(authStatusCtxKey{}).(bool)
+	return v
+}
+
 // HasForwardedHeaders reports whether the request carries a forwarding
 // header (X-Forwarded-For or X-Real-IP). A same-machine reverse proxy
 // presents a loopback RemoteAddr AND adds one of these headers, so loopback

@@ -22,6 +22,19 @@ var (
 	mcpCacheCtxCancel context.CancelFunc
 )
 
+// UnauthenticatedIdentity is the MCP tool-cache identity for requests that
+// carried NO authenticated API key (auth disabled, or the request bypassed
+// the auth middleware). It is a fixed, stable, non-secret label — never
+// derived from credentials (there are none) and never from request data that
+// a local client could forge to impersonate another client. The bucket is
+// deliberately READ-ONLY (cacheMCPTool refuses to write it), so with auth
+// disabled different local clients can never pollute each other's cached
+// tools: nobody can write, and every unauthenticated request sees only the
+// shared admin-injected bucket. It aliases config.McpUnauthenticatedIdentity
+// — the reserved string lives in config (which must not import mcp) so
+// LoadConfig can reject api_keys entries that would collide with it.
+const UnauthenticatedIdentity = config.McpUnauthenticatedIdentity
+
 func init() {
 	var ctx context.Context
 	ctx, mcpCacheCtxCancel = context.WithCancel(context.Background())
@@ -61,13 +74,19 @@ func StopMCPCache() {
 // (config.McpAdminIdentity) is dropped outright — the request path must
 // NEVER write into the shared admin-injected bucket (config validation
 // forbids such key names; this guard covers programmatically built key
-// sets). Tools cached under one identity are never returned to another
-// (per-identity isolation).
+// sets). The unauthenticated identity (UnauthenticatedIdentity) is also
+// refused: with auth disabled there is no per-client identity, and caching
+// under one shared label would let different local clients pollute each
+// other's tool views. Tools cached under one identity are never returned to
+// another (per-identity isolation).
 func cacheMCPTool(identity string, tool map[string]any) {
 	if identity == "" {
 		identity = "default"
 	}
 	if identity == config.McpAdminIdentity {
+		return
+	}
+	if identity == UnauthenticatedIdentity {
 		return
 	}
 	cacheTool(identity, tool)
@@ -126,13 +145,20 @@ func ClearMCPCache() {
 // admin-injected definitions stay visible to every identity. On a name
 // collision the identity's own tool wins over the shared one. The "default"
 // identity is a plain per-client bucket (the anonymous fallback for empty
-// identities); it has no special relationship to the admin bucket.
+// identities); it has no special relationship to the admin bucket. The
+// unauthenticated identity (UnauthenticatedIdentity) sees ONLY the shared
+// admin bucket: its bucket is read-only (see cacheMCPTool), so there is
+// nothing per-client to merge.
 func getTenantMCPTools(identity string) []map[string]any {
 	if identity == "" {
 		identity = "default"
 	}
 	mcpCacheMu.Lock()
 	defer mcpCacheMu.Unlock()
+
+	if identity == UnauthenticatedIdentity {
+		return snapshotTenantToolsLocked(config.McpAdminIdentity)
+	}
 
 	shared := snapshotTenantToolsLocked(config.McpAdminIdentity)
 	own := snapshotTenantToolsLocked(identity)

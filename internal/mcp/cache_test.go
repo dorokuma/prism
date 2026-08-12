@@ -225,6 +225,44 @@ func TestMCPCache_RequestPathNeverWritesAdminBucket(t *testing.T) {
 	}
 }
 
+// TestMCPCache_UnauthenticatedBucketIsReadOnly pins the auth-disabled
+// isolation: with no authenticated API key the request identity is the
+// fixed mcp.UnauthenticatedIdentity, whose bucket is READ-ONLY —
+// cacheMCPTool refuses to write it and getTenantMCPTools returns only the
+// shared admin-injected tools. Different local clients can therefore never
+// pollute each other's cached tools when auth is disabled.
+func TestMCPCache_UnauthenticatedBucketIsReadOnly(t *testing.T) {
+	snap := cacheSnapshot()
+	ClearMCPCache()
+	defer restoreCache(snap)
+
+	cacheAdminTool(toolWithName("admin__global"))
+	// Request-path writes under the unauthenticated identity are dropped.
+	cacheMCPTool(UnauthenticatedIdentity, toolWithName("anon__leak"))
+	cacheMCPTool("", toolWithName("empty__leak")) // empty → "default", NOT unauthenticated
+
+	// The unauthenticated identity sees ONLY the admin bucket.
+	got := toolNames(getTenantMCPTools(UnauthenticatedIdentity))
+	if len(got) != 1 || !got["admin__global"] {
+		t.Errorf("unauthenticated identity must see only the admin tools, got %v", got)
+	}
+
+	// A second unauthenticated "client" sees exactly the same admin-only
+	// set — nothing the first client cached can leak to it.
+	got2 := toolNames(getTenantMCPTools(UnauthenticatedIdentity))
+	if len(got2) != 1 || !got2["admin__global"] {
+		t.Errorf("second unauthenticated identity must see only the admin tools, got %v", got2)
+	}
+
+	// The dropped write must not leak into ANY writable bucket either.
+	for _, id := range []string{"default", "key-a"} {
+		names := toolNames(getTenantMCPTools(id))
+		if names["anon__leak"] {
+			t.Errorf("identity %q must not see the dropped unauthenticated write", id)
+		}
+	}
+}
+
 // TestSanitizeTools_DeepSchemaFails pins item 5 at the mcp surface: a tool
 // parameter schema deeper than the limit fails fast with ErrSchemaTooDeep
 // (propagated to the caller → convert → 400 invalid_request) instead of

@@ -210,6 +210,7 @@ func TestLoadConfig_NonLoopbackRequiresCredential(t *testing.T) {
 	t.Run("non-loopback with api_keys passes", func(t *testing.T) {
 		content := `
 listen: 0.0.0.0:8080
+allow_insecure_http: true
 api_keys:
   - name: ci-bot
     token: sk-ci-111
@@ -228,6 +229,7 @@ accounts:
 		t.Setenv("PRISM_AUTH_TOKEN", "env-token-456")
 		content := `
 listen: 0.0.0.0:8080
+allow_insecure_http: true
 accounts:
   - name: test-acc
     key: test-key-12345
@@ -242,6 +244,7 @@ accounts:
 	t.Run("non-loopback with api_keys + auth_token dup passes", func(t *testing.T) {
 		content := `
 listen: 0.0.0.0:8080
+allow_insecure_http: true
 auth_token: sk-ci-111
 api_keys:
   - name: ci-bot

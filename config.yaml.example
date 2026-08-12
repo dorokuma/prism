@@ -42,9 +42,21 @@ listen: "127.0.0.1:18790"
 #   - name: default
 #     token: "your-secret-token"
 
-# Optional TLS. When both set, server listens with HTTPS. Env vars: PRISM_TLS_CERT, PRISM_TLS_KEY.
+# Optional TLS. When BOTH are set (or both come from the PRISM_TLS_CERT /
+# PRISM_TLS_KEY env vars), the server listens with HTTPS. A non-loopback
+# listen address REQUIRES a complete TLS configuration: loading fails
+# otherwise, and configuring exactly one of the two files is always a load
+# error (the server would silently serve plaintext). trusted_proxies does
+# NOT relax this — it only controls X-Forwarded-For trust and cannot prevent
+# direct access to the listener. To explicitly serve plaintext on a
+# non-loopback address (e.g. an internal network or a TLS-terminating
+# reverse proxy you fully control), set allow_insecure_http: true — the
+# traffic is then unencrypted and any network observer can read the client
+# credentials. Loopback listeners (127.0.0.1 / ::1) never need TLS (local
+# development).
 # tls_cert_file: "/path/to/cert.pem"
 # tls_key_file: "/path/to/key.pem"
+# allow_insecure_http: false
 
 # Optional trusted reverse proxy CIDRs. When set, X-Forwarded-For is only
 # trusted for requests coming from these CIDRs. The XFF chain is walked
@@ -180,10 +192,11 @@ accounts:
 
 # ---------------------------------------------------------------------------
 # 可选：max_concurrent_per_account —— 按模型名精确匹配的单账号最大并发。
-# 未命中的模型回退到代码内置默认值（含 flash/pro 关键字推断），并打
-# "unknown model, using default concurrency" 告警；显式列出即可消除告警。
-# 值含义：agentrouter（第三方中转网关）账号取保守值 8；opencode-go 侧模型
-# 与 deepseek-v4-pro 同量级取 450。
+# 未命中的模型回退到内置保守默认值 8（不再按模型名猜 flash/pro 档位；
+# 对任何上游都安全，包括低速率限制的个人 key）。想提高并发必须显式配置：
+# 显式列出目标模型即可消除 "unknown model, using default concurrency"
+# 告警。值含义：agentrouter（第三方中转网关）账号取保守值 8；有充分
+# 上游余量的账号（如 deepseek-v4-pro 同量级）可调高到 450。
 # ---------------------------------------------------------------------------
 # max_concurrent_per_account:
 #   claude-opus-5: 8
@@ -205,9 +218,9 @@ mcp_tools_json: "/var/lib/prism/mcp_tools.json"
 # （账号名连字符转下划线后大写，规则同 account-1 → LB_KEY_ACCOUNT_1）
 #
 # probe_path: disabled —— 探活端点（GET /v1/models）未实测，disabled 表示
-# 不发探活请求；exhausted 账号会在每个 probe_interval 周期被乐观置回
-# healthy。若确认 GET /v1/models 可用，把该行改成 probe_path: /v1/models
-# 或删掉即可，不需要改代码。
+# 不发探活请求，也不改变账号状态：exhausted 账号保持 exhausted，直到运营者
+# 手动恢复或重新启用探活（“不探测”不等于“凭据已恢复”）。若确认 GET
+# /v1/models 可用，把该行改成 probe_path: /v1/models 或删掉即可，不需要改代码。
 #
 # auth_header（可选，账号级）：默认写 Authorization: Bearer <key>；若上游
 # 只认 x-api-key 之类的自定义头，设为该头名即可（值写裸 key，不再写

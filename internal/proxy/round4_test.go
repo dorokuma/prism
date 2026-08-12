@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/mcp"
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/pool"
 	"github.com/dorokuma/prism/internal/sanitize"
@@ -736,18 +737,38 @@ func TestProxyHandler_HealthServesOK(t *testing.T) {
 // Item 2: MCP cache identity = authenticated API key name
 // ---------------------------------------------------------------------------
 
-// TestGetTenantID_UsesAPIKeyNameFromAuthContext pins item 2 at the proxy
-// level: getTenantID returns the authenticated API key NAME (never the
-// token) from the auth middleware context, with a "default" fallback when
-// no auth context exists.
-func TestGetTenantID_UsesAPIKeyNameFromAuthContext(t *testing.T) {
+// TestGetTenantID_IdentityByAuthStatus pins the MCP-cache identity rule at
+// the proxy level: an authenticated request (real api_keys credential) gets
+// the API key NAME (never the token); a request that did NOT go through a
+// real credential check gets the fixed read-only
+// mcp.UnauthenticatedIdentity — never a shared writable bucket that would
+// let different local clients pollute each other when auth is disabled.
+func TestGetTenantID_IdentityByAuthStatus(t *testing.T) {
+	// No auth context at all (direct handler test, auth disabled): the
+	// unauthenticated identity — NOT "default" (a writable shared bucket).
 	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
-	if got := getTenantID(r); got != "default" {
-		t.Errorf("no auth context: identity = %q, want default", got)
+	if got := getTenantID(r); got != mcp.UnauthenticatedIdentity {
+		t.Errorf("no auth context: identity = %q, want %q", got, mcp.UnauthenticatedIdentity)
 	}
+
+	// A key name alone (WithAPIKey without the auth-status flag) is not
+	// enough: the request must also be marked authenticated.
 	r = r.WithContext(middleware.WithAPIKey(r.Context(), "ci-bot"))
+	if got := getTenantID(r); got != mcp.UnauthenticatedIdentity {
+		t.Errorf("key name without auth status: identity = %q, want %q (unauthenticated until marked)", got, mcp.UnauthenticatedIdentity)
+	}
+
+	// Authenticated request: the key NAME is the identity.
+	r = r.WithContext(middleware.WithAuthenticated(r.Context(), true))
 	if got := getTenantID(r); got != "ci-bot" {
 		t.Errorf("with auth context: identity = %q, want ci-bot", got)
+	}
+
+	// Authenticated but no key name installed: plain "default" bucket.
+	r2 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
+	r2 = r2.WithContext(middleware.WithAuthenticated(r2.Context(), true))
+	if got := getTenantID(r2); got != "default" {
+		t.Errorf("authenticated without key name: identity = %q, want default", got)
 	}
 }
 

@@ -14,6 +14,66 @@ import (
 // ErrEmptyUpstreamStream is returned when the chat completion stream has no model output.
 var ErrEmptyUpstreamStream = errors.New("empty upstream chat completion stream")
 
+// ErrResponsesStreamTooLarge is returned when an accumulation limit of the
+// responses stream translator is exceeded: the PER-BUFFER cap
+// (MaxResponsesStreamAccumulatedBytes — output text, reasoning text, or
+// one tool call's arguments) or the TOTAL cap
+// (MaxResponsesStreamTotalBytes — text + reasoning + every tool call's
+// arguments combined). The error is explicit: the caller must surface it
+// to the client (response.failed when the stream already started) instead
+// of silently truncating the accumulated content, which would corrupt the
+// final output_text.done / function_call arguments.
+var ErrResponsesStreamTooLarge = errors.New("responses stream accumulated output exceeds the size limit")
+
+// MaxResponsesStreamAccumulatedBytes is the per-buffer cap for the
+// accumulated output of a /v1/responses stream translation: output text
+// (content + refusal), reasoning text, and EACH tool call's arguments are
+// each bounded by this value. 16 MiB is generous for any realistic model
+// output (a 128k-token completion is roughly 0.5 MiB of text). A buffer
+// that would exceed the cap aborts the translation with
+// ErrResponsesStreamTooLarge (never silent truncation).
+const MaxResponsesStreamAccumulatedBytes = 16 << 20
+
+// MaxResponsesStreamTotalBytes is the cap for the SUM of ALL accumulated
+// output of one /v1/responses stream translation: output text (content +
+// refusal) + reasoning text + every tool call's arguments combined. 32 MiB
+// (2× the per-buffer cap) bounds the worst-case translator memory
+// regardless of how many tool calls the upstream emits — the per-buffer
+// caps alone would let N tools hold N×16 MiB of arguments. A translation
+// whose total would exceed the cap aborts with ErrResponsesStreamTooLarge
+// (never silent truncation); normal streams (text or reasoning well under
+// 32 MiB) are unaffected.
+const MaxResponsesStreamTotalBytes = 32 << 20
+
+// responsesStreamMaxAccumulated is the per-buffer cap used by
+// TranslateChatStreamToResponses. It is a variable (not a const) so tests
+// can shrink it to exercise the overflow path without allocating 16 MiB;
+// production always uses MaxResponsesStreamAccumulatedBytes.
+var responsesStreamMaxAccumulated = MaxResponsesStreamAccumulatedBytes
+
+// responsesStreamMaxTotal is the total cap (text + reasoning + all tool
+// args) used by TranslateChatStreamToResponses. Variable (not const) for
+// the same reason as responsesStreamMaxAccumulated; production always uses
+// MaxResponsesStreamTotalBytes.
+var responsesStreamMaxTotal = MaxResponsesStreamTotalBytes
+
+// SetResponsesStreamLimitsForTest overrides the accumulation caps used by
+// TranslateChatStreamToResponses (per-buffer and total) for the duration
+// of a test and returns a restore function. It exists so tests — including
+// proxy-package tests that drive the production handler path — can
+// exercise the over-limit behavior without allocating 16+ MiB per test;
+// production limits are the constants above.
+func SetResponsesStreamLimitsForTest(maxPerBuffer, maxTotal int) (restore func()) {
+	oldPerBuffer := responsesStreamMaxAccumulated
+	oldTotal := responsesStreamMaxTotal
+	responsesStreamMaxAccumulated = maxPerBuffer
+	responsesStreamMaxTotal = maxTotal
+	return func() {
+		responsesStreamMaxAccumulated = oldPerBuffer
+		responsesStreamMaxTotal = oldTotal
+	}
+}
+
 type reasoningPhase uint8
 
 const (
@@ -56,6 +116,18 @@ type responsesStreamTranslator struct {
 	messagePhase       messagePhase
 	textBuf            strings.Builder
 	reasoningBuf       strings.Builder
+	// maxAccumulated is the per-buffer cap for textBuf, reasoningBuf and
+	// each tool call's args (see MaxResponsesStreamAccumulatedBytes).
+	maxAccumulated int
+	// maxTotal is the cap for the SUM of all accumulated output (text +
+	// reasoning + every tool call's args; see MaxResponsesStreamTotalBytes).
+	maxTotal int
+	// totalAccumulated counts the bytes accumulated into every buffer so
+	// far (text + reasoning + all tool args). int64: the overflow-safe
+	// check below compares int64(len(s)) against
+	// int64(maxTotal)-totalAccumulated, so the counter can never wrap
+	// regardless of platform int width.
+	totalAccumulated int64
 	// tool_search interception
 	searchToolCache []map[string]any
 	pendingSearchID string
@@ -78,7 +150,68 @@ func newResponsesStreamTranslator(model string, searchToolCache []map[string]any
 		nextOutputIdx:   0,
 		searchToolCache: searchToolCache,
 		reasoningBuf:    strings.Builder{},
+		maxAccumulated:  responsesStreamMaxAccumulated,
+		maxTotal:        responsesStreamMaxTotal,
 	}
+}
+
+// appendText accumulates one content/refusal delta into textBuf, failing
+// with ErrResponsesStreamTooLarge when the per-buffer cap or the total
+// cap would be exceeded (explicit error, never silent truncation). The
+// wrapped context names the limit so the error is diagnosable.
+func (tr *responsesStreamTranslator) appendText(s string) error {
+	if tr.textBuf.Len()+len(s) > tr.maxAccumulated {
+		return fmt.Errorf("%w (output text buffer)", ErrResponsesStreamTooLarge)
+	}
+	if err := tr.checkTotal(len(s)); err != nil {
+		return err
+	}
+	tr.textBuf.WriteString(s)
+	return nil
+}
+
+// appendReasoning accumulates one reasoning delta into reasoningBuf,
+// failing with ErrResponsesStreamTooLarge when the per-buffer cap or the
+// total cap would be exceeded.
+func (tr *responsesStreamTranslator) appendReasoning(s string) error {
+	if tr.reasoningBuf.Len()+len(s) > tr.maxAccumulated {
+		return fmt.Errorf("%w (reasoning buffer)", ErrResponsesStreamTooLarge)
+	}
+	if err := tr.checkTotal(len(s)); err != nil {
+		return err
+	}
+	tr.reasoningBuf.WriteString(s)
+	return nil
+}
+
+// appendToolArgs accumulates one arguments delta into a tool call's args,
+// failing with ErrResponsesStreamTooLarge when the per-buffer cap or the
+// total cap would be exceeded.
+func (tr *responsesStreamTranslator) appendToolArgs(st *streamToolState, s string) error {
+	if len(st.args)+len(s) > tr.maxAccumulated {
+		return fmt.Errorf("%w (tool call arguments buffer)", ErrResponsesStreamTooLarge)
+	}
+	if err := tr.checkTotal(len(s)); err != nil {
+		return err
+	}
+	st.args += s
+	return nil
+}
+
+// checkTotal fails when adding n more bytes would push the SUM of all
+// accumulated output (text + reasoning + all tool args) past maxTotal. The
+// comparison is overflow-safe: it is rewritten as
+// int64(n) > int64(maxTotal)-totalAccumulated, so neither side can wrap
+// (totalAccumulated is only ever advanced after passing this check, hence
+// int64(maxTotal)-totalAccumulated >= 0 always). On success the counter is
+// advanced. The wrapped context names the limit so the error is
+// diagnosable.
+func (tr *responsesStreamTranslator) checkTotal(n int) error {
+	if int64(n) > int64(tr.maxTotal)-tr.totalAccumulated {
+		return fmt.Errorf("%w (total accumulated output across text, reasoning and all tool call arguments)", ErrResponsesStreamTooLarge)
+	}
+	tr.totalAccumulated += int64(n)
+	return nil
 }
 
 func (tr *responsesStreamTranslator) emit(w io.Writer, payload map[string]any) error {

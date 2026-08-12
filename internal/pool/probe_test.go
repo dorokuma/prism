@@ -358,9 +358,12 @@ func TestProbeExhausted_CustomProbePath(t *testing.T) {
 	}
 }
 
-// TestProbeExhausted_DisabledOptimistic verifies probe_path: disabled sends
-// ZERO HTTP requests and optimistically marks the exhausted account healthy.
-func TestProbeExhausted_DisabledOptimistic(t *testing.T) {
+// TestProbeExhausted_DisabledKeepsState pins probe_path: disabled semantics:
+// ZERO HTTP requests are sent, and the account state is NOT touched — an
+// exhausted account must NOT be optimistically revived ("probing disabled"
+// does not mean "the credential recovered"; the exhausted flag is only set
+// for permanent upstream rejection).
+func TestProbeExhausted_DisabledKeepsState(t *testing.T) {
 	hits := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
@@ -378,11 +381,35 @@ func TestProbeExhausted_DisabledOptimistic(t *testing.T) {
 
 	ProbeExhausted(pool)
 
-	if !accs[0].IsHealthy() {
-		t.Error("account should be optimistically marked healthy when probe is disabled")
+	if accs[0].IsHealthy() {
+		t.Error("account must stay exhausted when probe is disabled (no optimistic revival)")
 	}
 	if hits != 0 {
 		t.Errorf("expected 0 HTTP requests, got %d", hits)
+	}
+}
+
+// TestProbeExhausted_DisabledHealthyStaysHealthy: a HEALTHY account with
+// probe_path disabled is untouched too (no request, no state change).
+func TestProbeExhausted_DisabledHealthyStaysHealthy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("no HTTP request should be sent when probe is disabled")
+	}))
+	defer upstream.Close()
+
+	pool := NewPool([]config.AccountConfig{
+		{Name: "healthy1", Key: "k1", BaseURL: upstream.URL, ProbePath: "disabled"},
+	})
+
+	accs := pool.AllAccounts()
+	if !accs[0].IsHealthy() {
+		t.Fatal("account must start healthy")
+	}
+
+	ProbeExhausted(pool)
+
+	if !accs[0].IsHealthy() {
+		t.Error("healthy account must stay healthy")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/mcp"
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/util"
 )
@@ -151,19 +152,32 @@ func enrichModel(entry map[string]any, provider, modelID string, cfg *config.Con
 	return entry
 }
 
-// getTenantID returns the MCP tool-cache identity for the request: the
-// authenticated API key NAME from the auth middleware context (stable and
-// non-secret — never the raw token). The MCP cache is isolated per identity
-// so tools cached from one key's namespace bundles are never visible to
-// another key (dual-tenant isolation). The "default" fallback covers
-// requests that did not go through the auth middleware (direct handler
-// tests) and is a plain per-client bucket — it is NOT the admin bucket: the
-// shared admin-injected bucket (mcp_tools.json) uses an internal reserved
-// key (config.McpAdminIdentity) that config validation forbids for client
-// keys, and the request path can never write to it (see mcp.cacheMCPTool /
-// cacheAdminTool). It stays visible to every identity (see
-// mcp.getTenantMCPTools).
+// getTenantID returns the MCP tool-cache identity for the request:
+//
+//   - authenticated requests (a real api_keys credential was presented) get
+//     the authenticated API key NAME from the auth middleware context
+//     (stable and non-secret — never the raw token), so tools cached from
+//     one key's namespace bundles are never visible to another key
+//     (dual-tenant isolation);
+//   - requests that did NOT go through a real credential check (auth
+//     disabled, or direct handler tests) get the fixed, read-only
+//     mcp.UnauthenticatedIdentity — with auth disabled there is no
+//     per-client identity, and a shared writable bucket would let different
+//     local clients pollute each other's cached MCP tools. The
+//     unauthenticated bucket is never written (mcp.cacheMCPTool refuses)
+//     and sees only the shared admin-injected bucket.
+//
+// The "default" fallback only applies to the (authenticated) case where the
+// auth middleware installed no key name at all — a plain per-client bucket,
+// NOT the admin bucket: the shared admin-injected bucket (mcp_tools.json)
+// uses an internal reserved key (config.McpAdminIdentity) that config
+// validation forbids for client keys, and the request path can never write
+// to it (see mcp.cacheMCPTool / cacheAdminTool). It stays visible to every
+// identity (see mcp.getTenantMCPTools).
 func getTenantID(r *http.Request) string {
+	if !middleware.IsAuthenticated(r.Context()) {
+		return mcp.UnauthenticatedIdentity
+	}
 	if id := middleware.APIKeyFromContext(r.Context()); id != "" {
 		return id
 	}

@@ -18,13 +18,29 @@ var (
 
 const (
 	// DeepseekV4ProConcurrency is the concurrency limit for DeepSeek v4 (official × 90% safety margin).
+	// Kept for compatibility (exported constant); the built-in DEFAULT per-account
+	// concurrency is now the conservative DefaultAccountConcurrency — model-name
+	// heuristics no longer guess a provider.
 	DeepseekV4ProConcurrency = 500
 
 	// DeepseekV4FlashConcurrency is the concurrency limit for DeepSeek v4 flash.
+	// Kept for compatibility (exported constant); see DeepseekV4ProConcurrency.
 	DeepseekV4FlashConcurrency = 2500
 
 	// DefaultConcurrencyRatio is the default concurrency ratio (90%).
+	// Kept for compatibility (exported constant); see DeepseekV4ProConcurrency.
 	DefaultConcurrencyRatio = 90
+
+	// DefaultAccountConcurrency is the conservative built-in per-account
+	// concurrency cap used when no max_concurrent_per_account entry matches
+	// the model or the "*" wildcard. 8 concurrent requests per account is a
+	// safe default for any upstream (including personal API keys with low
+	// rate limits); operators that want more MUST configure it explicitly.
+	// It deliberately does NOT depend on the model name: guessing a provider
+	// or tier from arbitrary model-name substrings misclassified models
+	// (e.g. any "*-pro" model was treated as a DeepSeek v4 tier) and could
+	// oversubscribe an unrelated upstream.
+	DefaultAccountConcurrency = 8
 
 	// ProbeTimeout is the timeout for model probes.
 	ProbeTimeout = 30 * time.Second

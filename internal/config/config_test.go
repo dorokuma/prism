@@ -531,6 +531,7 @@ accounts:
 	t.Run("non-loopback with auth token", func(t *testing.T) {
 		content := `
 listen: 0.0.0.0:8080
+allow_insecure_http: true
 auth_token: my-secret-token
 accounts:
   - name: test-acc
@@ -1622,13 +1623,15 @@ accounts:
 	}
 }
 
-// TestLoadConfig_APIKeyNameValidation pins the MCP admin-bucket isolation
-// contract (item 1): API key NAMEs are the MCP tool-cache identity, so
-// empty names, duplicate names and the reserved admin identity
-// (McpAdminIdentity) are explicit load errors. The legacy auth_token
-// expansion and an explicit name "default" remain valid — "default" is a
-// plain per-client bucket, NOT the admin bucket (only the reserved identity
-// is forbidden). The errors must name the key but never echo any token.
+// TestLoadConfig_APIKeyNameValidation pins the MCP identity isolation
+// contract: API key NAMEs are the MCP tool-cache identity, so empty names,
+// duplicate names and the reserved identities (McpAdminIdentity — the
+// shared admin-injected bucket — and McpUnauthenticatedIdentity — the
+// read-only bucket for requests without a credential) are explicit load
+// errors. The legacy auth_token expansion and an explicit name "default"
+// remain valid — "default" is a plain per-client bucket, NOT a reserved
+// identity (only McpAdminIdentity and McpUnauthenticatedIdentity are
+// forbidden). The errors must name the key but never echo any token.
 func TestLoadConfig_APIKeyNameValidation(t *testing.T) {
 	base := `
 accounts:
@@ -1683,6 +1686,29 @@ api_keys:
 			t.Error("error must never echo the token")
 		}
 	})
+	t.Run("reserved unauthenticated identity rejected", func(t *testing.T) {
+		// The unauthenticated MCP bucket identity must be unusable as an api
+		// key name: an authenticated key named like it would silently lose
+		// its own MCP tool cache and be indistinguishable from an
+		// unauthenticated request. The literal is pinned so a rename of the
+		// shared constant breaks this test instead of silently diverging.
+		if McpUnauthenticatedIdentity != "unauthenticated" {
+			t.Fatalf("McpUnauthenticatedIdentity = %q, want the pinned literal %q", McpUnauthenticatedIdentity, "unauthenticated")
+		}
+		_, err := loadConfigFrom(t, base+`
+api_keys:
+  - name: `+McpUnauthenticatedIdentity+`
+    token: "sk-1"`)
+		if err == nil {
+			t.Fatalf("the reserved unauthenticated identity %q must be rejected as a key name", McpUnauthenticatedIdentity)
+		}
+		if !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("error = %q, want it to mention the reserved name", err)
+		}
+		if strings.Contains(err.Error(), "sk-1") {
+			t.Error("error must never echo the token")
+		}
+	})
 	t.Run("legacy auth_token still expands to name default", func(t *testing.T) {
 		cfg, err := loadConfigFrom(t, base+`
 auth_token: "legacy-secret"`)
@@ -1722,7 +1748,7 @@ api_keys:
 // built-in default. Non-positive entries are ignored, never treated as a
 // zero limit.
 func TestResolveFetchConcurrency(t *testing.T) {
-	defaultFallback := DeepseekV4ProConcurrency * DefaultConcurrencyRatio / 100
+	defaultFallback := DefaultAccountConcurrency
 	tests := []struct {
 		name string
 		m    map[string]int
@@ -1746,6 +1772,39 @@ func TestResolveFetchConcurrency(t *testing.T) {
 	// nil config → default (matches ResolveMaxConcurrent's nil-safety).
 	if got := ResolveFetchConcurrency(nil); got != defaultFallback {
 		t.Errorf("ResolveFetchConcurrency(nil) = %d, want %d", got, defaultFallback)
+	}
+}
+
+// TestResolveMaxConcurrent_ConservativeDefault pins the conservative built-in
+// default: without an explicit max_concurrent_per_account entry the cap is
+// DefaultAccountConcurrency regardless of the model name — the old
+// "flash"/"pro" substring heuristics that guessed a DeepSeek tier from an
+// arbitrary model name are gone.
+func TestResolveMaxConcurrent_ConservativeDefault(t *testing.T) {
+	if got := ResolveMaxConcurrent("gpt-5.5-pro", nil); got != DefaultAccountConcurrency {
+		t.Errorf("model name containing 'pro' must NOT raise the default: got %d, want %d", got, DefaultAccountConcurrency)
+	}
+	if got := ResolveMaxConcurrent("deepseek-v4-flash", nil); got != DefaultAccountConcurrency {
+		t.Errorf("model name containing 'flash' must NOT raise the default: got %d, want %d", got, DefaultAccountConcurrency)
+	}
+	if got := ResolveMaxConcurrent("", nil); got != DefaultAccountConcurrency {
+		t.Errorf("empty model must use the conservative default: got %d, want %d", got, DefaultAccountConcurrency)
+	}
+	if got := ResolveMaxConcurrent("any-model", &Config{}); got != DefaultAccountConcurrency {
+		t.Errorf("config without entries must use the conservative default: got %d, want %d", got, DefaultAccountConcurrency)
+	}
+}
+
+// TestResolveMaxConcurrent_ConfigStillWins pins the priority of the existing
+// configuration over the built-in default: exact model match first, then the
+// "*" wildcard.
+func TestResolveMaxConcurrent_ConfigStillWins(t *testing.T) {
+	cfg := &Config{MaxConcurrentPerAccount: map[string]int{"gpt-5.5-pro": 2, "*": 5}}
+	if got := ResolveMaxConcurrent("gpt-5.5-pro", cfg); got != 2 {
+		t.Errorf("exact match = %d, want 2", got)
+	}
+	if got := ResolveMaxConcurrent("some-other-model", cfg); got != 5 {
+		t.Errorf("wildcard = %d, want 5", got)
 	}
 }
 
@@ -1790,5 +1849,364 @@ accounts:
 	}
 	if cfg.MaxUpstreamResponseBytes != MaxUpstreamResponseBytesLimit {
 		t.Errorf("max_upstream_response_bytes at cap = %d, want %d", cfg.MaxUpstreamResponseBytes, MaxUpstreamResponseBytesLimit)
+	}
+}
+
+// TestLoadConfig_BaseURLValidation pins the startup base_url check: every
+// account must have an absolute http(s) URL with a non-empty host. Invalid
+// schemes, missing hosts and unparseable URLs are load errors; the error
+// names the account but never echoes the URL (a base_url may embed
+// credentials).
+func TestLoadConfig_BaseURLValidation(t *testing.T) {
+	keyLine := "    key: test-key-12345\n"
+	t.Run("valid https accepted", func(t *testing.T) {
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: https://api.example.com/v1\n"
+		if _, err := loadConfigFrom(t, content); err != nil {
+			t.Fatalf("https base_url must load: %v", err)
+		}
+	})
+	t.Run("valid http accepted", func(t *testing.T) {
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: http://127.0.0.1:8080\n"
+		if _, err := loadConfigFrom(t, content); err != nil {
+			t.Fatalf("http base_url must load: %v", err)
+		}
+	})
+	t.Run("non-http scheme rejected", func(t *testing.T) {
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: ftp://files.example.com/v1\n"
+		_, err := loadConfigFrom(t, content)
+		if err == nil {
+			t.Fatal("a non-http(s) base_url must be rejected")
+		}
+		if !strings.Contains(err.Error(), "a") || strings.Contains(err.Error(), "ftp://") {
+			t.Errorf("error must name the account but never echo the URL, got: %q", err.Error())
+		}
+	})
+	t.Run("missing scheme rejected", func(t *testing.T) {
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: api.example.com/v1\n"
+		if _, err := loadConfigFrom(t, content); err == nil {
+			t.Fatal("a base_url without a scheme must be rejected")
+		}
+	})
+	t.Run("empty host rejected", func(t *testing.T) {
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: https:///v1\n"
+		if _, err := loadConfigFrom(t, content); err == nil {
+			t.Fatal("a base_url without a host must be rejected")
+		}
+	})
+	t.Run("unparseable rejected", func(t *testing.T) {
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: '://bad url with spaces'\n"
+		if _, err := loadConfigFrom(t, content); err == nil {
+			t.Fatal("an unparseable base_url must be rejected")
+		}
+	})
+	t.Run("credential-carrying URL never echoed", func(t *testing.T) {
+		// A base_url embedding credentials must be rejected on the scheme
+		// (here "file") without the credentials reaching the error.
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: file://user:supersecret@/etc/passwd\n"
+		_, err := loadConfigFrom(t, content)
+		if err == nil {
+			t.Fatal("a non-http(s) base_url must be rejected")
+		}
+		if strings.Contains(err.Error(), "supersecret") {
+			t.Errorf("error must never echo credentials, got: %q", err.Error())
+		}
+	})
+}
+
+// TestLoadConfig_NonLoopbackTLSRequiresOptIn pins the non-loopback TLS
+// gate: a non-loopback listener must either have a COMPLETE TLS
+// configuration (both files, or both via the PRISM_TLS_CERT/PRISM_TLS_KEY
+// env fallbacks — the env fallback runs BEFORE this check) or the explicit
+// allow_insecure_http: true opt-in. trusted_proxies does NOT relax the
+// check (it cannot prevent direct access to the listener). Exactly one of
+// cert/key is a load error regardless of allow_insecure_http. Loopback
+// listeners stay TLS-free (local development).
+func TestLoadConfig_NonLoopbackTLSRequiresOptIn(t *testing.T) {
+	base := `
+api_keys:
+  - name: ci-bot
+    token: sk-ci-111
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`
+
+	t.Run("loopback without TLS loads", func(t *testing.T) {
+		if _, err := loadConfigFrom(t, "listen: 127.0.0.1:18790\n"+base); err != nil {
+			t.Fatalf("loopback listen without TLS must load (development): %v", err)
+		}
+	})
+	t.Run("non-loopback with both TLS files loads", func(t *testing.T) {
+		if _, err := loadConfigFrom(t, "listen: 0.0.0.0:8080\n"+base+"tls_cert_file: /c.pem\ntls_key_file: /k.pem\n"); err != nil {
+			t.Fatalf("non-loopback with complete TLS must load: %v", err)
+		}
+	})
+	t.Run("non-loopback with TLS from env vars loads", func(t *testing.T) {
+		// The env fallback runs BEFORE the completeness check: env-provided
+		// cert+key must count as a complete TLS configuration.
+		t.Setenv("PRISM_TLS_CERT", "/env-c.pem")
+		t.Setenv("PRISM_TLS_KEY", "/env-k.pem")
+		cfg, err := loadConfigFrom(t, "listen: 0.0.0.0:8080\n"+base)
+		if err != nil {
+			t.Fatalf("non-loopback with env-provided TLS must load: %v", err)
+		}
+		if cfg.TLSCertFile != "/env-c.pem" || cfg.TLSKeyFile != "/env-k.pem" {
+			t.Errorf("env TLS fallback not applied: cert=%q key=%q", cfg.TLSCertFile, cfg.TLSKeyFile)
+		}
+	})
+	t.Run("non-loopback without TLS and without opt-in rejected", func(t *testing.T) {
+		t.Setenv("PRISM_TLS_CERT", "")
+		t.Setenv("PRISM_TLS_KEY", "")
+		_, err := loadConfigFrom(t, "listen: 0.0.0.0:8080\n"+base)
+		if err == nil {
+			t.Fatal("non-loopback without TLS must fail loading without allow_insecure_http")
+		}
+		if !strings.Contains(err.Error(), "allow_insecure_http") {
+			t.Errorf("error = %q, want it to name the allow_insecure_http opt-in", err)
+		}
+	})
+	t.Run("trusted_proxies does not relax the TLS check", func(t *testing.T) {
+		// trusted_proxies only governs X-Forwarded-For trust; it cannot
+		// prevent direct access to the listener, so it must NOT count as
+		// TLS safety.
+		t.Setenv("PRISM_TLS_CERT", "")
+		t.Setenv("PRISM_TLS_KEY", "")
+		_, err := loadConfigFrom(t, "listen: 0.0.0.0:8080\n"+base+"trusted_proxies:\n  - 127.0.0.1/32\n")
+		if err == nil {
+			t.Fatal("trusted_proxies without TLS must still fail loading")
+		}
+		if !strings.Contains(err.Error(), "allow_insecure_http") {
+			t.Errorf("error = %q, want it to name the allow_insecure_http opt-in", err)
+		}
+	})
+	t.Run("non-loopback without TLS with explicit opt-in loads", func(t *testing.T) {
+		cfg, err := loadConfigFrom(t, "listen: 0.0.0.0:8080\n"+base+"allow_insecure_http: true\n")
+		if err != nil {
+			t.Fatalf("non-loopback with allow_insecure_http: true must load: %v", err)
+		}
+		if !cfg.AllowInsecureHTTP {
+			t.Error("AllowInsecureHTTP must be true after load")
+		}
+	})
+	t.Run("cert without key rejected even with opt-in", func(t *testing.T) {
+		t.Setenv("PRISM_TLS_CERT", "")
+		t.Setenv("PRISM_TLS_KEY", "")
+		_, err := loadConfigFrom(t, "listen: 0.0.0.0:8080\n"+base+"allow_insecure_http: true\ntls_cert_file: /c.pem\n")
+		if err == nil {
+			t.Fatal("cert without key must fail loading regardless of allow_insecure_http")
+		}
+		if !strings.Contains(err.Error(), "incomplete TLS") {
+			t.Errorf("error = %q, want it to mention the incomplete TLS configuration", err)
+		}
+	})
+	t.Run("key without cert rejected even with opt-in", func(t *testing.T) {
+		t.Setenv("PRISM_TLS_CERT", "")
+		t.Setenv("PRISM_TLS_KEY", "")
+		_, err := loadConfigFrom(t, "listen: 0.0.0.0:8080\n"+base+"allow_insecure_http: true\ntls_key_file: /k.pem\n")
+		if err == nil {
+			t.Fatal("key without cert must fail loading regardless of allow_insecure_http")
+		}
+		if !strings.Contains(err.Error(), "incomplete TLS") {
+			t.Errorf("error = %q, want it to mention the incomplete TLS configuration", err)
+		}
+	})
+	t.Run("incomplete TLS rejected without opt-in too", func(t *testing.T) {
+		t.Setenv("PRISM_TLS_CERT", "")
+		t.Setenv("PRISM_TLS_KEY", "")
+		if _, err := loadConfigFrom(t, "listen: 0.0.0.0:8080\n"+base+"tls_key_file: /k.pem\n"); err == nil {
+			t.Fatal("key without cert must fail loading even without allow_insecure_http")
+		}
+	})
+}
+
+// TestReloadConfig_AccountsKept pins the holder/pool consistency rule:
+// when a reload changes accounts, the running accounts configuration is
+// KEPT (the pool is built once at startup — publishing different accounts
+// would split the holder from the pool) with a clear warning, while other
+// fields still hot-reload.
+func TestReloadConfig_AccountsKept(t *testing.T) {
+	content1 := `
+accounts:
+  - name: acc1
+    key: key1
+    base_url: https://api1.example.com
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	// Change accounts (add acc2) AND a hot-reloadable field (model_tiers).
+	content2 := `
+model_tiers:
+  tier1: upstream-b
+accounts:
+  - name: acc1
+    key: key1
+    base_url: https://api1.example.com
+  - name: acc2
+    key: key2
+    base_url: https://api2.example.com
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	cur := holder.Load()
+
+	// The held accounts MUST equal the RUNNING (old) accounts — never the
+	// new ones (holder/pool split).
+	if len(cur.Accounts) != 1 || cur.Accounts[0].Name != "acc1" || cur.Accounts[0].BaseURL != "https://api1.example.com" {
+		t.Errorf("held accounts = %+v, want the running [acc1] (accounts must be kept on reload)", cur.Accounts)
+	}
+	// The warning must be explicit.
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "keeping the running accounts") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a keeping-accounts warning, got: %v", warnings)
+	}
+	// Other fields still hot-reload.
+	if cur.ModelTiers["tier1"] != "upstream-b" {
+		t.Errorf("model_tiers must still hot-reload, got %v", cur.ModelTiers)
+	}
+}
+
+// TestReloadConfig_AccountsKept_ProviderSchemaConsistent pins that the
+// provider → effort schema map is rebuilt from the KEPT accounts, so
+// EffortSchema stays consistent with the running pool after an accounts
+// change.
+func TestReloadConfig_AccountsKept_ProviderSchemaConsistent(t *testing.T) {
+	content1 := `
+accounts:
+  - name: acc1
+    key: key1
+    base_url: https://ollama.com/v1
+    provider: ollama-p
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+	if got := holder.Load().EffortSchema("ollama-p"); got != "ollama" {
+		t.Fatalf("initial EffortSchema = %q, want ollama", got)
+	}
+
+	// New config: same provider name but a non-ollama host (would resolve to
+	// the opencode schema "").
+	content2 := `
+accounts:
+  - name: acc1
+    key: key1
+    base_url: https://api.example.com/v1
+    provider: ollama-p
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReloadConfig(holder, f.Name()); err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	// Accounts were kept → the schema must stay ollama (derived from the
+	// KEPT base_url), not flip to the discarded new host.
+	if got := holder.Load().EffortSchema("ollama-p"); got != "ollama" {
+		t.Errorf("EffortSchema after accounts-changing reload = %q, want ollama (schema must follow the kept accounts)", got)
+	}
+}
+
+// TestReloadConfig_AccountsKept_DefaultProviderConsistent pins that a new
+// default_provider referencing a provider that only exists in the DISCARDED
+// new accounts is rolled back to the previous default_provider with a
+// warning (a dangling default would route header-less requests into
+// no_healthy).
+func TestReloadConfig_AccountsKept_DefaultProviderConsistent(t *testing.T) {
+	content1 := `
+accounts:
+  - name: acc1
+    key: key1
+    base_url: https://api1.example.com
+    provider: prov-a
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	// New config: default_provider prov-b exists only in the new accounts
+	// (which are discarded).
+	content2 := `
+default_provider: prov-b
+accounts:
+  - name: acc1
+    key: key1
+    base_url: https://api1.example.com
+    provider: prov-a
+  - name: acc2
+    key: key2
+    base_url: https://api2.example.com
+    provider: prov-b
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	cur := holder.Load()
+	if cur.DefaultProvider != "" {
+		t.Errorf("default_provider = %q, want the previous value (empty — prov-b is not among the kept accounts)", cur.DefaultProvider)
+	}
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "default_provider") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a default_provider rollback warning, got: %v", warnings)
 	}
 }

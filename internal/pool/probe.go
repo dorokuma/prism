@@ -22,7 +22,9 @@ var (
 // resolveProbePath resolves an account's probe_path into the probe endpoint
 // path and whether probing is disabled:
 //   - empty/"default" → "/v1/models" (legacy behavior)
-//   - "-"/"disabled"/"none" → disabled (no HTTP, optimistic recovery)
+//   - "-"/"disabled"/"none" → disabled (no HTTP request is sent and the
+//     account state is deliberately left untouched — an exhausted account
+//     stays exhausted until the operator restores it; see ProbeAccountOnce)
 //   - any other explicit value → used as the path (a leading "/" is added
 //     when missing)
 func resolveProbePath(acc *Account) (path string, disabled bool) {
@@ -45,7 +47,8 @@ func resolveProbePath(acc *Account) (path string, disabled bool) {
 // account-level auth header applied.
 // When probing is disabled (probe_path: disabled/-/none) it returns
 // skipped=true without sending any HTTP request and without touching account
-// state; the caller decides whether to apply optimistic recovery.
+// state; the caller must NOT treat "disabled" as "healthy" (an exhausted
+// account stays exhausted until the operator restores it).
 // On HTTP success/failure it returns the status code and a body snippet
 // (redacted by the caller), with err non-nil only for transport-level errors.
 func ProbeAccountOnce(acc *Account) (statusCode int, body []byte, skipped bool, err error) {
@@ -124,11 +127,15 @@ func ProbeExhausted(pool *Pool) {
 				stop := func() bool {
 					statusCode, respBody, skipped, err := ProbeAccountOnce(acc)
 					if skipped {
-						// probe_path disabled: no HTTP request is sent; the
-						// exhausted account is optimistically marked healthy
-						// so it recovers within one probe_interval.
-						pool.MarkHealthy(acc)
-						slog.Info("probe disabled, optimistic recover", "account", acc.Name())
+						// probe_path disabled: no HTTP request is sent and the
+						// account state is deliberately NOT touched. An exhausted
+						// account must not be optimistically revived here: the
+						// exhausted flag is only set for permanent upstream
+						// rejection (401/402 or a recognized structured
+						// credential/quota error), and "probing disabled" does
+						// not mean "the credential recovered". The operator
+						// restores the account (or re-enables probing) explicitly.
+						slog.Info("probe disabled, keeping account state unchanged", "account", acc.Name())
 						return true
 					}
 					if err != nil {

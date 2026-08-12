@@ -1310,3 +1310,349 @@ func TestTranslateStream_Logprobs(t *testing.T) {
 		t.Fatal("expected created_at in response.completed")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Accumulation limits (item: unbounded textBuf/reasoningBuf/tool args)
+// ---------------------------------------------------------------------------
+
+// withSmallAccumulationLimit shrinks the per-buffer accumulation cap for the
+// duration of a test and restores the production default afterwards.
+func withSmallAccumulationLimit(t *testing.T, limit int) {
+	t.Helper()
+	old := responsesStreamMaxAccumulated
+	responsesStreamMaxAccumulated = limit
+	t.Cleanup(func() { responsesStreamMaxAccumulated = old })
+}
+
+// withSmallAccumulationLimits shrinks BOTH the per-buffer cap and the total
+// cap (text + reasoning + all tool args) for the duration of a test and
+// restores the production defaults afterwards.
+func withSmallAccumulationLimits(t *testing.T, perBuffer, total int) {
+	t.Helper()
+	t.Cleanup(SetResponsesStreamLimitsForTest(perBuffer, total))
+}
+
+func TestTranslateStream_AccumulatedTextTooLarge_MidStream(t *testing.T) {
+	// The first chunk commits the 200 (events are already written); the
+	// second chunk would push the text buffer past the cap. The failure
+	// must be EXPLICIT: a response.failed frame with code response_too_large
+	// and a non-nil ErrResponsesStreamTooLarge — never silent truncation of
+	// the accumulated text.
+	withSmallAccumulationLimit(t, 8)
+
+	input := `data: {"choices":[{"delta":{"content":"hello"}}]}
+
+data: {"choices":[{"delta":{"content":" world, this is a long tail"}}]}
+
+data: [DONE]
+`
+	rec := httptest.NewRecorder()
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if !errors.Is(err, ErrResponsesStreamTooLarge) {
+		t.Fatalf("expected ErrResponsesStreamTooLarge, got %v", err)
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("expected at least the pre-limit events")
+	}
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.failed" {
+		t.Fatalf("expected last event to be response.failed, got %q", lastEv.Type)
+	}
+	code := getStringField(t, lastEv.Raw, "response", "error", "code")
+	if code != "response_too_large" {
+		t.Errorf("expected error code response_too_large, got %q", code)
+	}
+	// The stream must not be completed and no truncated text may be emitted.
+	for _, ev := range events {
+		if ev.Type == "response.completed" {
+			t.Error("response.completed must not be emitted after an accumulation-limit failure")
+		}
+	}
+}
+
+func TestTranslateStream_AccumulatedTextTooLarge_PreFirstEvent(t *testing.T) {
+	// The very first chunk already exceeds the cap: nothing may be written
+	// (the caller must be able to answer a real HTTP 502) and the error is
+	// the explicit sentinel.
+	withSmallAccumulationLimit(t, 4)
+
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n"
+	rec := httptest.NewRecorder()
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if !errors.Is(err, ErrResponsesStreamTooLarge) {
+		t.Fatalf("expected ErrResponsesStreamTooLarge, got %v", err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected NO events to be written before the first event, got: %s", rec.Body.String())
+	}
+}
+
+func TestTranslateStream_AccumulatedReasoningTooLarge(t *testing.T) {
+	withSmallAccumulationLimit(t, 8)
+
+	input := `data: {"choices":[{"delta":{"reasoning_content":"step one"}}]}
+
+data: {"choices":[{"delta":{"reasoning_content":"step two, much longer reasoning text"}}]}
+
+data: [DONE]
+`
+	rec := httptest.NewRecorder()
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "deepseek", nil, nil, context.Background())
+	if !errors.Is(err, ErrResponsesStreamTooLarge) {
+		t.Fatalf("expected ErrResponsesStreamTooLarge, got %v", err)
+	}
+	events := parseSSE(t, rec.Body.String())
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.failed" {
+		t.Fatalf("expected last event to be response.failed, got %q", lastEv.Type)
+	}
+	code := getStringField(t, lastEv.Raw, "response", "error", "code")
+	if code != "response_too_large" {
+		t.Errorf("expected error code response_too_large, got %q", code)
+	}
+}
+
+func TestTranslateStream_AccumulatedToolArgsTooLarge(t *testing.T) {
+	withSmallAccumulationLimit(t, 8)
+
+	input := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec","arguments":"{\"a\":1}"}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"b\":\"a very long argument payload\"}"}}]}}]}
+
+data: [DONE]
+`
+	rec := httptest.NewRecorder()
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if !errors.Is(err, ErrResponsesStreamTooLarge) {
+		t.Fatalf("expected ErrResponsesStreamTooLarge, got %v", err)
+	}
+	events := parseSSE(t, rec.Body.String())
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.failed" {
+		t.Fatalf("expected last event to be response.failed, got %q", lastEv.Type)
+	}
+	code := getStringField(t, lastEv.Raw, "response", "error", "code")
+	if code != "response_too_large" {
+		t.Errorf("expected error code response_too_large, got %q", code)
+	}
+}
+
+// TestTranslateStream_TotalTooLarge_MultiTool pins the TOTAL accumulation
+// cap across tool calls: N tools each under the per-buffer cap must still
+// fail when their args SUM exceeds the total cap — the per-buffer caps alone
+// would let N tools hold N×16 MiB. The failure is the explicit sentinel
+// with the mid-stream response.failed frame.
+func TestTranslateStream_TotalTooLarge_MultiTool(t *testing.T) {
+	// Per-buffer cap is generous (1 KiB); the TOTAL cap (100 bytes) is what
+	// three 40-byte argument buffers together exceed — each tool alone stays
+	// far below its own per-buffer limit.
+	withSmallAccumulationLimits(t, 1024, 100)
+
+	args := strings.Repeat("A", 40)
+	input := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec1\",\"arguments\":\"" + args + "\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"exec2\",\"arguments\":\"" + args + "\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2,\"id\":\"call_3\",\"type\":\"function\",\"function\":{\"name\":\"exec3\",\"arguments\":\"" + args + "\"}}]}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if !errors.Is(err, ErrResponsesStreamTooLarge) {
+		t.Fatalf("expected ErrResponsesStreamTooLarge (total cap across tool args), got %v", err)
+	}
+	events := parseSSE(t, rec.Body.String())
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.failed" {
+		t.Fatalf("expected last event to be response.failed, got %q", lastEv.Type)
+	}
+	code := getStringField(t, lastEv.Raw, "response", "error", "code")
+	if code != "response_too_large" {
+		t.Errorf("expected error code response_too_large, got %q", code)
+	}
+}
+
+// TestTranslateStream_TotalTooLarge_TextPlusReasoning pins the TOTAL cap
+// across buffer TYPES: reasoning and output text that each stay under the
+// per-buffer cap must still fail when their SUM exceeds the total cap.
+func TestTranslateStream_TotalTooLarge_TextPlusReasoning(t *testing.T) {
+	withSmallAccumulationLimits(t, 1024, 100)
+
+	reasoning := strings.Repeat("R", 60)
+	text := strings.Repeat("T", 60)
+	input := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"" + reasoning + "\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"" + text + "\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "deepseek", nil, nil, context.Background())
+	if !errors.Is(err, ErrResponsesStreamTooLarge) {
+		t.Fatalf("expected ErrResponsesStreamTooLarge (total cap across buffer types), got %v", err)
+	}
+	events := parseSSE(t, rec.Body.String())
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.failed" {
+		t.Fatalf("expected last event to be response.failed, got %q", lastEv.Type)
+	}
+	code := getStringField(t, lastEv.Raw, "response", "error", "code")
+	if code != "response_too_large" {
+		t.Errorf("expected error code response_too_large, got %q", code)
+	}
+}
+
+// TestTranslateStream_TotalBelowLimit_OK guards the happy path of the total
+// cap: several tool calls whose args SUM stays under the total cap translate
+// normally — the total cap must not false-positive on legitimate multi-tool
+// streams.
+func TestTranslateStream_TotalBelowLimit_OK(t *testing.T) {
+	withSmallAccumulationLimits(t, 1024, 1000)
+
+	args := strings.Repeat("A", 100)
+	input := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec1\",\"arguments\":\"" + args + "\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"exec2\",\"arguments\":\"" + args + "\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2,\"id\":\"call_3\",\"type\":\"function\",\"function\":{\"name\":\"exec3\",\"arguments\":\"" + args + "\"}}]}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	if err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	events := parseSSE(t, rec.Body.String())
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.completed" {
+		t.Fatalf("expected last event to be response.completed, got %q", lastEv.Type)
+	}
+}
+
+// TestTranslateStream_AccumulationBelowLimitOK guards the happy path: content
+// that stays within the cap translates normally (no false positive).
+func TestTranslateStream_AccumulationBelowLimitOK(t *testing.T) {
+	withSmallAccumulationLimit(t, 64)
+
+	input := `data: {"choices":[{"delta":{"content":"hello"}}]}
+
+data: {"choices":[{"delta":{"content":" world"}}]}
+
+data: [DONE]
+`
+	rec := httptest.NewRecorder()
+	if err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	events := parseSSE(t, rec.Body.String())
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.completed" {
+		t.Fatalf("expected last event to be response.completed, got %q", lastEv.Type)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SSE data: field parsing (item: accept data: and data: <payload>)
+// ---------------------------------------------------------------------------
+
+// TestTranslateStream_DataColonNoSpace pins the SSE spec form: a data line
+// of "data:{...}" (no space after the colon) is a valid event payload and
+// must be translated exactly like "data: {...}".
+func TestTranslateStream_DataColonNoSpace(t *testing.T) {
+	input := `data:{"choices":[{"delta":{"content":"Hello"}}]}
+
+data:{"choices":[{"delta":{"content":" world"}}]}
+
+data:[DONE]
+`
+	rec := httptest.NewRecorder()
+	if err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	events := parseSSE(t, rec.Body.String())
+	if len(events) != 8 {
+		t.Fatalf("expected 8 events, got %d", len(events))
+	}
+	var joined string
+	for _, ev := range events {
+		if ev.Type == "response.output_text.delta" {
+			joined += getStringField(t, ev.Raw, "delta")
+		}
+	}
+	if joined != "Hello world" {
+		t.Errorf("accumulated text = %q, want %q", joined, "Hello world")
+	}
+}
+
+// TestTranslateStream_DataColonMixedSpacing mixes both spec-accepted forms
+// in one stream.
+func TestTranslateStream_DataColonMixedSpacing(t *testing.T) {
+	input := `data:{"choices":[{"delta":{"content":"a"}}]}
+
+data: {"choices":[{"delta":{"content":"b"}}]}
+
+data:[DONE]
+`
+	rec := httptest.NewRecorder()
+	if err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	events := parseSSE(t, rec.Body.String())
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.completed" {
+		t.Fatalf("expected response.completed, got %q", lastEv.Type)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SSE single-line limit (item: 4 MiB scanner cap must be diagnosable)
+// ---------------------------------------------------------------------------
+
+// withSmallScannerLimit shrinks the stream scanner single-line cap for the
+// duration of a test and restores the production default afterwards.
+func withSmallScannerLimit(t *testing.T, limit int) {
+	t.Helper()
+	old := streamScannerMaxBuf
+	streamScannerMaxBuf = limit
+	t.Cleanup(func() { streamScannerMaxBuf = old })
+}
+
+func TestTranslateStream_LineTooLong_MidStream(t *testing.T) {
+	withSmallScannerLimit(t, 64)
+
+	// First a valid small chunk (commits the 200), then a single data line
+	// over the cap.
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"" + strings.Repeat("x", 200) + "\"}}]}\n\n"
+	rec := httptest.NewRecorder()
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if err == nil {
+		t.Fatal("expected an error for an over-limit SSE line")
+	}
+	if !strings.Contains(err.Error(), "single-line limit") {
+		t.Errorf("error must name the single-line limit, got: %v", err)
+	}
+	events := parseSSE(t, rec.Body.String())
+	lastEv := events[len(events)-1]
+	if lastEv.Type != "response.failed" {
+		t.Fatalf("expected last event to be response.failed, got %q", lastEv.Type)
+	}
+	code := getStringField(t, lastEv.Raw, "response", "error", "code")
+	if code != "stream_line_too_long" {
+		t.Errorf("expected error code stream_line_too_long, got %q", code)
+	}
+}
+
+func TestTranslateStream_LineTooLong_PreFirstEvent(t *testing.T) {
+	withSmallScannerLimit(t, 64)
+
+	// The very first line already exceeds the cap: nothing may be written
+	// and the error must be diagnosable (name the limit).
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"" + strings.Repeat("x", 200) + "\"}}]}\n\n"
+	rec := httptest.NewRecorder()
+	err := TranslateChatStreamToResponses(rec, strings.NewReader(input), "gpt-5.5", nil, nil, context.Background())
+	if err == nil {
+		t.Fatal("expected an error for an over-limit SSE line")
+	}
+	if !strings.Contains(err.Error(), "single-line limit") {
+		t.Errorf("error must name the single-line limit, got: %v", err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected NO events to be written, got: %s", rec.Body.String())
+	}
+}

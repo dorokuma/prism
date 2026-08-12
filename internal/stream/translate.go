@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -53,6 +54,54 @@ type chatStreamChunk struct {
 	} `json:"usage"`
 }
 
+// streamScannerMaxBuf is the maximum single SSE line size accepted by the
+// responses stream scanner. It is a variable (not a const) so tests can
+// shrink it to exercise the over-limit path without allocating 4 MiB;
+// production always uses config.StreamScannerMaxBuf (4 MiB — generous for
+// any real chunk, while keeping scanner memory bounded).
+var streamScannerMaxBuf = config.StreamScannerMaxBuf
+
+// dropCR removes a trailing carriage return (SSE lines may end with \r\n;
+// the scanner must not hand a trailing \r to the JSON parser).
+func dropCR(data []byte) []byte {
+	if len(data) > 0 && data[len(data)-1] == '\r' {
+		return data[0 : len(data)-1]
+	}
+	return data
+}
+
+// sseLineSplit is the bufio.SplitFunc for the responses stream scanner. It
+// splits on "\n" exactly like ScanLines but enforces streamScannerMaxBuf
+// EXPLICITLY: bufio.Scanner only reports ErrTooLong when its internal
+// buffer needs to grow beyond the cap, which never happens when the initial
+// buffer (config.StreamScannerInitialBuf, 64 KiB) is larger than the limit
+// — a long line would silently pass through. Checking the line length in
+// the split function makes the 4 MiB single-line limit a hard, diagnosable
+// error (bufio.ErrTooLong) regardless of the initial buffer size.
+func sseLineSplit(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		if i > streamScannerMaxBuf {
+			return 0, nil, bufio.ErrTooLong
+		}
+		return i + 1, dropCR(data[0:i]), nil
+	}
+	if atEOF {
+		if len(data) > streamScannerMaxBuf {
+			return 0, nil, bufio.ErrTooLong
+		}
+		return len(data), dropCR(data), nil
+	}
+	// No newline yet: fail fast once the buffered data already exceeds the
+	// cap instead of waiting for more data that can only grow the line.
+	if len(data) > streamScannerMaxBuf {
+		return 0, nil, bufio.ErrTooLong
+	}
+	return 0, nil, nil
+}
+
 // TranslateChatStreamToResponses reads a chat completion SSE stream from body,
 // translates each chunk into Responses API SSE events, and writes them to w.
 // This is the streaming counterpart of convert.ChatCompletionToResponse.
@@ -63,11 +112,33 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		dst = &flushWriter{w: w, f: flusher}
 	}
 	tr := newResponsesStreamTranslator(model, searchToolCache)
+	// abortStream converts an accumulation-limit violation into an explicit
+	// protocol failure: when events were already delivered (the 200 is
+	// committed) the client gets a response.failed frame with a diagnosable
+	// code instead of a silent connection drop; when nothing was written
+	// yet the caller can still answer a real HTTP 502.
+	abortStream := func(err error) error {
+		if tr.wroteAny {
+			_ = tr.ensureCreated(dst)
+			_ = tr.emit(dst, map[string]any{
+				"type": "response.failed",
+				"response": map[string]any{
+					"id": tr.respID, "object": "response", "status": "failed", "model": tr.model,
+					"error": map[string]any{
+						"code":    "response_too_large",
+						"message": "upstream stream output exceeded the accumulated-size limit",
+					},
+				},
+			})
+		}
+		return err
+	}
 	// Wrap body with a ctx-aware reader so that a blocked Read (e.g.
 	// upstream silent during long reasoning) returns promptly when the
 	// context is cancelled.
 	sc := bufio.NewScanner(ctxReader(ctx, body))
-	sc.Buffer(make([]byte, 0, config.StreamScannerInitialBuf), config.StreamScannerMaxBuf)
+	sc.Split(sseLineSplit)
+	sc.Buffer(make([]byte, 0, config.StreamScannerInitialBuf), streamScannerMaxBuf)
 	var usage map[string]any
 	completed := false
 	lastFinishReason := ""
@@ -78,10 +149,14 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			return err
 		}
 		line := sc.Bytes()
-		if !bytes.HasPrefix(line, []byte("data: ")) {
+		// Per the SSE specification a field line is "data:value" with an
+		// OPTIONAL single leading space in the value ("data: value"); both
+		// forms must be accepted. A bare "data:" (empty payload) fails the
+		// JSON parse below and is skipped like any unparseable line.
+		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
-		payload := bytes.TrimSpace(line[6:])
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line[len("data:"):], []byte(" ")))
 		if bytes.Equal(payload, []byte("[DONE]")) {
 			completed = true
 			break
@@ -139,9 +214,11 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		// response.reasoning_summary_text.delta (not reasoning_summary.delta).
 		if d.ReasoningContent != "" {
 			if util.DebugMode {
-				slog.Debug("stream reasoning chunk", "req", util.RequestIDFromCtx(ctx), "content", d.ReasoningContent)
+				slog.Debug("stream reasoning chunk", "req", util.RequestIDFromCtx(ctx), "chars", len(d.ReasoningContent))
 			}
-			tr.reasoningBuf.WriteString(d.ReasoningContent)
+			if err := tr.appendReasoning(d.ReasoningContent); err != nil {
+				return abortStream(err)
+			}
 			if err := tr.ensureReasoningStream(dst); err != nil {
 				return err
 			}
@@ -157,10 +234,12 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 		if d.Content != "" {
 			if util.DebugMode {
-				slog.Debug("stream content chunk", "req", util.RequestIDFromCtx(ctx), "content", d.Content)
+				slog.Debug("stream content chunk", "req", util.RequestIDFromCtx(ctx), "chars", len(d.Content))
 			}
 			tr.hadMessageContent = true
-			tr.textBuf.WriteString(d.Content)
+			if err := tr.appendText(d.Content); err != nil {
+				return abortStream(err)
+			}
 			if err := tr.ensureContentPart(dst); err != nil {
 				return err
 			}
@@ -176,10 +255,12 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 		if d.Refusal != "" {
 			if util.DebugMode {
-				slog.Debug("stream refusal chunk", "req", util.RequestIDFromCtx(ctx), "content", d.Refusal)
+				slog.Debug("stream refusal chunk", "req", util.RequestIDFromCtx(ctx), "chars", len(d.Refusal))
 			}
 			tr.hadMessageContent = true
-			tr.textBuf.WriteString(d.Refusal)
+			if err := tr.appendText(d.Refusal); err != nil {
+				return abortStream(err)
+			}
 			if err := tr.ensureContentPart(dst); err != nil {
 				return err
 			}
@@ -243,7 +324,9 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 				}
 			}
 			if tc.Function.Arguments != "" {
-				st.args += tc.Function.Arguments
+				if err := tr.appendToolArgs(st, tc.Function.Arguments); err != nil {
+					return abortStream(err)
+				}
 				// Codex 0.142.5 does not handle function_call_arguments.delta; arguments
 				// are delivered in response.output_item.done for the function_call item.
 			}
@@ -252,6 +335,39 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	if err := sc.Err(); err != nil {
 		if util.DebugMode {
 			slog.Debug("stream scanner done", "req", util.RequestIDFromCtx(ctx), "error", err)
+		}
+		// A single SSE line over the scanner cap (streamScannerMaxBuf) is a
+		// definite, diagnosable failure: the payload cannot be a valid chunk
+		// and no recovery is possible. Surface the limit explicitly instead
+		// of falling into the generic "upstream stream ended unexpectedly"
+		// path (which would mislead operators about the cause).
+		if errors.Is(err, bufio.ErrTooLong) {
+			msg := fmt.Sprintf("upstream SSE line exceeds the %d-byte single-line limit", streamScannerMaxBuf)
+			// If the context is already cancelled, the client closed the
+			// connection — don't try to write to a dead connection.
+			if ctx.Err() != nil {
+				return err
+			}
+			// Nothing was delivered to the client yet: the caller can still
+			// return a real HTTP error instead of committing an empty 200.
+			if !tr.wroteAny {
+				return fmt.Errorf("%s: %w", msg, err)
+			}
+			// Real upstream stream error mid-stream: emit a response.failed
+			// frame so the client sees an explicit error instead of a silent
+			// connection drop.
+			_ = tr.ensureCreated(dst)
+			_ = tr.emit(dst, map[string]any{
+				"type": "response.failed",
+				"response": map[string]any{
+					"id": tr.respID, "object": "response", "status": "failed", "model": tr.model,
+					"error": map[string]any{
+						"code":    "stream_line_too_long",
+						"message": msg,
+					},
+				},
+			})
+			return fmt.Errorf("%s: %w", msg, err)
 		}
 		// If the context is already cancelled, the client closed the
 		// connection — don't try to write to a dead connection.

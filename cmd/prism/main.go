@@ -180,6 +180,27 @@ func startUsageRecorder(cfg *config.Config) (*usage.Recorder, usage.Store) {
 	return rec, store
 }
 
+// envTokenMaxBytes is the maximum accepted length (in bytes) of the
+// METRICS_TOKEN and PRISM_ADMIN_TOKEN environment variables. Both tokens are
+// compared with the same fixed-length constant-time pad as business API keys
+// (middleware.authPadLen = 256): a longer token can never authenticate, so
+// the deployment would fail every request at runtime. Startup rejects it
+// instead (fail fast, see validateEnvTokenLengths).
+const envTokenMaxBytes = 256
+
+// validateEnvTokenLengths fails fast at startup when METRICS_TOKEN or
+// PRISM_ADMIN_TOKEN exceeds envTokenMaxBytes bytes. The error names only the
+// variable and the length — the token value itself must never be echoed
+// (it is a credential).
+func validateEnvTokenLengths() error {
+	for _, name := range []string{"METRICS_TOKEN", "PRISM_ADMIN_TOKEN"} {
+		if v := os.Getenv(name); len(v) > envTokenMaxBytes {
+			return fmt.Errorf("%s exceeds the maximum supported %d bytes (constant-time auth compares a fixed %d-byte pad)", name, envTokenMaxBytes, envTokenMaxBytes)
+		}
+	}
+	return nil
+}
+
 // newHTTPHandler builds the root HTTP handler: /metrics, the
 // /admin/usage/summary admin endpoint, the global api_keys auth gate and the
 // proxy dispatch. Extracted from main so tests can exercise the wiring
@@ -230,9 +251,16 @@ func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *
 			// usage.default_key_id so the recorded key_id follows config
 			// (default "anonymous"). With keys configured the matched key
 			// NAME wins and is never overridden.
-			if len(curCfg.APIKeys) == 0 {
+			authed := len(curCfg.APIKeys) > 0
+			if !authed {
 				keyName = curCfg.Usage.DefaultKeyID
 			}
+			// The authentication STATUS is recorded next to the key name: the
+			// MCP tool-cache identity must know whether a real credential was
+			// presented (auth disabled → the fixed read-only unauthenticated
+			// bucket, so local clients cannot pollute each other) while the
+			// usage key_id still follows config.
+			r = r.WithContext(middleware.WithAuthenticated(r.Context(), authed))
 			r = r.WithContext(middleware.WithAPIKey(r.Context(), keyName))
 		}
 		// Timeout decisions are delegated to proxyChatWithBody which applies
@@ -260,6 +288,16 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+
+	// Fail fast on over-long admin/metrics tokens: a token longer than the
+	// constant-time comparison pad (256 bytes) can never authenticate (the
+	// comparison rejects it outright), so every request would fail at
+	// runtime. The error names the variable and the byte length but NEVER
+	// the token value.
+	if err := validateEnvTokenLengths(); err != nil {
+		slog.Error("invalid environment token", "error", err)
+		os.Exit(1)
 	}
 
 	cfg, err := config.LoadConfig("config.yaml")

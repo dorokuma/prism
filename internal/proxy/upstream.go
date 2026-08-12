@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -568,6 +569,25 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 			// the 502 is written the same writer would report committed and
 			// the audit would misrecord the delivered status.
 			committed := w.Committed()
+			// Pre-first-event failures map to the SAME diagnosable error
+			// codes the translator uses mid-stream, so operators see one
+			// consistent taxonomy regardless of commit state:
+			//   - ErrResponsesStreamTooLarge (per-buffer or total
+			//     accumulation cap) → response_too_large (mid-stream: the
+			//     response.failed frame carries the same code);
+			//   - bufio.ErrTooLong (single SSE line over the scanner cap) →
+			//     stream_line_too_long;
+			//   - everything else → the generic upstream_stream_error.
+			errCode := "upstream_stream_error"
+			errMsg := "upstream stream failed before any event"
+			switch {
+			case errors.Is(err, stream.ErrResponsesStreamTooLarge):
+				errCode = "response_too_large"
+				errMsg = "upstream stream output exceeded the accumulated-size limit"
+			case errors.Is(err, bufio.ErrTooLong):
+				errCode = "stream_line_too_long"
+				errMsg = err.Error()
+			}
 			if !committed {
 				// Nothing was written to the client yet (pre-first-event
 				// failure): return a structured 502 instead of an empty 200.
@@ -575,7 +595,7 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 				// is still uncommitted, so this is the first and only
 				// WriteHeader on the wire.
 				util.WriteJSON(w, http.StatusBadGateway, map[string]any{
-					"error": map[string]any{"message": "upstream stream failed before any event", "code": "upstream_stream_error"},
+					"error": map[string]any{"message": errMsg, "code": errCode},
 				})
 			}
 			if a := middleware.AuditFromCtx(r.Context()); a != nil {
@@ -590,7 +610,15 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 					a.Status = http.StatusOK
 				}
 				a.Account = acc.Name()
-				a.ErrorType = util.ClassifyConnError(err)
+				// The two diagnosable failures keep their code as the audit
+				// error_type (like the non-streaming response_too_large
+				// path); everything else stays on the generic connection
+				// classification.
+				if errCode != "upstream_stream_error" {
+					a.ErrorType = errCode
+				} else {
+					a.ErrorType = util.ClassifyConnError(err)
+				}
 				a.Error = err.Error()
 			}
 			return true, err, UpstreamErrorTemporary

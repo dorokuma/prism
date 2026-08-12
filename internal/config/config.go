@@ -136,8 +136,10 @@ type AccountConfig struct {
 	// ProbePath overrides the health-check GET path for this account.
 	// Empty or "default" = "/v1/models"; an explicit path (e.g. "/models")
 	// is used as-is (joined with base_url); "-", "disabled" or "none"
-	// disables probing entirely (exhausted accounts are optimistically
-	// marked healthy each probe cycle, no HTTP request is sent).
+	// disables probing entirely (no HTTP request is sent, and the account
+	// state is left untouched — an exhausted account stays exhausted until
+	// the operator restores it; "probing disabled" is not "the credential
+	// recovered").
 	ProbePath string `yaml:"probe_path,omitempty"`
 	// SkipPISync excludes the provider from prism-managed pi models.json
 	// sync only: its pi metadata is hand-maintained and must not be
@@ -164,23 +166,50 @@ type APIKey struct {
 // because mcp already imports config and config must not import mcp.
 const McpAdminIdentity = "__prism_admin__"
 
+// McpUnauthenticatedIdentity is the reserved MCP tool-cache identity for
+// requests that presented NO authenticated API key (auth disabled, or the
+// request bypassed the auth middleware; see internal/mcp cache.go and
+// internal/proxy getTenantID). The bucket is deliberately READ-ONLY
+// (internal/mcp cacheMCPTool refuses to write it), so with auth disabled
+// different local clients can never pollute each other's cached tools. It
+// is deliberately NOT a usable API key name: LoadConfig rejects any
+// api_keys entry whose name equals this value, so an authenticated key can
+// never collide with — or shadow — the unauthenticated identity (an
+// authenticated request whose key name equals this label would otherwise
+// silently lose its own MCP tool cache and be indistinguishable from an
+// unauthenticated one). Defined here (not in internal/mcp) because mcp
+// already imports config and config must not import mcp; internal/mcp
+// aliases this value as its UnauthenticatedIdentity constant.
+const McpUnauthenticatedIdentity = "unauthenticated"
+
 // Config holds the top-level application configuration loaded from a YAML file.
 type Config struct {
-	Listen                   string                      `yaml:"listen"`
-	ProbeInterval            time.Duration               `yaml:"probe_interval"`
-	WireAPI                  string                      `yaml:"wire_api"`
-	Accounts                 []AccountConfig             `yaml:"accounts"`
-	ModelRemapEnabled        bool                        `yaml:"model_remap_enabled"`
-	ModelRemap               map[string]string           `yaml:"model_remap"`
-	ModelTiers               map[string]string           `yaml:"model_tiers"`
-	DefaultTier              string                      `yaml:"default_tier"`
-	StripFields              map[string][]string         `yaml:"strip_fields"`
-	Debug                    bool                        `yaml:"debug"`
-	MCPToolsJSON             string                      `yaml:"mcp_tools_json"`
-	AuthToken                string                      `yaml:"auth_token,omitempty"`
-	APIKeys                  []APIKey                    `yaml:"api_keys,omitempty"`
-	TLSCertFile              string                      `yaml:"tls_cert_file,omitempty"`
-	TLSKeyFile               string                      `yaml:"tls_key_file,omitempty"`
+	Listen            string              `yaml:"listen"`
+	ProbeInterval     time.Duration       `yaml:"probe_interval"`
+	WireAPI           string              `yaml:"wire_api"`
+	Accounts          []AccountConfig     `yaml:"accounts"`
+	ModelRemapEnabled bool                `yaml:"model_remap_enabled"`
+	ModelRemap        map[string]string   `yaml:"model_remap"`
+	ModelTiers        map[string]string   `yaml:"model_tiers"`
+	DefaultTier       string              `yaml:"default_tier"`
+	StripFields       map[string][]string `yaml:"strip_fields"`
+	Debug             bool                `yaml:"debug"`
+	MCPToolsJSON      string              `yaml:"mcp_tools_json"`
+	AuthToken         string              `yaml:"auth_token,omitempty"`
+	APIKeys           []APIKey            `yaml:"api_keys,omitempty"`
+	TLSCertFile       string              `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile        string              `yaml:"tls_key_file,omitempty"`
+	// AllowInsecureHTTP explicitly opts a non-loopback listener into
+	// plaintext HTTP (no TLS). Default false: LoadConfig fails when a
+	// non-loopback listen address has no complete TLS configuration
+	// (tls_cert_file + tls_key_file, or their PRISM_TLS_CERT /
+	// PRISM_TLS_KEY env-var fallbacks). trusted_proxies does NOT relax this
+	// check: it only limits which X-Forwarded-For hops are trusted and can
+	// not prevent direct access to the listener. Loopback listeners are
+	// always allowed without TLS (local development). Simple bool, default
+	// false; removing the field later is a safe no-op for every config that
+	// loads today.
+	AllowInsecureHTTP        bool                        `yaml:"allow_insecure_http,omitempty"`
 	TrustedProxies           []string                    `yaml:"trusted_proxies,omitempty"`
 	Tools                    map[string]string           `yaml:"tools,omitempty"`
 	ModelMetadata            ModelMetadataMap            `yaml:"model_metadata,omitempty"`
@@ -317,6 +346,21 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, err
 		}
 	}
+	// Every account base_url must be an absolute http(s) URL with a
+	// non-empty host. This is a CONFIG-CORRECTNESS check, not an SSRF
+	// defense: base_url is operator-controlled (never client-controlled), so
+	// there is no SSRF surface here — the validation exists because a
+	// malformed URL would fail every upstream request at runtime
+	// (http.NewRequest rejects it, and the request path logs the failure as
+	// invalid_upstream_url), and a missing host (e.g. "https:///v1") would
+	// be silently joined into a nonsense target. The error names the account
+	// but never echoes the URL value: a base_url may embed credentials
+	// (user:pass@host) that must not reach logs.
+	for _, acc := range cfg.Accounts {
+		if err := validateBaseURL(acc.Name, acc.BaseURL); err != nil {
+			return nil, err
+		}
+	}
 	if len(cfg.Accounts) == 0 {
 		return nil, fmt.Errorf("no accounts configured")
 	}
@@ -382,12 +426,16 @@ func LoadConfig(path string) (*Config, error) {
 	// unique so that (a) per-key MCP cache isolation holds — two keys
 	// sharing a name would see each other's cached tools — and (b) an
 	// authenticated request identity can never collide with the shared
-	// admin-injected MCP bucket (config.McpAdminIdentity). All three
+	// admin-injected MCP bucket (config.McpAdminIdentity) or with the
+	// read-only unauthenticated identity (config.McpUnauthenticatedIdentity,
+	// the bucket for requests that present no credential — an
+	// authenticated key named like it would silently lose its own tool
+	// cache and be indistinguishable from an unauthenticated one). All
 	// violations fail loading with an explicit error. The legacy auth_token
 	// expansion above legitimately produces the name "default" (a plain
-	// per-client bucket, NOT the admin bucket — only the reserved identity
-	// is forbidden), and the errors name the offending key but never echo
-	// any token.
+	// per-client bucket, NOT a reserved identity — only McpAdminIdentity
+	// and McpUnauthenticatedIdentity are forbidden), and the errors name
+	// the offending key but never echo any token.
 	seenNames := make(map[string]bool, len(cfg.APIKeys))
 	for _, k := range cfg.APIKeys {
 		if strings.TrimSpace(k.Name) == "" {
@@ -395,6 +443,9 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		if k.Name == McpAdminIdentity {
 			return nil, fmt.Errorf("api key name %q is reserved for the shared admin-injected MCP tool bucket; choose a different name", k.Name)
+		}
+		if k.Name == McpUnauthenticatedIdentity {
+			return nil, fmt.Errorf("api key name %q is reserved for the unauthenticated MCP tool bucket (requests without a credential); choose a different name", k.Name)
 		}
 		if seenNames[k.Name] {
 			return nil, fmt.Errorf("api_keys: duplicate key name %q; every key needs a unique name (it is the MCP cache identity and the audit key_id)", k.Name)
@@ -430,12 +481,39 @@ func LoadConfig(path string) (*Config, error) {
 	if !isLoopbackListen(cfg.Listen) && len(cfg.APIKeys) == 0 {
 		return nil, fmt.Errorf("non-loopback listen address %q requires auth_token, PRISM_AUTH_TOKEN, or api_keys", cfg.Listen)
 	}
-	// TLS cert/key fallback to env vars
+	// TLS cert/key fallback to env vars — MUST run BEFORE the TLS
+	// completeness check below, so env-provided certificates count as a
+	// complete TLS configuration.
 	if cfg.TLSCertFile == "" {
 		cfg.TLSCertFile = os.Getenv("PRISM_TLS_CERT")
 	}
 	if cfg.TLSKeyFile == "" {
 		cfg.TLSKeyFile = os.Getenv("PRISM_TLS_KEY")
+	}
+	// Non-loopback listeners must not serve plaintext unless the operator
+	// explicitly opts in with allow_insecure_http: true. trusted_proxies
+	// does NOT count as safety: it only governs which X-Forwarded-For hops
+	// are trusted for rate limiting and does not prevent direct access to
+	// the listener — a reverse proxy in front of a plaintext listener is
+	// not a security boundary. Hence:
+	//   - exactly one of tls_cert_file/tls_key_file → load error ALWAYS
+	//     (the server only serves TLS when BOTH are set, so the listener
+	//     would silently serve plaintext — a misconfiguration, not an
+	//     opt-in);
+	//   - neither set → load error unless allow_insecure_http: true makes
+	//     the plaintext explicit (a warning is still logged so the exposure
+	//     stays visible);
+	//   - loopback listeners stay TLS-free (local development).
+	if !isLoopbackListen(cfg.Listen) {
+		if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+			return nil, fmt.Errorf("non-loopback listen address %q has an incomplete TLS configuration (exactly one of tls_cert_file/tls_key_file is set): configure both or remove both", cfg.Listen)
+		}
+		if cfg.TLSCertFile == "" && !cfg.AllowInsecureHTTP {
+			return nil, fmt.Errorf("non-loopback listen address %q is served without TLS: configure tls_cert_file and tls_key_file (or PRISM_TLS_CERT/PRISM_TLS_KEY), or explicitly allow plaintext with allow_insecure_http: true", cfg.Listen)
+		}
+		if cfg.TLSCertFile == "" {
+			slog.Warn("non-loopback listen address serves plaintext HTTP (allow_insecure_http: true): traffic is unencrypted and any network observer can read credentials", "listen", cfg.Listen)
+		}
 	}
 	// Validate trusted proxies CIDRs
 	for _, s := range cfg.TrustedProxies {
@@ -483,6 +561,26 @@ func validateProviderName(name string) error {
 	}
 	if filepath.IsAbs(name) {
 		return fmt.Errorf("provider name %q must not be an absolute path", name)
+	}
+	return nil
+}
+
+// validateBaseURL checks that an account base_url is an absolute http(s)
+// URL with a non-empty host (see the LoadConfig call site for the
+// config-correctness rationale — deliberately NOT framed as SSRF
+// protection, since base_url is operator-controlled). The error names the
+// account but never echoes the URL value: a base_url may embed credentials
+// (user:pass@host) that must never reach logs.
+func validateBaseURL(name, baseURL string) error {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("account %q: base_url must be an absolute http(s) URL with a non-empty host (parse error)", name)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("account %q: base_url must be an absolute http(s) URL (scheme %q is not supported)", name, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("account %q: base_url must include a non-empty host", name)
 	}
 	return nil
 }
@@ -633,13 +731,18 @@ func (c *Config) VirtualModels() []string {
 // for the given model. Resolution order:
 //  1. cfg.MaxConcurrentPerAccount[model]  (exact match)
 //  2. cfg.MaxConcurrentPerAccount["*"]   (wildcard default)
-//  3. model name contains "flash" → deepseekV4FlashConcurrency * defaultConcurrencyRatio / 100
-//  4. model name contains "pro"   → deepseekV4ProConcurrency * defaultConcurrencyRatio / 100
-//  5. fallback: deepseekV4ProConcurrency * defaultConcurrencyRatio / 100
+//  3. the conservative built-in default (DefaultAccountConcurrency)
 //
-// An unknown non-empty model logs a warning (the fallback is a guess); an
-// empty model is the internal no-model case (model cache fetches) and
-// silently returns the fallback so background fetches do not spam the log.
+// The old model-name heuristics ("flash"/"pro" substrings → DeepSeek v4
+// tiers) are gone: they misjudged the provider from an arbitrary client-
+// supplied model name (any "*-pro" model was capped like a DeepSeek v4
+// tier) and could oversubscribe an unrelated upstream. The operator's
+// explicit max_concurrent_per_account configuration is the only way to
+// raise the cap; an unknown non-empty model logs a warning so the missing
+// configuration is visible. An empty model is the internal no-model case
+// (model cache fetches) and silently returns the default so background
+// fetches do not spam the log.
+//
 // It is the single concurrency-resolution implementation shared by the
 // proxy request path and the model cache fetch path (cache cannot import
 // proxy, so the function lives here to avoid a circular dependency).
@@ -652,18 +755,10 @@ func ResolveMaxConcurrent(model string, cfg *Config) int {
 			return v
 		}
 	}
-	modelLower := strings.ToLower(model)
-	if strings.Contains(modelLower, "flash") {
-		return DeepseekV4FlashConcurrency * DefaultConcurrencyRatio / 100
-	}
-	if strings.Contains(modelLower, "pro") {
-		return DeepseekV4ProConcurrency * DefaultConcurrencyRatio / 100
-	}
-	// Default for unknown models
 	if model != "" {
 		slog.Warn("unknown model, using default concurrency", "model", model)
 	}
-	return DeepseekV4ProConcurrency * DefaultConcurrencyRatio / 100
+	return DefaultAccountConcurrency
 }
 
 // ResolveFetchConcurrency returns the concurrency cap for model-cache
@@ -677,9 +772,8 @@ func ResolveMaxConcurrent(model string, cfg *Config) int {
 //     and any specific model cap must be respected by a fetch that may run
 //     alongside that model's traffic (taking the minimum is the only choice
 //     that cannot oversubscribe any configured model);
-//  3. no positive values → the same built-in default as the empty-model
-//     business resolution (DeepseekV4ProConcurrency *
-//     DefaultConcurrencyRatio / 100).
+//  3. no positive values → the conservative built-in default
+//     (DefaultAccountConcurrency), shared with the business-model path.
 //
 // Non-positive entries (0 or negative) are ignored in every branch: they
 // mean "no explicit limit", never "limit to zero".
@@ -698,7 +792,7 @@ func ResolveFetchConcurrency(cfg *Config) int {
 			return min
 		}
 	}
-	return DeepseekV4ProConcurrency * DefaultConcurrencyRatio / 100
+	return DefaultAccountConcurrency
 }
 
 // getCredential reads a credential file from the systemd LoadCredential
@@ -769,12 +863,33 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 			"listen changed from %q to %q: restart required to take effect",
 			oldCfg.Listen, newCfg.Listen))
 	}
-	// api_keys / auth_token are hot-reloadable: the ConfigHolder atomic pointer
-	// swap below publishes the new credential set and the auth middleware reads
-	// it per request, so a change takes effect immediately. No restart warning
-	// is emitted (the account pool is not rebuilt by this change).
+	// Accounts are NOT hot-reloaded: the pool is built once at startup, so
+	// publishing a config whose Accounts differ from the running pool would
+	// split the holder from the pool (new accounts never served, removed
+	// accounts still served, model-cache provider set stale). The reload is
+	// NOT rejected as a whole — every other field (model remap, tiers,
+	// strip_fields, api_keys, log level, debug, ...) still hot-reloads — but
+	// the running accounts configuration is KEPT, with a clear warning, so
+	// the holder and the pool can never diverge. Account changes apply on
+	// restart only.
 	if !accountsEqual(oldCfg.Accounts, newCfg.Accounts) {
-		warnings = append(warnings, "accounts changed: restart required to take effect")
+		warnings = append(warnings, "accounts changed: keeping the running accounts configuration (restart required to apply account changes)")
+		newCfg.Accounts = cloneAccounts(oldCfg.Accounts)
+		// providerSchema is derived from account base_url hosts: rebuild it
+		// from the KEPT accounts so EffortSchema stays consistent with the
+		// running pool.
+		newCfg.providerSchema = buildProviderSchema(newCfg.Accounts)
+		// default_provider must reference a provider that exists in the
+		// running accounts; if the new config's default_provider only exists
+		// in the (discarded) new accounts, keep the old default_provider and
+		// say so — a dangling default would route header-less requests into
+		// no_healthy.
+		if newCfg.DefaultProvider != "" && !hasProviderIn(newCfg.Accounts, newCfg.DefaultProvider) {
+			warnings = append(warnings, fmt.Sprintf(
+				"default_provider %q is not among the running accounts: keeping the previous default_provider %q",
+				newCfg.DefaultProvider, oldCfg.DefaultProvider))
+			newCfg.DefaultProvider = oldCfg.DefaultProvider
+		}
 	}
 	if oldCfg.ProbeInterval != newCfg.ProbeInterval {
 		warnings = append(warnings, "probe_interval changed: restart required to take effect")
@@ -815,6 +930,40 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	holder.Store(newCfg)
 
 	return warnings, nil
+}
+
+// cloneAccounts returns a deep-enough copy of an account slice: every
+// account is copied by value and the Headers map is copied (the only
+// reference field that the running config could mutate via the holder).
+func cloneAccounts(accs []AccountConfig) []AccountConfig {
+	out := make([]AccountConfig, len(accs))
+	for i, a := range accs {
+		if a.Headers != nil {
+			a.Headers = stringMapClone(a.Headers)
+		}
+		out[i] = a
+	}
+	return out
+}
+
+// hasProviderIn reports whether any account in accs belongs to the given
+// provider name.
+func hasProviderIn(accs []AccountConfig, name string) bool {
+	for _, a := range accs {
+		if a.Provider == name {
+			return true
+		}
+	}
+	return false
+}
+
+// stringMapClone copies a string map.
+func stringMapClone(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // accountsEqual compares two account slices by every field that cannot be

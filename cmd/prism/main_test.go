@@ -104,6 +104,53 @@ func TestStartUsageRecorder_UnwritableDBPathDegradesToNoOp(t *testing.T) {
 	}
 }
 
+// TestValidateEnvTokenLengths pins the startup fail-fast for over-long
+// admin/metrics tokens: a token longer than the 256-byte constant-time
+// comparison pad can never authenticate, so the deployment must fail at
+// startup — and the error must never echo the token value.
+func TestValidateEnvTokenLengths(t *testing.T) {
+	t.Run("absent tokens pass", func(t *testing.T) {
+		t.Setenv("METRICS_TOKEN", "")
+		t.Setenv("PRISM_ADMIN_TOKEN", "")
+		if err := validateEnvTokenLengths(); err != nil {
+			t.Fatalf("absent tokens must pass: %v", err)
+		}
+	})
+	t.Run("boundary length passes", func(t *testing.T) {
+		t.Setenv("METRICS_TOKEN", strings.Repeat("m", envTokenMaxBytes))
+		t.Setenv("PRISM_ADMIN_TOKEN", strings.Repeat("a", envTokenMaxBytes))
+		if err := validateEnvTokenLengths(); err != nil {
+			t.Fatalf("tokens of exactly %d bytes must pass: %v", envTokenMaxBytes, err)
+		}
+	})
+	t.Run("over-long METRICS_TOKEN fails fast", func(t *testing.T) {
+		const secret = "metrics-secret-value"
+		t.Setenv("METRICS_TOKEN", strings.Repeat("m", envTokenMaxBytes+1))
+		t.Setenv("PRISM_ADMIN_TOKEN", "")
+		err := validateEnvTokenLengths()
+		if err == nil {
+			t.Fatal("an over-long METRICS_TOKEN must fail startup")
+		}
+		if !strings.Contains(err.Error(), "METRICS_TOKEN") {
+			t.Errorf("error must name the variable, got: %v", err)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error must never echo the token, got: %v", err)
+		}
+	})
+	t.Run("over-long PRISM_ADMIN_TOKEN fails fast", func(t *testing.T) {
+		t.Setenv("METRICS_TOKEN", "")
+		t.Setenv("PRISM_ADMIN_TOKEN", strings.Repeat("a", envTokenMaxBytes+1))
+		err := validateEnvTokenLengths()
+		if err == nil {
+			t.Fatal("an over-long PRISM_ADMIN_TOKEN must fail startup")
+		}
+		if !strings.Contains(err.Error(), "PRISM_ADMIN_TOKEN") {
+			t.Errorf("error must name the variable, got: %v", err)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // HTTP wiring: usage degradation must never affect /v1 forwarding
 // ---------------------------------------------------------------------------
