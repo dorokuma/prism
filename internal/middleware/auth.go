@@ -18,6 +18,30 @@ import (
 // the same reason (config.maxAPIKeyTokenBytes).
 const authPadLen = 256
 
+// SplitBearerToken splits an Authorization header value into the auth scheme
+// and the credential, applying the shared Bearer semantics used by every
+// auth path (business keys via Authenticate, legacy single-token CheckAuth,
+// and the usage admin token):
+//   - the scheme is matched case-insensitively (Bearer / bearer / BEARER /
+//     BeArEr are all accepted); a missing scheme or a scheme other than
+//     Bearer is rejected;
+//   - an empty credential ("Bearer ") and a whitespace-only credential
+//     ("Bearer   ", "Bearer \t") are rejected outright — they are not
+//     tokens;
+//   - otherwise the token bytes are returned VERBATIM: only the scheme
+//     match is case-insensitive, the token itself is never folded or
+//     trimmed, and callers compare it with constant-time byte comparison.
+func SplitBearerToken(header string) (token string, ok bool) {
+	scheme, token, found := strings.Cut(header, " ")
+	if !found || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	if token == "" || strings.TrimSpace(token) == "" {
+		return "", false
+	}
+	return token, true
+}
+
 // CheckAuth returns true if the request carries a valid Authorization header for
 // the given token. When token is empty, all requests pass (auth disabled).
 // It is kept for legacy single-token callers (e.g. the /metrics endpoint);
@@ -27,19 +51,22 @@ func CheckAuth(r *http.Request, token string) bool {
 		return true
 	}
 	provided := r.Header.Get("Authorization")
-	expected := "Bearer " + token
+	tokenBytes, ok := SplitBearerToken(provided)
+	if !ok {
+		return false
+	}
 
 	// Pad both to a fixed length before constant-time comparison so that
 	// unequal lengths do not short-circuit the comparison and leak the
 	// length of expected via timing. Either side longer than the pad would
 	// be truncated and a prefix could match, so reject those outright.
-	if len(provided) > authPadLen || len(expected) > authPadLen {
+	if len(tokenBytes) > authPadLen || len(token) > authPadLen {
 		return false
 	}
 	pb := make([]byte, authPadLen)
 	eb := make([]byte, authPadLen)
-	copy(pb, provided)
-	copy(eb, expected)
+	copy(pb, tokenBytes)
+	copy(eb, token)
 	return subtle.ConstantTimeCompare(pb, eb) == 1
 }
 
@@ -48,13 +75,14 @@ func CheckAuth(r *http.Request, token string) bool {
 //
 //   - keys empty → request passes and keyName is "anonymous" (matches the
 //     historical auth-disabled behavior).
-//   - otherwise the Authorization header MUST start with "Bearer "; a bare
-//     token (no prefix) is rejected outright. The prefix is mandatory to
-//     match the legacy CheckAuth behavior and keep the auth surface tight
-//     (no accidental acceptance of raw tokens). The remainder is compared
-//     against every key token with subtle.ConstantTimeCompare (lengths
-//     padded to a fixed size so unequal lengths never short-circuit the
-//     comparison).
+//   - otherwise the Authorization header MUST carry a Bearer scheme
+//     (case-insensitive: "Bearer ", "bearer ", "BEARER " all accepted);
+//     a bare token (no scheme) is rejected outright. The scheme is
+//     mandatory to keep the auth surface tight (no accidental acceptance
+//     of raw tokens). The remainder is compared against every key token
+//     with subtle.ConstantTimeCompare (lengths padded to a fixed size so
+//     unequal lengths never short-circuit the comparison). Only the scheme
+//     match is case-insensitive — the token bytes are compared strictly.
 //
 // The loop ALWAYS scans the full key set before returning: there is no early
 // return on match, so the position of a hit (or whether one exists) cannot
@@ -65,11 +93,10 @@ func Authenticate(r *http.Request, keys []config.APIKey) (keyName string, ok boo
 		return "anonymous", true
 	}
 	provided := r.Header.Get("Authorization")
-	const bearerPrefix = "Bearer "
-	if !strings.HasPrefix(provided, bearerPrefix) {
+	token, found := SplitBearerToken(provided)
+	if !found {
 		return "", false
 	}
-	provided = provided[len(bearerPrefix):]
 	// Pad the provided token to a fixed length so that unequal lengths do
 	// not short-circuit the comparison and leak the expected length. A
 	// provided token longer than the pad cannot be compared without
@@ -77,11 +104,11 @@ func Authenticate(r *http.Request, keys []config.APIKey) (keyName string, ok boo
 	// The length-based reject leaks only the input's own length class (an
 	// input property), never anything about the keys; every ≤pad input is
 	// still compared against the full key set below.
-	if len(provided) > authPadLen {
+	if len(token) > authPadLen {
 		return "", false
 	}
 	pb := make([]byte, authPadLen)
-	copy(pb, provided)
+	copy(pb, token)
 	matched := false
 	matchedName := ""
 	for _, k := range keys {

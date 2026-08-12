@@ -54,49 +54,105 @@ func NewPool(cfgs []config.AccountConfig) *Pool {
 	}
 }
 
-// wakeWaiterFor scans the wait queue from the front and wakes the first
-// waiter that can use a slot freed on acc: a waiter whose provider matches
-// acc's provider, or a provider="" waiter (which can use any slot). Waking
-// a non-matching waiter would consume the wakeup and lose it (the woken
-// waiter would fail to select and re-queue at the back while the freed slot
-// sits idle), so only the first matching waiter is removed and closed —
-// exactly once. FIFO is preserved within the matching set because the scan
-// starts at the queue front. Must be called with p.mu held.
-func (p *Pool) wakeWaiterFor(acc *Account) {
-	prov := acc.Provider()
-	for elem := p.waiters.Front(); elem != nil; elem = elem.Next() {
-		w := elem.Value.(*waiter)
-		if w.provider != "" && w.provider != prov {
-			continue
-		}
-		p.waiters.Remove(elem)
-		w.active = false
-		close(w.ch)
-		return
-	}
-}
-
 func (p *Pool) Release(a *Account) {
 	a.Release()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.wakeWaiterFor(a)
+	// Wake the first waiter that can actually use the freed capacity:
+	// provider-matched AND within its own max right now. Waking the front
+	// waiter without the capacity check would let a front waiter with a
+	// too-small max consume the wakeup and re-park at the back while a
+	// later usable waiter stays parked — the mixed-max lost wakeup.
+	p.wakeNextUsable(a.Provider())
 }
 
 func (p *Pool) MarkHealthy(a *Account) {
 	a.MarkHealthy()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.wakeWaiterFor(a)
+	// Same capacity-aware scan as Release: the freshly-healthy account
+	// may only serve waiters whose provider/max fit, and waking an
+	// unusable front waiter would strand the usable waiter behind it.
+	p.wakeNextUsable(a.Provider())
 }
 
 func (p *Pool) removeWaiterAndTransfer(elem *list.Element) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	w := elem.Value.(*waiter)
+	woken := !w.active
 	if w.active {
 		p.waiters.Remove(elem)
 		w.active = false
+	}
+	// The waiter is bailing (ctx cancel / select timeout) after a wake was
+	// already consumed on it: a concurrent Release/MarkHealthy (or a
+	// previous transfer) freed capacity and woke THIS waiter, but the
+	// waiter's select picked the error case and exits without taking the
+	// slot. Without a handover the freed capacity would sit idle while the
+	// next waiter that could use it stays parked — the classic
+	// cancel-vs-release lost wakeup. Transfer the wakeup to the next
+	// waiter that can actually use currently-available capacity. When the
+	// waiter was never woken (woken == false) its removal cannot consume a
+	// wakeup: the releasing caller's own wake scan runs after this removal
+	// and reaches the next waiter directly, so transferring here would
+	// double-wake.
+	//
+	// The transfer is NOT gated on the bailing waiter's own
+	// provider/max: with mixed maxConcurrent values the freed capacity may
+	// be unusable for THIS waiter yet usable for the next one (a max=1
+	// waiter bailing while inFlight is in [1, maxOfNext) leaves the next
+	// max=N waiter servable). Gating on the bailing waiter's max would
+	// strand that waiter until its fallback timer — the mixed-max lost
+	// wakeup. wakeNextUsable applies each candidate waiter's OWN
+	// provider/max check, so the transfer can never wake a waiter that
+	// would immediately re-park.
+	if woken {
+		p.wakeNextUsable(w.provider)
+	}
+}
+
+// capacityAvailableFor reports whether a waiter with the given provider
+// ("" = any account) and maxConcurrent could currently acquire a slot: some
+// matching account is healthy, out of cooldown, and below its concurrency
+// cap. Must be called with p.mu held.
+func (p *Pool) capacityAvailableFor(provider string, max int) bool {
+	for _, acc := range p.accounts {
+		if provider != "" && acc.Provider() != provider {
+			continue
+		}
+		if acc.IsInCooldown() || !acc.IsHealthy() {
+			continue
+		}
+		if acc.InFlightCount() < max {
+			return true
+		}
+	}
+	return false
+}
+
+// wakeNextUsable wakes the front-most queued waiter that can use a slot of
+// the given provider ("" = any provider matches) AND has capacity available
+// for its own provider/max right now — the wakeup must not be spent on a
+// waiter that would immediately re-park. FIFO is preserved within the usable
+// set because the scan starts at the queue front. It is the single wake
+// path for every capacity-freeing event: Release/MarkHealthy (initial
+// wakeup after a slot frees or an account recovers) and the cancel-vs-
+// release transfer (removeWaiterAndTransfer). Must be called with p.mu
+// held.
+func (p *Pool) wakeNextUsable(provider string) {
+	for elem := p.waiters.Front(); elem != nil; elem = elem.Next() {
+		w := elem.Value.(*waiter)
+		if provider != "" && w.provider != "" && w.provider != provider {
+			continue
+		}
+		if !p.capacityAvailableFor(w.provider, w.max) {
+			continue
+		}
+		p.waiters.Remove(elem)
+		w.active = false
+		close(w.ch)
+		return
 	}
 }
 
@@ -177,6 +233,7 @@ func (p *Pool) Select(ctx context.Context, maxConcurrent int) (*Account, error) 
 			ch:       make(chan struct{}),
 			active:   true,
 			provider: "",
+			max:      maxConcurrent,
 		}
 		elem := p.waiters.PushBack(w)
 		p.mu.Unlock()
@@ -224,6 +281,17 @@ func (p *Pool) Select(ctx context.Context, maxConcurrent int) (*Account, error) 
 			p.removeWaiterAndTransfer(elem)
 		}
 	}
+}
+
+// WaitingCount returns the number of waiters currently parked in the wait
+// queue (across all providers). It is a read-only observability view of the
+// queue, safe for concurrent use. It also lets tests deterministically
+// observe wait-queue entry (poll until a waiter is provably parked — it is
+// registered under the pool lock) without a global test hook.
+func (p *Pool) WaitingCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.waiters.Len()
 }
 
 func (p *Pool) AllAccounts() []*Account {
@@ -328,6 +396,7 @@ func (p *Pool) SelectByProvider(ctx context.Context, maxConcurrent int, provider
 			ch:       make(chan struct{}),
 			active:   true,
 			provider: provider,
+			max:      maxConcurrent,
 		}
 		elem := p.waiters.PushBack(w)
 		p.mu.Unlock()

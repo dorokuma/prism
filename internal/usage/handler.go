@@ -156,12 +156,15 @@ const adminTokenPadLen = 256
 // PRISM_ADMIN_TOKEN means remote access is denied entirely.
 func (h *SummaryHandler) authorized(r *http.Request) bool {
 	if h.token != "" {
-		const prefix = "Bearer "
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, prefix) {
+		// Shared Bearer semantics with the business auth path
+		// (middleware.SplitBearerToken): case-insensitive scheme, token bytes
+		// returned verbatim (never trimmed or folded), and an empty or
+		// whitespace-only credential rejected outright — "Bearer  token"
+		// (double space) is a different token, not a trimmed "token".
+		got, ok := middleware.SplitBearerToken(r.Header.Get("Authorization"))
+		if !ok {
 			return false
 		}
-		got := strings.TrimSpace(auth[len(prefix):])
 		// Fixed-length pad comparison, identical to middleware.Authenticate:
 		// unequal lengths must not short-circuit the comparison and leak the
 		// expected length via timing. Length-based rejection leaks only the

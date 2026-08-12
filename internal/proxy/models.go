@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -45,7 +46,27 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 		slog.Info("models cache miss, fetching", "provider", provider, "req", requestID)
 		if err := mc.Fetch(provider); err != nil {
 			slog.Error("models fetch failed", "provider", provider, "error", err, "req", requestID)
-			util.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []any{}})
+			// A cache-miss fetch failure must never answer 200 with an empty
+			// list (a client would cache "no models" forever). Failures are
+			// classified from the Fetch sentinel errors:
+			//   - no healthy account / saturated → 503 (the provider has no
+			//     capacity right now; no_healthy / model_fetch_saturated)
+			//   - everything else (upstream error, parse error, response
+			//     over the size cap) → 502 model_fetch_failed
+			// The no-provider-header and cache-hit paths above are unchanged.
+			var code, msg string
+			status := http.StatusBadGateway
+			switch {
+			case errors.Is(err, cache.ErrNoHealthyAccount):
+				status, code, msg = http.StatusServiceUnavailable, "no_healthy", "no healthy account"
+			case errors.Is(err, cache.ErrFetchSaturated):
+				status, code, msg = http.StatusServiceUnavailable, "model_fetch_saturated", "model fetch saturated"
+			default:
+				code, msg = "model_fetch_failed", "model fetch failed"
+			}
+			util.WriteJSON(w, status, map[string]any{
+				"error": map[string]any{"message": msg, "code": code},
+			})
 			return
 		}
 		models = mc.GetModels(provider)

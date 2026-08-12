@@ -105,6 +105,140 @@ func TestParseStreamUsage_AnthropicDetectedByHead(t *testing.T) {
 	}
 }
 
+// TestParseStreamUsage_AnthropicDetectedWithSpacesAndFieldOrder guards the
+// wire-format detection against formatting: the message_start type is read
+// from the PARSED data JSON, so `"type": "message_start"` (space after the
+// colon) and reordered fields are detected exactly like the compact form — a
+// raw byte-substring match for `"type":"message_start"` would miss both
+// and misroute the stream to the OpenAI parser (zero usage).
+func TestParseStreamUsage_AnthropicDetectedWithSpacesAndFieldOrder(t *testing.T) {
+	tail := []byte("event: message_delta\ndata: {\"type\": \"message_delta\", \"usage\": {\"output_tokens\": 3}}\n\n")
+	cases := [][]byte{
+		// Space after the colon (valid JSON, defeats a no-space byte match).
+		[]byte("event: message_start\ndata: {\"type\": \"message_start\", \"message\": {\"usage\": {\"input_tokens\": 10}}}\n\n"),
+		// Field order: type after message (also defeats a prefix byte match).
+		[]byte("event: message_start\ndata: {\"message\": {\"usage\": {\"input_tokens\": 10}}, \"type\": \"message_start\"}\n\n"),
+	}
+	for i, head := range cases {
+		u := parseStreamUsage(head, tail)
+		want := usagemeta.Usage{Prompt: 10, Completion: 3, Total: 13, Source: usagemeta.SourceAnthropic}
+		if u != want {
+			t.Errorf("head %d: parseStreamUsage = %+v, want %+v (anthropic path with whitespace/reordered fields)", i, u, want)
+		}
+	}
+}
+
+// TestParseStreamUsage_AnthropicWithPreamble guards the wire-format
+// detection against events that precede message_start: a proxy/upstream may
+// emit a ping event (or any other parseable event) before the Anthropic
+// message_start, and the detector must scan ALL data payloads instead of
+// returning false on the first parseable non-message_start event.
+func TestParseStreamUsage_AnthropicWithPreamble(t *testing.T) {
+	tail := []byte("event: message_delta\ndata: {\"type\": \"message_delta\", \"usage\": {\"output_tokens\": 3}}\n\n")
+	heads := [][]byte{
+		// Parseable preamble: Anthropic ping event before message_start.
+		[]byte("event: ping\ndata: {\"type\": \"ping\"}\n\nevent: message_start\ndata: {\"type\": \"message_start\", \"message\": {\"usage\": {\"input_tokens\": 10}}}\n\n"),
+		// Unparseable preamble: a data line that is not valid JSON must be
+		// skipped, not treated as the answer.
+		[]byte("data: keepalive-not-json\n\nevent: message_start\ndata: {\"type\": \"message_start\", \"message\": {\"usage\": {\"input_tokens\": 10}}}\n\n"),
+		// Non-Anthropic first event: an OpenAI-shaped chunk before the
+		// message_start must not misroute the stream.
+		[]byte("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\nevent: message_start\ndata: {\"type\": \"message_start\", \"message\": {\"usage\": {\"input_tokens\": 10}}}\n\n"),
+	}
+	for i, head := range heads {
+		u := parseStreamUsage(head, tail)
+		want := usagemeta.Usage{Prompt: 10, Completion: 3, Total: 13, Source: usagemeta.SourceAnthropic}
+		if u != want {
+			t.Errorf("head %d: parseStreamUsage = %+v, want %+v (anthropic path despite preamble)", i, u, want)
+		}
+	}
+}
+
+// TestParseStreamUsage_MultiLineData guards the SSE multi-line data rule: a
+// single event whose data field spans several "data:" lines is joined with
+// "\n" (per the SSE spec) BEFORE JSON parsing, so a message_start split
+// across lines is still detected, and a message_delta split across lines
+// still yields output tokens.
+func TestParseStreamUsage_MultiLineData(t *testing.T) {
+	// message_start split across three data: lines (valid JSON once joined).
+	head := []byte("event: message_start\n" +
+		"data: {\"type\": \"message_start\",\n" +
+		"data: \"message\": {\"usage\": {\"input_tokens\": 10}},\n" +
+		"data: \"id\": \"msg_1\"}\n\n")
+	// message_delta split across two data: lines.
+	tail := []byte("event: message_delta\n" +
+		"data: {\"type\": \"message_delta\",\n" +
+		"data: \"usage\": {\"output_tokens\": 3}}\n\n")
+	u := parseStreamUsage(head, tail)
+	want := usagemeta.Usage{Prompt: 10, Completion: 3, Total: 13, Source: usagemeta.SourceAnthropic}
+	if u != want {
+		t.Errorf("parseStreamUsage(multi-line data) = %+v, want %+v", u, want)
+	}
+}
+
+// TestSSEDataPayloads_MergesMultiLineData is a direct unit test of the SSE
+// data: extraction: multi-line data within one event is merged into a single
+// payload (joined with "\n"), each event yields at most one payload, and
+// events without data lines are skipped.
+func TestSSEDataPayloads_MergesMultiLineData(t *testing.T) {
+	buf := []byte("event: ping\ndata: {\"type\": \"ping\"}\n\n" +
+		"event: message_start\ndata: {\"type\": \"message_start\",\ndata: \"message\": {}}\n\n" +
+		": keep-alive comment\n\n" +
+		"data: [DONE]\n\n")
+	payloads := sseDataPayloads(buf)
+	if len(payloads) != 2 {
+		t.Fatalf("sseDataPayloads returned %d payloads, want 2", len(payloads))
+	}
+	if string(payloads[0]) != `{"type": "ping"}` {
+		t.Errorf("payload[0] = %q, want the ping JSON", payloads[0])
+	}
+	if string(payloads[1]) != "{\"type\": \"message_start\",\n\"message\": {}}" {
+		t.Errorf("payload[1] = %q, want the merged multi-line data", payloads[1])
+	}
+}
+
+// TestSSEDataPayloads_EmptyDataLinesPerSpec pins the SSE empty-data-line
+// rule: per the spec an empty data: line is still a data line and
+// contributes an empty fragment to the joined payload (data lines are
+// joined with "\n"), so `data: a` + `data:` + `data: b` yields "a\n\nb" —
+// the parser must not silently drop the empty line and produce "a\nb"
+// (which would change the JSON). Events whose ONLY data line is empty still
+// produce no payload.
+func TestSSEDataPayloads_EmptyDataLinesPerSpec(t *testing.T) {
+	buf := []byte(
+		"event: e1\n" +
+			"data: {\"a\":1,\n" +
+			"data:\n" +
+			"data: \"b\":2}\n\n" +
+			"data:\n\n" + // event with only an empty data line → no payload
+			"data: [DONE]\n\n")
+	payloads := sseDataPayloads(buf)
+	if len(payloads) != 1 {
+		t.Fatalf("sseDataPayloads returned %d payloads, want 1", len(payloads))
+	}
+	want := "{\"a\":1,\n\n\"b\":2}"
+	if string(payloads[0]) != want {
+		t.Errorf("payload = %q, want %q (empty data line must join as an empty fragment, not be dropped)", payloads[0], want)
+	}
+}
+
+// TestParseStreamUsage_AnthropicWithEmptyDataLine verifies empty data lines
+// inside an event do not break usage parsing: the message_start payload
+// joined per spec (with the empty fragment) still parses and yields the
+// input tokens.
+func TestParseStreamUsage_AnthropicWithEmptyDataLine(t *testing.T) {
+	head := []byte("event: message_start\n" +
+		"data: {\"type\": \"message_start\",\n" +
+		"data:\n" +
+		"data: \"message\": {\"usage\": {\"input_tokens\": 10}}}\n\n")
+	tail := []byte("event: message_delta\ndata: {\"type\": \"message_delta\", \"usage\": {\"output_tokens\": 3}}\n\n")
+	u := parseStreamUsage(head, tail)
+	want := usagemeta.Usage{Prompt: 10, Completion: 3, Total: 13, Source: usagemeta.SourceAnthropic}
+	if u != want {
+		t.Errorf("parseStreamUsage(empty data line) = %+v, want %+v", u, want)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // StreamResponseBody end-to-end (passthrough + audit capture)
 // ---------------------------------------------------------------------------

@@ -147,7 +147,7 @@ func ProbeExhausted(pool *Pool) {
 						return true
 					}
 
-					slog.Warn("probe account still exhausted", "account", acc.Name(), "status", statusCode, "attempt", attempt, "max_attempts", maxProbeAttempts, "body", util.RedactBody(respBody))
+					slog.Warn("probe account still exhausted", "account", acc.Name(), "status", statusCode, "attempt", attempt, "max_attempts", maxProbeAttempts, "body", string(util.RedactBodyBytesWithKeys(respBody, []string{acc.Key()})))
 					return false
 				}()
 

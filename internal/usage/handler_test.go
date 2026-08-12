@@ -124,6 +124,54 @@ func TestHandlerEmptyTokenDeniesRemote(t *testing.T) {
 	}
 }
 
+// TestHandlerAuth_BearerSchemeCaseInsensitive guards the admin-token scheme
+// match: bearer/BEARER/BeArEr all authenticate with the exact same token,
+// while a bare token and a wrong token are still rejected.
+func TestHandlerAuth_BearerSchemeCaseInsensitive(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	h := NewSummaryHandler(openTestStore(t))
+	for _, scheme := range []string{"Bearer", "bearer", "BEARER", "BeArEr"} {
+		rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "10.1.2.3:9999", scheme+" sekret")
+		if rec.Code != http.StatusOK {
+			t.Errorf("scheme %q: got %d, want 200", scheme, rec.Code)
+		}
+	}
+	// bare token (no scheme) still denied
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "10.1.2.3:9999", "sekret"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("bare token: got %d, want 401", rec.Code)
+	}
+	// wrong token under a lowercase scheme still denied
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "10.1.2.3:9999", "bearer wrong"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("wrong token: got %d, want 401", rec.Code)
+	}
+}
+
+// TestHandlerAuth_EmptyAndWhitespaceTokenRejected guards the unified Bearer
+// semantics on the admin path (shared middleware.SplitBearerToken): an empty
+// credential, a whitespace-only credential, and a double-space
+// "Bearer  sekret" (which the old TrimSpace implementation accepted as
+// "sekret") must all be rejected — the token bytes are byte-strict, exactly
+// like middleware.Authenticate / CheckAuth.
+func TestHandlerAuth_EmptyAndWhitespaceTokenRejected(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
+	h := NewSummaryHandler(openTestStore(t))
+	for _, auth := range []string{
+		"Bearer ",
+		"Bearer   ",
+		"Bearer \t",
+		"Bearer  sekret", // double space: old TrimSpace accepted this as "sekret"
+		"bearer  sekret",
+	} {
+		if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "10.1.2.3:9999", auth); rec.Code != http.StatusUnauthorized {
+			t.Errorf("Authorization %q: got %d, want 401 (empty/whitespace/mis-spaced token must be rejected)", auth, rec.Code)
+		}
+	}
+	// The correct single-space token still passes.
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "10.1.2.3:9999", "Bearer sekret"); rec.Code != http.StatusOK {
+		t.Errorf("Bearer sekret: got %d, want 200", rec.Code)
+	}
+}
+
 func TestHandlerDBUnavailable(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	h := NewSummaryHandler(nil)       // no store: must 503, not panic

@@ -43,15 +43,21 @@ func DumpDebugResponsesBody(originalBody []byte) {
 	}
 }
 
-// DumpDebugUpstreamResponse dumps the upstream response to a temp file for debugging.
-func DumpDebugUpstreamResponse(rawBody []byte) {
+// DumpDebugUpstreamResponse dumps the upstream response body to a temp file
+// for debugging. extraKeys (the account key) are scrubbed as literal
+// substrings on top of the sk-/Bearer regex redaction, so a custom
+// auth_header key that does not look like an sk-/Bearer token never lands on
+// disk when an upstream echoes the credential it received.
+func DumpDebugUpstreamResponse(rawBody []byte, extraKeys []string) {
 	if !DebugMode {
 		return
 	}
 	dir := initDebugDumpDir()
 	path := filepath.Join(dir, "last-upstream-response.json")
-	sanitized := []byte(RedactBody(rawBody))
+	sanitized := RedactBodyBytesWithKeys(rawBody, extraKeys)
 	if err := os.WriteFile(path, sanitized, 0o600); err != nil {
 		slog.Debug("debug upstream response dump failed", "error", err)
+		return
 	}
+	slog.Debug("debug wrote upstream response dump", "path", path, "bytes", len(sanitized))
 }

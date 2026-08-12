@@ -129,6 +129,42 @@ func TestAuthenticate_LongKeyPrefixMatchRejected(t *testing.T) {
 	}
 }
 
+// TestAuthenticate_BearerSchemeCaseInsensitive guards the scheme match:
+// bearer/BEARER/BeArEr all authenticate with the exact same token bytes,
+// while a bare token and a wrong token are still rejected. Only the scheme
+// is folded — the token comparison itself is byte-strict, so a case-folded
+// token must NOT match.
+func TestAuthenticate_BearerSchemeCaseInsensitive(t *testing.T) {
+	keys := []config.APIKey{{Name: "ci-bot", Token: "sk-ci-111"}}
+	for _, scheme := range []string{"Bearer", "bearer", "BEARER", "BeArEr"} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.Header.Set("Authorization", scheme+" sk-ci-111")
+		name, ok := middleware.Authenticate(r, keys)
+		if !ok || name != "ci-bot" {
+			t.Errorf("scheme %q: (%q, %v), want (ci-bot, true)", scheme, name, ok)
+		}
+	}
+	// The token bytes are still compared strictly: a case-folded token must
+	// not authenticate.
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Authorization", "Bearer SK-CI-111")
+	if name, ok := middleware.Authenticate(r, keys); ok {
+		t.Errorf("case-folded token must be rejected, matched as %q", name)
+	}
+	// Bare token (no scheme) still rejected.
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.Header.Set("Authorization", "sk-ci-111")
+	if _, ok := middleware.Authenticate(r2, keys); ok {
+		t.Error("bare token must still be rejected")
+	}
+	// Wrong token under a lowercase scheme still rejected.
+	r3 := httptest.NewRequest("GET", "/", nil)
+	r3.Header.Set("Authorization", "bearer sk-wrong")
+	if _, ok := middleware.Authenticate(r3, keys); ok {
+		t.Error("wrong token must still be rejected")
+	}
+}
+
 // TestAuthenticate_BareTokenRejected: an Authorization header without a
 // "Bearer " prefix is rejected outright — the prefix is mandatory, matching
 // the legacy CheckAuth behavior. A bare token must never authenticate.
@@ -153,6 +189,35 @@ func TestAuthenticate_BearerPrefixOnlyRejected(t *testing.T) {
 	r.Header.Set("Authorization", "Bearer ")
 	if _, ok := middleware.Authenticate(r, keys); ok {
 		t.Fatal("prefix-only Authorization header must be rejected")
+	}
+}
+
+// TestAuthenticate_EmptyAndWhitespaceTokenRejected guards the explicit
+// rejection of an empty credential and a whitespace-only credential after
+// the Bearer scheme: "Bearer ", "Bearer   " and "Bearer \t" are not tokens
+// and must never reach the constant-time comparison. The token bytes are
+// byte-strict and never trimmed: a double-space "Bearer  sk-ci-111" is a
+// different (invalid) token, not a trimmed "sk-ci-111".
+func TestAuthenticate_EmptyAndWhitespaceTokenRejected(t *testing.T) {
+	keys := []config.APIKey{{Name: "ci-bot", Token: "sk-ci-111"}}
+	for _, auth := range []string{
+		"Bearer ",
+		"Bearer   ",
+		"Bearer \t",
+		"Bearer  sk-ci-111", // double space: token would be " sk-ci-111" — must NOT match
+		"bearer  sk-ci-111",
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.Header.Set("Authorization", auth)
+		if name, ok := middleware.Authenticate(r, keys); ok {
+			t.Errorf("Authorization %q: (%q, %v), want rejected (empty/whitespace/mis-spaced token)", auth, name, ok)
+		}
+	}
+	// The correct single-space token still authenticates.
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Authorization", "Bearer sk-ci-111")
+	if name, ok := middleware.Authenticate(r, keys); !ok || name != "ci-bot" {
+		t.Errorf("Bearer sk-ci-111: (%q, %v), want (ci-bot, true)", name, ok)
 	}
 }
 

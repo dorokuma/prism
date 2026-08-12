@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -17,12 +16,8 @@ import (
 func proxyResponses(p *pool.Pool, w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 	start := time.Now()
 	defer r.Body.Close()
-	const maxBodySize = 10 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		slog.Error("responses body read error", "error", err)
-		http.Error(w, "failed to read body", 500)
+	bodyBytes, ok := readRequestBody(w, r, "responses")
+	if !ok {
 		return
 	}
 	tenantID := getTenantID(r)

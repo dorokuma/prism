@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.14.0  Date: 2026-08-12  Status: living document
+> Version: v0.14.1  Date: 2026-08-12  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -45,6 +45,16 @@ Hyphens in the account name become underscores in the credential/env name.
 
 ```bash
 cd /path/to/prism
+HEALTH_URL=http://127.0.0.1:18790/health ./deploy.sh   # HEALTH_URL 可覆盖，默认即此值
+```
+
+`deploy.sh` 编译 → 原子替换二进制 → `systemctl restart prism` → 健康验证 → 失败自动回退。
+健康检查地址默认 `http://127.0.0.1:18790/health`，可用环境变量 `HEALTH_URL` 覆盖（如非默认端口或远程探测）。
+
+手动部署：
+
+```bash
+cd /path/to/prism
 go build -o prism .
 install -m 755 prism /usr/local/bin/prism
 # config edits: edit /var/lib/prism/config.yaml then:
@@ -65,7 +75,7 @@ systemctl restart prism   # only when you intend downtime / reload
 | `default_tier` | string | — | Fallback tier |
 | `default_provider` | string | — | Fallback provider for requests missing the X-Prism-Provider header; unset = reject them with HTTP 400 |
 | `max_concurrent_per_account` | map | — | Model → max concurrent requests per account (exact match; silences the unknown-model default warning) |
-| `max_upstream_response_bytes` | int | `33554432` (32 MiB) | Cap for non-streaming upstream response bodies (both the legacy chat path and the responses translation path); larger bodies are rejected with HTTP 502 `response_too_large`. `0`/absent = default, negative or above `268435456` (256 MiB, hard upper bound) = startup error. Hot-reloadable |
+| `max_upstream_response_bytes` | int | `33554432` (32 MiB) | Cap for non-streaming upstream response bodies (both the legacy chat path and the responses translation path) AND for model-cache success reads (`/v1/models` and ollama `/api/show`); larger bodies are rejected with HTTP 502 `response_too_large` (chat) or the model fetch fails (`model_fetch_failed`). `0`/absent = default, negative or above `268435456` (256 MiB, hard upper bound) = startup error. Hot-reloadable |
 | `usage` | map | disabled | Token usage recording to SQLite: `enabled` (default false, opt-in), `db_path` (default `/var/lib/prism/usage.db`; NOT hot-reloadable), `retention_days` (absent → default 30; explicit `0` → keep forever, cleanup disabled), `channel_size` (default 4096), `batch_size` (default 50), `batch_flush_ms` (default 200), `default_key_id` (default `anonymous`; key_id recorded for requests without an authenticated api key — explicit empty falls back to `anonymous`). Cost is priced from `model_metadata[].cost` (USD per 1M tokens); the pricing 口径 follows the upstream wire format (OpenAI `prompt_tokens` includes cached tokens, Anthropic `input_tokens` excludes the cache counters) and is persisted per row as `usage_source`. Any usage failure degrades to logs + counters and never affects `/v1` forwarding |
 
 ### Model remapping behavior
@@ -109,7 +119,7 @@ upstream model name. The resolution logic is:
 |------|--------|-------------|
 | `/v1/chat/completions` | POST | Chat proxy (non-POST → 405 `method_not_allowed`) |
 | `/v1/responses` | POST | Responses path (non-POST → 405 `method_not_allowed`) |
-| `/v1/models` | GET | Virtual models |
+| `/v1/models` | GET | Model list. No `X-Prism-Provider` header → empty 200 list. Cache hit → cached models. Cache miss → fetch from upstream; fetch failure is never a 200 empty list: no healthy account → 503 `no_healthy`, account saturated → 503 `model_fetch_saturated`, other upstream/parse/size errors → 502 `model_fetch_failed`. Request body cap 10 MiB (413 `request_too_large` / 400 `invalid_request`) on the POST surfaces |
 | `/health` | GET | `ok` |
 | `/metrics` | GET | expvar metrics. Auth (fail-closed): when `METRICS_TOKEN` is configured every request — loopback included — must present it as a Bearer token; only when it is unset is a direct loopback request (no `X-Forwarded-For`/`X-Real-IP`) allowed without a token, while loopback with forwarding headers (same-machine reverse proxy) and all remote requests are denied |
 | `/admin/usage/summary` | GET | Aggregated token usage/cost summary (when `usage.enabled`). Auth (fail-closed): when `PRISM_ADMIN_TOKEN` is configured every request — loopback included — must present it as a Bearer token; only when it is unset is a direct loopback request (no `X-Forwarded-For`/`X-Real-IP`) allowed; mounted before the global api_keys gate (like `/metrics`). Query params: `from`/`to` (unix seconds), `group_by` (`model`,`provider`,`account`,`key_id`,`stream`,`success`,`hour`,`day`), filters `model`/`provider`/`account`/`key_id`/`stream`/`success`, `limit` (default 100, max 1000). Returns 503 `store_unavailable` when usage is disabled or the store failed |
@@ -144,6 +154,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-12** — v0.14.1 — audit round 2: 10 reliability/security fixes. Model cache: `Fetch` releases its concurrency slot through the pool (`mc.pool.Release`), so a completed fetch wakes a parked provider waiter (previously waiters could strand until an unrelated request freed the account); `/v1/models` and ollama `/api/show` SUCCESS responses are now read with the same bounded helper as chat responses (`max_upstream_response_bytes`, default 32 MiB, invalid caps never degrade to an unbounded read — helper moved to `internal/util` so cache and proxy share it without an import cycle); SIGHUP no longer blocks the signal loop on `RefreshAll`/`SyncTools` — a controlled background refresh (reentry-coalesced, internal cancellable context, `Stop()` aborts an in-flight refresh and waits for it, no cache file written after cancellation, config snapshotted to avoid races with `UpdateConfig`) runs the refresh + tools sync; `/v1/models` cache-miss fetch failures are classified instead of returning 200 empty lists — no healthy account → 503 `no_healthy`, saturated → 503 `model_fetch_saturated`, other upstream/parse/size errors → 502 `model_fetch_failed`. Upstream error handling: every 401/402/429/4xx/5xx log and audit error body (runtime, startup probe, probe loop) is redacted with `RedactBodyBytesWithKeys(..., acc.Key())`, closing the leak for account keys that are not `sk-`/Bearer shaped (custom `auth_header`). Request bodies: `/v1/chat/completions`, `/v1/responses`, `/v1/messages` bodies over 10 MiB return HTTP 413 `request_too_large` (JSON envelope), other read errors return HTTP 400 `invalid_request` — one shared helper instead of three divergent paths. Auth: the Bearer scheme is matched case-insensitively (`bearer`/`BEARER`/`BeArEr`) across `Authenticate`, `CheckAuth` and the usage admin auth, while the token bytes stay strictly compared (bare tokens and wrong tokens still rejected). Anthropic SSE wire-format detection parses the `data:` JSON `type` field (whitespace- and field-order-insensitive) instead of matching the exact byte string `"type":"message_start"`. `deploy.sh` health-check URL is now overridable via the `HEALTH_URL` environment variable (default unchanged). All round-1 guarantees kept: empty-token keys, fail-closed admin auth, cross-provider waiters, XFF multi-hop, 256 MiB cap, select error codes, cost clamping, bucket cap, 405.
 
 - **2026-08-12** — v0.14.0 — audit round: 14 reliability/security fixes. Account selection: select timeout now bound to `r.Context()` (client disconnect cancels the wait immediately) and select failures are classified with `errors.Is` into four response codes — `no_healthy` / `select_timeout` / `client_canceled` / `select_failed` — replacing the old single `no_accounts` code on the select path (HTTP stays 503; **compat note**: clients matching on `code` must update). Pool waiters are provider-aware: `Release`/`MarkHealthy` wake the first queued waiter that can use the freed slot (provider match, or `provider=""` waiters that can use any slot), FIFO within the matching set, no lost wakeups. Auth hardening: `api_keys` with empty/whitespace tokens are rejected at load and skipped defensively by `Authenticate`; `/metrics` and `/admin/usage/summary` auth is fail-closed — when `METRICS_TOKEN`/`PRISM_ADMIN_TOKEN` is configured EVERY request (loopback included) must present it as a Bearer token, and token-free direct loopback (no `X-Forwarded-For`/`X-Real-IP`) is allowed only when the token is unset. Upstream response handling: non-streaming success reads capped at `max_upstream_response_bytes` (default 32 MiB, hard upper bound 256 MiB, read max+1, over-limit → 502 `response_too_large`); `IsQuotaError` now accepts only the structured permanent quota envelope (`insufficient_quota`/`gousagelimiterror`) — plain-text quota messages on 429 go to cooldown; bare 403 is never permanent, while a 403 carrying a recognized structured credential/quota body exhausts the account via the shared `ClassifyUpstreamError` used by both runtime and startup — the original 403 body/status still passes through to the client (body read once, redacted). Trusted-proxy client IP: `GetClientIP` walks XFF right-to-left skipping all trusted hops (multi-hop chains resolve to the real client). Model cache: non-200 error bodies are redacted before entering errors/logs; `Fetch` now `TryAcquire`s a concurrency slot and fails fast when saturated, using `config.ResolveFetchConcurrency` (configured `*` wildcard, else the smallest positive per-model limit, else the built-in default) because a fetch is not tied to a single business model. `/v1/chat/completions` and `/v1/responses` return 405 `method_not_allowed` for non-POST. Rate limiter buckets have a deterministic cap (default 100000; oldest `lastCheck` evicted; test-injectable). Cost accounting: all four token counters (prompt/completion/cached/cache-write) are clamped non-negative at the cost entry and at every parse entry — OpenAI keeps cached ≤ prompt, Anthropic only drops negatives and keeps its formula semantics — so no broken upstream report can ever produce a negative cost.
 

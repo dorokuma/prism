@@ -70,7 +70,16 @@ func (c *captureWriter) headBytes() []byte { return c.head }
 func (c *captureWriter) tailBytes() []byte { return c.tail }
 
 // sseDataPayloads returns the data: payloads of all SSE events in buf, in
-// stream order. [DONE] sentinels and empty payloads are skipped.
+// stream order. Per the SSE specification an event's data field may span
+// multiple data: lines, which are joined with a single "\n" before the
+// payload is returned (a fragment would not parse as JSON). An EMPTY data:
+// line is still a data line: it contributes an empty fragment to the join
+// (so `data: a` + `data:` + `data: b` yields "a\n\nb", never the silently
+// altered "a\nb"). [DONE] sentinels, events without data lines, and events
+// whose joined payload is empty are skipped. The field value is everything
+// after "data:" with one optional leading space stripped (the spec
+// delimiter); surrounding whitespace is trimmed so a payload with
+// leading/trailing spaces still parses.
 func sseDataPayloads(buf []byte) [][]byte {
 	var out [][]byte
 	for _, event := range bytes.Split(buf, []byte("\n\n")) {
@@ -78,16 +87,33 @@ func sseDataPayloads(buf []byte) [][]byte {
 		if len(event) == 0 {
 			continue
 		}
+		var lines [][]byte
 		for _, line := range bytes.Split(event, []byte("\n")) {
-			if !bytes.HasPrefix(line, []byte("data: ")) {
+			if !bytes.HasPrefix(line, []byte("data:")) {
 				continue
 			}
-			payload := bytes.TrimSpace(line[6:])
-			if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
-				continue
-			}
-			out = append(out, payload)
+			payload := bytes.TrimPrefix(line[len("data:"):], []byte(" "))
+			payload = bytes.TrimSpace(payload)
+			// Keep empty data lines: they are part of the spec's join and
+			// dropping them would change the merged payload (e.g. two JSON
+			// fragments separated by an empty line must stay two "\n"s
+			// apart, not one).
+			lines = append(lines, payload)
 		}
+		if len(lines) == 0 {
+			continue
+		}
+		payload := bytes.Join(lines, []byte("\n"))
+		if len(payload) == 0 {
+			continue
+		}
+		// The [DONE] sentinel is matched on the trimmed joined payload: an
+		// empty trailing data line inside the sentinel event must not make
+		// the sentinel undetectable.
+		if bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]")) {
+			continue
+		}
+		out = append(out, payload)
 	}
 	return out
 }
@@ -103,6 +129,31 @@ type anthropicEvent struct {
 	Usage json.RawMessage `json:"usage"`
 }
 
+// isAnthropicMessageStart reports whether the stream head contains an
+// Anthropic message_start event. The event type is read from the PARSED JSON
+// of every data: payload, and ALL payloads are scanned: a preamble event
+// before message_start (e.g. an Anthropic ping, a proxy keep-alive comment
+// event, or an unparseable data line) must not cause an early false — the
+// stream is Anthropic as soon as ANY event carries type=message_start. The
+// parse-based check also defeats a `"type":"message_start"` byte search
+// failure mode: an upstream that emits `"type": "message_start"` (space
+// after the colon) or puts type after other fields would misroute the
+// stream to the OpenAI parser.
+func isAnthropicMessageStart(head []byte) bool {
+	for _, payload := range sseDataPayloads(head) {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(payload, &ev) != nil {
+			continue
+		}
+		if ev.Type == "message_start" {
+			return true
+		}
+	}
+	return false
+}
+
 // parseStreamUsage extracts token usage from a captured SSE stream prefix
 // (head) and suffix (tail). The wire format is detected from the head:
 // Anthropic streams open with a message_start event, OpenAI streams do not.
@@ -115,7 +166,7 @@ type anthropicEvent struct {
 //     tail carries output_tokens. Both ends are parsed with the shared
 //     Anthropic parser and merged.
 func parseStreamUsage(head, tail []byte) usagemeta.Usage {
-	if bytes.Contains(head, []byte(`"type":"message_start"`)) {
+	if isAnthropicMessageStart(head) {
 		return parseAnthropicStreamUsage(head, tail)
 	}
 	return parseOpenAIStreamUsage(tail)

@@ -17,17 +17,17 @@ var ErrEmptyUpstreamStream = errors.New("empty upstream chat completion stream")
 type reasoningPhase uint8
 
 const (
-	reasoningIdle      reasoningPhase = iota // 0: not started
-	reasoningItemOpen                         // 1: output_item.added emitted
-	reasoningPartOpen                         // 2: reasoning_summary_part.added emitted
+	reasoningIdle     reasoningPhase = iota // 0: not started
+	reasoningItemOpen                       // 1: output_item.added emitted
+	reasoningPartOpen                       // 2: reasoning_summary_part.added emitted
 )
 
 type messagePhase uint8
 
 const (
-	messageIdle      messagePhase = iota // 0: not started
-	messageItemOpen                        // 1: output_item.added emitted
-	messagePartOpen                        // 2: content_part.added emitted
+	messageIdle     messagePhase = iota // 0: not started
+	messageItemOpen                     // 1: output_item.added emitted
+	messagePartOpen                     // 2: content_part.added emitted
 )
 
 type streamToolState struct {

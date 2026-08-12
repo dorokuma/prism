@@ -41,15 +41,48 @@ type ChatForwardOpts struct {
 	SkipSanitize bool
 }
 
+// maxRequestBodyBytes caps the client request body read for the three POST
+// surfaces (/v1/chat/completions, /v1/responses, /v1/messages). Bodies over
+// the cap are rejected with HTTP 413 request_too_large instead of being
+// buffered whole into memory.
+const maxRequestBodyBytes = 10 << 20
+
+// readRequestBody reads and validates the client request body. It is the
+// single implementation shared by proxyChat / proxyResponses / proxyMessages:
+//   - body over maxRequestBodyBytes → HTTP 413, Content-Type
+//     application/json, error.code request_too_large (via
+//     http.MaxBytesReader, which surfaces *http.MaxBytesError);
+//   - any other read error → HTTP 400, Content-Type application/json,
+//     error.code invalid_request.
+//
+// On error it writes the JSON envelope and returns (nil, false); on success
+// it returns (body, true).
+func readRequestBody(w http.ResponseWriter, r *http.Request, what string) ([]byte, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			slog.Warn(what+" body too large", "error", err, "max_bytes", maxRequestBodyBytes)
+			util.WriteJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+				"error": map[string]any{"message": "request body too large", "code": "request_too_large"},
+			})
+			return nil, false
+		}
+		slog.Error(what+" body read error", "error", err)
+		util.WriteJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]any{"message": "failed to read body", "code": "invalid_request"},
+		})
+		return nil, false
+	}
+	return body, true
+}
+
 func proxyChat(p *pool.Pool, w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 	start := time.Now()
 	defer r.Body.Close()
-	const maxBodySize = 10 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		slog.Error("chat body read error", "error", err)
-		http.Error(w, "failed to read body", 500)
+	bodyBytes, ok := readRequestBody(w, r, "chat")
+	if !ok {
 		return
 	}
 	tenantID := getTenantID(r)

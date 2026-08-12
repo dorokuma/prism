@@ -12,7 +12,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BINARY="/usr/local/bin/prism"
 BACKUP="${BINARY}.bak"
-HEALTH_URL="http://127.0.0.1:18790/health"
+# 健康检查地址：可用环境变量覆盖（如部署在非默认端口/远程探测），默认保持
+# http://127.0.0.1:18790/health。
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18790/health}"
 
 echo "=== 编译 ==="
 cd "$ROOT" || exit 3

@@ -330,14 +330,14 @@ func main() {
 				// recover the account.
 				switch proxy.ClassifyUpstreamError(statusCode, bodyBytes) {
 				case proxy.UpstreamErrorPermanentCredential, proxy.UpstreamErrorPermanentQuota:
-					slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", statusCode, "body", util.RedactBody(bodyBytes))
+					slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", statusCode, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
 					a.MarkExhausted()
 				default:
 					if statusCode == 429 {
-						slog.Warn("startup check temporary quota error, cooling down", "account", a.Name(), "status", 429, "body", util.RedactBody(bodyBytes))
+						slog.Warn("startup check temporary quota error, cooling down", "account", a.Name(), "status", 429, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
 						a.SetCooldown(2 * time.Minute)
 					} else {
-						slog.Warn("startup check temporary error, cooling down", "account", a.Name(), "status", statusCode, "body", util.RedactBody(bodyBytes))
+						slog.Warn("startup check temporary error, cooling down", "account", a.Name(), "status", statusCode, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
 						a.SetCooldown(5 * time.Minute)
 					}
 				}
@@ -457,11 +457,13 @@ func main() {
 				mcp.LoadMCPTools(curCfg.MCPToolsJSON)
 				slog.Info("mcp_tools.json reloaded", "path", curCfg.MCPToolsJSON)
 
-				// SIGHUP 时强制刷新模型缓存并同步 tools
+				// SIGHUP 时强制刷新模型缓存并同步 tools。刷新与 tools 同步在后台
+				// goroutine 中执行（RefreshAllAsync 内部可取消、禁止并发重入），
+				// 信号循环绝不阻塞在慢上游上；Stop 时会取消正在进行的刷新。
 				mc.UpdateConfig(holder.Load())
-				mc.RefreshAll()
-				newCfg := holder.Load()
-				mc.SyncTools(newCfg)
+				mc.RefreshAllAsync(func() {
+					mc.SyncTools(holder.Load())
+				})
 
 				continue
 			}

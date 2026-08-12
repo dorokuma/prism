@@ -17,18 +17,18 @@ var (
 // sensitiveJSONKeys names JSON object keys whose values should be redacted
 // in debug logs and error responses. Compared after strings.ToLower.
 var sensitiveJSONKeys = map[string]bool{
-	"api_key":        true,
-	"apikey":         true,
-	"token":          true,
-	"access_token":   true,
-	"refresh_token":  true,
-	"password":       true,
-	"passwd":         true,
-	"secret":         true,
-	"authorization":  true,
-	"key":            true,
-	"client_key":     true,
-	"session_key":    true,
+	"api_key":       true,
+	"apikey":        true,
+	"token":         true,
+	"access_token":  true,
+	"refresh_token": true,
+	"password":      true,
+	"passwd":        true,
+	"secret":        true,
+	"authorization": true,
+	"key":           true,
+	"client_key":    true,
+	"session_key":   true,
 }
 
 // RedactBody masks common sensitive patterns in error/response bodies for safe

@@ -2,8 +2,8 @@ package sanitize
 
 // Only Codex-internal properties that have no meaning for upstream models.
 var codexParamPropertyBlacklist = map[string]bool{
-	"justification":        true,
-	"sandbox_permissions":  true,
+	"justification":       true,
+	"sandbox_permissions": true,
 	"prefix_rule":         true,
 	"login":               true,
 	"yield_time_ms":       true,

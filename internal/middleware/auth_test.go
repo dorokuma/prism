@@ -56,6 +56,46 @@ func TestCheckAuth(t *testing.T) {
 		t.Error("CheckAuth with correct token should return true")
 	}
 
+	// Case-insensitive scheme: bearer/BEARER/BeArEr all pass with the same
+	// token bytes; only the scheme is folded, the token stays byte-strict.
+	for _, scheme := range []string{"bearer", "BEARER", "BeArEr"} {
+		rScheme := httptest.NewRequest("GET", "/", nil)
+		rScheme.Header.Set("Authorization", scheme+" secret")
+		if !middleware.CheckAuth(rScheme, "secret") {
+			t.Errorf("CheckAuth with scheme %q should pass", scheme)
+		}
+	}
+	// Case-folded token must NOT match (token comparison is byte-strict).
+	rFold := httptest.NewRequest("GET", "/", nil)
+	rFold.Header.Set("Authorization", "Bearer SECRET")
+	if middleware.CheckAuth(rFold, "secret") {
+		t.Error("CheckAuth with a case-folded token should fail (byte-strict comparison)")
+	}
+	// Bare token (no scheme) still fails.
+	rBare := httptest.NewRequest("GET", "/", nil)
+	rBare.Header.Set("Authorization", "secret")
+	if middleware.CheckAuth(rBare, "secret") {
+		t.Error("CheckAuth with a bare token should fail")
+	}
+
+	// An empty or whitespace-only credential after the Bearer scheme is
+	// rejected outright (byte-strict token semantics, matching Authenticate):
+	// "Bearer ", "Bearer   " and "Bearer \t" are not tokens.
+	for _, auth := range []string{"Bearer ", "Bearer   ", "Bearer \t"} {
+		rEmpty := httptest.NewRequest("GET", "/", nil)
+		rEmpty.Header.Set("Authorization", auth)
+		if middleware.CheckAuth(rEmpty, "secret") {
+			t.Errorf("CheckAuth with Authorization %q should fail (empty/whitespace token)", auth)
+		}
+	}
+	// A double-space "Bearer  secret" must NOT be trimmed into "secret":
+	// the token bytes are compared verbatim.
+	rDouble := httptest.NewRequest("GET", "/", nil)
+	rDouble.Header.Set("Authorization", "Bearer  secret")
+	if middleware.CheckAuth(rDouble, "secret") {
+		t.Error("CheckAuth with a double-space Bearer token should fail (token bytes are strict)")
+	}
+
 	// Long wrong token must not pass (length difference must not leak expected length).
 	r2 := httptest.NewRequest("GET", "/", nil)
 	r2.Header.Set("Authorization", "Bearer "+string(make([]byte, 200)))

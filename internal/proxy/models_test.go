@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/dorokuma/prism/internal/cache"
@@ -248,5 +249,175 @@ func TestProxyModels_NoProviderHeader_Empty(t *testing.T) {
 	}
 	if len(resp.Data) != 0 {
 		t.Fatalf("data len = %d, want 0 (no provider header)", len(resp.Data))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Batch-2 audit: cache-miss fetch failures are classified (503/502), never
+// a 200 empty list
+// ---------------------------------------------------------------------------
+
+// emptyCacheMC builds a ModelCache with no on-disk cache (every lookup is a
+// miss → fetch) over the given pool/config.
+func emptyCacheMC(t *testing.T, p *pool.Pool, cfg *config.Config) *cache.ModelCache {
+	t.Helper()
+	mc, err := cache.New(t.TempDir(), p, cfg)
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	return mc
+}
+
+func getModelsError(t *testing.T, mc *cache.ModelCache, cfg *config.Config) (int, string) {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	r.Header.Set("X-Prism-Provider", "p")
+	w := httptest.NewRecorder()
+	proxyModels(mc, w, r, cfg)
+	return w.Code, decodeErrorCode(t, w.Body.String())
+}
+
+// TestProxyModels_FetchNoHealthy503: a cache miss over a provider whose only
+// account is exhausted must answer 503 no_healthy, never 200 with an empty
+// list (a client would cache "no models" forever).
+func TestProxyModels_FetchNoHealthy503(t *testing.T) {
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "a1", Provider: "p", BaseURL: "http://localhost:1", Key: "k"}}}
+	p := pool.NewPool(cfg.Accounts)
+	p.AllAccounts()[0].MarkExhausted()
+	mc := emptyCacheMC(t, p, cfg)
+
+	status, code := getModelsError(t, mc, cfg)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (no healthy account)", status)
+	}
+	if code != "no_healthy" {
+		t.Errorf("error code = %q, want no_healthy", code)
+	}
+}
+
+// TestProxyModels_FetchSaturated503: a cache miss while the provider's
+// account is at its concurrency cap must answer 503 model_fetch_saturated.
+func TestProxyModels_FetchSaturated503(t *testing.T) {
+	cfg := &config.Config{
+		Accounts:                []config.AccountConfig{{Name: "a1", Provider: "p", BaseURL: "http://localhost:1", Key: "k"}},
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	p := pool.NewPool(cfg.Accounts)
+	if !p.AllAccounts()[0].TryAcquire(1) {
+		t.Fatal("test setup: TryAcquire failed")
+	}
+	defer p.AllAccounts()[0].Release()
+	mc := emptyCacheMC(t, p, cfg)
+
+	status, code := getModelsError(t, mc, cfg)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (saturated)", status)
+	}
+	if code != "model_fetch_saturated" {
+		t.Errorf("error code = %q, want model_fetch_saturated", code)
+	}
+}
+
+// TestProxyModels_FetchUpstreamError502: a cache miss whose upstream fetch
+// fails (5xx here) must answer 502 model_fetch_failed.
+func TestProxyModels_FetchUpstreamError502(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`boom`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "a1", Provider: "p", BaseURL: upstream.URL, Key: "k"}}}
+	p := pool.NewPool(cfg.Accounts)
+	mc := emptyCacheMC(t, p, cfg)
+
+	status, code := getModelsError(t, mc, cfg)
+	if status != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (upstream error)", status)
+	}
+	if code != "model_fetch_failed" {
+		t.Errorf("error code = %q, want model_fetch_failed", code)
+	}
+}
+
+// TestProxyModels_FetchParseError502: a 200 upstream body that is not valid
+// JSON must answer 502 model_fetch_failed (parse error).
+func TestProxyModels_FetchParseError502(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`not json at all`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "a1", Provider: "p", BaseURL: upstream.URL, Key: "k"}}}
+	p := pool.NewPool(cfg.Accounts)
+	mc := emptyCacheMC(t, p, cfg)
+
+	status, code := getModelsError(t, mc, cfg)
+	if status != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (parse error)", status)
+	}
+	if code != "model_fetch_failed" {
+		t.Errorf("error code = %q, want model_fetch_failed", code)
+	}
+}
+
+// TestProxyModels_FetchSizeError502: a 200 upstream body larger than the
+// configured max_upstream_response_bytes must answer 502 model_fetch_failed
+// (size error), not buffer the whole body.
+func TestProxyModels_FetchSizeError502(t *testing.T) {
+	big := `{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"x","padding":"` + strings.Repeat("a", 4096) + `"}]}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(big))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{
+		Accounts:                 []config.AccountConfig{{Name: "a1", Provider: "p", BaseURL: upstream.URL, Key: "k"}},
+		MaxUpstreamResponseBytes: 512,
+	}
+	p := pool.NewPool(cfg.Accounts)
+	mc := emptyCacheMC(t, p, cfg)
+
+	status, code := getModelsError(t, mc, cfg)
+	if status != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (size error)", status)
+	}
+	if code != "model_fetch_failed" {
+		t.Errorf("error code = %q, want model_fetch_failed", code)
+	}
+}
+
+// TestProxyModels_FetchSucceedsOnMiss guards the happy path: a cache miss
+// with a healthy account fetches successfully and returns the models with
+// 200 (the new error mapping must not break the success case).
+func TestProxyModels_FetchSucceedsOnMiss(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "a1", Provider: "p", BaseURL: upstream.URL, Key: "k"}}}
+	p := pool.NewPool(cfg.Accounts)
+	mc := emptyCacheMC(t, p, cfg)
+
+	r := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	r.Header.Set("X-Prism-Provider", "p")
+	w := httptest.NewRecorder()
+	proxyModels(mc, w, r, cfg)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data) != 1 || resp.Data[0]["id"] != "m1" {
+		t.Errorf("data = %v, want [m1]", resp.Data)
 	}
 }
