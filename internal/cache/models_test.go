@@ -1013,14 +1013,15 @@ func TestFetch_TryAcquireSaturatedFailsFast(t *testing.T) {
 
 	// Occupy the account's single slot (the wildcard limit of 1).
 	acc := mc.pool.AllAccounts()[0]
-	if !acc.TryAcquire(1) {
-		t.Fatal("test setup: TryAcquire(1) failed")
+	slot := acc.TryAcquire("", 1)
+	if slot == nil {
+		t.Fatal(`test setup: TryAcquire("", 1) failed`)
 	}
 
 	start := time.Now()
 	err := mc.Fetch("p")
 	elapsed := time.Since(start)
-	acc.Release()
+	acc.Release(slot)
 
 	if err == nil {
 		t.Fatal("Fetch must fail when the account is saturated")
@@ -1072,14 +1073,15 @@ func TestFetch_TryAcquireUsesMinOfSpecificModels(t *testing.T) {
 	// Occupy the single slot (the fetch cap must be the min, 1 — not the
 	// built-in default of 450).
 	acc := mc.pool.AllAccounts()[0]
-	if !acc.TryAcquire(1) {
-		t.Fatal("test setup: TryAcquire(1) failed")
+	slot := acc.TryAcquire("", 1)
+	if slot == nil {
+		t.Fatal(`test setup: TryAcquire("", 1) failed`)
 	}
 
 	start := time.Now()
 	err := mc.Fetch("p")
 	elapsed := time.Since(start)
-	acc.Release()
+	acc.Release(slot)
 
 	if err == nil {
 		t.Fatal("Fetch must fail when the account is saturated at the min-of-specific-models cap")
@@ -1189,14 +1191,18 @@ func TestFetch_ReleaseWakesProviderWaiter(t *testing.T) {
 	}
 
 	// The fetch holds the account's only slot; a provider waiter now parks.
-	waiterDone := make(chan *pool.Account, 1)
+	type waiterResult struct {
+		acc  *pool.Account
+		slot *pool.Slot
+	}
+	waiterDone := make(chan waiterResult, 1)
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 1, "p")
+		acc, slot, err := p.SelectByProvider(context.Background(), "", 1, "p")
 		if err != nil {
-			waiterDone <- nil
+			waiterDone <- waiterResult{}
 			return
 		}
-		waiterDone <- acc
+		waiterDone <- waiterResult{acc: acc, slot: slot}
 	}()
 
 	// Deterministic synchronization: poll the pool's read-only wait-queue
@@ -1224,14 +1230,14 @@ func TestFetch_ReleaseWakesProviderWaiter(t *testing.T) {
 	}
 
 	select {
-	case acc := <-waiterDone:
-		if acc == nil {
+	case res := <-waiterDone:
+		if res.acc == nil {
 			t.Fatal("waiter select failed")
 		}
-		if acc.Name() != "a1" {
-			t.Errorf("waiter got %q, want a1", acc.Name())
+		if res.acc.Name() != "a1" {
+			t.Errorf("waiter got %q, want a1", res.acc.Name())
 		}
-		p.Release(acc)
+		p.Release(res.slot)
 	case <-time.After(3 * time.Second):
 		t.Fatal("provider waiter was not woken by the fetch's slot release (pool.Release missing?)")
 	}
@@ -2957,12 +2963,13 @@ func TestFetch_FailoverFirstSaturatedSecondSucceeds(t *testing.T) {
 
 	accs := mc.pool.AllAccounts()
 	// Occupy the first account's single slot: the fetch must fail over to a2.
-	if !accs[0].TryAcquire(1) {
-		t.Fatal("test setup: TryAcquire(1) on a1 failed")
+	slot0 := accs[0].TryAcquire("", 1)
+	if slot0 == nil {
+		t.Fatal(`test setup: TryAcquire("", 1) on a1 failed`)
 	}
 
 	err := mc.Fetch("p")
-	accs[0].Release()
+	accs[0].Release(slot0)
 
 	if err != nil {
 		t.Fatalf("Fetch must fail over to the second account, got: %v", err)
@@ -3017,13 +3024,15 @@ func TestFetch_FailoverAllSaturated(t *testing.T) {
 	}
 
 	accs := mc.pool.AllAccounts()
-	if !accs[0].TryAcquire(1) || !accs[1].TryAcquire(1) {
-		t.Fatal("test setup: TryAcquire(1) failed")
+	s0 := accs[0].TryAcquire("", 1)
+	s1 := accs[1].TryAcquire("", 1)
+	if s0 == nil || s1 == nil {
+		t.Fatal(`test setup: TryAcquire("", 1) failed`)
 	}
 
 	err := mc.Fetch("p")
-	accs[0].Release()
-	accs[1].Release()
+	accs[0].Release(s0)
+	accs[1].Release(s1)
 
 	if !errors.Is(err, ErrFetchSaturated) {
 		t.Fatalf("Fetch error = %v, want ErrFetchSaturated", err)
@@ -3074,12 +3083,13 @@ func TestFetch_FailoverAcquiredThenSaturated(t *testing.T) {
 	// Occupy a2's single slot: a1 will be acquired and fail, a2 stays
 	// saturated — the exact mixed-failure shape that must NOT report
 	// saturated.
-	if !accs[1].TryAcquire(1) {
-		t.Fatal("test setup: TryAcquire(1) on a2 failed")
+	slot1 := accs[1].TryAcquire("", 1)
+	if slot1 == nil {
+		t.Fatal(`test setup: TryAcquire("", 1) on a2 failed`)
 	}
 
 	err := mc.Fetch("p")
-	accs[1].Release()
+	accs[1].Release(slot1)
 
 	if err == nil {
 		t.Fatal("Fetch must fail (a1 upstream 500, a2 saturated)")

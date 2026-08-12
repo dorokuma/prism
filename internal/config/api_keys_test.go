@@ -17,6 +17,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	cfg := loadCfgString(t, content)
 	if len(cfg.APIKeys) != 1 {
@@ -39,6 +40,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	cfg := loadCfgString(t, content)
 	if len(cfg.APIKeys) != 1 {
@@ -62,6 +64,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	cfg := loadCfgString(t, content)
 	if len(cfg.APIKeys) != 2 {
@@ -95,6 +98,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	cfg := loadCfgString(t, content)
 	if len(cfg.APIKeys) != 3 {
@@ -124,6 +128,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	cfg := loadCfgString(t, content)
 	if len(cfg.APIKeys) != 2 {
@@ -159,6 +164,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -196,6 +202,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	cfg := loadCfgString(t, content) // must load without error
 	if len(cfg.APIKeys) != 1 {
@@ -218,6 +225,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		cfg := loadCfgString(t, content)
 		if len(cfg.APIKeys) != 1 {
@@ -234,6 +242,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		cfg := loadCfgString(t, content)
 		if len(cfg.APIKeys) != 1 || cfg.APIKeys[0].Name != "default" {
@@ -253,6 +262,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		cfg := loadCfgString(t, content)
 		if len(cfg.APIKeys) != 1 {
@@ -267,6 +277,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-*.yaml")
 		if err != nil {
@@ -299,6 +310,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-*.yaml")
 		if err != nil {
@@ -323,6 +335,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 			t.Fatal(err)
@@ -352,6 +365,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-*.yaml")
 		if err != nil {
@@ -380,6 +394,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 			t.Fatal(err)
@@ -414,6 +429,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -437,6 +453,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 		t.Fatal(err)

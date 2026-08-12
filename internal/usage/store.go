@@ -368,8 +368,13 @@ func (s *SQLiteStore) InsertBatch(ctx context.Context, events []Event) error {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			slog.Warn("usage: insert event failed, dropping record", "error", err,
-				"request_id", e.RequestID, "model", e.Model)
+			// Rate-limited like every other loss signal: a sustained
+			// per-event failure cannot flood the log while the counters
+			// (write error + dropped) keep the loss observable.
+			if flushLogThrottle.allow() {
+				slog.Warn("usage: insert event failed, dropping record", "error", err,
+					"request_id", e.RequestID, "model", e.Model)
+			}
 			util.RecordUsageWriteErrors()
 			util.RecordUsageEventsDropped()
 			continue

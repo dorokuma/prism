@@ -75,11 +75,24 @@ func UpdatePoolMetrics(healthy, exhausted int) {
 //     cleanup failure, flush panic, failed batch, per-event insert failure).
 //     It is not an event counter: one failed batch of N events is one
 //     incident, with the N events accounted by dropped.
+//   - usage_recorder_status is the lifecycle state ("unknown" / "disabled" /
+//     "started" / "stopped"): management observability for whether usage
+//     persistence is live at all (audit round 6, item 2).
 var (
-	MetricsUsageEventsWritten = expvar.NewInt("usage_events_written")
-	MetricsUsageEventsDropped = expvar.NewInt("usage_events_dropped")
-	MetricsUsageWriteErrors   = expvar.NewInt("usage_write_errors")
+	MetricsUsageEventsWritten  = expvar.NewInt("usage_events_written")
+	MetricsUsageEventsDropped  = expvar.NewInt("usage_events_dropped")
+	MetricsUsageWriteErrors    = expvar.NewInt("usage_write_errors")
+	MetricsUsageRecorderStatus = expvar.NewString("usage_recorder_status")
 )
+
+func init() {
+	MetricsUsageRecorderStatus.Set("unknown")
+}
+
+// RecordUsageRecorderStatus updates the usage_recorder_status expvar.
+func RecordUsageRecorderStatus(status string) {
+	MetricsUsageRecorderStatus.Set(status)
+}
 
 // RecordUsageEventsWritten records one usage event persisted to the store.
 func RecordUsageEventsWritten() {

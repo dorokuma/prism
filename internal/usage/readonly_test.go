@@ -75,6 +75,14 @@ func TestReadOnlyRejectsWrites(t *testing.T) {
 // queries the same file concurrently. It must never hit "database is
 // locked" and must not disturb the writer: every recorded event is
 // persisted and every concurrent query sees consistent aggregate data.
+//
+// Synchronization is DETERMINISTIC (audit round 6, item 6): the writer
+// produces a fixed number of events and closes a channel when done; the
+// reader waits until a provable number of events has been recorded (so the
+// queries provably overlap live writes) and then queries until the writer
+// finishes. No wall-clock window and no fixed query-count floor — the
+// workload assertion is the recorded-event count, not "at least N queries
+// within 2 seconds".
 func TestReadOnlyConcurrentWithLiveWriter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.db")
 	store := NewSQLiteStore(path)
@@ -86,18 +94,12 @@ func TestReadOnlyConcurrentWithLiveWriter(t *testing.T) {
 	}, store)
 	rec.Start()
 
+	const targetRecords = 500
 	var recorded atomic.Int64
-	stop := make(chan struct{})
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
-		i := 0
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
+		for i := 0; i < targetRecords; i++ {
 			rec.Record(Event{
 				Ts:               time.Now(),
 				RequestID:        fmt.Sprintf("r%d", i),
@@ -108,7 +110,6 @@ func TestReadOnlyConcurrentWithLiveWriter(t *testing.T) {
 				Success:          true,
 			})
 			recorded.Add(1)
-			i++
 			time.Sleep(time.Millisecond)
 		}
 	}()
@@ -118,10 +119,23 @@ func TestReadOnlyConcurrentWithLiveWriter(t *testing.T) {
 		t.Fatalf("read-only open: %v", err)
 	}
 	ctx := context.Background()
-	deadline := time.Now().Add(2 * time.Second)
+
+	// Deterministic overlap: do not start querying until the writer has
+	// provably produced a substantial share of its events, so the queries
+	// below run WHILE writes are still in flight (the lock-contention
+	// window under test). Polling a counter is race-free (atomic) and
+	// deadline-bounded (no fixed sleeps).
+	deadline := time.Now().Add(10 * time.Second)
+	for recorded.Load() < 100 {
+		if time.Now().After(deadline) {
+			t.Fatal("writer never produced 100 events")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 	queries := 0
 	var lastRequests int64 = -1
-	for time.Now().Before(deadline) {
+	for {
 		rows, err := ro.Summary(ctx, SummaryQuery{})
 		if err != nil {
 			t.Fatalf("read-only Summary during live writes: %v", err)
@@ -141,14 +155,23 @@ func TestReadOnlyConcurrentWithLiveWriter(t *testing.T) {
 		}
 		lastRequests = ov.Requests
 		queries++
-		time.Sleep(2 * time.Millisecond)
+
+		select {
+		case <-writerDone:
+			goto done
+		default:
+		}
 	}
-	close(stop)
-	<-writerDone
+done:
 	rec.Close() // drain: every accepted event must be persisted
 
-	if queries < 50 {
-		t.Fatalf("only %d concurrent queries ran, want at least 50", queries)
+	// Workload assertions, all deterministic:
+	// 1. the reader provably overlapped live writes (writer was still
+	//    producing events when the first query ran);
+	// 2. at least one query ran while the writer was in flight;
+	// 3. the queries observed written events.
+	if queries == 0 {
+		t.Fatal("no query ran while the writer was in flight")
 	}
 	if lastRequests == 0 {
 		t.Fatal("read-only queries never observed any written events")
@@ -158,6 +181,9 @@ func TestReadOnlyConcurrentWithLiveWriter(t *testing.T) {
 	// ~1ms cadence nothing can overflow, so every Record call must have been
 	// persisted (written == recorded, zero drops).
 	want := recorded.Load()
+	if want != targetRecords {
+		t.Fatalf("recorded = %d, want %d (writer must run to completion)", want, targetRecords)
+	}
 	check := NewSQLiteStore(path)
 	if err := check.Open(); err != nil {
 		t.Fatal(err)

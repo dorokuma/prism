@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -16,6 +17,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -56,6 +58,7 @@ func TestLoadConfigKeyFromEnv(t *testing.T) {
 accounts:
   - name: test-acc
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -81,6 +84,7 @@ func TestLoadConfigMissingKeyError(t *testing.T) {
 accounts:
   - name: test-acc
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -156,6 +160,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-*.yaml")
 		if err != nil {
@@ -195,6 +200,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-*.yaml")
 		if err != nil {
@@ -234,6 +240,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-*.yaml")
 		if err != nil {
@@ -270,6 +277,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-*.yaml")
 		if err != nil {
@@ -350,14 +358,41 @@ func TestLoadConfig_RejectsUnsafeProviderNames(t *testing.T) {
 			}
 		})
 	}
-	// A normal provider name (and an empty provider) still loads.
+	// A normal provider name still loads.
 	path := writeConfig(t, "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n    provider: opencode-go\n")
 	if _, err := LoadConfig(path); err != nil {
 		t.Errorf("normal provider name must load: %v", err)
 	}
+	// A provider-less account is now a LOAD ERROR (audit round 6, item 3):
+	// it can never be selected by business requests, so loading it silently
+	// would hide a dead account. The error names the account and the fix.
 	path = writeConfig(t, "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n")
+	if _, err := LoadConfig(path); err == nil {
+		t.Error("provider-less account must be rejected at load (it can never be selected)")
+	}
+}
+
+// TestLoadConfig_RejectsProviderlessAccount pins audit round 6 item 3: an
+// account without a provider can never be selected (business requests route
+// by provider via X-Prism-Provider/default_provider, model-cache fetches
+// select by provider too), so loading must fail fast instead of silently
+// keeping a dead account in the pool. The providers-block form and an
+// explicit account.provider both load.
+func TestLoadConfig_RejectsProviderlessAccount(t *testing.T) {
+	// Bare top-level accounts (no provider field) → load error.
+	path := writeConfig(t, "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n")
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("provider-less account must be rejected at load")
+	}
+	// Explicit account.provider → loads.
+	path = writeConfig(t, "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n    provider: p\n")
 	if _, err := LoadConfig(path); err != nil {
-		t.Errorf("provider-less account must still load: %v", err)
+		t.Errorf("explicit account.provider must load: %v", err)
+	}
+	// providers block → loads (provider is inherited from the block).
+	path = writeConfig(t, "providers:\n  p:\n    accounts:\n      - name: t\n        key: k\n        base_url: https://api.example.com\n")
+	if _, err := LoadConfig(path); err != nil {
+		t.Errorf("providers-block account must load: %v", err)
 	}
 }
 
@@ -394,6 +429,202 @@ func TestParseTrustedProxies(t *testing.T) {
 	}
 }
 
+// TestResolveAccountTotalCap pins the account-wide aggregate cap
+// resolution (the backward-compatible default): an explicit
+// max_concurrent_per_account_total wins; otherwise the SUM of the distinct
+// positive per-model values reproduces the old per-max-value-grouped worst
+// case (same-max models share the aggregate budget, never a counter); with
+// no positive per-model values the built-in default applies; the sum is
+// clamped to math.MaxInt32 (int32 accounting).
+func TestResolveAccountTotalCap(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  *Config
+		want int
+	}{
+		{"explicit wins",
+			&Config{MaxConcurrentPerAccountTotal: 20, MaxConcurrentPerAccount: map[string]int{"a": 10, "b": 10}},
+			20},
+		{"explicit 0 falls back to default",
+			&Config{MaxConcurrentPerAccountTotal: 0, MaxConcurrentPerAccount: map[string]int{"a": 10, "b": 10}},
+			10}, // distinct values {10} → 10, not 20: same-max models share the total
+		{"sum of distinct values",
+			&Config{MaxConcurrentPerAccount: map[string]int{"a": 10, "b": 10, "c": 5, "d": 0, "e": -1}},
+			15}, // distinct positive {10,5} → 15 (0/negative ignored)
+		{"wildcard only",
+			&Config{MaxConcurrentPerAccount: map[string]int{"*": 8}},
+			8},
+		{"no entries", &Config{}, DefaultAccountConcurrency},
+		{"nil map", nil, DefaultAccountConcurrency},
+		{"clamped to int32",
+			&Config{MaxConcurrentPerAccount: map[string]int{"a": math.MaxInt32, "b": math.MaxInt32}},
+			math.MaxInt32},
+	}
+	for _, tc := range cases {
+		if got := ResolveAccountTotalCap(tc.cfg); got != tc.want {
+			t.Errorf("%s: ResolveAccountTotalCap = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestLoadConfig_RejectsBadAccountTotalCap: max_concurrent_per_account_total
+// is validated at load like the per-model entries — negative values are
+// always a typo and values above math.MaxInt32 would truncate in the pool's
+// int32 total counter.
+func TestLoadConfig_RejectsBadAccountTotalCap(t *testing.T) {
+	base := "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n    provider: p\n"
+	if _, err := LoadConfig(writeConfig(t, base+"max_concurrent_per_account_total: -1\n")); err == nil {
+		t.Error("negative max_concurrent_per_account_total must be rejected")
+	}
+	if _, err := LoadConfig(writeConfig(t, base+"max_concurrent_per_account_total: 2147483648\n")); err == nil {
+		t.Error("max_concurrent_per_account_total above math.MaxInt32 must be rejected")
+	}
+	cfg, err := LoadConfig(writeConfig(t, base+"max_concurrent_per_account_total: 12\n"))
+	if err != nil {
+		t.Fatalf("valid max_concurrent_per_account_total must load: %v", err)
+	}
+	if cfg.MaxConcurrentPerAccountTotal != 12 {
+		t.Errorf("MaxConcurrentPerAccountTotal = %d, want 12", cfg.MaxConcurrentPerAccountTotal)
+	}
+}
+
+// TestReloadConfig_RejectsProviderlessAndWholeNet pins that the empty-
+// provider and whole-address-space-trust validations run on the RELOAD path
+// too (ReloadConfig loads through LoadConfig): a reload with a
+// provider-less account or a 0.0.0.0/0 trusted_proxies entry fails and the
+// OLD config is preserved.
+func TestReloadConfig_RejectsProviderlessAndWholeNet(t *testing.T) {
+	content1 := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`
+	path := writeConfig(t, content1)
+	cfg1, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	for name, content2 := range map[string]string{
+		"provider-less account": `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+`, // no provider → load error on reload
+		"whole-address-space trust": `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+trusted_proxies:
+  - "0.0.0.0/0"
+`, // /0 → load error on reload
+	} {
+		if err := os.WriteFile(path, []byte(content2), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReloadConfig(holder, path); err == nil {
+			t.Errorf("%s: reload must fail", name)
+		}
+		if got := holder.Load(); got == nil || len(got.Accounts) != 1 || got.Accounts[0].Provider != "test" {
+			t.Errorf("%s: old config must be preserved after a failed reload", name)
+		}
+		if got := holder.Load(); got != nil && len(got.TrustedProxies) != 0 {
+			t.Errorf("%s: old config must keep its trusted_proxies", name)
+		}
+	}
+}
+
+// TestReloadConfig_TotalCapChangedWarning: max_concurrent_per_account_total
+// is a pool-construction property (the pool is built once at startup), so a
+// reload that changes it must warn that a restart is required.
+func TestReloadConfig_TotalCapChangedWarning(t *testing.T) {
+	content1 := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+max_concurrent_per_account_total: 8
+`
+	path := writeConfig(t, content1)
+	cfg1, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	content2 := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+max_concurrent_per_account_total: 16
+`
+	if err := os.WriteFile(path, []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	warnings, err := ReloadConfig(holder, path)
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "max_concurrent_per_account_total") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("warnings = %v, want a max_concurrent_per_account_total restart warning", warnings)
+	}
+	if got := holder.Load().MaxConcurrentPerAccountTotal; got != 16 {
+		t.Errorf("reloaded MaxConcurrentPerAccountTotal = %d, want 16", got)
+	}
+}
+
+// TestParseTrustedProxiesRejectsWholeNet pins the audit round 6 item 8
+// rule: 0.0.0.0/0 and ::/0 ("trust every network") are rejected by the
+// parser itself, while bounded IPv4 and IPv6 CIDRs still parse.
+func TestParseTrustedProxiesRejectsWholeNet(t *testing.T) {
+	for _, bad := range []string{"0.0.0.0/0", "::/0"} {
+		if _, err := ParseTrustedProxies([]string{bad}); err == nil {
+			t.Errorf("ParseTrustedProxies(%q) must be rejected (whole-address-space trust)", bad)
+		}
+	}
+	for _, good := range []string{"10.0.0.0/8", "192.168.1.0/24", "fd00::/8", "2001:db8::/32"} {
+		if _, err := ParseTrustedProxies([]string{good}); err != nil {
+			t.Errorf("ParseTrustedProxies(%q) = %v, want nil (bounded CIDR must parse)", good, err)
+		}
+	}
+}
+
+// TestLoadConfig_RejectsWholeNetTrustedProxies pins the same rule at the
+// config-load stage (fail fast): a trusted_proxies entry covering the whole
+// address space would let any client spoof X-Forwarded-For / X-Real-IP past
+// the IP rate limiter, so loading must fail instead of silently trusting
+// every network. Bounded IPv4/IPv6 ranges still load.
+func TestLoadConfig_RejectsWholeNetTrustedProxies(t *testing.T) {
+	base := "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n    provider: p\n"
+	for _, bad := range []string{"0.0.0.0/0", "::/0"} {
+		path := writeConfig(t, base+"trusted_proxies:\n  - \""+bad+"\"\n")
+		if _, err := LoadConfig(path); err == nil {
+			t.Errorf("trusted_proxies %q must fail loading (whole-address-space trust)", bad)
+		}
+	}
+	for _, good := range []string{"10.0.0.0/8", "192.168.1.0/24", "fd00::/8", "2001:db8::/32"} {
+		path := writeConfig(t, base+"trusted_proxies:\n  - \""+good+"\"\n")
+		if _, err := LoadConfig(path); err != nil {
+			t.Errorf("trusted_proxies %q must load: %v", good, err)
+		}
+	}
+}
+
 func TestLoadConfigProbeIntervalTooSmall(t *testing.T) {
 	content := `
 probe_interval: 500ms
@@ -401,6 +632,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -463,6 +695,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-.yaml")
 		if err != nil {
@@ -487,6 +720,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-.yaml")
 		if err != nil {
@@ -511,6 +745,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-.yaml")
 		if err != nil {
@@ -537,6 +772,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-.yaml")
 		if err != nil {
@@ -562,6 +798,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		f, err := os.CreateTemp("", "config-.yaml")
 		if err != nil {
@@ -593,6 +830,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -627,6 +865,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 		t.Fatal(err)
@@ -657,6 +896,7 @@ accounts:
   - name: acc1
     key: key1
     base_url: https://api1.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -680,9 +920,11 @@ accounts:
   - name: acc1
     key: key1
     base_url: https://api1.example.com
+    provider: test
   - name: acc2
     key: key2
     base_url: https://api2.example.com
+    provider: test
 `
 	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 		t.Fatal(err)
@@ -712,6 +954,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -736,6 +979,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 		t.Fatal(err)
@@ -765,6 +1009,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -789,6 +1034,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 		t.Fatal(err)
@@ -824,6 +1070,7 @@ accounts:
   - name: acc1
     key: key1
     base_url: https://api1.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -847,6 +1094,7 @@ accounts:
   - name: acc1
     key: key1
     base_url: https://api1.example.com
+    provider: test
 `
 	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 		t.Fatal(err)
@@ -992,6 +1240,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -1238,6 +1487,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -1288,6 +1538,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -1336,6 +1587,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	cfg := loadCfgString(t, content)
 	if cfg.Usage.RetentionDays != 0 {
@@ -1354,6 +1606,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		cfg := loadCfgString(t, content)
 		if cfg.Usage.DefaultKeyID != "anonymous" {
@@ -1369,6 +1622,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		cfg := loadCfgString(t, content)
 		if cfg.Usage.DefaultKeyID != "gateway-pi" {
@@ -1384,6 +1638,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 		cfg := loadCfgString(t, content)
 		if cfg.Usage.DefaultKeyID != "anonymous" {
@@ -1403,6 +1658,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -1428,6 +1684,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 		t.Fatal(err)
@@ -1457,6 +1714,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -1481,6 +1739,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 		t.Fatal(err)
@@ -1513,6 +1772,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -1540,6 +1800,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 		t.Fatal(err)
@@ -1580,6 +1841,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	for name, keys := range map[string]string{
 		"empty token": `api_keys:
@@ -1613,6 +1875,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	cfg, err := loadConfigFrom(t, content)
 	if err != nil {
@@ -1638,6 +1901,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	t.Run("empty name rejected", func(t *testing.T) {
 		_, err := loadConfigFrom(t, base+`
@@ -1814,6 +2078,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 	cfg, err := loadConfigFrom(t, base)
 	if err != nil {
@@ -1860,19 +2125,19 @@ accounts:
 func TestLoadConfig_BaseURLValidation(t *testing.T) {
 	keyLine := "    key: test-key-12345\n"
 	t.Run("valid https accepted", func(t *testing.T) {
-		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: https://api.example.com/v1\n"
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: https://api.example.com/v1\n    provider: test\n"
 		if _, err := loadConfigFrom(t, content); err != nil {
 			t.Fatalf("https base_url must load: %v", err)
 		}
 	})
 	t.Run("valid http accepted", func(t *testing.T) {
-		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: http://127.0.0.1:8080\n"
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: http://127.0.0.1:8080\n    provider: test\n"
 		if _, err := loadConfigFrom(t, content); err != nil {
 			t.Fatalf("http base_url must load: %v", err)
 		}
 	})
 	t.Run("non-http scheme rejected", func(t *testing.T) {
-		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: ftp://files.example.com/v1\n"
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: ftp://files.example.com/v1\n    provider: test\n"
 		_, err := loadConfigFrom(t, content)
 		if err == nil {
 			t.Fatal("a non-http(s) base_url must be rejected")
@@ -1882,19 +2147,19 @@ func TestLoadConfig_BaseURLValidation(t *testing.T) {
 		}
 	})
 	t.Run("missing scheme rejected", func(t *testing.T) {
-		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: api.example.com/v1\n"
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: api.example.com/v1\n    provider: test\n"
 		if _, err := loadConfigFrom(t, content); err == nil {
 			t.Fatal("a base_url without a scheme must be rejected")
 		}
 	})
 	t.Run("empty host rejected", func(t *testing.T) {
-		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: https:///v1\n"
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: https:///v1\n    provider: test\n"
 		if _, err := loadConfigFrom(t, content); err == nil {
 			t.Fatal("a base_url without a host must be rejected")
 		}
 	})
 	t.Run("unparseable rejected", func(t *testing.T) {
-		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: '://bad url with spaces'\n"
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: '://bad url with spaces'\n    provider: test\n"
 		if _, err := loadConfigFrom(t, content); err == nil {
 			t.Fatal("an unparseable base_url must be rejected")
 		}
@@ -1902,7 +2167,7 @@ func TestLoadConfig_BaseURLValidation(t *testing.T) {
 	t.Run("credential-carrying URL never echoed", func(t *testing.T) {
 		// A base_url embedding credentials must be rejected on the scheme
 		// (here "file") without the credentials reaching the error.
-		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: file://user:supersecret@/etc/passwd\n"
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: file://user:supersecret@/etc/passwd\n    provider: test\n"
 		_, err := loadConfigFrom(t, content)
 		if err == nil {
 			t.Fatal("a non-http(s) base_url must be rejected")
@@ -1930,6 +2195,7 @@ accounts:
   - name: test-acc
     key: test-key-12345
     base_url: https://api.example.com
+    provider: test
 `
 
 	t.Run("loopback without TLS loads", func(t *testing.T) {
@@ -2031,6 +2297,7 @@ accounts:
   - name: acc1
     key: key1
     base_url: https://api1.example.com
+    provider: test
 `
 	f, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {
@@ -2056,9 +2323,11 @@ accounts:
   - name: acc1
     key: key1
     base_url: https://api1.example.com
+    provider: test
   - name: acc2
     key: key2
     base_url: https://api2.example.com
+    provider: test
 `
 	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
 		t.Fatal(err)

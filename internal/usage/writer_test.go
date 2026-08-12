@@ -1,8 +1,10 @@
 package usage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -727,6 +729,199 @@ func TestCloseNoWaiterGoroutineLeak(t *testing.T) {
 	}
 	if n := runtime.NumGoroutine(); n > baseline+1 {
 		t.Fatalf("goroutines after Close = %d, baseline %d: a waiter goroutine leaked", n, baseline)
+	}
+}
+
+// -------------------------------------------------------------------------
+// Audit round 6, item 2: rate-limited loss logs + recorder status expvar
+// -------------------------------------------------------------------------
+
+// captureSlog redirects slog output into a buffer (Warn level) and returns
+// the buffer plus a restore function.
+func captureSlog(t *testing.T) (*bytes.Buffer, func()) {
+	t.Helper()
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	return &buf, func() { slog.SetDefault(old) }
+}
+
+// resetLossThrottles clears the package-level rate-limiter state so tests
+// can assert exact log counts without cross-test interference.
+func resetLossThrottles() {
+	droppedLogThrottle.mu.Lock()
+	droppedLogThrottle.last = time.Time{}
+	droppedLogThrottle.mu.Unlock()
+	flushLogThrottle.mu.Lock()
+	flushLogThrottle.last = time.Time{}
+	flushLogThrottle.mu.Unlock()
+}
+
+// TestRecordQueueFullLogsRateLimited pins the audit round 6 item 2
+// requirement: a full queue drops the event (counter, never blocks) AND
+// emits a visible log line — but rate-limited, so 1000 drops under a
+// sustained full queue produce exactly one line per lossLogInterval, not a
+// log flood. The counters stay event-exact regardless of the log
+// throttling.
+func TestRecordQueueFullLogsRateLimited(t *testing.T) {
+	old := lossLogInterval
+	lossLogInterval = time.Hour // long interval: one line for the whole burst
+	defer func() { lossLogInterval = old; resetLossThrottles() }()
+	resetLossThrottles()
+
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	r := NewRecorder(Config{Enabled: true, ChannelSize: 1, BatchSize: 1000, BatchFlushMS: 60000}, &fakeStore{})
+	// never started: the single slot stays full after the first event
+	droppedBefore := util.MetricsUsageEventsDropped.Value()
+	r.Record(Event{Model: "m1"}) // fills the only slot
+	for i := 0; i < 100; i++ {
+		r.Record(Event{Model: "m2"})
+	}
+	if got := util.MetricsUsageEventsDropped.Value() - droppedBefore; got != 100 {
+		t.Fatalf("dropped counter delta = %d, want 100 (event accounting must be exact regardless of log throttling)", got)
+	}
+	lines := strings.Count(buf.String(), "usage event queue full, dropping event")
+	if lines != 1 {
+		t.Errorf("queue-full log lines = %d, want exactly 1 (rate-limited)", lines)
+	}
+
+	// With a zero interval every loss is logged: the throttle is the only
+	// suppression mechanism, and disabling it must surface every event.
+	lossLogInterval = 0
+	resetLossThrottles()
+	buf.Reset()
+	for i := 0; i < 10; i++ {
+		r.Record(Event{Model: "m3"})
+	}
+	if lines := strings.Count(buf.String(), "usage event queue full, dropping event"); lines != 10 {
+		t.Errorf("queue-full log lines with zero interval = %d, want 10 (throttle must be the only suppressor)", lines)
+	}
+	r.Close()
+}
+
+// TestRecordAfterCloseLogsRateLimited: events recorded after Close are
+// counted dropped AND logged (rate-limited), so shutdown-time loss is never
+// silent.
+func TestRecordAfterCloseLogsRateLimited(t *testing.T) {
+	old := lossLogInterval
+	lossLogInterval = 0
+	defer func() { lossLogInterval = old; resetLossThrottles() }()
+	resetLossThrottles()
+
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	r := NewRecorder(Config{Enabled: true, ChannelSize: 8, BatchSize: 100, BatchFlushMS: 60000}, &fakeStore{})
+	r.Start()
+	r.Close()
+	droppedBefore := util.MetricsUsageEventsDropped.Value()
+	r.Record(Event{Model: "m"})
+	if got := util.MetricsUsageEventsDropped.Value() - droppedBefore; got != 1 {
+		t.Errorf("dropped delta after Close = %d, want 1", got)
+	}
+	if !strings.Contains(buf.String(), "recorder closed, usage event dropped") &&
+		!strings.Contains(buf.String(), "recorder not started or already closed, usage event dropped") {
+		t.Errorf("post-Close drop must be logged, got: %s", buf.String())
+	}
+}
+
+// TestRecordNotStartedLogsRateLimited: a recorder that failed to start
+// (e.g. no store configured) counts every drop AND logs it — the failure is
+// never silent.
+func TestRecordNotStartedLogsRateLimited(t *testing.T) {
+	old := lossLogInterval
+	lossLogInterval = 0
+	defer func() { lossLogInterval = old; resetLossThrottles() }()
+	resetLossThrottles()
+
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	r := NewRecorder(Config{Enabled: true, ChannelSize: 8, BatchSize: 100, BatchFlushMS: 60000}, nil)
+	r.Start() // store == nil → recorder disabled, stopped=true
+	droppedBefore := util.MetricsUsageEventsDropped.Value()
+	r.Record(Event{Model: "m"})
+	if got := util.MetricsUsageEventsDropped.Value() - droppedBefore; got != 1 {
+		t.Errorf("dropped delta on not-started recorder = %d, want 1", got)
+	}
+	if !strings.Contains(buf.String(), "recorder not started or already closed") {
+		t.Errorf("not-started drop must be logged, got: %s", buf.String())
+	}
+	r.Close()
+}
+
+// TestFlushFailureLogsRateLimited: a failing store logs each failed batch
+// at most once per lossLogInterval (no log flood) while the write-error and
+// dropped counters stay exact for EVERY batch.
+func TestFlushFailureLogsRateLimited(t *testing.T) {
+	old := lossLogInterval
+	lossLogInterval = time.Hour
+	defer func() { lossLogInterval = old; resetLossThrottles() }()
+	resetLossThrottles()
+
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	store := &fakeStore{errOnInsert: true}
+	r := NewRecorder(Config{Enabled: true, ChannelSize: 64, BatchSize: 5, BatchFlushMS: 5}, store)
+	r.Start()
+	c, _ := costOf(0, 0, 0, 0, "", &Price{Input: 1, Output: 1})
+	errorsBefore := util.MetricsUsageWriteErrors.Value()
+	droppedBefore := util.MetricsUsageEventsDropped.Value()
+	// 20 events < ChannelSize 64: every event reaches the worker, so the
+	// failure count is deterministic (4 batches of 5) instead of racing the
+	// queue-full path.
+	const n = 20
+	for i := 0; i < n; i++ {
+		r.Record(Event{Model: "m", Cost: c, CostStatus: CostStatusOK})
+	}
+	// Wait until ALL events were dropped (every batch failed): the counters
+	// are the ground truth (20 events = 4 batches of 5), the log is the
+	// throttled signal.
+	deadline := time.Now().Add(5 * time.Second)
+	for util.MetricsUsageEventsDropped.Value() < droppedBefore+n && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	errorsDelta := util.MetricsUsageWriteErrors.Value() - errorsBefore
+	droppedDelta := util.MetricsUsageEventsDropped.Value() - droppedBefore
+	if droppedDelta != n {
+		t.Fatalf("dropped delta = %d, want %d (every event of every failed batch counted)", droppedDelta, n)
+	}
+	if errorsDelta != n/5 {
+		t.Errorf("write-error delta = %d, want %d (one incident per failed batch of 5)", errorsDelta, n/5)
+	}
+	lines := strings.Count(buf.String(), "batch insert failed, dropping batch")
+	if lines != 1 {
+		t.Errorf("batch-failure log lines = %d, want exactly 1 (rate-limited across %d failures)", lines, errorsDelta)
+	}
+	r.Close()
+}
+
+// TestRecorderStatusExpvar pins the management-observability surface (audit
+// round 6, item 2): the usage_recorder_status expvar reflects the recorder
+// lifecycle (started / stopped / disabled) so an operator can query whether
+// usage persistence is live.
+func TestRecorderStatusExpvar(t *testing.T) {
+	// Disabled recorder → "disabled".
+	r := NewRecorder(Config{Enabled: false}, &fakeStore{})
+	r.Start()
+	if got := util.MetricsUsageRecorderStatus.Value(); got != "disabled" {
+		t.Errorf("disabled recorder status = %q, want disabled", got)
+	}
+	r.Close()
+
+	// Started + closed → "started" then "stopped".
+	r2 := NewRecorder(Config{Enabled: true, ChannelSize: 8, BatchSize: 100, BatchFlushMS: 60000}, &fakeStore{})
+	r2.Start()
+	if got := util.MetricsUsageRecorderStatus.Value(); got != "started" {
+		t.Errorf("started recorder status = %q, want started", got)
+	}
+	r2.Record(Event{Model: "m"})
+	r2.Close()
+	if got := util.MetricsUsageRecorderStatus.Value(); got != "stopped" {
+		t.Errorf("closed recorder status = %q, want stopped", got)
 	}
 }
 

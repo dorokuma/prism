@@ -216,6 +216,17 @@ type Config struct {
 	ModelMetadataPerProvider map[string]ModelMetadataMap `yaml:"model_metadata_per_provider,omitempty"`
 	LogLevel                 string                      `yaml:"log_level"`
 	MaxConcurrentPerAccount  map[string]int              `yaml:"max_concurrent_per_account"`
+	// MaxConcurrentPerAccountTotal is the per-account AGGREGATE concurrency
+	// cap across ALL models (the account-wide total of every per-model
+	// counter, applied to each account). 0/absent → the backward-compatible
+	// default (see ResolveAccountTotalCap: the sum of distinct positive
+	// per-model values, which reproduces the old per-max-value-grouped
+	// worst case); negative or above math.MaxInt32 is a load error. It is
+	// NOT hot-reloadable: the pool is built once at startup (ReloadConfig
+	// warns). Per-model max_concurrent_per_account values DO hot-reload
+	// (they are resolved per request), but the aggregate bound needs a
+	// restart.
+	MaxConcurrentPerAccountTotal int `yaml:"max_concurrent_per_account_total,omitempty"`
 	// MaxUpstreamResponseBytes caps the size of a non-streaming upstream
 	// response body (both the legacy chat path and the responses translation
 	// path). Bodies larger than the cap are rejected with HTTP 502
@@ -288,6 +299,17 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("max_concurrent_per_account[%q] = %d exceeds the maximum supported %d (int32 concurrency accounting)", model, v, math.MaxInt32)
 		}
 	}
+	// Same int32-accounting bound for the account-wide aggregate cap: a
+	// value above math.MaxInt32 would truncate in the pool's int32 total
+	// counter. Negative values are rejected outright (the per-model entries
+	// ignore non-positive values as "no explicit limit", but a negative
+	// aggregate is always a typo, not a meaningful choice).
+	if cfg.MaxConcurrentPerAccountTotal > math.MaxInt32 {
+		return nil, fmt.Errorf("max_concurrent_per_account_total = %d exceeds the maximum supported %d (int32 concurrency accounting)", cfg.MaxConcurrentPerAccountTotal, math.MaxInt32)
+	}
+	if cfg.MaxConcurrentPerAccountTotal < 0 {
+		return nil, fmt.Errorf("max_concurrent_per_account_total must be >= 0, got %d", cfg.MaxConcurrentPerAccountTotal)
+	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
@@ -344,6 +366,22 @@ func LoadConfig(path string) (*Config, error) {
 	for _, acc := range cfg.Accounts {
 		if err := validateProviderName(acc.Provider); err != nil {
 			return nil, err
+		}
+	}
+	// Every account must belong to a provider (audit round 6, item 3). A
+	// provider-less account can never be selected: business requests route
+	// through SelectByProvider (the provider comes from X-Prism-Provider or
+	// default_provider and is non-empty — a missing provider rejects the
+	// request with 400), and model-cache fetches select accounts by provider
+	// name too. Such an account only occupies the pool and the probe loop
+	// while every business request misses it — a silent capacity loss. This
+	// USED to load silently (a bare top-level `accounts:` list); that
+	// configuration shape must now declare a provider per account (or move
+	// the accounts under a `providers:` block). See README changelog for
+	// the compatibility note.
+	for _, acc := range cfg.Accounts {
+		if acc.Provider == "" {
+			return nil, fmt.Errorf("account %q: provider is empty; every account must declare a provider (set account.provider or put the account under a providers block) — a provider-less account can never be selected by business requests", acc.Name)
 		}
 	}
 	// Every account base_url must be an absolute http(s) URL with a
@@ -515,10 +553,20 @@ func LoadConfig(path string) (*Config, error) {
 			slog.Warn("non-loopback listen address serves plaintext HTTP (allow_insecure_http: true): traffic is unencrypted and any network observer can read credentials", "listen", cfg.Listen)
 		}
 	}
-	// Validate trusted proxies CIDRs
+	// Validate trusted proxies CIDRs. The 0.0.0.0/0 and ::/0 "trust every
+	// network" ranges are rejected outright: they make ipTrusted return true
+	// for EVERY RemoteAddr, so any client can claim an arbitrary
+	// X-Forwarded-For / X-Real-IP (every hop is "trusted", the chain walk
+	// skips all of them and falls back to the client-supplied X-Real-IP) and
+	// bypass per-IP rate limiting entirely. A trusted proxy must be a real,
+	// bounded network.
 	for _, s := range cfg.TrustedProxies {
-		if _, _, err := net.ParseCIDR(s); err != nil {
+		_, cidr, err := net.ParseCIDR(s)
+		if err != nil {
 			return nil, fmt.Errorf("trusted_proxies: invalid CIDR %q: %v", s, err)
+		}
+		if ones, bits := cidr.Mask.Size(); ones == 0 {
+			return nil, fmt.Errorf("trusted_proxies: %q trusts the whole %d-bit address space; refusing to load (it would let arbitrary X-Forwarded-For hops bypass IP rate limiting) — configure the actual proxy network instead", s, bits)
 		}
 	}
 	// Precompute the provider → effort schema map from account base_url hosts.
@@ -795,6 +843,45 @@ func ResolveFetchConcurrency(cfg *Config) int {
 	return DefaultAccountConcurrency
 }
 
+// ResolveAccountTotalCap returns the per-account AGGREGATE concurrency cap
+// across all models (applied to every account; see
+// max_concurrent_per_account_total). Resolution order:
+//  1. the explicit max_concurrent_per_account_total when positive;
+//  2. otherwise the SUM of the distinct positive max_concurrent_per_account
+//     values — the backward-compatible default: the old per-max-value
+//     accounting kept one counter per distinct max value, bounding the
+//     account at exactly that sum, so an unconfigured deployment sees the
+//     same worst-case total while per-model counters still isolate models
+//     (same-max models share the aggregate budget, never a counter);
+//  3. no positive values → DefaultAccountConcurrency (the old single-shared-
+//     counter bound).
+//
+// The sum is clamped to math.MaxInt32 (the int32 total counter cannot hold
+// more; an operator-configurable bound above it is meaningless anyway). The
+// per-model entries themselves were validated <= math.MaxInt32 at load.
+func ResolveAccountTotalCap(cfg *Config) int {
+	if cfg != nil && cfg.MaxConcurrentPerAccountTotal > 0 {
+		return cfg.MaxConcurrentPerAccountTotal
+	}
+	sum := 0
+	seen := make(map[int]bool)
+	if cfg != nil {
+		for _, v := range cfg.MaxConcurrentPerAccount {
+			if v > 0 && !seen[v] {
+				seen[v] = true
+				sum += v
+			}
+		}
+	}
+	if sum == 0 {
+		return DefaultAccountConcurrency
+	}
+	if sum > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return sum
+}
+
 // getCredential reads a credential file from the systemd LoadCredential
 // directory (CREDENTIALS_DIRECTORY). Returns the trimmed contents on success,
 // or "" if CREDENTIALS_DIRECTORY is unset or the file cannot be read.
@@ -893,6 +980,15 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	}
 	if oldCfg.ProbeInterval != newCfg.ProbeInterval {
 		warnings = append(warnings, "probe_interval changed: restart required to take effect")
+	}
+	// The account AGGREGATE concurrency cap is a pool-construction property
+	// (NewPoolWithTotalCap at startup): the per-model max values hot-reload
+	// (they are resolved per request), but the total bound does not — warn
+	// so a silent divergence between the config and the running pool is
+	// visible. (max_concurrent_per_account per-model values themselves stay
+	// hot-reloadable; only the aggregate needs a restart.)
+	if oldCfg.MaxConcurrentPerAccountTotal != newCfg.MaxConcurrentPerAccountTotal {
+		warnings = append(warnings, "max_concurrent_per_account_total changed: restart required to take effect")
 	}
 	if oldCfg.WireAPI != newCfg.WireAPI {
 		warnings = append(warnings, "wire_api changed: restart required to take effect")
@@ -1034,7 +1130,10 @@ func isLoopbackListen(addr string) bool {
 }
 
 // ParseTrustedProxies parses a list of CIDR strings into *net.IPNet values.
-// This is a helper for main.go to use after loading config.
+// This is a helper for main.go to use after loading config. The
+// whole-address-space ranges 0.0.0.0/0 and ::/0 are rejected (same rule as
+// LoadConfig): they would make every RemoteAddr "trusted", letting any
+// client spoof X-Forwarded-For / X-Real-IP past the IP rate limiter.
 func ParseTrustedProxies(proxies []string) ([]*net.IPNet, error) {
 	if len(proxies) == 0 {
 		return nil, nil
@@ -1044,6 +1143,9 @@ func ParseTrustedProxies(proxies []string) ([]*net.IPNet, error) {
 		_, cidr, err := net.ParseCIDR(s)
 		if err != nil {
 			return nil, err
+		}
+		if ones, _ := cidr.Mask.Size(); ones == 0 {
+			return nil, fmt.Errorf("trusted_proxies: %q trusts the whole address space; refusing (arbitrary X-Forwarded-For would bypass IP rate limiting)", s)
 		}
 		parsed = append(parsed, cidr)
 	}

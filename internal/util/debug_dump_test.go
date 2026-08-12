@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -14,9 +15,9 @@ import (
 // disk when an upstream echoes the credential it received.
 func TestDumpDebugUpstreamResponseScrubsAccountKey(t *testing.T) {
 	const key = "raw-key-98765"
-	prev := DebugMode
-	DebugMode = true
-	defer func() { DebugMode = prev }()
+	prev := DebugMode.Load()
+	DebugMode.Store(true)
+	defer func() { DebugMode.Store(prev) }()
 
 	dir := filepath.Join(os.TempDir(), "prism-debug")
 	if err := os.RemoveAll(dir); err != nil {
@@ -38,10 +39,55 @@ func TestDumpDebugUpstreamResponseScrubsAccountKey(t *testing.T) {
 		t.Errorf("debug dump should carry the redaction marker: %s", data)
 	}
 	// Without the key the dump stays off (DebugMode false → no file).
-	DebugMode = false
+	DebugMode.Store(false)
 	_ = os.RemoveAll(dir)
 	DumpDebugUpstreamResponse(body, []string{key})
 	if _, err := os.Stat(filepath.Join(dir, "last-upstream-response.json")); err == nil {
 		t.Error("debug dump must not be written when DebugMode is off")
 	}
+}
+
+// TestDebugModeConcurrentReadWrite is the race-coverage test for the
+// atomic DebugMode (audit round 6, item 4): the SIGHUP reload path writes
+// the flag (Store) while request goroutines read it (Load) on every
+// request. A plain bool was a data race; this test hammers concurrent
+// Loads (through the real dump functions) against Stores, so `go test
+// -race` proves the access is race-free. It also pins the behavior: each
+// dump observes exactly the last stored value (atomic snapshot semantics).
+func TestDebugModeConcurrentReadWrite(t *testing.T) {
+	prev := DebugMode.Load()
+	defer func() { DebugMode.Store(prev) }()
+
+	dir := filepath.Join(os.TempDir(), "prism-debug")
+	_ = os.RemoveAll(dir)
+	defer os.RemoveAll(dir)
+
+	body := []byte(`{"choices":[{"message":{"content":"x"}}]}`)
+	const readers = 8
+	const rounds = 200
+	var wg sync.WaitGroup
+
+	// Writers: flip the flag like the SIGHUP handler does.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			DebugMode.Store(i%2 == 0)
+		}
+	}()
+
+	// Readers: exercise the real debug-dump read paths (the exact Load
+	// sites request goroutines hit).
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				DumpDebugChatBody(body)
+				DumpDebugResponsesBody(body)
+				DumpDebugUpstreamResponse(body, []string{"k"})
+			}
+		}()
+	}
+	wg.Wait()
 }

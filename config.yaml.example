@@ -63,6 +63,11 @@ listen: "127.0.0.1:18790"
 # right-to-left skipping every trusted hop; the first untrusted valid IP is
 # the client (multi-hop chains resolve correctly). When empty, only
 # RemoteAddr is used for rate limiting (safest default).
+#
+# Whole-address-space ranges are REJECTED at load: 0.0.0.0/0 and ::/0 would
+# make every RemoteAddr "trusted", so any client could spoof
+# X-Forwarded-For/X-Real-IP past the per-IP rate limiter. Always configure
+# the actual proxy network.
 # trusted_proxies:
 #   - "10.0.0.0/8"
 #   - "127.0.0.0/8"
@@ -124,8 +129,13 @@ model_remap:
 #
 #   启用后降级保证：usage 的任何故障（库打不开、磁盘满、SQLITE_BUSY、
 #   队列满、计价异常）一律只打日志加计数器（expvar usage_write_errors /
-#   usage_events_dropped / usage_events_written），绝不影响 /v1 代理转发，
-#   绝不 panic，绝不阻塞请求收尾。
+#   usage_events_dropped / usage_events_written / usage_recorder_status），
+#   绝不影响 /v1 代理转发，绝不 panic，绝不阻塞请求收尾。丢失事件的日志
+#   限频（默认 5 秒内同类别最多一条），计数不受限频影响。
+#
+#   ⚠ 计费口径：usage 记录是尽力而为（best-effort），不是严格计费源。
+#   队列满 / 进程关闭 / 存储故障时事件会被丢弃（dropped 计数 + 限频日志
+#   可查），对账请以 request.complete 审计日志为准。
 #
 #   enabled:        总开关。默认 false。
 #   db_path:        SQLite 文件路径。默认 /var/lib/prism/usage.db（与模型
@@ -173,11 +183,16 @@ model_remap:
 
 accounts:
   # name "account-1" → credential/env LB_KEY_ACCOUNT_1
+  # provider 必填（v0.17.0 起）：provider 为空的账号永远选不到（业务请求按
+  # provider 路由），加载会直接报错。裸顶层 accounts 必须声明 provider，
+  # 或改用下方 providers 块。
   - name: account-1
     # key: "sk-..."   # optional; omit in production and use LoadCredential/env
     base_url: https://opencode.ai/zen/go/v1
+    provider: opencode-go
   - name: account-2
     base_url: https://opencode.ai/zen/go/v1
+    provider: opencode-go
 
 # ---------------------------------------------------------------------------
 # 可选：default_provider —— 请求未带 X-Prism-Provider 头时的兜底 provider。
@@ -195,8 +210,21 @@ accounts:
 # 未命中的模型回退到内置保守默认值 8（不再按模型名猜 flash/pro 档位；
 # 对任何上游都安全，包括低速率限制的个人 key）。想提高并发必须显式配置：
 # 显式列出目标模型即可消除 "unknown model, using default concurrency"
-# 告警。值含义：agentrouter（第三方中转网关）账号取保守值 8；有充分
-# 上游余量的账号（如 deepseek-v4-pro 同量级）可调高到 450。
+# 告警。
+#
+# 并发上限按“模型名”分组（v0.17.0 起）：每个模型（客户端请求里的
+# model 字段，即 max_concurrent_per_account 的键）在账号上拥有独立的
+# 在途计数，两个模型即使配置了相同的 max 值也互不挤占（max=2 的模型
+# 不会被另一个 max=2 模型的流量饿死）；低上限模型也不会被高上限流量
+# 饿死（max=1 的模型在 max=10 的模型占满 10 个并发时仍能拿到自己的
+# 1 个并发）。账号总在途 = 各模型之和（/metrics 可查），并受
+# max_concurrent_per_account_total 约束。
+#
+# max_concurrent_per_account_total: 账号级总并发上限（对每个账号生效）。
+# 缺省/0 时取向后兼容默认值 = max_concurrent_per_account 中互不相同的
+# 正值之和（等价于旧版按 max 值分组的账号总并发上限，配置不变则总并发
+# 不变）；显式配置后 N 个模型档位不会让账号总并发线性叠加。
+# 负值或大于 2^31-1 报错；改动需重启生效（ReloadConfig 会警告）。
 # ---------------------------------------------------------------------------
 # max_concurrent_per_account:
 #   claude-opus-5: 8

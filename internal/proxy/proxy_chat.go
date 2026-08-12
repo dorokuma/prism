@@ -179,8 +179,19 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 
 	defer func() {
 		aud.DurationMs = float64(time.Since(start).Milliseconds())
-		aud.Status = sc.Code
-		aud.Success = sc.Code >= 200 && sc.Code < 300 && aud.ErrorType == ""
+		// The audit status must be a REAL status even when nothing could be
+		// written: a client that disconnected before the first response byte
+		// leaves sc.Code at 0, which would record a bare 0 in the audit (and
+		// a success=false line with no error_type). 499 (nginx's de-facto
+		// "client closed request") is recorded instead whenever the client
+		// context is gone and no status was committed (audit round 6, item
+		// 7). Every other path keeps the committed status.
+		if sc.Code == 0 && r.Context().Err() != nil {
+			aud.Status = 499
+		} else {
+			aud.Status = sc.Code
+		}
+		aud.Success = aud.Status >= 200 && aud.Status < 300 && aud.ErrorType == ""
 		middleware.EmitAudit(aud)
 	}()
 
@@ -254,6 +265,12 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		return
 	}
 	maxAttempts := p.AccountCount() * 2
+	// The concurrency key is the client-requested model — the SAME string
+	// ResolveMaxConcurrent looks up — so per-model counters and per-model
+	// caps stay aligned 1:1 (two models with the same max never share a
+	// counter), and the account-wide total cap bounds the sum. The key is
+	// stable across reloads: changing a model's max value does not reset or
+	// split its in-flight accounting.
 	maxConcurrent := config.ResolveMaxConcurrent(opts.Model, cfg)
 	if opts.MaxResponseBytes == 0 {
 		opts.MaxResponseBytes = cfg.MaxUpstreamResponseBytes
@@ -280,7 +297,7 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		// timeout still applies for clients that stay connected.
 		selectCtx, cancel := context.WithTimeout(r.Context(), config.AccountSelectTimeout)
 		selectStart := time.Now()
-		acc, err := p.SelectByProvider(selectCtx, maxConcurrent, provider)
+		acc, slot, err := p.SelectByProvider(selectCtx, opts.Model, maxConcurrent, provider)
 		selectDuration := time.Since(selectStart).Milliseconds()
 		cancel()
 		accName := "nil"
@@ -335,7 +352,12 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		var terminalFatalErr error
 
 		func() {
-			defer p.Release(acc)
+			// Release the acquisition's own lease: slot carries the exact
+			// account/key/max, so the release can never mismatch the acquire
+			// (the old Release(acc, max) let a wrong max corrupt the
+			// accounting). On a retry the slot is freed before the next
+			// attempt acquires a new one.
+			defer p.Release(slot)
 			res := doUpstreamRequest(acc, r, bodyBytes, opts, requestID)
 			if res.resp != nil {
 				done, fatalErr, upClass := handleUpstreamResponse(acc, sc, r, res.resp, bodyBytes, start, opts, requestID, res.ctx, res.cancel)
@@ -364,6 +386,19 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 
 		if terminalDone {
 			if terminalFatalErr != nil {
+				// The upstream connection failed before any response byte was
+				// produced (doUpstreamRequest's only fatal result: the client
+				// disconnected while the upstream was being connected). No
+				// response can be written to a gone client, but the audit must
+				// record a real status instead of a bare 0 (audit round 6,
+				// item 7): 499 is the de-facto "client closed request" status
+				// (nginx convention), and error_type carries the same signal
+				// the log already uses.
+				if r.Context().Err() != nil {
+					aud.Status = 499
+					aud.ErrorType = "client_disconnect"
+					aud.Error = terminalFatalErr.Error()
+				}
 				return
 			}
 			return

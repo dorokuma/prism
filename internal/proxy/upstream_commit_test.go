@@ -65,11 +65,11 @@ func directResponsesStream(t *testing.T, upstreamBody string, w responseCommitWr
 
 	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: "http://upstream.invalid", Provider: "t"}}}
 	p := pool.NewPool(cfg.Accounts)
-	acc, err := p.SelectByProvider(context.Background(), 1, "t")
+	acc, slot, err := p.SelectByProvider(context.Background(), "gpt-4", 1, "t")
 	if err != nil {
 		t.Fatalf("select account: %v", err)
 	}
-	defer p.Release(acc)
+	defer p.Release(slot)
 
 	aud := &middleware.RequestAudit{Req: "direct-commit-1", Method: "POST", Path: "/v1/responses", Model: "gpt-4"}
 	r := httptest.NewRequest("POST", "/v1/responses", nil)

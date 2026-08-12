@@ -309,11 +309,11 @@ func main() {
 
 	middleware.InitLogger(cfg.LogLevel)
 
-	util.DebugMode = cfg.Debug
+	util.DebugMode.Store(cfg.Debug)
 	mcp.LoadMCPTools(cfg.MCPToolsJSON)
-	p := pool.NewPool(cfg.Accounts)
+	p := pool.NewPoolWithTotalCap(cfg.Accounts, config.ResolveAccountTotalCap(cfg))
 	wire, _ := config.ParseWireAPIMode(cfg.WireAPI)
-	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", util.DebugMode, "auth", len(cfg.APIKeys) > 0, "auth_keys", len(cfg.APIKeys), "tls", cfg.TLSCertFile != "")
+	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", util.DebugMode.Load(), "auth", len(cfg.APIKeys) > 0, "auth_keys", len(cfg.APIKeys), "tls", cfg.TLSCertFile != "")
 
 	// 初始化模型缓存
 	cacheDir := "/var/lib/prism/model_cache"
@@ -494,7 +494,7 @@ func main() {
 						slog.Warn("config reload warning", "warning", w)
 					}
 					newCfg := holder.Load()
-					util.DebugMode = newCfg.Debug
+					util.DebugMode.Store(newCfg.Debug)
 					// Keep the EmitAudit key_id fallback in sync with the
 					// reloaded usage.default_key_id: the auth-disabled path in
 					// newHTTPHandler reads the holder live, so the fallback

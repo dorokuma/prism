@@ -237,7 +237,7 @@ func flattenResponseContentParts(parts []map[string]any) any {
 		case "input_text", "output_text":
 			out = append(out, map[string]any{"type": "text", "text": p["text"]})
 		default:
-			if util.DebugMode {
+			if util.DebugMode.Load() {
 				slog.Debug("unknown content part type", "type", p["type"])
 			}
 			out = append(out, p)

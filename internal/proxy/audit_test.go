@@ -662,3 +662,49 @@ func TestAuditLog_Metadata(t *testing.T) {
 		}
 	})
 }
+
+// TestAuditClientDisconnectBeforeUpstreamResponse pins audit round 6 item
+// 7: when the client disconnects before the upstream connection is
+// established (or before any response byte), no HTTP response can be
+// written — but the audit must record a REAL status (499, the de-facto
+// "client closed request" code) and error_type client_disconnect instead of
+// a bare status 0. The request context is pre-cancelled so the upstream
+// Do fails with the client-cancel classification deterministically.
+func TestAuditClientDisconnectBeforeUpstreamResponse(t *testing.T) {
+	h := &capturingHandler{}
+	restore := stashSlog(h)
+	defer restore()
+
+	// Unreachable upstream: the Do fails; the pre-cancelled client context
+	// classifies the failure as client_disconnect (no retry).
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: "http://127.0.0.1:1", Provider: "t"}}}
+	p := pool.NewPool(cfg.Accounts)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // client already gone before the upstream connect attempt
+	defer cancel()
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequestWithContext(ctx, "POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "t")
+
+	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{Model: "gpt-4"}, cfg)
+
+	// Nothing can be written to a gone client: the recorder keeps its
+	// initial state (Code defaults to 200 in httptest.Recorder — the real
+	// signal of "no write happened" is the empty body and no explicit
+	// WriteHeader).
+	if rec.Body.Len() != 0 {
+		t.Errorf("no response body may be written to a disconnected client, got %q", rec.Body.String())
+	}
+	out := h.output()
+	if !strings.Contains(out, `"status":499`) {
+		t.Errorf("audit must record status 499 for client disconnect before upstream connect, got: %s", out)
+	}
+	if !strings.Contains(out, `"error_type":"client_disconnect"`) {
+		t.Errorf("audit must record error_type client_disconnect, got: %s", out)
+	}
+	if strings.Contains(out, `"status":0`) {
+		t.Errorf("audit must never record a bare status 0 on this path, got: %s", out)
+	}
+}

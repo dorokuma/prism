@@ -16,25 +16,25 @@ import (
 // later, because the earlier one blocks inside Select until woken).
 type gatedWaiter struct {
 	goCh chan struct{}
-	done chan *Account
+	done chan slotResult
 }
 
-func (g *gatedWaiter) run(p *Pool, provider string, releaseAfter bool) {
+func (g *gatedWaiter) run(p *Pool, key string, provider string, max int, releaseAfter bool) {
 	<-g.goCh
-	var acc *Account
+	var res slotResult
 	var err error
 	if provider == "" {
-		acc, err = p.Select(context.Background(), 1)
+		res.acc, res.slot, err = p.Select(context.Background(), key, max)
 	} else {
-		acc, err = p.SelectByProvider(context.Background(), 1, provider)
+		res.acc, res.slot, err = p.SelectByProvider(context.Background(), key, max, provider)
 	}
 	if err != nil {
-		g.done <- nil
+		g.done <- slotResult{}
 		return
 	}
-	g.done <- acc
+	g.done <- res
 	if releaseAfter {
-		p.Release(acc) // cascade the slot to the next waiter
+		p.Release(res.slot) // cascade the slot to the next waiter
 	}
 }
 
@@ -81,22 +81,22 @@ func TestReleaseWakesFirstMatchingProviderWaiter(t *testing.T) {
 	p := NewPool(cfgs)
 
 	// Occupy both accounts (maxConcurrent=1 each).
-	accX, err := p.Select(context.Background(), 1)
+	_, slotX, err := p.Select(context.Background(), "m", 1)
 	if err != nil {
 		t.Fatalf("select acc-x: %v", err)
 	}
-	accY, err := p.Select(context.Background(), 1)
+	_, slotY, err := p.Select(context.Background(), "m", 1)
 	if err != nil {
 		t.Fatalf("select acc-y: %v", err)
 	}
 
 	// Deterministic queue order: gX first, then gAny, then gY.
-	gX := &gatedWaiter{goCh: make(chan struct{}), done: make(chan *Account, 1)}
-	gAny := &gatedWaiter{goCh: make(chan struct{}), done: make(chan *Account, 1)}
-	gY := &gatedWaiter{goCh: make(chan struct{}), done: make(chan *Account, 1)}
-	go gX.run(p, "X", false)
-	go gAny.run(p, "", false)
-	go gY.run(p, "Y", true) // gY releases after delivery (cascade is asserted separately)
+	gX := &gatedWaiter{goCh: make(chan struct{}), done: make(chan slotResult, 1)}
+	gAny := &gatedWaiter{goCh: make(chan struct{}), done: make(chan slotResult, 1)}
+	gY := &gatedWaiter{goCh: make(chan struct{}), done: make(chan slotResult, 1)}
+	go gX.run(p, "m", "X", 1, false)
+	go gAny.run(p, "m", "", 1, false)
+	go gY.run(p, "m", "Y", 1, true) // gY releases after delivery (cascade is asserted separately)
 
 	close(gX.goCh)
 	time.Sleep(100 * time.Millisecond) // gX is now queued (it cannot return while acc-x is busy)
@@ -106,26 +106,26 @@ func TestReleaseWakesFirstMatchingProviderWaiter(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // gY queued behind gAny
 
 	// Release the X account: the X waiter is the front-most X-matching waiter.
-	p.Release(accX)
-	if got := waitForAccount(t, gX.done, 2*time.Second, "X waiter"); got.Name() != "acc-x" {
-		t.Fatalf("X waiter got %q, want acc-x", got.Name())
+	p.Release(slotX)
+	if got := waitForSlotResult(t, gX.done, 2*time.Second, "X waiter"); got.acc.Name() != "acc-x" {
+		t.Fatalf("X waiter got %q, want acc-x", got.acc.Name())
 	}
 	// The "" waiter matches X too but was queued behind the X waiter: it
 	// must NOT be woken by this release (FIFO within the matching set).
-	expectNoAccount(t, gAny.done, 200*time.Millisecond, "global waiter after X release")
+	expectNoSlotResult(t, gAny.done, 200*time.Millisecond, "global waiter after X release")
 
 	// Release the Y account: matching set is {gAny, gY}; gAny is front-most.
-	p.Release(accY)
-	if got := waitForAccount(t, gAny.done, 2*time.Second, "global waiter"); got.Name() != "acc-y" {
-		t.Fatalf("global waiter got %q, want acc-y", got.Name())
+	p.Release(slotY)
+	if got := waitForSlotResult(t, gAny.done, 2*time.Second, "global waiter"); got.acc.Name() != "acc-y" {
+		t.Fatalf("global waiter got %q, want acc-y", got.acc.Name())
 	}
 	// The Y waiter must still be queued.
-	expectNoAccount(t, gY.done, 200*time.Millisecond, "Y waiter after global-waiter wake")
+	expectNoSlotResult(t, gY.done, 200*time.Millisecond, "Y waiter after global-waiter wake")
 
 	// The Y waiter is served by a later matching release (the cascade path
 	// is exercised in the FIFO and stress tests below); here we only verify
 	// it was not spuriously woken while gX and gAny hold both slots.
-	expectNoAccount(t, gY.done, 100*time.Millisecond, "Y waiter before any Y-slot release")
+	expectNoSlotResult(t, gY.done, 100*time.Millisecond, "Y waiter before any Y-slot release")
 }
 
 // TestReleaseFIFOProviderWaiterBehindGlobal verifies the reverse FIFO order:
@@ -139,33 +139,33 @@ func TestReleaseFIFOProviderWaiterBehindGlobal(t *testing.T) {
 	}
 	p := NewPool(cfgs)
 
-	accX, err := p.Select(context.Background(), 1)
+	_, slotX, err := p.Select(context.Background(), "m", 1)
 	if err != nil {
 		t.Fatalf("select acc-x: %v", err)
 	}
-	accY, err := p.Select(context.Background(), 1)
+	_, slotY, err := p.Select(context.Background(), "m", 1)
 	if err != nil {
 		t.Fatalf("select acc-y: %v", err)
 	}
-	_ = accX // stays busy for the whole test
+	_ = slotX // stays busy for the whole test
 
 	// Queue order: gY first, then gAny.
-	gY := &gatedWaiter{goCh: make(chan struct{}), done: make(chan *Account, 1)}
-	gAny := &gatedWaiter{goCh: make(chan struct{}), done: make(chan *Account, 1)}
-	go gY.run(p, "Y", true)
-	go gAny.run(p, "", true)
+	gY := &gatedWaiter{goCh: make(chan struct{}), done: make(chan slotResult, 1)}
+	gAny := &gatedWaiter{goCh: make(chan struct{}), done: make(chan slotResult, 1)}
+	go gY.run(p, "m", "Y", 1, true)
+	go gAny.run(p, "m", "", 1, true)
 	close(gY.goCh)
 	time.Sleep(100 * time.Millisecond) // gY queued
 	close(gAny.goCh)
 	time.Sleep(100 * time.Millisecond) // gAny queued behind gY
 
 	// Release Y: gY is the front-most Y-matching waiter → gY wins the slot.
-	p.Release(accY)
-	if got := waitForAccount(t, gY.done, 2*time.Second, "Y waiter"); got.Name() != "acc-y" {
-		t.Fatalf("Y waiter got %q, want acc-y", got.Name())
+	p.Release(slotY)
+	if got := waitForSlotResult(t, gY.done, 2*time.Second, "Y waiter"); got.acc.Name() != "acc-y" {
+		t.Fatalf("Y waiter got %q, want acc-y", got.acc.Name())
 	}
-	if got := waitForAccount(t, gAny.done, 2*time.Second, "global waiter"); got.Name() != "acc-y" {
-		t.Fatalf("global waiter got %q, want acc-y", got.Name())
+	if got := waitForSlotResult(t, gAny.done, 2*time.Second, "global waiter"); got.acc.Name() != "acc-y" {
+		t.Fatalf("global waiter got %q, want acc-y", got.acc.Name())
 	}
 }
 
@@ -179,34 +179,34 @@ func TestReleaseDoesNotWakeNonMatchingProvider(t *testing.T) {
 	}
 	p := NewPool(cfgs)
 
-	accX, err := p.Select(context.Background(), 1)
+	_, slotX, err := p.Select(context.Background(), "m", 1)
 	if err != nil {
 		t.Fatalf("select acc-x: %v", err)
 	}
-	accY, err := p.Select(context.Background(), 1)
+	_, slotY, err := p.Select(context.Background(), "m", 1)
 	if err != nil {
 		t.Fatalf("select acc-y: %v", err)
 	}
 
-	chX := make(chan *Account, 1)
+	chX := make(chan slotResult, 1)
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 1, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "X")
 		if err != nil {
-			chX <- nil
+			chX <- slotResult{}
 			return
 		}
-		chX <- acc
+		chX <- slotResult{acc: acc, slot: slot}
 	}()
 	time.Sleep(150 * time.Millisecond) // let it queue
 
 	// Release the Y account: no Y or "" waiter is queued → nobody woken.
-	p.Release(accY)
-	expectNoAccount(t, chX, 200*time.Millisecond, "X waiter after Y release")
+	p.Release(slotY)
+	expectNoSlotResult(t, chX, 200*time.Millisecond, "X waiter after Y release")
 
 	// Release the X account → the X waiter is woken.
-	p.Release(accX)
-	if got := waitForAccount(t, chX, 2*time.Second, "X waiter"); got.Name() != "acc-x" {
-		t.Fatalf("X waiter got %q, want acc-x", got.Name())
+	p.Release(slotX)
+	if got := waitForSlotResult(t, chX, 2*time.Second, "X waiter"); got.acc.Name() != "acc-x" {
+		t.Fatalf("X waiter got %q, want acc-x", got.acc.Name())
 	}
 }
 
@@ -224,65 +224,63 @@ func TestMarkHealthyWakesMatchingProviderWaiter(t *testing.T) {
 	p := NewPool(cfgs)
 
 	// Occupy x1 and y1; exhaust x2 and y2 (probe will recover them).
-	var x1, x2, y1, y2 *Account
+	var x2, y2 *Account
 	for _, acc := range p.AllAccounts() {
 		switch acc.Name() {
-		case "x1":
-			x1 = acc
 		case "x2":
 			x2 = acc
-		case "y1":
-			y1 = acc
 		case "y2":
 			y2 = acc
 		}
 	}
-	if _, err := p.SelectByProvider(context.Background(), 1, "X"); err != nil { // x1
+	_, slotX1, err := p.SelectByProvider(context.Background(), "m", 1, "X") // x1
+	if err != nil {
 		t.Fatalf("select x1: %v", err)
 	}
-	if _, err := p.SelectByProvider(context.Background(), 1, "Y"); err != nil { // y1
+	_, slotY1, err := p.SelectByProvider(context.Background(), "m", 1, "Y") // y1
+	if err != nil {
 		t.Fatalf("select y1: %v", err)
 	}
 	x2.MarkExhausted()
 	y2.MarkExhausted()
 
-	chX := make(chan *Account, 1)
-	chY := make(chan *Account, 1)
+	chX := make(chan slotResult, 1)
+	chY := make(chan slotResult, 1)
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 1, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "X")
 		if err != nil {
-			chX <- nil
+			chX <- slotResult{}
 			return
 		}
-		chX <- acc
+		chX <- slotResult{acc: acc, slot: slot}
 	}()
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 1, "Y")
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "Y")
 		if err != nil {
-			chY <- nil
+			chY <- slotResult{}
 			return
 		}
-		chY <- acc
+		chY <- slotResult{acc: acc, slot: slot}
 	}()
 	time.Sleep(150 * time.Millisecond) // let both queue
 
 	// Recover x2: the X waiter (front-most X-matching) must be woken and get
 	// x2; the Y waiter must stay queued.
 	p.MarkHealthy(x2)
-	if got := waitForAccount(t, chX, 2*time.Second, "X waiter"); got.Name() != "x2" {
-		t.Fatalf("X waiter got %q, want x2", got.Name())
+	if got := waitForSlotResult(t, chX, 2*time.Second, "X waiter"); got.acc.Name() != "x2" {
+		t.Fatalf("X waiter got %q, want x2", got.acc.Name())
 	}
-	expectNoAccount(t, chY, 200*time.Millisecond, "Y waiter after MarkHealthy(x2)")
+	expectNoSlotResult(t, chY, 200*time.Millisecond, "Y waiter after MarkHealthy(x2)")
 
 	// Recover y2: the Y waiter wakes and gets y2.
 	p.MarkHealthy(y2)
-	if got := waitForAccount(t, chY, 2*time.Second, "Y waiter"); got.Name() != "y2" {
-		t.Fatalf("Y waiter got %q, want y2", got.Name())
+	if got := waitForSlotResult(t, chY, 2*time.Second, "Y waiter"); got.acc.Name() != "y2" {
+		t.Fatalf("Y waiter got %q, want y2", got.acc.Name())
 	}
 
 	// Cleanup the still-held slots.
-	p.Release(x1)
-	p.Release(y1)
+	p.Release(slotX1)
+	p.Release(slotY1)
 }
 
 // TestWaiterProviderStressMixed is the high-risk concurrency test: a pool
@@ -303,13 +301,13 @@ func TestWaiterProviderStressMixed(t *testing.T) {
 	p := NewPool(cfgs)
 
 	// Occupy all four slots.
-	held := make([]*Account, 0, 4)
+	held := make([]*Slot, 0, 4)
 	for i := 0; i < 4; i++ {
-		acc, err := p.Select(context.Background(), 1)
+		_, slot, err := p.Select(context.Background(), "m", 1)
 		if err != nil {
 			t.Fatalf("occupy slot %d: %v", i, err)
 		}
-		held = append(held, acc)
+		held = append(held, slot)
 	}
 
 	const (
@@ -324,19 +322,19 @@ func TestWaiterProviderStressMixed(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var acc *Account
+			var res slotResult
 			var err error
 			if provider == "" {
-				acc, err = p.Select(context.Background(), 1)
+				res.acc, res.slot, err = p.Select(context.Background(), "m", 1)
 			} else {
-				acc, err = p.SelectByProvider(context.Background(), 1, provider)
+				res.acc, res.slot, err = p.SelectByProvider(context.Background(), "m", 1, provider)
 			}
 			if err != nil {
 				t.Errorf("waiter(%q) failed: %v", provider, err)
 				return
 			}
 			atomic.AddInt32(&done, 1)
-			p.Release(acc) // cascade
+			p.Release(res.slot) // cascade
 		}()
 	}
 	for i := 0; i < nX; i++ {
@@ -351,8 +349,8 @@ func TestWaiterProviderStressMixed(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // let all 40 queue
 
 	// Release all four slots; the wakeups cascade through the waiters.
-	for _, acc := range held {
-		p.Release(acc)
+	for _, s := range held {
+		p.Release(s)
 	}
 
 	doneCh := make(chan struct{})
@@ -400,43 +398,43 @@ func TestRemoveWaiterTransfersWokenWakeupOnBail(t *testing.T) {
 	}
 	p := NewPool(cfgs)
 
-	accX, err := p.Select(context.Background(), 1)
+	_, slotX, err := p.Select(context.Background(), "m", 1)
 	if err != nil {
 		t.Fatalf("occupy acc-x: %v", err)
 	}
 
 	// Real second waiter: parks behind the simulated first waiter.
-	ch2 := make(chan *Account, 1)
+	ch2 := make(chan slotResult, 1)
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 1, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "X")
 		if err != nil {
-			ch2 <- nil
+			ch2 <- slotResult{}
 			return
 		}
-		ch2 <- acc
+		ch2 <- slotResult{acc: acc, slot: slot}
 	}()
 	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "second waiter to park")
 
 	// Simulated first waiter, queued AHEAD of the real one: it is the
 	// front-most X-matching waiter, so the Release below wakes IT.
 	p.mu.Lock()
-	w1 := &waiter{ch: make(chan struct{}), active: true, provider: "X", max: 1}
+	w1 := &waiter{ch: make(chan struct{}), active: true, provider: "X", key: "m", max: 1}
 	elem1 := p.waiters.PushFront(w1)
 	p.mu.Unlock()
 
 	// Release: the wakeup lands on w1 (removed from the queue, channel
 	// closed) — while w1's select has already committed to ctx.Done.
-	p.Release(accX)
+	p.Release(slotX)
 
 	// w1 bails: removeWaiterAndTransfer must hand the consumed wakeup to
 	// the next waiter that can use the freed slot (the real waiter).
 	p.removeWaiterAndTransfer(elem1)
 
-	got := waitForAccount(t, ch2, 2*time.Second, "second waiter after first waiter bailed")
-	if got.Name() != "acc-x" {
-		t.Fatalf("second waiter got %q, want acc-x", got.Name())
+	got := waitForSlotResult(t, ch2, 2*time.Second, "second waiter after first waiter bailed")
+	if got.acc.Name() != "acc-x" {
+		t.Fatalf("second waiter got %q, want acc-x", got.acc.Name())
 	}
-	p.Release(got)
+	p.Release(got.slot)
 }
 
 // TestRemoveWaiterNoTransferWhenCapacityGone: the wakeup is NOT transferred
@@ -449,42 +447,42 @@ func TestRemoveWaiterNoTransferWhenCapacityGone(t *testing.T) {
 	}
 	p := NewPool(cfgs)
 
-	accX, err := p.Select(context.Background(), 1)
+	_, slotX, err := p.Select(context.Background(), "m", 1)
 	if err != nil {
 		t.Fatalf("occupy acc-x: %v", err)
 	}
-	ch2 := make(chan *Account, 1)
+	ch2 := make(chan slotResult, 1)
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 1, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "X")
 		if err != nil {
-			ch2 <- nil
+			ch2 <- slotResult{}
 			return
 		}
-		ch2 <- acc
+		ch2 <- slotResult{acc: acc, slot: slot}
 	}()
 	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "second waiter to park")
 
 	p.mu.Lock()
-	w1 := &waiter{ch: make(chan struct{}), active: true, provider: "X", max: 1}
+	w1 := &waiter{ch: make(chan struct{}), active: true, provider: "X", key: "m", max: 1}
 	elem1 := p.waiters.PushFront(w1)
 	p.mu.Unlock()
 
-	p.Release(accX) // wakeup consumed by w1
+	p.Release(slotX) // wakeup consumed by w1
 	// Another caller grabs the freed slot before w1 bails.
-	accX2, err := p.Select(context.Background(), 1)
+	_, slotX2, err := p.Select(context.Background(), "m", 1)
 	if err != nil {
 		t.Fatalf("re-acquire freed slot: %v", err)
 	}
 	p.removeWaiterAndTransfer(elem1) // w1 bails: no capacity left → no transfer
 
-	expectNoAccount(t, ch2, 200*time.Millisecond, "second waiter after capacity gone")
+	expectNoSlotResult(t, ch2, 200*time.Millisecond, "second waiter after capacity gone")
 
-	p.Release(accX2)
-	got := waitForAccount(t, ch2, 2*time.Second, "second waiter after real release")
-	if got.Name() != "acc-x" {
-		t.Fatalf("second waiter got %q, want acc-x", got.Name())
+	p.Release(slotX2)
+	got := waitForSlotResult(t, ch2, 2*time.Second, "second waiter after real release")
+	if got.acc.Name() != "acc-x" {
+		t.Fatalf("second waiter got %q, want acc-x", got.acc.Name())
 	}
-	p.Release(got)
+	p.Release(got.slot)
 }
 
 // TestRemoveWaiterNoTransferToNonMatchingProvider: a bailing X waiter's
@@ -498,187 +496,199 @@ func TestRemoveWaiterNoTransferToNonMatchingProvider(t *testing.T) {
 	}
 	p := NewPool(cfgs)
 
-	accX, err := p.SelectByProvider(context.Background(), 1, "X")
+	_, slotX, err := p.SelectByProvider(context.Background(), "m", 1, "X")
 	if err != nil {
 		t.Fatalf("occupy acc-x: %v", err)
 	}
-	accY, err := p.SelectByProvider(context.Background(), 1, "Y")
+	_, slotY, err := p.SelectByProvider(context.Background(), "m", 1, "Y")
 	if err != nil {
 		t.Fatalf("occupy acc-y: %v", err)
 	}
 
-	chY := make(chan *Account, 1)
+	chY := make(chan slotResult, 1)
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 1, "Y")
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "Y")
 		if err != nil {
-			chY <- nil
+			chY <- slotResult{}
 			return
 		}
-		chY <- acc
+		chY <- slotResult{acc: acc, slot: slot}
 	}()
 	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "Y waiter to park")
 
 	p.mu.Lock()
-	wX := &waiter{ch: make(chan struct{}), active: true, provider: "X", max: 1}
+	wX := &waiter{ch: make(chan struct{}), active: true, provider: "X", key: "m", max: 1}
 	elemX := p.waiters.PushFront(wX)
 	p.mu.Unlock()
 
 	// The X release's wakeup is consumed by the bailing X waiter; the
 	// transfer must skip the Y waiter (provider mismatch, no Y capacity).
-	p.Release(accX)
+	p.Release(slotX)
 	p.removeWaiterAndTransfer(elemX)
-	expectNoAccount(t, chY, 200*time.Millisecond, "Y waiter after X slot freed")
+	expectNoSlotResult(t, chY, 200*time.Millisecond, "Y waiter after X slot freed")
 
 	// A real Y release wakes the Y waiter.
-	p.Release(accY)
-	got := waitForAccount(t, chY, 2*time.Second, "Y waiter after Y release")
-	if got.Name() != "acc-y" {
-		t.Fatalf("Y waiter got %q, want acc-y", got.Name())
+	p.Release(slotY)
+	got := waitForSlotResult(t, chY, 2*time.Second, "Y waiter after Y release")
+	if got.acc.Name() != "acc-y" {
+		t.Fatalf("Y waiter got %q, want acc-y", got.acc.Name())
 	}
-	p.Release(got)
+	p.Release(got.slot)
 }
 
-// TestRemoveWaiterTransferMixedMax is the deterministic mixed-max
-// regression test: the bailing waiter A has a SMALL maxConcurrent and the
-// next queued waiter B has a LARGE one. After a release the account's
-// inFlight sits in the band [A.max, B.max) — A cannot use the freed
-// capacity, B can. A consumes the release's wakeup and then bails; the
-// transfer MUST wake B, which acquires the account immediately. Before the
-// fix the transfer was gated on the bailing waiter's OWN max
-// (capacityAvailableFor(A.provider, A.max)), which is false in this band,
-// so B stayed parked until its 60s fallback timer — the mixed-max lost
-// wakeup. wakeNextUsable applies each candidate waiter's own provider/max,
-// so the FIFO scan wakes exactly the first waiter that can use the slot.
-func TestRemoveWaiterTransferMixedMax(t *testing.T) {
+// TestRemoveWaiterTransferMixedKey is the deterministic mixed-key
+// regression test under per-model-key concurrency accounting: the bailing
+// waiter A has a SMALL max on key "lo" and the next queued waiter B has a
+// LARGE max on key "hi". A is woken by a release that frees capacity in a
+// DIFFERENT key (the release wakes the first waiter whose own key has room —
+// A's "lo" counter is empty, so A is servable even though the freed slot
+// belongs to the "hi" key). A then bails; the transfer MUST wake B (its
+// "hi" key now has room), so the consumed wakeup is never lost.
+func TestRemoveWaiterTransferMixedKey(t *testing.T) {
 	cfgs := []config.AccountConfig{
 		{Name: "acc-x", Key: "kx", BaseURL: "http://localhost:8001", Provider: "X"},
 	}
 	p := NewPool(cfgs)
 
-	// Occupy acc-x with three max=3 holders: each Select adds one in-flight
-	// slot (TryAcquire is +1 while inFlight < max), so inFlight = 3 — the
-	// smallest value at which a max=3 waiter parks.
-	held := make([]*Account, 0, 3)
+	// Occupy acc-x with three "hi" (max=3) holders plus one "lo" (max=1)
+	// holder: the "hi" counter sits at 3 (a "hi" waiter parks) and the "lo"
+	// counter at 1 (a "lo" waiter parks).
+	heldHi := make([]*Slot, 0, 3)
 	for i := 0; i < 3; i++ {
-		acc, err := p.Select(context.Background(), 3)
+		_, slot, err := p.Select(context.Background(), "hi", 3)
 		if err != nil {
-			t.Fatalf("occupy slot %d: %v", i, err)
+			t.Fatalf("occupy hi slot %d: %v", i, err)
 		}
-		held = append(held, acc)
+		heldHi = append(heldHi, slot)
+	}
+	_, heldLo, err := p.Select(context.Background(), "lo", 1)
+	if err != nil {
+		t.Fatalf("occupy lo slot: %v", err)
 	}
 
-	// Real waiter B with max=3: it parks (inFlight 3 >= 3) and needs the
-	// band inFlight < 3 to become servable.
-	chB := make(chan *Account, 1)
+	// Real waiter B with key "hi" (max=3): it parks ("hi" counter at 3).
+	chB := make(chan slotResult, 1)
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 3, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "hi", 3, "X")
 		if err != nil {
-			chB <- nil
+			chB <- slotResult{}
 			return
 		}
-		chB <- acc
+		chB <- slotResult{acc: acc, slot: slot}
 	}()
-	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "B waiter (max=3) to park")
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "B waiter (hi) to park")
 
-	// Simulated bailing waiter A with max=1, queued AHEAD of B: the
-	// release below wakes A (front-most X-matching waiter).
+	// Simulated bailing waiter A with key "lo" (max=1), queued AHEAD of B:
+	// the release below wakes A (front-most X-matching waiter with room in
+	// its "lo" counter).
 	p.mu.Lock()
-	wA := &waiter{ch: make(chan struct{}), active: true, provider: "X", max: 1}
+	wA := &waiter{ch: make(chan struct{}), active: true, provider: "X", key: "lo", max: 1}
 	elemA := p.waiters.PushFront(wA)
 	p.mu.Unlock()
 
-	// Release one holder: inFlight 3→2, which is in the band
-	// [A.max=1, B.max=3). A consumes the wakeup...
-	p.Release(held[0])
+	// Release one "hi" holder: A ("lo" counter empty) consumes the
+	// wakeup...
+	p.Release(heldHi[0])
 
-	// ...then bails: the transfer must skip the capacity gate and reach B.
+	// ...then bails: the transfer must reach the next waiter whose own key
+	// has room (B, "hi" counter now at 2).
 	p.removeWaiterAndTransfer(elemA)
 
 	// B must get the account promptly (no fallback-timer starvation).
-	got := waitForAccount(t, chB, 2*time.Second, "B waiter (max=3) after A bailed")
-	if got.Name() != "acc-x" {
-		t.Fatalf("B waiter got %q, want acc-x", got.Name())
+	got := waitForSlotResult(t, chB, 2*time.Second, "B waiter (hi) after A bailed")
+	if got.acc.Name() != "acc-x" {
+		t.Fatalf("B waiter got %q, want acc-x", got.acc.Name())
 	}
 
-	// Cleanup: B acquired one slot (inFlight 3); release everything.
-	p.Release(got)
-	p.Release(held[1])
-	p.Release(held[2])
+	// Cleanup: B acquired one slot ("hi" counter back to 3); release
+	// everything.
+	p.Release(got.slot)
+	p.Release(heldHi[1])
+	p.Release(heldHi[2])
+	p.Release(heldLo)
 }
 
-// TestRemoveWaiterTransferSkipsUnusableMixedMax is the FIFO companion: with
-// a max=1 waiter C queued AHEAD of the max=3 waiter B, a bailing max=1
-// waiter's transfer must NOT wake C (inFlight is in the band where C is
-// unusable) — it wakes the first waiter that CAN use the freed capacity (B),
-// preserving FIFO among the usable set. The unusable C stays parked.
-func TestRemoveWaiterTransferSkipsUnusableMixedMax(t *testing.T) {
+// TestRemoveWaiterTransferSkipsUnusableMixedKey is the FIFO companion under
+// per-model-key accounting: with a "lo" waiter C queued AHEAD of the "hi"
+// waiter B, and the "lo" counter full (C unusable), a release that frees
+// "hi" capacity must NOT wake C (its own key has no room) — it wakes the
+// first waiter that CAN use the freed capacity (B), preserving FIFO among
+// the usable set. The unusable C stays parked until its own key frees up.
+func TestRemoveWaiterTransferSkipsUnusableMixedKey(t *testing.T) {
 	cfgs := []config.AccountConfig{
 		{Name: "acc-x", Key: "kx", BaseURL: "http://localhost:8001", Provider: "X"},
 	}
 	p := NewPool(cfgs)
 
-	// Occupy acc-x with three max=3 holders (each Select adds one in-flight
-	// slot): inFlight = 3, the smallest value at which a max=3 waiter parks.
-	held := make([]*Account, 0, 3)
+	// Occupy acc-x with three "hi" (max=3) holders and one "lo" (max=1)
+	// holder: the "hi" counter sits at 3 (a "hi" waiter parks) and the "lo"
+	// counter at 1 (a "lo" waiter parks).
+	heldHi := make([]*Slot, 0, 3)
 	for i := 0; i < 3; i++ {
-		acc, err := p.Select(context.Background(), 3)
+		_, slot, err := p.Select(context.Background(), "hi", 3)
 		if err != nil {
-			t.Fatalf("occupy slot %d: %v", i, err)
+			t.Fatalf("occupy hi slot %d: %v", i, err)
 		}
-		held = append(held, acc)
+		heldHi = append(heldHi, slot)
+	}
+	_, heldLo, err := p.Select(context.Background(), "lo", 1)
+	if err != nil {
+		t.Fatalf("occupy lo slot: %v", err)
 	}
 
-	// Real waiters: C (max=1) queues first, B (max=3) second.
-	chC := make(chan *Account, 1)
-	chB := make(chan *Account, 1)
+	// Real waiters: C ("lo") queues first, B ("hi") second.
+	chC := make(chan slotResult, 1)
+	chB := make(chan slotResult, 1)
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 1, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "lo", 1, "X")
 		if err != nil {
-			chC <- nil
+			chC <- slotResult{}
 			return
 		}
-		chC <- acc
+		chC <- slotResult{acc: acc, slot: slot}
 	}()
-	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "C waiter (max=1) to park")
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "C waiter (lo) to park")
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 3, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "hi", 3, "X")
 		if err != nil {
-			chB <- nil
+			chB <- slotResult{}
 			return
 		}
-		chB <- acc
+		chB <- slotResult{acc: acc, slot: slot}
 	}()
-	waitUntil(t, func() bool { return p.WaitingCount() == 2 }, "B waiter (max=3) to park")
+	waitUntil(t, func() bool { return p.WaitingCount() == 2 }, "B waiter (hi) to park")
 
-	// Simulated bailing waiter A (max=1) queued ahead of both.
+	// Simulated bailing waiter A ("lo") queued ahead of both. Its key is
+	// full too, so the release below skips it along with C.
 	p.mu.Lock()
-	wA := &waiter{ch: make(chan struct{}), active: true, provider: "X", max: 1}
+	wA := &waiter{ch: make(chan struct{}), active: true, provider: "X", key: "lo", max: 1}
 	elemA := p.waiters.PushFront(wA)
 	p.mu.Unlock()
 
-	// Release one holder: inFlight 3→2. A consumes the wakeup and bails;
-	// the transfer scan passes over C (max=1, unusable at inFlight=2) and
-	// wakes B (max=3, usable) — FIFO within the usable set, C not woken.
-	p.Release(held[0])
-	p.removeWaiterAndTransfer(elemA)
+	// Release one "hi" holder: the "hi" counter drops to 2. The wake scan
+	// passes over A ("lo" full) and C ("lo" full) and wakes B ("hi" at 2) —
+	// FIFO within the usable set, C not woken.
+	p.Release(heldHi[0])
+	p.removeWaiterAndTransfer(elemA) // A was never woken: no transfer needed
 
-	expectNoAccount(t, chC, 200*time.Millisecond, "C waiter (max=1) after transfer at inFlight=2")
-	got := waitForAccount(t, chB, 2*time.Second, "B waiter (max=3) after A bailed")
-	if got.Name() != "acc-x" {
-		t.Fatalf("B waiter got %q, want acc-x", got.Name())
+	expectNoSlotResult(t, chC, 200*time.Millisecond, "C waiter (lo) after hi release")
+	got := waitForSlotResult(t, chB, 2*time.Second, "B waiter (hi) after release")
+	if got.acc.Name() != "acc-x" {
+		t.Fatalf("B waiter got %q, want acc-x", got.acc.Name())
 	}
-	p.Release(got)
+	p.Release(got.slot)
 
-	// A further release (inFlight 2→1) still cannot serve C (needs < 1);
-	// the final release (1→0) wakes C.
-	p.Release(held[1])
-	expectNoAccount(t, chC, 200*time.Millisecond, "C waiter at inFlight=1")
-	p.Release(held[2])
-	gotC := waitForAccount(t, chC, 2*time.Second, "C waiter (max=1) after inFlight reached 0")
-	if gotC.Name() != "acc-x" {
-		t.Fatalf("C waiter got %q, want acc-x", gotC.Name())
+	// Further "hi" releases still cannot serve C (its own key is full);
+	// releasing the "lo" holder wakes C.
+	p.Release(heldHi[1])
+	expectNoSlotResult(t, chC, 200*time.Millisecond, "C waiter while lo counter still full")
+	p.Release(heldLo)
+	gotC := waitForSlotResult(t, chC, 2*time.Second, "C waiter (lo) after lo counter freed")
+	if gotC.acc.Name() != "acc-x" {
+		t.Fatalf("C waiter got %q, want acc-x", gotC.acc.Name())
 	}
-	p.Release(gotC)
+	p.Release(gotC.slot)
+	p.Release(heldHi[2])
 }
 
 // TestSelectCancelReleaseRaceNoLostWakeup hammers the real interleaving
@@ -697,149 +707,153 @@ func TestSelectCancelReleaseRaceNoLostWakeup(t *testing.T) {
 	}
 	for i := 0; i < 200; i++ {
 		p := NewPool(cfgs)
-		accX, err := p.Select(context.Background(), 1)
+		_, slotX, err := p.Select(context.Background(), "m", 1)
 		if err != nil {
 			t.Fatalf("iter %d: occupy acc-x: %v", i, err)
 		}
 
 		ctx1, cancel1 := context.WithCancel(context.Background())
-		ch1 := make(chan *Account, 1)
-		ch2 := make(chan *Account, 1)
+		ch1 := make(chan slotResult, 1)
+		ch2 := make(chan slotResult, 1)
 		go1 := make(chan struct{})
 		go2 := make(chan struct{})
 		go func() {
 			<-go1
-			acc, err := p.SelectByProvider(ctx1, 1, "X")
+			acc, slot, err := p.SelectByProvider(ctx1, "m", 1, "X")
 			if err != nil {
-				ch1 <- nil
+				ch1 <- slotResult{}
 				return
 			}
-			ch1 <- acc
+			ch1 <- slotResult{acc: acc, slot: slot}
 		}()
 		go func() {
 			<-go2
-			acc, err := p.SelectByProvider(context.Background(), 1, "X")
+			acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "X")
 			if err != nil {
-				ch2 <- nil
+				ch2 <- slotResult{}
 				return
 			}
-			ch2 <- acc
+			ch2 <- slotResult{acc: acc, slot: slot}
 		}()
 		close(go1)
 		waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "waiter 1 to park")
 		close(go2)
 		waitUntil(t, func() bool { return p.WaitingCount() == 2 }, "waiter 2 to park")
 
-		cancel1()       // waiter 1's select may pick ctx.Done...
-		p.Release(accX) // ...while the release wakes the front-most waiter (1)
+		cancel1()        // waiter 1's select may pick ctx.Done...
+		p.Release(slotX) // ...while the release wakes the front-most waiter (1)
 
-		// Waiter 1 exits either way: bailed (nil) or woken-then-acquired
+		// Waiter 1 exits either way: bailed (zero) or woken-then-acquired
 		// (account; its release cascades the slot to waiter 2).
 		select {
-		case acc := <-ch1:
-			if acc != nil {
-				p.Release(acc)
+		case res := <-ch1:
+			if res.slot != nil {
+				p.Release(res.slot)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("iter %d: waiter 1 never exited", i)
 		}
 		// Waiter 2 must get the slot promptly — no lost wakeup.
 		select {
-		case acc := <-ch2:
-			if acc == nil || acc.Name() != "acc-x" {
-				t.Fatalf("iter %d: waiter 2 got %v, want acc-x", i, acc)
+		case res := <-ch2:
+			if res.acc == nil || res.acc.Name() != "acc-x" {
+				t.Fatalf("iter %d: waiter 2 got %v, want acc-x", i, res.acc)
 			}
-			p.Release(acc)
+			p.Release(res.slot)
 		case <-time.After(2 * time.Second):
 			t.Fatalf("iter %d: waiter 2 starved — wakeup swallowed by the bailing waiter 1", i)
 		}
 	}
 }
 
-// TestReleaseInitialWakeMixedMax is the deterministic mixed-max regression
-// test for the INITIAL Release wakeup (no bailing waiter involved): a
-// max=1 waiter C queues AHEAD of a max=3 waiter B while the account's
-// inFlight is 3. One release brings inFlight to 2 — the band where C is
-// unusable (needs inFlight < 1) and B is usable (needs inFlight < 3). The
-// release MUST skip C and wake B: waking the front-most provider-matching
-// waiter without the capacity check (the old wakeWaiterFor) would let C
+// TestReleaseInitialWakeMixedKey is the deterministic mixed-key regression
+// test for the INITIAL Release wakeup under per-model-key accounting: a
+// "lo" waiter C queues AHEAD of a "hi" waiter B while the "lo" counter is
+// full (one holder) and the "hi" counter is full (three holders). One "hi"
+// release frees room in the "hi" counter only; the release MUST skip C (its
+// own key still has no room) and wake B — waking the front-most
+// provider-matching waiter without the per-key capacity check would let C
 // consume the wakeup, fail to select and re-park at the back while B stays
-// parked until its 60s fallback timer — the mixed-max lost wakeup on the
+// parked until its 60s fallback timer — the mixed-key lost wakeup on the
 // plain Release path. FIFO among the usable set is preserved: B is the
 // first waiter that can use the freed capacity.
-func TestReleaseInitialWakeMixedMax(t *testing.T) {
+func TestReleaseInitialWakeMixedKey(t *testing.T) {
 	cfgs := []config.AccountConfig{
 		{Name: "acc-x", Key: "kx", BaseURL: "http://localhost:8001", Provider: "X"},
 	}
 	p := NewPool(cfgs)
 
-	// Occupy acc-x with three max=3 holders: inFlight = 3, the smallest
-	// value at which a max=3 waiter parks.
-	held := make([]*Account, 0, 3)
+	// Occupy acc-x with three "hi" (max=3) holders plus one "lo" (max=1)
+	// holder: the "hi" counter sits at 3 and the "lo" counter at 1.
+	heldHi := make([]*Slot, 0, 3)
 	for i := 0; i < 3; i++ {
-		acc, err := p.Select(context.Background(), 3)
+		_, slot, err := p.Select(context.Background(), "hi", 3)
 		if err != nil {
-			t.Fatalf("occupy slot %d: %v", i, err)
+			t.Fatalf("occupy hi slot %d: %v", i, err)
 		}
-		held = append(held, acc)
+		heldHi = append(heldHi, slot)
+	}
+	_, heldLo, err := p.Select(context.Background(), "lo", 1)
+	if err != nil {
+		t.Fatalf("occupy lo slot: %v", err)
 	}
 
-	// Real waiters: C (max=1) queues first, B (max=3) second.
-	chC := make(chan *Account, 1)
-	chB := make(chan *Account, 1)
+	// Real waiters: C ("lo") queues first, B ("hi") second.
+	chC := make(chan slotResult, 1)
+	chB := make(chan slotResult, 1)
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 1, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "lo", 1, "X")
 		if err != nil {
-			chC <- nil
+			chC <- slotResult{}
 			return
 		}
-		chC <- acc
+		chC <- slotResult{acc: acc, slot: slot}
 	}()
-	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "C waiter (max=1) to park")
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "C waiter (lo) to park")
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 3, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "hi", 3, "X")
 		if err != nil {
-			chB <- nil
+			chB <- slotResult{}
 			return
 		}
-		chB <- acc
+		chB <- slotResult{acc: acc, slot: slot}
 	}()
-	waitUntil(t, func() bool { return p.WaitingCount() == 2 }, "B waiter (max=3) to park")
+	waitUntil(t, func() bool { return p.WaitingCount() == 2 }, "B waiter (hi) to park")
 
-	// Release one holder: inFlight 3→2, in the band [C.max=1, B.max=3).
-	// The wake scan must pass over C (unusable) and wake B — the first
-	// waiter that can use the freed capacity.
-	p.Release(held[0])
+	// Release one "hi" holder: the "hi" counter drops to 2. The wake scan
+	// must pass over C ("lo" full) and wake B — the first waiter that can
+	// use the freed capacity.
+	p.Release(heldHi[0])
 
-	expectNoAccount(t, chC, 200*time.Millisecond, "C waiter (max=1) after initial release at inFlight=2")
-	got := waitForAccount(t, chB, 2*time.Second, "B waiter (max=3) after initial release")
-	if got.Name() != "acc-x" {
-		t.Fatalf("B waiter got %q, want acc-x", got.Name())
+	expectNoSlotResult(t, chC, 200*time.Millisecond, "C waiter (lo) after hi release")
+	got := waitForSlotResult(t, chB, 2*time.Second, "B waiter (hi) after initial release")
+	if got.acc.Name() != "acc-x" {
+		t.Fatalf("B waiter got %q, want acc-x", got.acc.Name())
 	}
 
-	// Cleanup: B holds one slot (inFlight back to 3). C needs inFlight < 1
-	// to become servable; it is woken only by the final release (1→0).
-	p.Release(held[1]) // 3→2
-	expectNoAccount(t, chC, 200*time.Millisecond, "C waiter at inFlight=2")
-	p.Release(held[2]) // 2→1
-	expectNoAccount(t, chC, 200*time.Millisecond, "C waiter at inFlight=1")
-	p.Release(got) // 1→0
-	gotC := waitForAccount(t, chC, 2*time.Second, "C waiter (max=1) after inFlight reached 0")
-	if gotC.Name() != "acc-x" {
-		t.Fatalf("C waiter got %q, want acc-x", gotC.Name())
+	// Cleanup: B holds one slot ("hi" counter back to 3). C is servable
+	// only once the "lo" counter frees up.
+	p.Release(heldHi[1])
+	expectNoSlotResult(t, chC, 200*time.Millisecond, "C waiter while lo counter still full")
+	p.Release(heldLo) // lo counter 1→0: C becomes servable
+	gotC := waitForSlotResult(t, chC, 2*time.Second, "C waiter (lo) after lo counter freed")
+	if gotC.acc.Name() != "acc-x" {
+		t.Fatalf("C waiter got %q, want acc-x", gotC.acc.Name())
 	}
-	p.Release(gotC)
+	p.Release(gotC.slot)
+	p.Release(got.slot)
+	p.Release(heldHi[2])
 }
 
-// TestMarkHealthyInitialWakeMixedMax is the MarkHealthy companion: an
-// exhausted account with inFlight=2 (probe exhaustion while requests are
-// still in flight) recovers with C (max=1) queued ahead of B (max=3) while
-// the other X account sits at inFlight=3. MarkHealthy makes x2 selectable
-// again, but its 2 in-flight slots can only serve B (needs < 3), not C
-// (needs < 1). The wake must skip the unusable front waiter C and wake B
-// directly — waking C first would burn the wakeup (C re-parks at the back)
-// and strand B until its fallback timer.
-func TestMarkHealthyInitialWakeMixedMax(t *testing.T) {
+// TestMarkHealthyInitialWakeMixedKey is the MarkHealthy companion under
+// per-model-key accounting: every X account has its "lo" counter FULL (C is
+// unusable everywhere) while the "hi" counters are also full (B is unusable
+// on x1; x2 is exhausted). MarkHealthy makes x2 selectable again, but its
+// "mid" counter at 2 can only serve B (needs < 3), not C (needs < 1). The
+// wake must skip the unusable front waiter C and wake B directly — waking
+// C first would burn the wakeup (C re-parks at the back) and strand B
+// until its fallback timer.
+func TestMarkHealthyInitialWakeMixedKey(t *testing.T) {
 	cfgs := []config.AccountConfig{
 		{Name: "x1", Key: "kx1", BaseURL: "http://localhost:8001", Provider: "X"},
 		{Name: "x2", Key: "kx2", BaseURL: "http://localhost:8002", Provider: "X"},
@@ -855,72 +869,86 @@ func TestMarkHealthyInitialWakeMixedMax(t *testing.T) {
 			x2 = acc
 		}
 	}
-	// Occupy x1 to inFlight=3 (three max=3 holders — unusable for both C
-	// and B) and x2 to inFlight=2 (two max=2 holders). Direct TryAcquire
-	// keeps the per-account occupancy deterministic regardless of the
-	// round-robin rotation.
+	// Occupy x1 ("lo" at 1, "hi" at 3) and x2 ("lo" at 1, "mid" at 2).
+	// Direct TryAcquire keeps the per-key occupancy deterministic
+	// regardless of the round-robin rotation.
+	loX1 := x1.TryAcquire("lo", 1)
+	if loX1 == nil {
+		t.Fatal("occupy x1 lo counter")
+	}
+	hiX1 := make([]*Slot, 0, 3)
 	for i := 0; i < 3; i++ {
-		if !x1.TryAcquire(3) {
-			t.Fatalf("occupy x1 slot %d", i)
+		s := x1.TryAcquire("hi", 3)
+		if s == nil {
+			t.Fatalf("occupy x1 hi counter slot %d", i)
 		}
+		hiX1 = append(hiX1, s)
 	}
+	loX2 := x2.TryAcquire("lo", 1)
+	if loX2 == nil {
+		t.Fatal("occupy x2 lo counter")
+	}
+	midX2 := make([]*Slot, 0, 2)
 	for i := 0; i < 2; i++ {
-		if !x2.TryAcquire(2) {
-			t.Fatalf("occupy x2 slot %d", i)
+		s := x2.TryAcquire("mid", 2)
+		if s == nil {
+			t.Fatalf("occupy x2 mid counter slot %d", i)
 		}
+		midX2 = append(midX2, s)
 	}
-	// Simulate a probe marking x2 exhausted while its two requests are
-	// still in flight.
+	// Simulate a probe marking x2 exhausted while its requests are still
+	// in flight.
 	x2.MarkExhausted()
 
-	// C (max=1) parks first, B (max=3) second: x1 is busy at inFlight=3
-	// (too full for either), x2 is exhausted (not selectable).
-	chC := make(chan *Account, 1)
-	chB := make(chan *Account, 1)
+	// C ("lo") parks first, B ("hi") second: x1 has both counters full (C
+	// needs lo < 1, B needs hi < 3) and x2 is exhausted.
+	chC := make(chan slotResult, 1)
+	chB := make(chan slotResult, 1)
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 1, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "lo", 1, "X")
 		if err != nil {
-			chC <- nil
+			chC <- slotResult{}
 			return
 		}
-		chC <- acc
+		chC <- slotResult{acc: acc, slot: slot}
 	}()
-	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "C waiter (max=1) to park")
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "C waiter (lo) to park")
 	go func() {
-		acc, err := p.SelectByProvider(context.Background(), 3, "X")
+		acc, slot, err := p.SelectByProvider(context.Background(), "hi", 3, "X")
 		if err != nil {
-			chB <- nil
+			chB <- slotResult{}
 			return
 		}
-		chB <- acc
+		chB <- slotResult{acc: acc, slot: slot}
 	}()
-	waitUntil(t, func() bool { return p.WaitingCount() == 2 }, "B waiter (max=3) to park")
+	waitUntil(t, func() bool { return p.WaitingCount() == 2 }, "B waiter (hi) to park")
 
-	// Recover x2: inFlight stays 2, in the band [C.max=1, B.max=3) — the
-	// wake scan must skip C (x2: 2<1 false; x1: 3<1 false) and wake B
-	// (x2: 2<3 true).
+	// Recover x2: its "mid" counter sits at 2, in the band [C.max=1,
+	// B.max=3) — the wake scan must skip C (x2 lo counter: 1<1 false; x1 lo
+	// counter: 1<1 false) and wake B (x2 mid counter: 2<3 true).
 	p.MarkHealthy(x2)
 
-	expectNoAccount(t, chC, 200*time.Millisecond, "C waiter (max=1) after MarkHealthy at inFlight=2")
-	got := waitForAccount(t, chB, 2*time.Second, "B waiter (max=3) after MarkHealthy")
-	if got.Name() != "x2" {
-		t.Fatalf("B waiter got %q, want x2", got.Name())
+	expectNoSlotResult(t, chC, 200*time.Millisecond, "C waiter (lo) after MarkHealthy")
+	got := waitForSlotResult(t, chB, 2*time.Second, "B waiter (hi) after MarkHealthy")
+	if got.acc.Name() != "x2" {
+		t.Fatalf("B waiter got %q, want x2", got.acc.Name())
 	}
 
-	// Cleanup: B holds one x2 slot (inFlight(x2) = 2 holders + B = 3). C
-	// needs some X account below 1; x2 reaches 0 only on the final release.
-	p.Release(x2) // 3→2
-	expectNoAccount(t, chC, 200*time.Millisecond, "C waiter at inFlight=2")
-	p.Release(x2) // 2→1
-	expectNoAccount(t, chC, 200*time.Millisecond, "C waiter at inFlight=1")
-	p.Release(x2) // 1→0
-	gotC := waitForAccount(t, chC, 2*time.Second, "C waiter (max=1) after inFlight reached 0")
-	if gotC.Name() != "x2" {
-		t.Fatalf("C waiter got %q, want x2", gotC.Name())
+	// Cleanup: B holds one x2 "hi" slot. C is servable only once some X
+	// account's "lo" counter frees up; x2's "lo" holder is released last.
+	p.Release(midX2[0]) // mid 2→1
+	expectNoSlotResult(t, chC, 200*time.Millisecond, "C waiter while lo counters still full")
+	p.Release(midX2[1]) // mid 1→0
+	expectNoSlotResult(t, chC, 200*time.Millisecond, "C waiter while lo counters still full")
+	p.Release(loX2) // x2 lo 1→0: C becomes servable on x2
+	gotC := waitForSlotResult(t, chC, 2*time.Second, "C waiter (lo) after lo counter freed")
+	if gotC.acc.Name() != "x2" {
+		t.Fatalf("C waiter got %q, want x2", gotC.acc.Name())
 	}
-	p.Release(gotC)
-	// Release the x1 holders so no slot leaks.
-	for i := 0; i < 3; i++ {
-		p.Release(x1)
+	p.Release(gotC.slot)
+	p.Release(got.slot) // B's x2 "hi" slot
+	p.Release(loX1)     // x1 lo holder
+	for _, s := range hiX1 {
+		p.Release(s)
 	}
 }

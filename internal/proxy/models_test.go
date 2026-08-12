@@ -305,10 +305,11 @@ func TestProxyModels_FetchSaturated503(t *testing.T) {
 		MaxConcurrentPerAccount: map[string]int{"*": 1},
 	}
 	p := pool.NewPool(cfg.Accounts)
-	if !p.AllAccounts()[0].TryAcquire(1) {
+	slot0 := p.AllAccounts()[0].TryAcquire("", 1)
+	if slot0 == nil {
 		t.Fatal("test setup: TryAcquire failed")
 	}
-	defer p.AllAccounts()[0].Release()
+	defer p.AllAccounts()[0].Release(slot0)
 	mc := emptyCacheMC(t, p, cfg)
 
 	status, code := getModelsError(t, mc, cfg)
@@ -342,10 +343,11 @@ func TestProxyModels_FetchAcquiredThenSaturated502(t *testing.T) {
 	}
 	p := pool.NewPool(cfg.Accounts)
 	// Occupy a2's single slot so only a1 can be acquired (and then fails).
-	if !p.AllAccounts()[1].TryAcquire(1) {
+	slot1 := p.AllAccounts()[1].TryAcquire("", 1)
+	if slot1 == nil {
 		t.Fatal("test setup: TryAcquire failed")
 	}
-	defer p.AllAccounts()[1].Release()
+	defer p.AllAccounts()[1].Release(slot1)
 	mc := emptyCacheMC(t, p, cfg)
 
 	status, code := getModelsError(t, mc, cfg)

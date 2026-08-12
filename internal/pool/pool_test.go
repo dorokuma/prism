@@ -23,12 +23,12 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 
 	ctx := context.Background()
 	slog.Info("TEST: Selecting acc1")
-	acc1, err := p.Select(ctx, 1)
+	_, slot1, err := p.Select(ctx, "m", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	slog.Info("TEST: Selecting acc2")
-	acc2, err := p.Select(ctx, 1)
+	_, slot2, err := p.Select(ctx, "m", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 
 	go func() {
 		slog.Info("TEST: Goroutine 1 calling Select")
-		acc, err := p.Select(ctx, 1)
+		acc, _, err := p.Select(ctx, "m", 1)
 		slog.Info("TEST: Goroutine 1 Select returned", "account", acc.Name(), "error", err)
 		ch1 <- acc
 		slog.Info("TEST: Goroutine 1 sent to ch1")
@@ -46,7 +46,7 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 
 	go func() {
 		slog.Info("TEST: Goroutine 2 calling Select")
-		acc, err := p.Select(ctx, 1)
+		acc, _, err := p.Select(ctx, "m", 1)
 		slog.Info("TEST: Goroutine 2 Select returned", "account", acc.Name(), "error", err)
 		ch2 <- acc
 		slog.Info("TEST: Goroutine 2 sent to ch2")
@@ -54,8 +54,8 @@ func TestPoolFIFOAndRelease(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	slog.Info("TEST: Releasing acc1 and acc2")
-	p.Release(acc1)
-	p.Release(acc2)
+	p.Release(slot1)
+	p.Release(slot2)
 
 	// 此时两个协程应该都被唤醒并返回
 	var results []*Account
@@ -102,11 +102,11 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 	p := NewPool(cfgs)
 
 	ctx := context.Background()
-	acc1, _ := p.Select(ctx, 1) // occupies the only account
+	_, slot1, _ := p.Select(ctx, "m", 1) // occupies the only account
 
 	accChB := make(chan *Account, 1)
 	go func() {
-		acc, _ := p.Select(ctx, 1)
+		acc, _, _ := p.Select(ctx, "m", 1)
 		accChB <- acc
 	}()
 
@@ -117,7 +117,7 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 
 	errChA := make(chan error, 1)
 	go func() {
-		_, err := p.Select(ctxCancel, 1)
+		_, _, err := p.Select(ctxCancel, "m", 1)
 		errChA <- err
 	}()
 
@@ -132,7 +132,7 @@ func TestPoolCancelAndSignalTransfer(t *testing.T) {
 	}
 
 	// Now release to wake B
-	p.Release(acc1)
+	p.Release(slot1)
 
 	select {
 	case acc := <-accChB:
@@ -156,19 +156,19 @@ func TestPoolMarkHealthyWakeup(t *testing.T) {
 
 	ctx := context.Background()
 	// 占满这两个账号，把 acc-1 变为 Exhausted，acc-2 在长冷却中
-	acc1, _ := p.Select(ctx, 1)
-	acc2, _ := p.Select(ctx, 1)
+	acc1, slot1, _ := p.Select(ctx, "m", 1)
+	acc2, slot2, _ := p.Select(ctx, "m", 1)
 
 	acc1.MarkExhausted()
-	p.Release(acc1) // 此时 acc1 在 Exhausted 状态，不能用于 Select
+	p.Release(slot1) // 此时 acc1 在 Exhausted 状态，不能用于 Select
 
 	acc2.SetCooldown(1 * time.Hour)
-	p.Release(acc2) // 此时 acc2 在 Healthy 状态但在 cooldown，所以可以参与 Select 但需要等待
+	p.Release(slot2) // 此时 acc2 在 Healthy 状态但在 cooldown，所以可以参与 Select 但需要等待
 
 	// 此时启动 Select，因为 acc2 处于健康但 cooldown 中，会阻塞等待它的 cooldown 计时器。
 	accCh := make(chan *Account, 1)
 	go func() {
-		acc, _ := p.Select(ctx, 1)
+		acc, _, _ := p.Select(ctx, "m", 1)
 		accCh <- acc
 	}()
 
@@ -260,12 +260,12 @@ func TestSelectByProviderRoundRobinStrict(t *testing.T) {
 
 	var got []string
 	for i := 0; i < 6; i++ {
-		acc, err := p.SelectByProvider(ctx, 1, "prov")
+		acc, slot, err := p.SelectByProvider(ctx, "m", 1, "prov")
 		if err != nil {
 			t.Fatalf("select %d: %v", i, err)
 		}
 		got = append(got, acc.Name())
-		p.Release(acc)
+		p.Release(slot)
 	}
 	want := []string{"a1", "a2", "a1", "a2", "a1", "a2"}
 	if !slices.Equal(got, want) {
@@ -289,19 +289,19 @@ func TestSelectByProviderCrossProviderIsolation(t *testing.T) {
 
 	var gotA, gotB []string
 	for i := 0; i < 4; i++ {
-		acc, err := p.SelectByProvider(ctx, 1, "provA")
+		acc, slot, err := p.SelectByProvider(ctx, "m", 1, "provA")
 		if err != nil {
 			t.Fatalf("select A %d: %v", i, err)
 		}
 		gotA = append(gotA, acc.Name())
-		p.Release(acc)
+		p.Release(slot)
 
-		acc, err = p.SelectByProvider(ctx, 1, "provB")
+		acc, slot, err = p.SelectByProvider(ctx, "m", 1, "provB")
 		if err != nil {
 			t.Fatalf("select B %d: %v", i, err)
 		}
 		gotB = append(gotB, acc.Name())
-		p.Release(acc)
+		p.Release(slot)
 	}
 	if want := []string{"a1", "a2", "a1", "a2"}; !slices.Equal(gotA, want) {
 		t.Errorf("provider A sequence = %v, want %v", gotA, want)
@@ -327,25 +327,25 @@ func TestSelectByProviderHighTrafficIsolation(t *testing.T) {
 
 	// 100 selections on the high-traffic single-account provider.
 	for i := 0; i < 100; i++ {
-		acc, err := p.SelectByProvider(ctx, 1, "plan")
+		acc, slot, err := p.SelectByProvider(ctx, "m", 1, "plan")
 		if err != nil {
 			t.Fatalf("plan select %d: %v", i, err)
 		}
 		if acc.Name() != "plan-3" {
 			t.Fatalf("plan select %d got %s, want plan-3", i, acc.Name())
 		}
-		p.Release(acc)
+		p.Release(slot)
 	}
 
 	// The low-traffic provider must still rotate strictly 2:2.
 	var got []string
 	for i := 0; i < 4; i++ {
-		acc, err := p.SelectByProvider(ctx, 1, "agentrouter-openai")
+		acc, slot, err := p.SelectByProvider(ctx, "m", 1, "agentrouter-openai")
 		if err != nil {
 			t.Fatalf("agent select %d: %v", i, err)
 		}
 		got = append(got, acc.Name())
-		p.Release(acc)
+		p.Release(slot)
 	}
 	want := []string{"oai-1", "oai-2", "oai-1", "oai-2"}
 	if !slices.Equal(got, want) {
@@ -374,12 +374,12 @@ func TestSelectByProviderCooldownRoundRobin(t *testing.T) {
 
 	var got []string
 	for i := 0; i < 6; i++ {
-		acc, err := p.SelectByProvider(ctx, 1, "prov")
+		acc, slot, err := p.SelectByProvider(ctx, "m", 1, "prov")
 		if err != nil {
 			t.Fatalf("select %d: %v", i, err)
 		}
 		got = append(got, acc.Name())
-		p.Release(acc)
+		p.Release(slot)
 	}
 	want := []string{"c1", "c3", "c1", "c3", "c1", "c3"}
 	if !slices.Equal(got, want) {
@@ -399,12 +399,12 @@ func TestSelectRoundRobinUniform(t *testing.T) {
 
 	var got []string
 	for i := 0; i < 6; i++ {
-		acc, err := p.Select(ctx, 1)
+		acc, slot, err := p.Select(ctx, "m", 1)
 		if err != nil {
 			t.Fatalf("select %d: %v", i, err)
 		}
 		got = append(got, acc.Name())
-		p.Release(acc)
+		p.Release(slot)
 	}
 	want := []string{"acc-1", "acc-2", "acc-1", "acc-2", "acc-1", "acc-2"}
 	if !slices.Equal(got, want) {
@@ -423,10 +423,10 @@ func TestConcurrentLimitN(t *testing.T) {
 	const maxc = 5
 
 	// Acquire maxc slots on the single account.
-	accs := make([]*Account, maxc)
+	slots := make([]*Slot, maxc)
 	for i := 0; i < maxc; i++ {
 		var err error
-		accs[i], err = p.Select(context.Background(), maxc)
+		_, slots[i], err = p.Select(context.Background(), "m", maxc)
 		if err != nil {
 			t.Fatalf("select %d: %v", i, err)
 		}
@@ -435,14 +435,14 @@ func TestConcurrentLimitN(t *testing.T) {
 	// N+1 should fail with timeout (short context).
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, err := p.Select(ctx, maxc)
+	_, _, err := p.Select(ctx, "m", maxc)
 	if err == nil {
 		t.Fatal("expected select to timeout when all slots are full")
 	}
 
 	// Release one, then N+1 should succeed.
-	p.Release(accs[0])
-	accN1, err := p.Select(context.Background(), maxc)
+	p.Release(slots[0])
+	accN1, slotN1, err := p.Select(context.Background(), "m", maxc)
 	if err != nil {
 		t.Fatalf("select after release: %v", err)
 	}
@@ -450,10 +450,10 @@ func TestConcurrentLimitN(t *testing.T) {
 		t.Errorf("expected acc-1, got %s", accN1.Name())
 	}
 	// Cleanup
-	for _, a := range accs[1:] {
-		p.Release(a)
+	for _, s := range slots[1:] {
+		p.Release(s)
 	}
-	p.Release(accN1)
+	p.Release(slotN1)
 }
 
 // TestReleaseWakesWaiter verifies that when maxc slots are full, releasing one
@@ -466,50 +466,49 @@ func TestReleaseWakesWaiterWithConcurrency(t *testing.T) {
 	const maxc = 3
 
 	// Fill all maxc slots.
-	accs := make([]*Account, maxc)
+	slots := make([]*Slot, maxc)
 	for i := 0; i < maxc; i++ {
 		var err error
-		accs[i], err = p.Select(context.Background(), maxc)
+		_, slots[i], err = p.Select(context.Background(), "m", maxc)
 		if err != nil {
 			t.Fatalf("select %d: %v", i, err)
 		}
 	}
 
 	// Start a goroutine that waits for a slot.
-	ch := make(chan *Account, 1)
+	ch := make(chan slotResult, 1)
 	go func() {
-		acc, err := p.Select(context.Background(), maxc)
+		acc, slot, err := p.Select(context.Background(), "m", maxc)
 		if err != nil {
-			t.Errorf("waiter select error: %v", err)
-			ch <- nil
+			ch <- slotResult{}
 			return
 		}
-		ch <- acc
+		ch <- slotResult{acc: acc, slot: slot}
 	}()
 
 	// Give the goroutine time to enter the waiter.
 	time.Sleep(200 * time.Millisecond)
 
 	// Release one slot.
-	p.Release(accs[0])
+	p.Release(slots[0])
 
 	// Waiter should be woken up.
 	select {
-	case acc := <-ch:
-		if acc == nil {
+	case res := <-ch:
+		if res.acc == nil {
 			t.Fatal("waiter got nil account")
 		}
-		if acc.Name() != "acc-1" {
-			t.Errorf("expected acc-1, got %s", acc.Name())
+		if res.acc.Name() != "acc-1" {
+			t.Errorf("expected acc-1, got %s", res.acc.Name())
 		}
-		p.Release(acc)
+		p.Release(res.slot)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout: waiter was not woken up by Release")
 	}
 
 	// Cleanup remaining.
-	for _, a := range accs[1:] {
-		p.Release(a)
+	for _, s := range slots[1:] {
+		p.Release(s)
 	}
 }
 
@@ -528,7 +527,7 @@ func TestTryAcquireStrictMax(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			if acc.TryAcquire(max) {
+			if acc.TryAcquire("m", max) != nil {
 				acquired[idx] = true
 			}
 		}(i)
@@ -556,22 +555,527 @@ func TestTryAcquireStrictMax(t *testing.T) {
 	}
 }
 
-// TestReleaseSafety verifies that double-Release does not underflow inFlight.
+// TestReleaseSafety verifies that double-Release (releasing the same lease
+// twice — a caller bug) does not underflow inFlight.
 func TestReleaseSafety(t *testing.T) {
 	acc := &Account{cfg: config.AccountConfig{Name: "test"}, status: StatusHealthy, client: newHTTPClient()}
 
 	// Acquire one slot
-	if !acc.TryAcquire(1) {
+	slot := acc.TryAcquire("m", 1)
+	if slot == nil {
 		t.Fatal("TryAcquire failed unexpectedly")
 	}
 	if got := acc.InFlightCount(); got != 1 {
 		t.Errorf("inFlight after acquire = %d, want 1", got)
 	}
-	acc.Release() // first release: inFlight goes to 0
-	acc.Release() // second release: should trigger warn and clamp to 0
+	acc.Release(slot) // first release: inFlight goes to 0
+	acc.Release(slot) // second release: should trigger warn and clamp to 0
 
 	if got := acc.InFlightCount(); got != 0 {
 		t.Errorf("inFlight after double release = %d, want 0", got)
+	}
+}
+
+// TestReleaseMismatchedSlotIgnored verifies the lease contract: releasing a
+// slot belonging to another account (or a nil slot) is a caller bug that is
+// warned about and ignored — it must never decrement another account's
+// counters.
+func TestReleaseMismatchedSlotIgnored(t *testing.T) {
+	a1 := &Account{cfg: config.AccountConfig{Name: "a1"}, status: StatusHealthy, client: newHTTPClient()}
+	a2 := &Account{cfg: config.AccountConfig{Name: "a2"}, status: StatusHealthy, client: newHTTPClient()}
+
+	s1 := a1.TryAcquire("m", 1)
+	if s1 == nil {
+		t.Fatal("a1 acquire failed")
+	}
+	s2 := a2.TryAcquire("m", 1)
+	if s2 == nil {
+		t.Fatal("a2 acquire failed")
+	}
+	// Releasing a1's slot on a2 must be ignored (a2 keeps its in-flight).
+	a2.Release(s1)
+	if got := a2.InFlightCount(); got != 1 {
+		t.Errorf("a2 inFlight after mismatched release = %d, want 1", got)
+	}
+	if got := a1.InFlightCount(); got != 1 {
+		t.Errorf("a1 inFlight after mismatched release = %d, want 1 (its slot must stay held)", got)
+	}
+	a2.Release(nil)
+	if got := a2.InFlightCount(); got != 1 {
+		t.Errorf("a2 inFlight after nil release = %d, want 1", got)
+	}
+	a1.Release(s1)
+	a2.Release(s2)
+}
+
+// -------------------------------------------------------------------------
+// Per-model-KEY concurrency — the concurrency domain is the MODEL, not the
+// max VALUE (two models with the same max never share a counter), bounded
+// by an explicit account-wide total cap.
+// -------------------------------------------------------------------------
+
+// TestSameMaxDifferentModelsIsolated is the acceptance test for per-key
+// isolation: two models with the SAME max value (both 2) must not share a
+// counter — the old per-max-value grouping merged them and let one model's
+// traffic starve the other. With per-model keys, model "a" filling its 2
+// slots must NOT block model "b"'s 2 slots (the account total cap 4 admits
+// both).
+func TestSameMaxDifferentModelsIsolated(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+	}
+	p := NewPoolWithTotalCap(cfgs, 4)
+
+	// Fill model "a" to its cap of 2.
+	slotsA := make([]*Slot, 0, 2)
+	for i := 0; i < 2; i++ {
+		acc, slot, err := p.Select(context.Background(), "a", 2)
+		if err != nil {
+			t.Fatalf("occupy a slot %d: %v", i, err)
+		}
+		if acc.Name() != "acc-1" {
+			t.Fatalf("a slot %d got %q, want acc-1", i, acc.Name())
+		}
+		slotsA = append(slotsA, slot)
+	}
+	// A third "a" request must park (a's own counter is full).
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if _, _, err := p.Select(ctx, "a", 2); err == nil {
+		t.Fatal("third a-slot must wait (per-key cap must hold)")
+	}
+
+	// Model "b" (same max 2, DIFFERENT key) must acquire immediately — its
+	// counter is empty even though "a" holds 2. Fill b to its own cap of 2.
+	slotsB := make([]*Slot, 0, 2)
+	for i := 0; i < 2; i++ {
+		accB, slot, err := p.Select(context.Background(), "b", 2)
+		if err != nil {
+			t.Fatalf("b select starved by same-max a traffic: %v (per-max-value grouping would block it)", err)
+		}
+		if accB.Name() != "acc-1" {
+			t.Fatalf("b got %q, want acc-1", accB.Name())
+		}
+		slotsB = append(slotsB, slot)
+	}
+	// Account-wide total is the SUM of both keys (2 + 2), bounded by the
+	// total cap 4.
+	acc := p.AllAccounts()[0]
+	if got := acc.InFlightCount(); got != 4 {
+		t.Fatalf("total in-flight = %d, want 4 (2×a + 2×b)", got)
+	}
+	// A third key "c" must now park: the account total cap (4) is reached
+	// even though c's own counter is empty — the aggregate bound holds.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel2()
+	if _, _, err := p.Select(ctx2, "c", 2); err == nil {
+		t.Fatal("c must wait: account total cap reached (aggregate bound must hold)")
+	}
+
+	// Releasing an "a" slot must not touch b's counter.
+	p.Release(slotsA[0])
+	if got := acc.InFlightForKey("b"); got != 2 {
+		t.Errorf("b in-flight after a release = %d, want 2 (keys must be independent)", got)
+	}
+	if got := acc.InFlightCount(); got != 3 {
+		t.Errorf("total in-flight after a release = %d, want 3", got)
+	}
+
+	// Cleanup.
+	for _, s := range slotsB {
+		p.Release(s)
+	}
+	for _, s := range slotsA[1:] {
+		p.Release(s)
+	}
+	if got := p.AllAccounts()[0].InFlightCount(); got != 0 {
+		t.Fatalf("total in-flight after cleanup = %d, want 0", got)
+	}
+}
+
+// TestDifferentMaxModelsIsolated: a low-max model must never be starved by
+// high-max traffic on the same account — the two models own independent
+// per-key counters (the old single shared counter starved the low-max
+// class). With the total cap set to the sum (10+1), both classes coexist.
+func TestDifferentMaxModelsIsolated(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+	}
+	p := NewPoolWithTotalCap(cfgs, 11)
+
+	// Fill the max=10 model "hi" to its cap.
+	heldHi := make([]*Slot, 0, 10)
+	for i := 0; i < 10; i++ {
+		_, slot, err := p.Select(context.Background(), "hi", 10)
+		if err != nil {
+			t.Fatalf("occupy hi slot %d: %v", i, err)
+		}
+		heldHi = append(heldHi, slot)
+	}
+	if got := p.AllAccounts()[0].InFlightCount(); got != 10 {
+		t.Fatalf("total in-flight = %d, want 10", got)
+	}
+
+	// The max=1 model "lo" must succeed IMMEDIATELY (its own counter is
+	// empty) — 200ms context proves it did not park.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	accLo, slotLo, err := p.Select(ctx, "lo", 1)
+	if err != nil {
+		t.Fatalf("lo select starved by hi traffic: %v (per-key isolation broken)", err)
+	}
+	if accLo.Name() != "acc-1" {
+		t.Fatalf("lo select got %q, want acc-1", accLo.Name())
+	}
+	// Total in-flight is the SUM of both keys (10 + 1).
+	if got := accLo.InFlightCount(); got != 11 {
+		t.Fatalf("total in-flight after mixed acquire = %d, want 11", got)
+	}
+
+	// Releasing a hi slot must not touch the lo counter.
+	p.Release(heldHi[0])
+	if got := accLo.InFlightForKey("lo"); got != 1 {
+		t.Errorf("lo key after hi release = %d, want 1 (keys must be independent)", got)
+	}
+
+	// Cleanup.
+	p.Release(slotLo)
+	for _, s := range heldHi[1:] {
+		p.Release(s)
+	}
+	if got := p.AllAccounts()[0].InFlightCount(); got != 0 {
+		t.Fatalf("total in-flight after cleanup = %d, want 0", got)
+	}
+}
+
+// slotResult carries the account and its lease out of a waiter goroutine.
+type slotResult struct {
+	acc  *Account
+	slot *Slot
+}
+
+// waitForSlotResult waits up to timeout for a slotResult on ch (a failed
+// select delivers a zero slotResult).
+func waitForSlotResult(t *testing.T, ch <-chan slotResult, timeout time.Duration, what string) slotResult {
+	t.Helper()
+	select {
+	case v := <-ch:
+		if v.acc == nil || v.slot == nil {
+			t.Fatalf("%s delivered no slot (select failed)", what)
+		}
+		return v
+	case <-time.After(timeout):
+		t.Fatalf("timeout waiting for %s", what)
+		return slotResult{}
+	}
+}
+
+// expectNoSlotResult asserts that ch delivers nothing within wait.
+func expectNoSlotResult(t *testing.T, ch <-chan slotResult, wait time.Duration, what string) {
+	t.Helper()
+	select {
+	case v := <-ch:
+		t.Fatalf("%s was woken unexpectedly with %q", what, v.acc.Name())
+	case <-time.After(wait):
+	}
+}
+
+// TestAccountTotalCapEnforced: the account-wide aggregate cap is explicit
+// and finite — per-key counters alone would let N configured models stack
+// N×max in-flight on one account. With totalCap=4, two full keys (2+2)
+// exhaust the account; a third key parks even though its own counter is
+// empty, and is served as soon as the total drops below the cap.
+func TestAccountTotalCapEnforced(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+	}
+	p := NewPoolWithTotalCap(cfgs, 4)
+
+	// Two keys each fill 2 of the 4 total slots.
+	slotsA := make([]*Slot, 0, 2)
+	for i := 0; i < 2; i++ {
+		_, slot, err := p.Select(context.Background(), "a", 2)
+		if err != nil {
+			t.Fatalf("occupy a slot %d: %v", i, err)
+		}
+		slotsA = append(slotsA, slot)
+	}
+	slotsB := make([]*Slot, 0, 2)
+	for i := 0; i < 2; i++ {
+		_, slot, err := p.Select(context.Background(), "b", 2)
+		if err != nil {
+			t.Fatalf("occupy b slot %d: %v", i, err)
+		}
+		slotsB = append(slotsB, slot)
+	}
+
+	// A waiter for key "c" parks: its own counter is empty, but the total
+	// cap is reached — the waiter must NOT be woken by an unrelated
+	// capacity event that does not lower the total.
+	ch := make(chan slotResult, 1)
+	go func() {
+		acc, slot, err := p.Select(context.Background(), "c", 2)
+		if err != nil {
+			ch <- slotResult{}
+			return
+		}
+		ch <- slotResult{acc: acc, slot: slot}
+	}()
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "c waiter to park")
+
+	// Releasing a slot of key "a" lowers the total to 3 → the c waiter is
+	// servable (its own counter empty, total 3 < 4) and must be woken.
+	p.Release(slotsA[0])
+	res := waitForSlotResult(t, ch, 2*time.Second, "c waiter after total drops below cap")
+	if res.acc.Name() != "acc-1" {
+		t.Fatalf("c waiter got %q, want acc-1", res.acc.Name())
+	}
+	if v := res.acc.InFlightCount(); v != 4 {
+		t.Fatalf("total in-flight after c acquired = %d, want 4 (back at the cap)", v)
+	}
+
+	// Cleanup: the remaining a/b slots and the c slot.
+	p.Release(res.slot)
+	for _, s := range append(slotsB, slotsA[1:]...) {
+		p.Release(s)
+	}
+	if got := p.AllAccounts()[0].InFlightCount(); got != 0 {
+		t.Fatalf("total in-flight after cleanup = %d, want 0", got)
+	}
+}
+
+// TestTotalCapPerAccountIndependent: the aggregate cap is applied to EACH
+// account independently — two accounts can each hold totalCap in flight.
+func TestTotalCapPerAccountIndependent(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+		{Name: "acc-2", Key: "key-2", BaseURL: "http://localhost:8002"},
+	}
+	p := NewPoolWithTotalCap(cfgs, 4)
+
+	// Fill both accounts to their own cap of 4 (8 total across the pool).
+	held := make([]*Slot, 0, 8)
+	for i := 0; i < 8; i++ {
+		_, slot, err := p.Select(context.Background(), "m", 4)
+		if err != nil {
+			t.Fatalf("occupy slot %d: %v", i, err)
+		}
+		held = append(held, slot)
+	}
+	for _, a := range p.AllAccounts() {
+		if got := a.InFlightCount(); got != 4 {
+			t.Errorf("account %s in-flight = %d, want 4 (per-account cap)", a.Name(), got)
+		}
+	}
+	// The 9th must park (both accounts at their own cap).
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if _, _, err := p.Select(ctx, "m", 4); err == nil {
+		t.Fatal("9th slot must wait (every account at its own total cap)")
+	}
+	for _, s := range held {
+		p.Release(s)
+	}
+}
+
+// TestMixedKeyGroupBoundStillEnforced: per-key isolation must not weaken the
+// cap WITHIN a key — after one "lo" (max=1) slot is taken, a second "lo"
+// request still parks (and fails on a short context) exactly like the
+// ungrouped behavior, and succeeds once the first is released.
+func TestMixedKeyGroupBoundStillEnforced(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+	}
+	p := NewPool(cfgs)
+
+	// Occupy the single "lo" slot while a "hi" (max=10) holder is also in
+	// flight: the two keys coexist.
+	_, holdHi, err := p.Select(context.Background(), "hi", 10)
+	if err != nil {
+		t.Fatalf("occupy hi slot: %v", err)
+	}
+	_, holdLo, err := p.Select(context.Background(), "lo", 1)
+	if err != nil {
+		t.Fatalf("occupy lo slot: %v", err)
+	}
+
+	// Second "lo" request must park (lo counter full) and time out on a
+	// short context.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, _, err := p.Select(ctx, "lo", 1); err == nil {
+		t.Fatal("second lo select must wait (per-key cap must still hold)")
+	}
+
+	// Release the lo slot: a new lo request succeeds immediately.
+	p.Release(holdLo)
+	_, slotLo2, err := p.Select(context.Background(), "lo", 1)
+	if err != nil {
+		t.Fatalf("lo select after release: %v", err)
+	}
+	p.Release(slotLo2)
+	p.Release(holdHi)
+	if got := p.AllAccounts()[0].InFlightCount(); got != 0 {
+		t.Fatalf("total in-flight after cleanup = %d, want 0", got)
+	}
+}
+
+// TestMixedKeyWakeupRespectsKeys: the wake path must apply the same per-key
+// + total gate as TryAcquire. A "lo" waiter parks only when its OWN key is
+// full; a release of the "hi" key must NOT wake it (its key still has no
+// room), and releasing the "lo" holder wakes it.
+func TestMixedKeyWakeupRespectsKeys(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+	}
+	p := NewPool(cfgs)
+
+	// Fill the "hi" key and take the single "lo" slot.
+	heldHi := make([]*Slot, 0, 10)
+	for i := 0; i < 10; i++ {
+		_, slot, err := p.Select(context.Background(), "hi", 10)
+		if err != nil {
+			t.Fatalf("occupy hi slot %d: %v", i, err)
+		}
+		heldHi = append(heldHi, slot)
+	}
+	_, heldLo, err := p.Select(context.Background(), "lo", 1)
+	if err != nil {
+		t.Fatalf("occupy lo slot: %v", err)
+	}
+
+	// A lo waiter parks behind the full lo counter.
+	ch := make(chan slotResult, 1)
+	go func() {
+		acc, slot, err := p.Select(context.Background(), "lo", 1)
+		if err != nil {
+			ch <- slotResult{}
+			return
+		}
+		ch <- slotResult{acc: acc, slot: slot}
+	}()
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "lo waiter to park")
+
+	// Releasing a hi slot must NOT wake it (its own key is still full) —
+	// key isolation in the wake path.
+	p.Release(heldHi[0])
+	expectNoSlotResult(t, ch, 200*time.Millisecond, "lo waiter after hi release")
+
+	// Releasing the lo holder wakes it.
+	p.Release(heldLo)
+	res := waitForSlotResult(t, ch, 2*time.Second, "lo waiter after lo release")
+	p.Release(res.slot)
+
+	for _, s := range heldHi[1:] {
+		p.Release(s)
+	}
+	if got := p.AllAccounts()[0].InFlightCount(); got != 0 {
+		t.Fatalf("total in-flight after cleanup = %d, want 0", got)
+	}
+}
+
+// TestSelectCancelNoSlotLeak: cancelling a parked Select must never leak a
+// concurrency slot — after the cancel the account's in-flight returns to
+// the pre-wait level and a subsequent Select succeeds.
+func TestSelectCancelNoSlotLeak(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+	}
+	p := NewPool(cfgs)
+
+	// Occupy the only slot.
+	_, held, err := p.Select(context.Background(), "m", 1)
+	if err != nil {
+		t.Fatalf("occupy slot: %v", err)
+	}
+
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := p.Select(ctxCancel, "m", 1)
+		done <- err
+	}()
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "waiter to park")
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel select err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for cancelled select")
+	}
+	if got := p.AllAccounts()[0].InFlightCount(); got != 1 {
+		t.Fatalf("in-flight after cancelled wait = %d, want 1 (only the held slot)", got)
+	}
+	p.Release(held)
+	if got := p.AllAccounts()[0].InFlightCount(); got != 0 {
+		t.Fatalf("in-flight after release = %d, want 0", got)
+	}
+}
+
+// TestRetryAcquireReleasePairing simulates the proxy retry loop: every
+// attempt acquires its own lease and releases it before the next attempt —
+// the accounting must return to zero after each release, and repeated
+// acquire/release cycles must not drift (the old Release(max) API could
+// corrupt a counter when the caller passed a wrong max; the lease API makes
+// the pairing exact by construction).
+func TestRetryAcquireReleasePairing(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "acc-1", Key: "key-1", BaseURL: "http://localhost:8001"},
+	}
+	p := NewPoolWithTotalCap(cfgs, 3)
+	acc := p.AllAccounts()[0]
+
+	// Interleave two keys like the retry loop would: acquire m1, release,
+	// acquire m1 again — with the total cap binding at 3.
+	for i := 0; i < 50; i++ {
+		_, s1, err := p.Select(context.Background(), "m1", 2)
+		if err != nil {
+			t.Fatalf("iter %d select m1: %v", i, err)
+		}
+		if got := acc.InFlightCount(); got != 1 {
+			t.Fatalf("iter %d in-flight after m1 acquire = %d, want 1", i, got)
+		}
+		p.Release(s1) // attempt failed → release before the next attempt
+		if got := acc.InFlightCount(); got != 0 {
+			t.Fatalf("iter %d in-flight after m1 release = %d, want 0 (slot must be freed on retry)", i, got)
+		}
+	}
+	// Mixed keys: the total never exceeds the cap and always returns to 0.
+	for i := 0; i < 25; i++ {
+		_, sA, err := p.Select(context.Background(), "a", 2)
+		if err != nil {
+			t.Fatalf("iter %d select a: %v", i, err)
+		}
+		_, sB, err := p.Select(context.Background(), "b", 2)
+		if err != nil {
+			t.Fatalf("iter %d select b: %v", i, err)
+		}
+		_, sC, err := p.Select(context.Background(), "c", 2)
+		if err != nil {
+			t.Fatalf("iter %d select c: %v", i, err)
+		}
+		if got := acc.InFlightCount(); got != 3 {
+			t.Fatalf("iter %d in-flight = %d, want 3 (at the total cap)", i, got)
+		}
+		// A fourth key must park (cap reached), like the retry loop waiting.
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		_, _, err = p.Select(ctx, "d", 2)
+		cancel()
+		if err == nil {
+			t.Fatalf("iter %d: d must wait at the total cap", i)
+		}
+		p.Release(sA)
+		p.Release(sB)
+		p.Release(sC)
+		if got := acc.InFlightCount(); got != 0 {
+			t.Fatalf("iter %d in-flight after cleanup = %d, want 0", i, got)
+		}
+	}
+	if got := acc.TotalRequests(); got != 50+25*3 {
+		t.Fatalf("total requests = %d, want %d (every acquire counted exactly once)", got, int64(50+25*3))
 	}
 }
 

@@ -57,11 +57,11 @@ func TestSelectClientCanceled(t *testing.T) {
 	p := pool.NewPool(cfg.Accounts)
 
 	// Occupy the only slot.
-	acc, err := p.Select(context.Background(), 1)
+	_, slot, err := p.Select(context.Background(), "gpt-4", 1)
 	if err != nil {
 		t.Fatalf("occupy slot: %v", err)
 	}
-	defer p.Release(acc)
+	defer p.Release(slot)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // request already canceled
@@ -122,11 +122,11 @@ func TestSelectTimeoutCode(t *testing.T) {
 	}
 	p := pool.NewPool(cfg.Accounts)
 
-	acc, err := p.Select(context.Background(), 1)
+	_, slot, err := p.Select(context.Background(), "gpt-4", 1)
 	if err != nil {
 		t.Fatalf("occupy slot: %v", err)
 	}
-	defer p.Release(acc)
+	defer p.Release(slot)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))

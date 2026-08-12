@@ -67,6 +67,50 @@ const (
 	defaultBatchFlush  = 200 * time.Millisecond
 )
 
+// lossLogInterval bounds how often a repeated usage-loss signal is logged
+// (queue full, closed recorder, failed batch). Every lost event is ALWAYS
+// counted in usage_events_dropped / usage_write_errors; the log line is the
+// operator-visible signal and must not flood under a sustained failure. It
+// is a var so tests can shorten it (or disable it) without touching
+// production behavior.
+var lossLogInterval = 5 * time.Second
+
+// logThrottle rate-limits a recurring log line: the first call always
+// allows, later calls within lossLogInterval are suppressed. Safe for
+// concurrent use (the Record path runs on request goroutines). The interval
+// is read from the package-level lossLogInterval on every call so tests can
+// inject a different cadence (or disable the throttle with 0).
+type logThrottle struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+func newLogThrottle() *logThrottle {
+	return &logThrottle{}
+}
+
+// allow reports whether a log line may be emitted now.
+func (t *logThrottle) allow() bool {
+	now := time.Now()
+	interval := lossLogInterval
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.last.IsZero() || now.Sub(t.last) >= interval {
+		t.last = now
+		return true
+	}
+	return false
+}
+
+// droppedLogThrottle and flushLogThrottle are the two rate-limited loss
+// channels: event-level drops on the Record path (queue full / not started
+// / closed) and batch-level failures on the writer path (insert error /
+// flush panic).
+var (
+	droppedLogThrottle = newLogThrottle()
+	flushLogThrottle   = newLogThrottle()
+)
+
 // closeFlushTimeout bounds the total time Close spends waiting for the
 // background worker to drain the queue and flush. It is a var so tests can
 // shorten it; production uses 5 seconds.
@@ -191,30 +235,40 @@ func NewRecorder(cfg Config, store Store) *Recorder {
 // Start opens the store, applies migrations and launches the background
 // writer and the retention cleanup loop. It never returns an error: any
 // failure (open, migrate) is logged and counted and the recorder degrades to
-// a no-op so request proxying is never affected.
+// a no-op so request proxying is never affected. The lifecycle state is
+// published to the usage_recorder_status expvar (management observability,
+// audit round 6 item 2).
 func (r *Recorder) Start() {
-	if r == nil || !r.cfg.Enabled {
+	if r == nil {
+		return
+	}
+	if !r.cfg.Enabled {
+		util.RecordUsageRecorderStatus("disabled")
 		return
 	}
 	if r.store == nil {
 		slog.Error("usage: recorder disabled, no store configured")
 		util.RecordUsageWriteErrors()
+		util.RecordUsageRecorderStatus("disabled")
 		r.stopped.Store(true)
 		return
 	}
 	if err := r.store.Open(); err != nil {
 		slog.Error("usage: open store failed, recorder disabled", "error", err, "path", r.cfg.DBPath)
 		util.RecordUsageWriteErrors()
+		util.RecordUsageRecorderStatus("disabled")
 		r.stopped.Store(true)
 		return
 	}
 	if err := r.store.Migrate(r.abortCtx); err != nil {
 		slog.Error("usage: migrate failed, recorder disabled", "error", err, "path", r.cfg.DBPath)
 		util.RecordUsageWriteErrors()
+		util.RecordUsageRecorderStatus("disabled")
 		r.stopped.Store(true)
 		_ = r.store.Close()
 		return
 	}
+	util.RecordUsageRecorderStatus("started")
 	r.started.Store(true)
 	go r.run()
 	go r.cleanupLoop()
@@ -225,6 +279,12 @@ func (r *Recorder) Start() {
 // on HTTP request finalization paths. A nil receiver or a disabled recorder
 // is a no-op. An event recorded after Close is counted as dropped, so
 // shutdown-time loss is always observable.
+//
+// Every drop path emits a RATE-LIMITED warning (at most one line per
+// lossLogInterval per channel): the request side never blocks and never
+// receives the failure (product constraint), but the loss is never silent —
+// the expvar counters usage_events_dropped / usage_write_errors plus the
+// log line make it observable (audit round 6, item 2).
 func (r *Recorder) Record(e Event) {
 	if r == nil || !r.cfg.Enabled {
 		return
@@ -232,18 +292,21 @@ func (r *Recorder) Record(e Event) {
 	if r.stopped.Load() {
 		// Failed to start or already closed: nothing will ever persist this
 		// event. Count it so the loss is observable rather than silent.
+		logDroppedRateLimited("usage: recorder not started or already closed, usage event dropped")
 		util.RecordUsageEventsDropped()
 		return
 	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
+		logDroppedRateLimited("usage: recorder closed, usage event dropped")
 		util.RecordUsageEventsDropped()
 		return
 	}
 	select {
 	case r.ch <- e:
 	default:
+		logDroppedRateLimited("usage: usage event queue full, dropping event")
 		util.RecordUsageEventsDropped()
 	}
 	r.mu.Unlock()
@@ -296,13 +359,13 @@ func (r *Recorder) run() {
 		func() {
 			defer func() {
 				if p := recover(); p != nil {
-					slog.Error("usage: writer flush panic, dropping batch", "panic", p, "events", len(events))
+					logFlushRateLimited("usage: writer flush panic, dropping batch", slog.LevelError, "panic", p, "events", len(events))
 					util.RecordUsageWriteErrors()
 					countDropped(len(events))
 				}
 			}()
 			if err := r.store.InsertBatch(r.abortCtx, events); err != nil {
-				slog.Error("usage: batch insert failed, dropping batch", "error", err, "events", len(events))
+				logFlushRateLimited("usage: batch insert failed, dropping batch", slog.LevelError, "error", err, "events", len(events))
 				util.RecordUsageWriteErrors()
 				countDropped(len(events))
 			}
@@ -461,7 +524,34 @@ func (r *Recorder) Close() {
 		}
 		// Worker exited: its drain loop emptied the channel, so there is
 		// nothing left to count here (see the accounting comment above).
+		util.RecordUsageRecorderStatus("stopped")
 	})
+}
+
+// logDroppedRateLimited emits the rate-limited loss warning for one dropped
+// event on the Record path (queue full / not started / closed). The
+// event-granular accounting (usage_events_dropped) happens at the call
+// site; the log line is emitted at most once per lossLogInterval so a
+// sustained loss cannot flood the log while remaining visible.
+func logDroppedRateLimited(msg string) {
+	if droppedLogThrottle.allow() {
+		slog.Warn(msg)
+	}
+}
+
+// logFlushRateLimited emits the rate-limited loss log for a batch-level
+// failure on the writer path (insert error / flush panic). The batch
+// accounting (write error + per-event dropped) happens at the call site.
+func logFlushRateLimited(msg string, level slog.Level, attrs ...any) {
+	if !flushLogThrottle.allow() {
+		return
+	}
+	switch level {
+	case slog.LevelError:
+		slog.Error(msg, attrs...)
+	default:
+		slog.Warn(msg, attrs...)
+	}
 }
 
 // countDropped records n events as dropped. It is used when a whole batch is

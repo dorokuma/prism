@@ -4,10 +4,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 )
 
-// DebugMode controls whether debug dumps are written.
-var DebugMode bool
+// DebugMode controls whether debug dumps are written. It is an atomic.Bool:
+// the SIGHUP config reload in cmd/prism writes it (Store) while request
+// goroutines read it (Load) on every proxied request — a plain bool would be
+// a data race (audit round 6, item 4).
+var DebugMode atomic.Bool
 
 func initDebugDumpDir() string {
 	dir := filepath.Join(os.TempDir(), "prism-debug")
@@ -17,7 +21,7 @@ func initDebugDumpDir() string {
 
 // DumpDebugChatBody dumps the chat request body to a temp file for debugging.
 func DumpDebugChatBody(chatBody []byte) {
-	if !DebugMode {
+	if !DebugMode.Load() {
 		return
 	}
 	dir := initDebugDumpDir()
@@ -32,7 +36,7 @@ func DumpDebugChatBody(chatBody []byte) {
 
 // DumpDebugResponsesBody dumps the responses body to a temp file for debugging.
 func DumpDebugResponsesBody(originalBody []byte) {
-	if !DebugMode {
+	if !DebugMode.Load() {
 		return
 	}
 	dir := initDebugDumpDir()
@@ -49,7 +53,7 @@ func DumpDebugResponsesBody(originalBody []byte) {
 // auth_header key that does not look like an sk-/Bearer token never lands on
 // disk when an upstream echoes the credential it received.
 func DumpDebugUpstreamResponse(rawBody []byte, extraKeys []string) {
-	if !DebugMode {
+	if !DebugMode.Load() {
 		return
 	}
 	dir := initDebugDumpDir()

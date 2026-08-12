@@ -555,7 +555,13 @@ func (mc *ModelCache) fetchLeader(ctx context.Context, provider string) error {
 	var saturatedErr error // last saturated-candidate error (only returned when NOTHING was acquired)
 	acquired := false
 	for _, account := range accounts {
-		if !account.TryAcquire(maxConcurrent) {
+		// The fetch is not tied to a single business model: it acquires a
+		// slot under the empty concurrency key (""), so it never borrows or
+		// blocks any per-model counter; the account-wide total cap still
+		// bounds it like any other request. The returned *Slot is the only
+		// valid Release argument (it carries the exact account/key/max).
+		slot := account.TryAcquire("", maxConcurrent)
+		if slot == nil {
 			saturatedErr = fmt.Errorf("%w: provider %q account %s saturated (%d in flight)", ErrFetchSaturated, provider, account.Name(), account.InFlightCount())
 			continue
 		}
@@ -564,7 +570,7 @@ func (mc *ModelCache) fetchLeader(ctx context.Context, provider string) error {
 			// Deferred release: covers every normal error path AND a panic
 			// inside fetchFromAccount (defer runs during unwinding), so a
 			// concurrency slot can never leak out of the fetch round.
-			defer mc.pool.Release(account)
+			defer mc.pool.Release(slot)
 			return mc.fetchFromAccount(ctx, account, provider, cfg)
 		}()
 		if err == nil {

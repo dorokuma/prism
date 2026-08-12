@@ -213,7 +213,7 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		// Upstream may stream reasoning_content (e.g. DeepSeek). Codex 0.142.5 expects
 		// response.reasoning_summary_text.delta (not reasoning_summary.delta).
 		if d.ReasoningContent != "" {
-			if util.DebugMode {
+			if util.DebugMode.Load() {
 				slog.Debug("stream reasoning chunk", "req", util.RequestIDFromCtx(ctx), "chars", len(d.ReasoningContent))
 			}
 			if err := tr.appendReasoning(d.ReasoningContent); err != nil {
@@ -233,7 +233,7 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			}
 		}
 		if d.Content != "" {
-			if util.DebugMode {
+			if util.DebugMode.Load() {
 				slog.Debug("stream content chunk", "req", util.RequestIDFromCtx(ctx), "chars", len(d.Content))
 			}
 			tr.hadMessageContent = true
@@ -254,7 +254,7 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			}
 		}
 		if d.Refusal != "" {
-			if util.DebugMode {
+			if util.DebugMode.Load() {
 				slog.Debug("stream refusal chunk", "req", util.RequestIDFromCtx(ctx), "chars", len(d.Refusal))
 			}
 			tr.hadMessageContent = true
@@ -293,13 +293,13 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 				st.namespace = mcp.NamespaceForTool(tc.Function.Name)
 			}
 			if !st.added && st.name != "" {
-				if util.DebugMode {
+				if util.DebugMode.Load() {
 					slog.Debug("stream tool_call", "req", util.RequestIDFromCtx(ctx), "name", st.name, "call_id", st.callID)
 				}
 				// Intercept tool_search for synthetic response
 				if st.name == "tool_search" && len(tr.searchToolCache) > 0 {
 					tr.pendingSearchID = st.itemID
-					if util.DebugMode {
+					if util.DebugMode.Load() {
 						slog.Debug("stream tool_search intercepted", "req", util.RequestIDFromCtx(ctx), "cached_tools", len(tr.searchToolCache))
 					}
 				}
@@ -333,7 +333,7 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 	}
 	if err := sc.Err(); err != nil {
-		if util.DebugMode {
+		if util.DebugMode.Load() {
 			slog.Debug("stream scanner done", "req", util.RequestIDFromCtx(ctx), "error", err)
 		}
 		// A single SSE line over the scanner cap (streamScannerMaxBuf) is a
@@ -413,7 +413,7 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	}
 
 	if !hasSubstantive {
-		if util.DebugMode {
+		if util.DebugMode.Load() {
 			slog.Debug("stream empty upstream, returning ErrEmptyUpstreamStream", "req", util.RequestIDFromCtx(ctx))
 		}
 		return ErrEmptyUpstreamStream
@@ -426,7 +426,7 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 	// Clean EOF (sc.Err() == nil) with content but without a [DONE]
 	// completion event: upstream disconnected before finishing the stream.
 	if !completed {
-		if util.DebugMode {
+		if util.DebugMode.Load() {
 			slog.Debug("stream clean EOF without completion event", "req", util.RequestIDFromCtx(ctx))
 		}
 		// Nothing was delivered yet: the caller returns a real HTTP error
@@ -447,7 +447,7 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		return fmt.Errorf("upstream stream ended without completion event")
 	}
 
-	if util.DebugMode {
+	if util.DebugMode.Load() {
 		slog.Debug("stream ended", "req", util.RequestIDFromCtx(ctx), "had_content", tr.hadMessageContent, "tools", len(tr.tools))
 	}
 
@@ -487,7 +487,7 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 			}); err != nil {
 				return err
 			}
-			if util.DebugMode {
+			if util.DebugMode.Load() {
 				slog.Debug("stream tool_search synthetic result emitted", "req", util.RequestIDFromCtx(ctx), "tools", len(searchTools))
 			}
 			continue

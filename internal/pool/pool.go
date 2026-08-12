@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dorokuma/prism/internal/config"
@@ -28,13 +29,30 @@ type Pool struct {
 	waiters          *list.List
 }
 
+// NewPool builds a pool without an account-wide aggregate concurrency
+// bound (totalCap = 0). Production wiring uses NewPoolWithTotalCap with
+// config.ResolveAccountTotalCap; the bare constructor exists for tests and
+// callers that manage the bound themselves.
 func NewPool(cfgs []config.AccountConfig) *Pool {
+	return newPool(cfgs, 0)
+}
+
+// NewPoolWithTotalCap builds a pool whose every account is bounded by the
+// given account-wide aggregate concurrency cap (across ALL concurrency
+// keys; see Account.totalCap). A non-positive cap means no aggregate bound.
+func NewPoolWithTotalCap(cfgs []config.AccountConfig, totalCap int) *Pool {
+	return newPool(cfgs, totalCap)
+}
+
+func newPool(cfgs []config.AccountConfig, totalCap int) *Pool {
 	accs := make([]*Account, len(cfgs))
 	for i, cfg := range cfgs {
 		accs[i] = &Account{
-			cfg:    cfg,
-			status: StatusHealthy,
-			client: newHTTPClient(),
+			cfg:           cfg,
+			status:        StatusHealthy,
+			client:        newHTTPClient(),
+			totalCap:      totalCap,
+			inFlightByKey: make(map[string]*atomic.Int32),
 		}
 	}
 	// Per-provider account slices preserve the flattened config (YAML) order
@@ -54,16 +72,36 @@ func NewPool(cfgs []config.AccountConfig) *Pool {
 	}
 }
 
-func (p *Pool) Release(a *Account) {
-	a.Release()
+// Release frees the concurrency slot of the given lease and wakes the
+// first queued waiter that can actually use the freed capacity: provider-
+// matched, key-matched AND within its own max and the account total right
+// now. Waking the front waiter without the capacity check would let a
+// front waiter with a too-small max or a different key consume the wakeup
+// and re-park at the back while a later usable waiter stays parked — the
+// mixed-key lost wakeup.
+//
+// The wake scan runs ONLY when the slot was actually released: a nil
+// slot, a duplicate release (the slot's one-shot gate was already
+// consumed) or a release on zero in-flight frees no capacity, so no
+// waiter can be woken — a duplicate release must never trigger a false
+// waiter wakeup (the woken waiter would re-park on capacity that was
+// never freed).
+//
+// s must be the *Slot returned by the acquisition (TryAcquire via Select /
+// SelectByProvider); the slot carries the exact account, key and max, so a
+// mismatched release is impossible.
+func (p *Pool) Release(s *Slot) {
+	if s == nil {
+		return
+	}
+	if !s.acc.Release(s) {
+		// Nothing was actually released: no capacity was freed, so no
+		// waiter can be woken.
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// Wake the first waiter that can actually use the freed capacity:
-	// provider-matched AND within its own max right now. Waking the front
-	// waiter without the capacity check would let a front waiter with a
-	// too-small max consume the wakeup and re-park at the back while a
-	// later usable waiter stays parked — the mixed-max lost wakeup.
-	p.wakeNextUsable(a.Provider())
+	p.wakeNextUsable(s.acc.Provider())
 }
 
 func (p *Pool) MarkHealthy(a *Account) {
@@ -71,7 +109,7 @@ func (p *Pool) MarkHealthy(a *Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// Same capacity-aware scan as Release: the freshly-healthy account
-	// may only serve waiters whose provider/max fit, and waking an
+	// may only serve waiters whose provider/key/max fit, and waking an
 	// unusable front waiter would strand the usable waiter behind it.
 	p.wakeNextUsable(a.Provider())
 }
@@ -99,13 +137,13 @@ func (p *Pool) removeWaiterAndTransfer(elem *list.Element) {
 	// double-wake.
 	//
 	// The transfer is NOT gated on the bailing waiter's own
-	// provider/max: with mixed maxConcurrent values the freed capacity may
-	// be unusable for THIS waiter yet usable for the next one (a max=1
+	// provider/key/max: with mixed maxConcurrent values the freed capacity
+	// may be unusable for THIS waiter yet usable for the next one (a max=1
 	// waiter bailing while inFlight is in [1, maxOfNext) leaves the next
 	// max=N waiter servable). Gating on the bailing waiter's max would
 	// strand that waiter until its fallback timer — the mixed-max lost
 	// wakeup. wakeNextUsable applies each candidate waiter's OWN
-	// provider/max check, so the transfer can never wake a waiter that
+	// provider/key/max check, so the transfer can never wake a waiter that
 	// would immediately re-park.
 	if woken {
 		p.wakeNextUsable(w.provider)
@@ -113,10 +151,12 @@ func (p *Pool) removeWaiterAndTransfer(elem *list.Element) {
 }
 
 // capacityAvailableFor reports whether a waiter with the given provider
-// ("" = any account) and maxConcurrent could currently acquire a slot: some
-// matching account is healthy, out of cooldown, and below its concurrency
-// cap. Must be called with p.mu held.
-func (p *Pool) capacityAvailableFor(provider string, max int) bool {
+// ("" = any account), key and maxConcurrent could currently acquire a slot:
+// some matching account is healthy, out of cooldown, below ITS OWN per-key
+// cap (InFlightForKey(key) < max) AND below the account total cap — exactly
+// the two gates TryAcquire applies, so a woken waiter never immediately
+// re-parks. Must be called with p.mu held.
+func (p *Pool) capacityAvailableFor(provider, key string, max int) bool {
 	for _, acc := range p.accounts {
 		if provider != "" && acc.Provider() != provider {
 			continue
@@ -124,7 +164,7 @@ func (p *Pool) capacityAvailableFor(provider string, max int) bool {
 		if acc.IsInCooldown() || !acc.IsHealthy() {
 			continue
 		}
-		if acc.InFlightCount() < max {
+		if acc.canAcquire(key, max) {
 			return true
 		}
 	}
@@ -133,10 +173,10 @@ func (p *Pool) capacityAvailableFor(provider string, max int) bool {
 
 // wakeNextUsable wakes the front-most queued waiter that can use a slot of
 // the given provider ("" = any provider matches) AND has capacity available
-// for its own provider/max right now — the wakeup must not be spent on a
-// waiter that would immediately re-park. FIFO is preserved within the usable
-// set because the scan starts at the queue front. It is the single wake
-// path for every capacity-freeing event: Release/MarkHealthy (initial
+// for its own provider/key/max right now — the wakeup must not be spent on
+// a waiter that would immediately re-park. FIFO is preserved within the
+// usable set because the scan starts at the queue front. It is the single
+// wake path for every capacity-freeing event: Release/MarkHealthy (initial
 // wakeup after a slot frees or an account recovers) and the cancel-vs-
 // release transfer (removeWaiterAndTransfer). Must be called with p.mu
 // held.
@@ -146,7 +186,7 @@ func (p *Pool) wakeNextUsable(provider string) {
 		if provider != "" && w.provider != "" && w.provider != provider {
 			continue
 		}
-		if !p.capacityAvailableFor(w.provider, w.max) {
+		if !p.capacityAvailableFor(w.provider, w.key, w.max) {
 			continue
 		}
 		p.waiters.Remove(elem)
@@ -156,25 +196,59 @@ func (p *Pool) wakeNextUsable(provider string) {
 	}
 }
 
-func (p *Pool) trySelectLocked(maxConcurrent int) *Account {
-	if len(p.accounts) == 0 {
-		return nil
+// trySelectLocked returns the account+lease for one acquisition on an
+// account of the given provider ("" = any account, using the full-pool
+// cursor), or nil when every candidate account is at capacity. Each
+// provider rotates through its own account slice with its own cursor so
+// one provider's selections never advance or pollute another provider's
+// rotation; the full-pool path keeps its own cursor. A cursor only
+// advances past the account that was actually selected, so skipped
+// (cooldown/busy) accounts fall behind the cursor instead of being
+// re-picked.
+func (p *Pool) trySelectLocked(provider, key string, maxConcurrent int) (*Account, *Slot) {
+	if provider == "" {
+		if len(p.accounts) == 0 {
+			return nil, nil
+		}
+		startIdx := int(p.nextIdx % uint64(len(p.accounts)))
+		for i := 0; i < len(p.accounts); i++ {
+			idx := (startIdx + i) % len(p.accounts)
+			acc := p.accounts[idx]
+			if acc.IsInCooldown() {
+				continue
+			}
+			if acc.IsHealthy() {
+				if s := acc.TryAcquire(key, maxConcurrent); s != nil {
+					// Advance exactly one position per successful selection so
+					// the full-pool rotation stays uniform.
+					p.nextIdx = uint64(idx) + 1
+					return acc, s
+				}
+			}
+		}
+		return nil, nil
 	}
-	startIdx := int(p.nextIdx % uint64(len(p.accounts)))
-	for i := 0; i < len(p.accounts); i++ {
-		idx := (startIdx + i) % len(p.accounts)
-		acc := p.accounts[idx]
+	accs := p.providerAccounts[provider]
+	if len(accs) == 0 {
+		return nil, nil
+	}
+	startIdx := int(p.providerNextIdx[provider] % uint64(len(accs)))
+	for i := 0; i < len(accs); i++ {
+		idx := (startIdx + i) % len(accs)
+		acc := accs[idx]
 		if acc.IsInCooldown() {
 			continue
 		}
-		if acc.IsHealthy() && acc.TryAcquire(maxConcurrent) {
-			// Advance exactly one position per successful selection so the
-			// full-pool rotation stays uniform.
-			p.nextIdx = uint64(idx) + 1
-			return acc
+		if acc.IsHealthy() {
+			if s := acc.TryAcquire(key, maxConcurrent); s != nil {
+				// Land the cursor right after the selected account so the
+				// next selection continues the rotation.
+				p.providerNextIdx[provider] = uint64(idx) + 1
+				return acc, s
+			}
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // AccountCount returns the number of accounts in the pool.
@@ -189,7 +263,32 @@ var ErrNoHealthyAccounts = errors.New("no healthy accounts available")
 // Under normal operation the caller's context (accountSelectTimeout) expires first, so this acts as a fallback.
 var ErrSelectTimeout = errors.New("select account timeout")
 
-func (p *Pool) Select(ctx context.Context, maxConcurrent int) (*Account, error) {
+// Select acquires a concurrency slot for the given key (the model name the
+// caller resolved the max from; "" for model-less fetches) on any account,
+// waiting up to the context / fallback timer when all accounts are busy.
+// It returns the selected account and its *Slot lease; Release(slot) is
+// the only way to free the slot.
+func (p *Pool) Select(ctx context.Context, key string, maxConcurrent int) (*Account, *Slot, error) {
+	return p.selectKeyed(ctx, key, maxConcurrent, "")
+}
+
+// SelectByProvider is like Select but only considers accounts belonging to
+// the given provider. When provider is empty, it falls back to Select (all
+// accounts).
+func (p *Pool) SelectByProvider(ctx context.Context, key string, maxConcurrent int, provider string) (*Account, *Slot, error) {
+	if provider == "" {
+		return p.Select(ctx, key, maxConcurrent)
+	}
+	return p.selectKeyed(ctx, key, maxConcurrent, provider)
+}
+
+// selectKeyed is the single implementation behind Select and
+// SelectByProvider: acquire a slot for (key, max) on an account of the
+// given provider ("" = any), parking in the FIFO wait queue when every
+// candidate account is at capacity. The waiter carries the SAME (provider,
+// key, max) the acquisition used, so the wake scan (wakeNextUsable) applies
+// the identical per-key + total-capacity gates as TryAcquire.
+func (p *Pool) selectKeyed(ctx context.Context, key string, maxConcurrent int, provider string) (*Account, *Slot, error) {
 	timer := time.NewTimer(2 * config.AccountSelectTimeout)
 	defer timer.Stop()
 
@@ -201,6 +300,9 @@ func (p *Pool) Select(ctx context.Context, maxConcurrent int) (*Account, error) 
 
 		p.mu.Lock()
 		for _, acc := range p.accounts {
+			if provider != "" && acc.Provider() != provider {
+				continue
+			}
 			acc.mu.Lock()
 			isHealthy := acc.status == StatusHealthy
 			cooldownUntil := acc.cooldownUntil
@@ -221,18 +323,19 @@ func (p *Pool) Select(ctx context.Context, maxConcurrent int) (*Account, error) 
 
 		if !hasHealthy {
 			p.mu.Unlock()
-			return nil, ErrNoHealthyAccounts
+			return nil, nil, ErrNoHealthyAccounts
 		}
 
-		if acc := p.trySelectLocked(maxConcurrent); acc != nil {
+		if acc, s := p.trySelectLocked(provider, key, maxConcurrent); s != nil {
 			p.mu.Unlock()
-			return acc, nil
+			return acc, s, nil
 		}
 
 		w := &waiter{
 			ch:       make(chan struct{}),
 			active:   true,
-			provider: "",
+			provider: provider,
+			key:      key,
 			max:      maxConcurrent,
 		}
 		elem := p.waiters.PushBack(w)
@@ -262,7 +365,7 @@ func (p *Pool) Select(ctx context.Context, maxConcurrent int) (*Account, error) 
 			if cooldownTimer != nil {
 				cooldownTimer.Stop()
 			}
-			return nil, selectErr
+			return nil, nil, selectErr
 		}
 
 		if !isClosed {
@@ -342,136 +445,4 @@ func (p *Pool) SnapshotStats() PoolSnapshot {
 		s.InFlightSum += int(a.inFlight.Load())
 	}
 	return s
-}
-
-// SelectByProvider is like Select but only considers accounts belonging to the given provider.
-// When provider is empty, it falls back to Select (all accounts).
-func (p *Pool) SelectByProvider(ctx context.Context, maxConcurrent int, provider string) (*Account, error) {
-	if provider == "" {
-		return p.Select(ctx, maxConcurrent)
-	}
-	timer := time.NewTimer(2 * config.AccountSelectTimeout)
-	defer timer.Stop()
-
-	for {
-		hasHealthy := false
-		allHealthyInCooldown := true
-		var minCooldown time.Duration
-		now := time.Now()
-
-		p.mu.Lock()
-		for _, acc := range p.accounts {
-			if acc.Provider() != provider {
-				continue
-			}
-			acc.mu.Lock()
-			isHealthy := acc.status == StatusHealthy
-			cooldownUntil := acc.cooldownUntil
-			acc.mu.Unlock()
-
-			if isHealthy {
-				hasHealthy = true
-				if cooldownUntil.After(now) {
-					remaining := cooldownUntil.Sub(now)
-					if minCooldown == 0 || remaining < minCooldown {
-						minCooldown = remaining
-					}
-				} else {
-					allHealthyInCooldown = false
-				}
-			}
-		}
-
-		if !hasHealthy {
-			p.mu.Unlock()
-			return nil, ErrNoHealthyAccounts
-		}
-
-		if acc := p.trySelectLockedByProvider(maxConcurrent, provider); acc != nil {
-			p.mu.Unlock()
-			return acc, nil
-		}
-
-		w := &waiter{
-			ch:       make(chan struct{}),
-			active:   true,
-			provider: provider,
-			max:      maxConcurrent,
-		}
-		elem := p.waiters.PushBack(w)
-		p.mu.Unlock()
-
-		var cooldownChan <-chan time.Time
-		var cooldownTimer *time.Timer
-		if allHealthyInCooldown && minCooldown > 0 {
-			cooldownTimer = time.NewTimer(minCooldown)
-			cooldownChan = cooldownTimer.C
-		}
-
-		var selectErr error
-		var isClosed bool
-		select {
-		case <-ctx.Done():
-			selectErr = ctx.Err()
-		case <-timer.C:
-			selectErr = ErrSelectTimeout
-		case <-w.ch:
-			isClosed = true
-		case <-cooldownChan:
-		}
-
-		if selectErr != nil {
-			p.removeWaiterAndTransfer(elem)
-			if cooldownTimer != nil {
-				cooldownTimer.Stop()
-			}
-			return nil, selectErr
-		}
-
-		if !isClosed {
-			select {
-			case <-w.ch:
-				isClosed = true
-			default:
-			}
-		}
-
-		if cooldownTimer != nil {
-			cooldownTimer.Stop()
-		}
-
-		if !isClosed {
-			p.removeWaiterAndTransfer(elem)
-		}
-	}
-}
-
-// trySelectLockedByProvider is like trySelectLocked but only considers the
-// accounts of the given provider, rotating through that provider's own
-// account subset with its own cursor so one provider's selections never
-// advance or pollute another provider's rotation.
-func (p *Pool) trySelectLockedByProvider(maxConcurrent int, provider string) *Account {
-	if provider == "" {
-		return p.trySelectLocked(maxConcurrent)
-	}
-	accs := p.providerAccounts[provider]
-	if len(accs) == 0 {
-		return nil
-	}
-	startIdx := int(p.providerNextIdx[provider] % uint64(len(accs)))
-	for i := 0; i < len(accs); i++ {
-		idx := (startIdx + i) % len(accs)
-		acc := accs[idx]
-		if acc.IsInCooldown() {
-			continue
-		}
-		if acc.IsHealthy() && acc.TryAcquire(maxConcurrent) {
-			// Land the cursor right after the selected account so the next
-			// selection continues the rotation; skipped (cooldown/busy)
-			// accounts fall behind the cursor instead of being re-picked.
-			p.providerNextIdx[provider] = uint64(idx) + 1
-			return acc
-		}
-	}
-	return nil
 }

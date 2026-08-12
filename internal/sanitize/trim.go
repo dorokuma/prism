@@ -23,20 +23,20 @@ func StripCodexUpstreamBloat(system string) string {
 	s = reSkillsBlock.ReplaceAllString(s, "")
 	s = rePermsBlock.ReplaceAllString(s, "")
 	s = strings.TrimSpace(s)
-	if util.DebugMode {
+	if util.DebugMode.Load() {
 		if len(s) != origLen {
 			slog.Debug("strip bloat removed", "before", origLen, "after", len(s))
 		}
 	}
 	if s == "" {
-		if util.DebugMode {
+		if util.DebugMode.Load() {
 			slog.Debug("strip empty system prompt after bloat removal, replacing with default")
 		}
 		return "You are a helpful coding assistant."
 	}
 	if utf8.RuneCountInString(s) > config.SystemPromptMaxRunes {
 		// Truncate to systemPromptMaxRunes runes, preserving complete UTF-8 characters
-		if util.DebugMode {
+		if util.DebugMode.Load() {
 			slog.Debug("strip truncating system prompt", "from_runes", utf8.RuneCountInString(s), "to_runes", config.SystemPromptMaxRunes)
 		}
 		runes := []rune(s)

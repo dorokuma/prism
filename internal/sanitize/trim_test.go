@@ -179,9 +179,9 @@ func TestStripCodexUpstreamBloat_DebugLogging(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(oldDefault)
 
-	oldDebug := util.DebugMode
-	util.DebugMode = true
-	defer func() { util.DebugMode = oldDebug }()
+	oldDebug := util.DebugMode.Load()
+	util.DebugMode.Store(true)
+	defer func() { util.DebugMode.Store(oldDebug) }()
 
 	_ = StripCodexUpstreamBloat("Some system prompt.")
 
