@@ -1,18 +1,16 @@
 package usage
 
 import (
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/dorokuma/prism/internal/middleware"
+	"github.com/dorokuma/prism/internal/adminauth"
 	"github.com/dorokuma/prism/internal/util"
 )
 
@@ -48,7 +46,7 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if !h.authorized(r) {
+	if !adminauth.Authorized(r) {
 		util.WriteJSON(w, http.StatusUnauthorized, map[string]any{
 			"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
 		})
@@ -135,54 +133,6 @@ func writeSummaryError(w http.ResponseWriter, err error) {
 	util.WriteJSON(w, http.StatusBadRequest, map[string]any{
 		"error": map[string]any{"message": err.Error(), "code": "bad_request"},
 	})
-}
-
-// adminTokenPadLen is the fixed pad length for the admin-token comparison,
-// mirroring the business-key auth pad (middleware.authPadLen = 256) so both
-// auth paths use the same constant-time discipline. A token longer than the
-// pad cannot be compared without truncation (a prefix match could pass), so
-// it is rejected outright.
-const adminTokenPadLen = 256
-
-// authorized decides admin access. Fail-closed: a configured
-// PRISM_ADMIN_TOKEN means loopback is NOT trusted and every request must
-// present the correct Bearer token. The token is re-read from the
-// environment on every call, so a rotation takes effect without a restart
-// (identical to the /metrics METRICS_TOKEN behavior). Loopback is decided by
-// middleware.IsLocalhost — the same single implementation the business auth
-// and /metrics paths use (any 127.0.0.0/8 or ::1 address); there is no
-// second, divergent loopback check here. Only when the token is unset does
-// the loopback shortcut apply, and even then only for DIRECT local
-// requests: a same-machine reverse proxy also presents a loopback RemoteAddr
-// but adds X-Forwarded-For / X-Real-IP / Forwarded, so a loopback request
-// carrying a forwarding header is denied (mirrors the /metrics rule). An
-// unset PRISM_ADMIN_TOKEN means remote access is denied entirely.
-func (h *SummaryHandler) authorized(r *http.Request) bool {
-	token := os.Getenv("PRISM_ADMIN_TOKEN")
-	if token != "" {
-		// Shared Bearer semantics with the business auth path
-		// (middleware.SplitBearerToken): case-insensitive scheme, token bytes
-		// returned verbatim (never trimmed or folded), and an empty or
-		// whitespace-only credential rejected outright — "Bearer  token"
-		// (double space) is a different token, not a trimmed "token".
-		got, ok := middleware.SplitBearerToken(r.Header.Get("Authorization"))
-		if !ok {
-			return false
-		}
-		// Fixed-length pad comparison, identical to middleware.Authenticate:
-		// unequal lengths must not short-circuit the comparison and leak the
-		// expected length via timing. Length-based rejection leaks only the
-		// input's own length class, never anything about the configured token.
-		if len(got) > adminTokenPadLen || len(token) > adminTokenPadLen {
-			return false
-		}
-		pb := make([]byte, adminTokenPadLen)
-		eb := make([]byte, adminTokenPadLen)
-		copy(pb, got)
-		copy(eb, token)
-		return subtle.ConstantTimeCompare(pb, eb) == 1
-	}
-	return middleware.IsLocalhost(r) && !middleware.HasForwardedHeaders(r)
 }
 
 // parseSummaryQuery reads and validates the query parameters. All validation

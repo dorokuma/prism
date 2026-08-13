@@ -186,6 +186,24 @@ model_remap:
 #   batch_flush_ms: 200
 #   default_key_id: anonymous
 
+# ---------------------------------------------------------------------------
+# 可选：quota —— 上游套餐用量快照（当前：OpenCode Go 的 5h / 周 / 月窗口）。
+# 和上面的 usage 不是一层：usage 是本地 token 账本，quota 是官方限额百分比。
+# 关掉 usage.enabled 不影响 quota。
+#
+#   enabled:           缺省 true。显式 false 关闭 poller，GET /admin/quota 返回 503。
+#   refresh_interval:  后台刷新间隔，默认 120s，下限 30s。
+#   request_timeout:   单次上游超时，默认 5s。
+#
+#   查询：prism quota    或    GET /admin/quota
+#   鉴权与 /admin/usage/summary 相同（PRISM_ADMIN_TOKEN）。
+#   响应里的 ~usd 是按文档额度（$12 / $30 / $60）用整数 percent 估算，不是账单。
+# ---------------------------------------------------------------------------
+# quota:
+#   enabled: true
+#   refresh_interval: 120s
+#   request_timeout: 5s
+
 accounts:
   # name 规则（LoadConfig 强制，setup 交互同规则）：非空、唯一、以 ASCII
   # 字母/数字开头，仅允许 A-Z a-z 0-9 _ -，最长 64 字节（名称用于

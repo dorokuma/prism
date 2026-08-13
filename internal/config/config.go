@@ -93,6 +93,36 @@ type UsageConfig struct {
 	retentionDaysSet bool
 }
 
+// QuotaConfig is the yaml `quota` section: upstream plan-window snapshots
+// (OpenCode Go rolling/weekly/monthly). Independent of UsageConfig.
+//
+// enabled defaults to true when the field is absent. refresh_interval
+// defaults to 120s (minimum 30s). request_timeout defaults to 5s.
+type QuotaConfig struct {
+	Enabled         bool          `yaml:"enabled"`
+	RefreshInterval time.Duration `yaml:"refresh_interval"`
+	RequestTimeout  time.Duration `yaml:"request_timeout"`
+	enabledSet      bool
+}
+
+// UnmarshalYAML records whether enabled was explicitly present so LoadConfig
+// can tell "user set false" from "section missing".
+func (q *QuotaConfig) UnmarshalYAML(value *yaml.Node) error {
+	type plain QuotaConfig
+	if err := value.Decode((*plain)(q)); err != nil {
+		return err
+	}
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "enabled" {
+				q.enabledSet = true
+				break
+			}
+		}
+	}
+	return nil
+}
+
 // UnmarshalYAML decodes the usage section and remembers whether
 // retention_days was explicitly present, so LoadConfig can tell "user
 // configured 0" apart from "user did not configure the field".
@@ -244,6 +274,10 @@ type Config struct {
 	// Usage is the optional token-usage recording section (see UsageConfig).
 	Usage UsageConfig `yaml:"usage"`
 
+	// Quota is upstream plan-usage snapshots (see QuotaConfig). Independent
+	// of Usage: disabling local token recording does not disable quota.
+	Quota QuotaConfig `yaml:"quota"`
+
 	// providerSchema maps a provider name to its effort schema ("ollama" or
 	// empty for opencode). Precomputed from account base_url hosts at load time.
 	providerSchema map[string]string
@@ -337,6 +371,22 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Usage.DefaultKeyID == "" {
 		cfg.Usage.DefaultKeyID = "anonymous"
+	}
+	// Quota defaults. enabled defaults to true when the key is absent so a
+	// deployment with an opencode-go account starts reporting plan windows
+	// without extra YAML. Explicit enabled: false stays off.
+	if !cfg.Quota.enabledSet {
+		cfg.Quota.Enabled = true
+	}
+	if cfg.Quota.RefreshInterval == 0 {
+		cfg.Quota.RefreshInterval = 120 * time.Second
+	}
+	if cfg.Quota.RefreshInterval < 30*time.Second {
+		slog.Warn("quota.refresh_interval too small, falling back to 30s", "refresh_interval", cfg.Quota.RefreshInterval)
+		cfg.Quota.RefreshInterval = 30 * time.Second
+	}
+	if cfg.Quota.RequestTimeout == 0 {
+		cfg.Quota.RequestTimeout = 5 * time.Second
 	}
 	if _, err := ParseWireAPIMode(cfg.WireAPI); err != nil {
 		return nil, err

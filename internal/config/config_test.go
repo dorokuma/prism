@@ -2701,3 +2701,41 @@ accounts:
 		}
 	})
 }
+
+func TestLoadConfig_QuotaDefaultsAndExplicitOff(t *testing.T) {
+	cfg, err := loadConfigFrom(t, `
+accounts:
+  - name: go-1
+    key: test-key-12345
+    base_url: https://opencode.ai/zen/go/v1
+    provider: opencode-go
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Quota.Enabled {
+		t.Fatal("quota.enabled default = false, want true")
+	}
+	if cfg.Quota.RefreshInterval != 120*time.Second {
+		t.Fatalf("refresh_interval = %v, want 120s", cfg.Quota.RefreshInterval)
+	}
+	if cfg.Quota.RequestTimeout != 5*time.Second {
+		t.Fatalf("request_timeout = %v, want 5s", cfg.Quota.RequestTimeout)
+	}
+
+	off, err := loadConfigFrom(t, `
+quota:
+  enabled: false
+accounts:
+  - name: go-1
+    key: test-key-12345
+    base_url: https://opencode.ai/zen/go/v1
+    provider: opencode-go
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.Quota.Enabled {
+		t.Fatal("explicit quota.enabled: false must stay false")
+	}
+}

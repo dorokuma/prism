@@ -14,10 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dorokuma/prism/internal/adminauth"
 	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/mcp"
 	"github.com/dorokuma/prism/internal/middleware"
+	"github.com/dorokuma/prism/internal/planusage"
 	"github.com/dorokuma/prism/internal/pool"
 	"github.com/dorokuma/prism/internal/proxy"
 	"github.com/dorokuma/prism/internal/ratelimit"
@@ -205,7 +207,7 @@ func validateEnvTokenLengths() error {
 // /admin/usage/summary admin endpoint, the global api_keys auth gate and the
 // proxy dispatch. Extracted from main so tests can exercise the wiring
 // invariant that usage degradation never breaks /v1 forwarding.
-func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *ratelimit.RateLimiter, trustedProxies []*net.IPNet, summaryHandler http.Handler) http.Handler {
+func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *ratelimit.RateLimiter, trustedProxies []*net.IPNet, summaryHandler http.Handler, quotaHandler http.Handler) http.Handler {
 	return middleware.RequestIDMiddleware(ratelimit.RateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" {
 			token := os.Getenv("METRICS_TOKEN")
@@ -234,6 +236,22 @@ func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *
 		// mirroring the /metrics precedent.
 		if r.URL.Path == "/admin/usage/summary" {
 			summaryHandler.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/admin/quota" {
+			if !adminauth.Authorized(r) {
+				util.WriteJSON(w, http.StatusUnauthorized, map[string]any{
+					"error": map[string]any{"message": "unauthorized", "code": "unauthorized"},
+				})
+				return
+			}
+			if quotaHandler == nil {
+				util.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
+					"error": map[string]any{"message": "quota unavailable", "code": "quota_unavailable"},
+				})
+				return
+			}
+			quotaHandler.ServeHTTP(w, r)
 			return
 		}
 		curCfg := holder.Load()
@@ -285,6 +303,14 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "usage" {
 		if err := runUsage(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "usage 失败: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "quota" {
+		if err := runQuota(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "quota 失败: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -419,6 +445,17 @@ func main() {
 	}
 	summaryHandler := usage.NewSummaryHandler(usageStore)
 
+	quotaCache := planusage.NewCache()
+	quotaPoller := planusage.NewPoller(planusage.DefaultFetchers(), quotaCache, cfg.Quota.RefreshInterval, cfg.Quota.RequestTimeout)
+	var quotaViews []planusage.AccountView
+	for _, a := range p.AllAccounts() {
+		quotaViews = append(quotaViews, a)
+	}
+	quotaPoller.SetAccounts(quotaViews)
+	quotaPoller.SetOptions(cfg.Quota.Enabled, cfg.Quota.RefreshInterval, cfg.Quota.RequestTimeout)
+	quotaPoller.Start()
+	quotaHandler := planusage.NewHandler(quotaCache, quotaPoller.Enabled)
+
 	metricCtx, metricCancel := context.WithCancel(context.Background())
 
 	// Rate limiter: 60 req/s per IP with burst of 100
@@ -470,7 +507,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           newHTTPHandler(holder, proxyHandler, rl, trustedProxies, summaryHandler),
+		Handler:           newHTTPHandler(holder, proxyHandler, rl, trustedProxies, summaryHandler, quotaHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -500,6 +537,7 @@ func main() {
 					// newHTTPHandler reads the holder live, so the fallback
 					// must follow or the two paths would drift until restart.
 					middleware.SetUsageDefaultKeyID(newCfg.Usage.DefaultKeyID)
+					quotaPoller.SetOptions(newCfg.Quota.Enabled, newCfg.Quota.RefreshInterval, newCfg.Quota.RequestTimeout)
 				}
 				// Always reload MCP tools from current config (new or old).
 				curCfg := holder.Load()
@@ -520,6 +558,7 @@ func main() {
 			slog.Info("shutting down", "signal", sig.String())
 			close(stop)
 			mc.Stop()
+			quotaPoller.Stop()
 			metricCancel()
 			mcp.StopMCPCache()
 			// Graceful shutdown order: stop the HTTP server first and wait for

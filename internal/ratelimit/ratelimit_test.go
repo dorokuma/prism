@@ -34,7 +34,7 @@ func TestRateLimitMiddleware_HealthExempt(t *testing.T) {
 	}
 
 	// Every other path stays limited (the exemption must not widen).
-	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/models", "/metrics", "/admin/usage/summary"} {
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/models", "/metrics", "/admin/usage/summary", "/admin/quota"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusTooManyRequests {
