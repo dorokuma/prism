@@ -95,7 +95,7 @@ type streamToolState struct {
 	callID      string
 	name        string
 	namespace   string
-	args        string
+	args        strings.Builder
 	added       bool
 	outputIndex int
 }
@@ -186,15 +186,17 @@ func (tr *responsesStreamTranslator) appendReasoning(s string) error {
 
 // appendToolArgs accumulates one arguments delta into a tool call's args,
 // failing with ErrResponsesStreamTooLarge when the per-buffer cap or the
-// total cap would be exceeded.
+// total cap would be exceeded. args is a strings.Builder (like textBuf and
+// reasoningBuf) so accumulating many small SSE fragments stays O(n) instead
+// of O(n²) string re-concatenation.
 func (tr *responsesStreamTranslator) appendToolArgs(st *streamToolState, s string) error {
-	if len(st.args)+len(s) > tr.maxAccumulated {
+	if st.args.Len()+len(s) > tr.maxAccumulated {
 		return fmt.Errorf("%w (tool call arguments buffer)", ErrResponsesStreamTooLarge)
 	}
 	if err := tr.checkTotal(len(s)); err != nil {
 		return err
 	}
-	st.args += s
+	st.args.WriteString(s)
 	return nil
 }
 

@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.20.0  Date: 2026-08-13  Status: living document
+> Version: v0.20.1  Date: 2026-08-13  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -189,6 +189,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-13** — v0.20.1 — fix: harden response content and stream arguments. Responses-to-Chat conversion now rejects image content in BOTH message-content shapes — the array form (`content: [{type: image_url|input_image|input_file}, ...]`) and the single-object form (`content: {type: image_url|input_image|input_file}`) — instead of silently converting them to text through the normalize path; single-object text content (`input_text`/`output_text`) is not misclassified (regression test: table-driven `TestResponsesToChat_ImageContentRejected`). The streaming Responses translation accumulates tool-call argument deltas in a `strings.Builder` (like the text/reasoning buffers) instead of repeated string re-concatenation, so thousands of small SSE fragments accumulate in O(n) overall and the final `function_call` `output_item.done` carries the COMPLETE concatenation, never truncated (regression test: `TestTranslateStream_ToolArgsManyFragments`, 2000 fragments / 8 KiB).
 
 - **2026-08-13** — v0.20.0 — fix: audit hardening. SIGHUP reload validates `api_keys` against the running listen address (a public bind cannot drop keys by rewriting listen to loopback) and keeps the in-process listen value so `SyncTools` cannot publish a port the process is not bound to. Client `Api-Key` / `X-Goog-Api-Key` are stripped like other credential headers; the upstream credential is always the selected account key via `ApplyAuthHeader`. A 403 with a recognized permanent credential/quota envelope fails over like 401; a bare 403 still passes through. Mixed cooldown + full slots wake on the nearest cooldown instead of waiting out select timeout. Runtime `MarkExhaustedWithClass` records quota vs credential; a `/v1/models` 200 no longer revives quota-exhausted accounts; probe classification matches runtime and is capped at 10 concurrent probes. Empty Responses streams with `finish_reason`/`[DONE]` are legal completions. Reasoning `summary` arrays round-trip. MCP same-name tools replace the cached snapshot. `models.json` parse errors abort instead of wiping non-Prism providers; existing `apiKey` values are preserved; TLS writes `https://`; ollama `/api/show` uses a short separate budget and still persists `/v1/models` on show timeout. HTTP listen no longer waits for the startup probe wave; `TimeoutStopSec` is 45s. Plan-quota fetch uses the account auth header; unauthorized polls clear windows; debug dumps refuse symlink clobber; `WriteJSON` marshals before writing the status.
 

@@ -170,6 +170,45 @@ func TestResponsesToChat_InputImageRejected(t *testing.T) {
 	}
 }
 
+// TestResponsesToChat_ImageContentRejected is a table-driven guard that
+// image parts in message content are EXPLICITLY rejected whether they come
+// as an array of parts (content: [{...}]) or as a single object
+// (content: {type: image_url|input_image|input_file}) — never silently
+// converted to text by the normalize path. Normal single-object text content
+// (input_text/output_text) must NOT be misclassified as an image.
+func TestResponsesToChat_ImageContentRejected(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string // JSON value for the message "content" field
+		wantErr bool
+	}{
+		{"array image_url", `[{"type":"image_url","image_url":"https://example.com/img.png"}]`, true},
+		{"array input_image", `[{"type":"input_image","image_url":"https://example.com/img.png"}]`, true},
+		{"array input_file", `[{"type":"input_file","file_id":"file_1"}]`, true},
+		{"single object image_url", `{"type":"image_url","image_url":"https://example.com/img.png"}`, true},
+		{"single object input_image", `{"type":"input_image","image_url":"https://example.com/img.png"}`, true},
+		{"single object input_file", `{"type":"input_file","file_id":"file_1"}`, true},
+		{"single object input_text", `{"type":"input_text","text":"hi"}`, false},
+		{"single object output_text", `{"type":"output_text","text":"hi"}`, false},
+		{"string content", `"plain text"`, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{
+				"model": "deepseek-v4-pro",
+				"input": [{"type":"message","role":"user","content":` + tc.content + `}]
+			}`)
+			_, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
+			if tc.wantErr && err == nil {
+				t.Fatal("expected image content to be rejected, got nil error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error for non-image content: %v", err)
+			}
+		})
+	}
+}
+
 func TestResponsesToChat_TextOnlyOK(t *testing.T) {
 	// Pure text content ([]any with text parts) should succeed without error.
 	body := []byte(`{

@@ -500,7 +500,7 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		}
 		item := map[string]any{
 			"type": "function_call", "id": st.itemID, "call_id": st.callID,
-			"name": st.name, "arguments": st.args, "status": "completed",
+			"name": st.name, "arguments": st.args.String(), "status": "completed",
 		}
 		if st.namespace != "" {
 			item["namespace"] = st.namespace

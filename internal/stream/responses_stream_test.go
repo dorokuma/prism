@@ -305,6 +305,64 @@ data: [DONE]
 	}
 }
 
+// TestTranslateStream_ToolArgsManyFragments pins the many-small-fragments
+// path for tool call arguments: thousands of tiny SSE deltas accumulate into
+// ONE arguments buffer. The accumulation must be O(n) overall (the args
+// buffer is a strings.Builder like textBuf/reasoningBuf — not repeated
+// string re-concatenation) and the final function_call output_item.done must
+// carry the COMPLETE concatenation: no truncation, no error, same observable
+// output as a single-chunk arguments payload.
+func TestTranslateStream_ToolArgsManyFragments(t *testing.T) {
+	const fragmentCount = 2000 // each fragment is 4 bytes -> 8 KiB total
+
+	var input strings.Builder
+	input.WriteString(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec","arguments":"{\"a\":\""}}]}}]}
+
+`)
+	for i := 0; i < fragmentCount; i++ {
+		fmt.Fprintf(&input, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"%04d\"}}]}}]}\n\n", i)
+	}
+	input.WriteString(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"}"}}]}}]}
+
+`)
+	input.WriteString("data: [DONE]\n\n")
+
+	rec := httptest.NewRecorder()
+	if err := TranslateChatStreamToResponses(rec, strings.NewReader(input.String()), "gpt-5.5", nil, nil, context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) != 4 {
+		t.Fatalf("expected 4 events, got %d", len(events))
+	}
+
+	var got string
+	foundDone := false
+	for _, ev := range events {
+		if ev.Type == "response.output_item.done" {
+			itemType := getStringField(t, ev.Raw, "item", "type")
+			if itemType == "function_call" {
+				foundDone = true
+				got = getStringField(t, ev.Raw, "item", "arguments")
+			}
+		}
+	}
+	if !foundDone {
+		t.Fatal("expected function_call output_item.done")
+	}
+
+	var want strings.Builder
+	want.WriteString(`{"a":"`)
+	for i := 0; i < fragmentCount; i++ {
+		fmt.Fprintf(&want, "%04d", i)
+	}
+	want.WriteString(`"}`)
+	if got != want.String() {
+		t.Errorf("accumulated arguments = %d bytes, want %d bytes (complete concatenation)", len(got), want.Len())
+	}
+}
+
 func TestTranslateStream_ToolSearchInterception(t *testing.T) {
 	// Simulate cached MCP tools
 	cachedTools := []map[string]any{

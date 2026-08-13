@@ -248,11 +248,17 @@ func flattenResponseContentParts(parts []map[string]any) any {
 
 // hasImagePart checks whether a message content contains image parts
 // (image_url, input_image, or input_file) that would be silently dropped
-// by flattenMessageContent in the normalize path.
+// by flattenMessageContent in the normalize path. It covers both the array
+// form (content: [{...}, ...]) and the single-object form
+// (content: {type: image_url|input_image|input_file}), which must be
+// rejected like the array form instead of being silently converted to text.
 func hasImagePart(content any) bool {
 	switch v := content.(type) {
 	case string, nil:
 		return false
+	case map[string]any:
+		typ, _ := v["type"].(string)
+		return typ == "image_url" || typ == "input_image" || typ == "input_file"
 	case []any:
 		for _, part := range v {
 			m, ok := part.(map[string]any)
