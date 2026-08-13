@@ -170,12 +170,19 @@ func probeExhaustedAccount(pool *Pool, acc *Account) {
 			}
 
 			if statusCode == 200 {
-				// /v1/models 200 does not mean chat quota recovered.
-				// PermanentQuota stays exhausted until a later window
-				// or a manual MarkHealthy. Permanent credential (and
-				// unspecified MarkExhausted) may revive on 200.
+				// /v1/models 200 does not by itself mean chat quota
+				// recovered. PermanentQuota revives only after
+				// config.QuotaReviveAfter since exhaustedAt.
+				// Permanent credential (and unspecified MarkExhausted)
+				// may revive on 200 immediately.
 				if acc.LastExhaustClass() == ExhaustPermanentQuota {
-					slog.Info("probe 200 ignored for quota-exhausted account", "account", acc.Name(), "status", 200)
+					if !acc.quotaReviveReady(config.QuotaReviveAfter) {
+						slog.Info("probe 200 ignored for quota-exhausted account until revive window",
+							"account", acc.Name(), "status", 200, "window", config.QuotaReviveAfter)
+						return true
+					}
+					pool.MarkHealthy(acc)
+					slog.Info("probe recovered quota-exhausted account after revive window", "account", acc.Name(), "status", 200)
 					return true
 				}
 				pool.MarkHealthy(acc)

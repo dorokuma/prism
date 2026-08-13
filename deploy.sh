@@ -23,6 +23,8 @@ BACKUP="${BINARY}.bak"
 # 想要 liveness 级别的部署检查，显式设置 HEALTH_URL=http://127.0.0.1:18790/health
 # 覆盖即可；不要把 HEALTH_TIMEOUT 盲目延长到数分钟来“等”全账号恢复——
 # 那只会把一次注定失败的上线拖到很晚才回滚。
+# 部署前若 HEALTH_URL 以 /ready 结尾且旧进程这次已经失败，本轮改打同 host
+# 的 /health，避免把「上游本来就挂」当成新版本失败而回滚并二次重启。
 # TLS 部署必须覆盖 HEALTH_URL=https://...；本脚本不猜测证书或协议。
 # 未确认证书时默认保持明文回环 http://127.0.0.1:18790/ready。
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18790/ready}"
@@ -30,10 +32,17 @@ HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18790/ready}"
 # /ready 仍 fail-closed。默认 35s 等 /ready（单账号 ProbeTimeout=30s 加余量）。
 # 可用环境变量覆盖；必须为正整数，非法值在任何副作用发生前 exit 3。
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-35}"
+# 单次 curl --max-time（秒）。默认 5；必须为正整数。实际取值是
+# min(HEALTH_CURL_MAX_TIME, HEALTH_TIMEOUT)，避免单次探测比窗口还长。
+HEALTH_CURL_MAX_TIME="${HEALTH_CURL_MAX_TIME:-5}"
 # shellcheck disable=SC1091
 source "$ROOT/scripts/deploy_health.sh"
 if ! validate_health_timeout; then
   echo "HEALTH_TIMEOUT must be a positive integer, got '${HEALTH_TIMEOUT:-<empty>}' — aborting before any change" >&2
+  exit 3
+fi
+if ! validate_health_curl_max_time; then
+  echo "HEALTH_CURL_MAX_TIME must be a positive integer, got '${HEALTH_CURL_MAX_TIME:-<empty>}' — aborting before any change" >&2
   exit 3
 fi
 
@@ -70,6 +79,16 @@ if ! rm -rf ./bin; then
   echo "WARN: 清理 ./bin 失败（不影响部署，残留构建目录）"
 fi
 echo "INSTALLED → $BINARY"
+
+# 部署前 /ready 基线：新二进制已 install，进程仍是旧 inode。
+# 若默认 /ready 此刻已经失败（进程没起来或池子本来就不 ready），本轮改打
+# /health，避免把「上游本来就挂」当成新版本失败而回滚并二次重启。
+if is_ready_health_url "$HEALTH_URL"; then
+  if ! curl_health "$HEALTH_URL"; then
+    echo "WARN: pre-restart $HEALTH_URL failed (old process not ready or down); this deploy will probe /health so an already-unready pool is not treated as a new-binary failure"
+    HEALTH_URL="$(liveness_url_from_ready "$HEALTH_URL")"
+  fi
+fi
 
 echo "=== systemctl restart 加载新二进制（停机窗口仅 restart 瞬间，不单独 stop）==="
 systemctl restart prism || true

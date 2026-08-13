@@ -3,6 +3,7 @@ package convert
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/dorokuma/prism/internal/sanitize"
@@ -299,6 +300,26 @@ func TestResponsesToChat_PreviousResponseIDRejected(t *testing.T) {
 	_, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
 	if err == nil {
 		t.Fatal("expected error for previous_response_id, got nil")
+	}
+}
+
+func TestResponsesToChat_ItemReferenceRejected(t *testing.T) {
+	body := []byte(`{
+		"model": "deepseek-v4-pro",
+		"input": [
+			{"type":"item_reference","id":"msg_abc"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+		]
+	}`)
+	_, _, _, err := ResponsesToChatCompletions(body, "test-tenant")
+	if err == nil {
+		t.Fatal("expected error for item_reference, got nil")
+	}
+	if !strings.Contains(err.Error(), "item_reference") {
+		t.Fatalf("error = %q, want item_reference", err)
+	}
+	if !strings.Contains(err.Error(), "stateless prism proxy") {
+		t.Fatalf("error = %q, want stateless prism proxy style", err)
 	}
 }
 

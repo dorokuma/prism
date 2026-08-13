@@ -81,20 +81,26 @@ func directResponsesStream(t *testing.T, upstreamBody string, w responseCommitWr
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
 	}
-	done, _, _ := handleUpstreamResponse(acc, w, r, resp, nil, time.Now(), ChatForwardOpts{ResponsesOut: true, Stream: true}, "direct-commit-1", ctx, cancel)
+	done, _, class := handleUpstreamResponse(acc, w, r, resp, nil, time.Now(), ChatForwardOpts{ResponsesOut: true, Stream: true}, "direct-commit-1", ctx, cancel)
+	if upstreamBody == "" {
+		if done {
+			t.Fatal("empty upstream stream must not be terminal; the caller retries another account")
+		}
+		if class != UpstreamErrorEmptyStream {
+			t.Fatalf("empty stream class = %d, want UpstreamErrorEmptyStream", class)
+		}
+		return aud
+	}
 	if !done {
 		t.Fatal("handleUpstreamResponse must report done for a terminal streaming response")
 	}
 	return aud
 }
 
-// TestHandleUpstreamResponse_StreamPreFirstEventFailure502_NonConcreteWrapper
-// proves the explicit commit-state source at the bypass level: with a
-// NON-*StatusCapture writer implementing responseCommitWriter, a failure
-// before the first event (empty upstream stream) returns a structured 502 —
-// never an empty 200 — the status is written exactly once, and the audit
-// records 502.
-func TestHandleUpstreamResponse_StreamPreFirstEventFailure502_NonConcreteWrapper(t *testing.T) {
+// TestHandleUpstreamResponse_EmptyStreamRetries_NonConcreteWrapper
+// proves an uncommitted empty Responses stream does not write 502: the
+// handler returns retry so proxyChatWithBody can try another account.
+func TestHandleUpstreamResponse_EmptyStreamRetries_NonConcreteWrapper(t *testing.T) {
 	h := &capturingHandler{}
 	restore := stashSlog(h)
 	defer restore()
@@ -102,25 +108,19 @@ func TestHandleUpstreamResponse_StreamPreFirstEventFailure502_NonConcreteWrapper
 	rec := httptest.NewRecorder()
 	w := &commitTrackWriter{inner: rec}
 
-	aud := directResponsesStream(t, "", w) // empty stream: no event was written
+	_ = directResponsesStream(t, "", w) // empty stream: no event was written
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502 (pre-first-event failure must not become an empty 200)", rec.Code)
+	if rec.Code != 0 && rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want uncommitted (empty stream retries, no 502 yet)", rec.Code)
 	}
-	if code, _ := decodeErrorBody(t, rec.Body.String()); code != "upstream_stream_error" {
-		t.Errorf("error code = %q, want upstream_stream_error", code)
+	if rec.Body.Len() != 0 {
+		t.Errorf("empty stream must not write a body, got %q", rec.Body.String())
 	}
-	if w.headerCalls != 1 {
-		t.Errorf("WriteHeader must be called exactly once, got %d calls", w.headerCalls)
+	if w.headerCalls != 0 {
+		t.Errorf("WriteHeader must not be called on empty-stream retry, got %d calls", w.headerCalls)
 	}
-	if w.code != http.StatusBadGateway {
-		t.Errorf("commit wrapper must record 502, got %d", w.code)
-	}
-	if !w.Committed() {
-		t.Error("commit wrapper must report committed after the 502")
-	}
-	if aud.Status != http.StatusBadGateway {
-		t.Errorf("audit status = %d, want 502", aud.Status)
+	if w.Committed() {
+		t.Error("commit wrapper must stay uncommitted so another account can still answer")
 	}
 }
 

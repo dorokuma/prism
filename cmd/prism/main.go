@@ -208,6 +208,19 @@ func validateEnvTokenLengths() error {
 // proxy dispatch. Extracted from main so tests can exercise the wiring
 // invariant that usage degradation never breaks /v1 forwarding.
 func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *ratelimit.RateLimiter, trustedProxies []*net.IPNet, summaryHandler http.Handler, quotaHandler http.Handler) http.Handler {
+	// Bucket key is resolved per request from the live holder so api_keys
+	// hot-reloads take effect. Authenticated keys (len(api_keys)>0 and a
+	// matching Bearer) share a per-key-name bucket; auth failure and
+	// key-less configs stay on GetClientIP.
+	bucketKey := func(r *http.Request) string {
+		cfg := holder.Load()
+		if cfg != nil && len(cfg.APIKeys) > 0 {
+			if name, ok := middleware.Authenticate(r, cfg.APIKeys); ok {
+				return "key:" + name
+			}
+		}
+		return ratelimit.GetClientIP(r, trustedProxies)
+	}
 	return middleware.RequestIDMiddleware(ratelimit.RateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" {
 			token := os.Getenv("METRICS_TOKEN")
@@ -285,7 +298,7 @@ func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *
 		// per-request timeouts based on the actual stream setting (parsed
 		// from the JSON body, not headers).
 		proxyHandler.ServeHTTP(w, r)
-	}), rl, trustedProxies))
+	}), rl, trustedProxies, bucketKey))
 }
 
 // startInitialAccountProbes launches the startup connectivity probes without

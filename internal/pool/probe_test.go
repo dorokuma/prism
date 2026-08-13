@@ -560,6 +560,53 @@ func TestProbeExhausted_200DoesNotReviveQuota(t *testing.T) {
 	}
 }
 
+func TestProbeExhausted_200RevivesQuotaAfterWindow(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "quota1", Key: "k1", BaseURL: upstream.URL},
+	})
+	accs := p.AllAccounts()
+	accs[0].MarkExhaustedWithClass(ExhaustPermanentQuota)
+	accs[0].mu.Lock()
+	accs[0].exhaustedAt = time.Now().Add(-config.QuotaReviveAfter - time.Second)
+	accs[0].mu.Unlock()
+
+	ProbeExhausted(p)
+
+	if !accs[0].IsHealthy() {
+		t.Error("quota-exhausted account must revive on 200 after QuotaReviveAfter")
+	}
+}
+
+func TestProbeExhausted_200RevivesQuotaWhenWindowZero(t *testing.T) {
+	old := config.QuotaReviveAfter
+	config.QuotaReviveAfter = 0
+	defer func() { config.QuotaReviveAfter = old }()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "quota0", Key: "k1", BaseURL: upstream.URL},
+	})
+	accs := p.AllAccounts()
+	accs[0].MarkExhaustedWithClass(ExhaustPermanentQuota)
+
+	ProbeExhausted(p)
+
+	if !accs[0].IsHealthy() {
+		t.Error("QuotaReviveAfter=0 must revive a quota-exhausted account on 200 immediately")
+	}
+}
+
 func TestProbeExhausted_200RevivesCredential(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)

@@ -14,6 +14,12 @@ var (
 	// SetAccountSelectTimeoutForTest in internal/proxy/export_test.go);
 	// the default 30s is unchanged.
 	AccountSelectTimeout = 30 * time.Second
+
+	// QuotaReviveAfter is how long a quota-exhausted account stays
+	// exhausted before a successful probe HTTP 200 may MarkHealthy.
+	// A variable (not a const) so tests can set it to 0 or a short
+	// duration; the default 6h is unchanged.
+	QuotaReviveAfter = 6 * time.Hour
 )
 
 const (

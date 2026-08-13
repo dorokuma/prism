@@ -253,6 +253,30 @@ func TestResponses_ConvertRejectionSingleAudit(t *testing.T) {
 	}
 }
 
+func TestResponses_ItemReferenceRejectionClassified(t *testing.T) {
+	h := &capturingHandler{}
+	restore := stashSlog(h)
+	defer restore()
+
+	cfg := &config.Config{}
+	p := pool.NewPool(nil)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/responses", bytes.NewReader([]byte(`{"model":"gpt-4","input":[{"type":"item_reference","id":"msg_1"}]}`)))
+	ctx := context.WithValue(r.Context(), util.RequestIDKey{}, "audit-item-ref-1")
+	r = r.WithContext(ctx)
+
+	proxyResponses(p, rec, r, cfg)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	out := h.output()
+	if !strings.Contains(out, `"error_type":"item_reference"`) {
+		t.Errorf("audit missing item_reference: %s", out)
+	}
+}
+
 // TestResponses_ReadRejectionSingleAudit: a /v1/responses body over the cap
 // (readRequestBody failure) must also produce exactly one audit — status 413
 // with error_type request_too_large.

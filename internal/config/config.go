@@ -1173,6 +1173,12 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	}
 	if oldCfg.TLSCertFile != newCfg.TLSCertFile || oldCfg.TLSKeyFile != newCfg.TLSKeyFile {
 		warnings = append(warnings, "tls_cert_file/tls_key_file changed: restart required to take effect")
+		// TLS is NOT hot-applied: http.Server keeps the cert/key it
+		// started with. Keep the running paths in the holder so
+		// SyncTools (and other readers) publish the same scheme the
+		// process is actually listening with.
+		newCfg.TLSCertFile = oldCfg.TLSCertFile
+		newCfg.TLSKeyFile = oldCfg.TLSKeyFile
 	}
 	if !equalStringSlices(oldCfg.TrustedProxies, newCfg.TrustedProxies) {
 		warnings = append(warnings, "trusted_proxies changed: restart required to take effect")

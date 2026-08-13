@@ -140,6 +140,10 @@ const (
 	// UpstreamErrorPermanentQuota: recognized structured quota exhaustion
 	// (insufficient_quota / gousagelimiterror) — mark the account exhausted.
 	UpstreamErrorPermanentQuota
+	// UpstreamErrorEmptyStream: upstream 200 with no SSE events before
+	// commit. The caller retries another account; a terminal all-empty
+	// loop answers 502 upstream_stream_error, not 503 all_exhausted.
+	UpstreamErrorEmptyStream
 )
 
 // ClassifyUpstreamError is the single classification point for how an
@@ -447,9 +451,19 @@ func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opt
 		// client_disconnect / upstream_error) are used by the model cache
 		// fetch, the probe and the startup check, so the log taxonomy cannot
 		// diverge between surfaces.
-		slog.Warn("chat retry, upstream connection error", "req", requestID, "model", opts.Model, "account", acc.Name(), "error_type", util.ClassifyConnError(err))
-		util.RecordUpstreamRetry()
-		return doUpstreamResult{retry: true}
+		// Retry is a separate gate (ConnErrorRetryable): a refused/DNS
+		// failure almost certainly never left this process; timeout /
+		// reset / EOF / broken pipe may already have reached the
+		// upstream, so a non-idempotent POST must not switch accounts.
+		errType := util.ClassifyConnError(err)
+		if util.ConnErrorRetryable(err) {
+			slog.Warn("chat retry, upstream connection error", "req", requestID, "model", opts.Model, "account", acc.Name(), "error_type", errType)
+			util.RecordUpstreamRetry()
+			return doUpstreamResult{retry: true}
+		}
+		slog.Warn("upstream connection error, not retrying", "req", requestID, "model", opts.Model, "account", acc.Name(), "error_type", errType)
+		util.RecordError()
+		return doUpstreamResult{retry: false, fatalErr: err}
 	}
 
 	return doUpstreamResult{resp: resp, ctx: ctx, cancel: cancel}
@@ -649,6 +663,15 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 				errCode = "stream_line_too_long"
 				errMsg = err.Error()
 			}
+			if !committed && errors.Is(err, stream.ErrEmptyUpstreamStream) {
+				// Empty upstream SSE before any event: the request is
+				// still uncommitted, so another account can still answer.
+				// Do not write 502 here — the retry loop decides.
+				acc.SetCooldown(upstreamCooldown)
+				slog.Warn("responses_stream empty stream, retrying another account", "req", requestID, "model", opts.Model, "account", acc.Name(), "error_type", "upstream_stream_error")
+				util.RecordUpstreamRetry()
+				return false, nil, UpstreamErrorEmptyStream
+			}
 			if !committed {
 				// Nothing was written to the client yet (pre-first-event
 				// failure): return a structured 502 instead of an empty 200.
@@ -819,21 +842,13 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 		}
 		if !committed {
 			// The upstream answered 2xx but closed the stream without a
-			// single event: an empty 200 would be indistinguishable from a
-			// successful stream to the client. Answer a structured 502 and
-			// audit the real status.
-			slog.Warn("legacy_stream empty stream", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "elapsed", time.Since(start), "error_type", "upstream_stream_error")
-			util.RecordError()
-			util.WriteJSON(w, http.StatusBadGateway, map[string]any{
-				"error": map[string]any{"message": "upstream stream closed before any event", "code": "upstream_stream_error"},
-			})
-			if a := middleware.AuditFromCtx(r.Context()); a != nil {
-				a.Status = http.StatusBadGateway
-				a.Account = acc.Name()
-				a.ErrorType = "upstream_stream_error"
-				a.Error = "upstream stream closed before any event"
-			}
-			return true, nil, UpstreamErrorTemporary
+			// single event. The response is still uncommitted: cool the
+			// account down and let the caller retry another account
+			// instead of writing a terminal 502 here.
+			slog.Warn("legacy_stream empty stream, retrying another account", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "elapsed", time.Since(start), "error_type", "upstream_stream_error")
+			acc.SetCooldown(upstreamCooldown)
+			util.RecordUpstreamRetry()
+			return false, nil, UpstreamErrorEmptyStream
 		}
 		if cl := resp.Header.Get("Content-Length"); cl != "" {
 			slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "content_length", cl, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))

@@ -1027,6 +1027,72 @@ accounts:
 	}
 }
 
+func TestReloadConfig_TLSChangedKeepsRunningPaths(t *testing.T) {
+	content1 := `
+listen: 127.0.0.1:8080
+tls_cert_file: /old/cert.pem
+tls_key_file: /old/key.pem
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	content2 := `
+listen: 127.0.0.1:8080
+tls_cert_file: /new/cert.pem
+tls_key_file: /new/key.pem
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "tls_cert_file") || strings.Contains(w, "tls_key_file") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning about TLS change, got: %v", warnings)
+	}
+
+	got := holder.Load()
+	if got.TLSCertFile != "/old/cert.pem" {
+		t.Errorf("holder TLSCertFile = %q, want /old/cert.pem (running TLS kept)", got.TLSCertFile)
+	}
+	if got.TLSKeyFile != "/old/key.pem" {
+		t.Errorf("holder TLSKeyFile = %q, want /old/key.pem (running TLS kept)", got.TLSKeyFile)
+	}
+}
+
 func TestReloadConfig_NonLoopbackNoAuthRejected(t *testing.T) {
 	content1 := `
 listen: 127.0.0.1:8080

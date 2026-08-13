@@ -54,6 +54,9 @@ listen: "127.0.0.1:18790"
 # traffic is then unencrypted and any network observer can read the client
 # credentials. Loopback listeners (127.0.0.1 / ::1) never need TLS (local
 # development).
+# SIGHUP cannot hot-apply TLS files: a change is warned and the running
+# cert/key paths stay in the holder so published tool URLs keep the scheme
+# of the live listener. Restart to pick up new files.
 # tls_cert_file: "/path/to/cert.pem"
 # tls_key_file: "/path/to/key.pem"
 # allow_insecure_http: false
@@ -66,6 +69,10 @@ listen: "127.0.0.1:18790"
 # CIDRs; an all-trusted XFF or a trusted/invalid X-Real-IP falls back to
 # RemoteAddr. When empty, only RemoteAddr is used for rate limiting
 # (safest default).
+# Authenticated requests (api_keys configured and a matching Bearer) are
+# rate-limited per key name (`key:<name>`), not per client IP, so a local
+# reverse proxy that presents 127.0.0.1 does not put every client in one
+# bucket. Failed or missing tokens still use the IP bucket.
 #
 # Whole-address-space ranges are REJECTED at load: 0.0.0.0/0 and ::/0 would
 # make every address "trusted", so the XFF chain walk finds no untrusted

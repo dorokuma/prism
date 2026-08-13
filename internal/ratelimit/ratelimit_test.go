@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/ratelimit"
 )
 
@@ -21,7 +23,7 @@ func TestRateLimitMiddleware_HealthExempt(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	h := ratelimit.RateLimitMiddleware(next, rl, nil)
+	h := ratelimit.RateLimitMiddleware(next, rl, nil, nil)
 
 	// /health and /ready always pass, even from an IP whose bucket is
 	// exhausted.
@@ -49,7 +51,7 @@ func TestRateLimitMiddleware_NilLimiterPassesThrough(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	h := ratelimit.RateLimitMiddleware(next, nil, nil)
+	h := ratelimit.RateLimitMiddleware(next, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
 	if rec.Code != http.StatusOK {
@@ -306,5 +308,92 @@ func TestRateLimiterBucketCapSparseAllow(t *testing.T) {
 		if !rl.Allow(fmt.Sprintf("10.0.0.%d", i+1)) {
 			t.Errorf("IP %d must be allowed while under the cap", i+1)
 		}
+	}
+}
+
+func TestRateLimitMiddleware_AuthenticatedKeysSeparateBuckets(t *testing.T) {
+	keys := []config.APIKey{
+		{Name: "alice", Token: "tok-alice"},
+		{Name: "bob", Token: "tok-bob"},
+	}
+	holder := config.NewConfigHolder(&config.Config{APIKeys: keys})
+	rl := ratelimit.NewRateLimiter(0, 1) // burst 1, no refill
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	bucketKey := func(r *http.Request) string {
+		cfg := holder.Load()
+		if cfg != nil && len(cfg.APIKeys) > 0 {
+			if name, ok := middleware.Authenticate(r, cfg.APIKeys); ok {
+				return "key:" + name
+			}
+		}
+		return ratelimit.GetClientIP(r, nil)
+	}
+	h := ratelimit.RateLimitMiddleware(next, rl, nil, bucketKey)
+
+	req := func(token string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		r.RemoteAddr = "127.0.0.1:12345"
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		return r
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req("tok-alice"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alice first: status = %d, want 200", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req("tok-alice"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("alice second: status = %d, want 429 (same key bucket)", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req("tok-bob"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bob first: status = %d, want 200 (different key must not share alice's bucket)", rec.Code)
+	}
+}
+
+func TestRateLimitMiddleware_BadTokenUsesIPBucket(t *testing.T) {
+	keys := []config.APIKey{{Name: "alice", Token: "tok-alice"}}
+	rl := ratelimit.NewRateLimiter(0, 1)
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	bucketKey := func(r *http.Request) string {
+		if name, ok := middleware.Authenticate(r, keys); ok && len(keys) > 0 {
+			return "key:" + name
+		}
+		return ratelimit.GetClientIP(r, nil)
+	}
+	h := ratelimit.RateLimitMiddleware(next, rl, nil, bucketKey)
+
+	req := func(token string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		r.RemoteAddr = "127.0.0.1:12345"
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		return r
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req(""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("no token first: status = %d, want 200 (IP bucket)", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req("bad-token"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("bad token: status = %d, want 429 (shares the IP bucket)", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req("tok-alice"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid key: status = %d, want 200 (key bucket is not the IP bucket)", rec.Code)
 	}
 }

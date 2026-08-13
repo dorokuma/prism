@@ -21,9 +21,11 @@ const (
 	StatusExhausted
 )
 
-// ExhaustClass is why an account was marked exhausted. Numeric values
-// match proxy.UpstreamErrorClass so a caller can store
-// ClassifyUpstreamError's result directly. Probe reads this to decide
+// ExhaustClass is why an account was marked exhausted. Values 0–2 match
+// proxy.UpstreamErrorClass (Temporary / PermanentCredential /
+// PermanentQuota) so ClassifyUpstreamError's exhaust outcomes can be
+// stored directly. proxy.UpstreamErrorEmptyStream is not an exhaust
+// class and must not be stored here. Probe reads this to decide
 // whether an HTTP 200 may revive the account.
 type ExhaustClass int
 
@@ -35,7 +37,8 @@ const (
 	// A 200 probe may revive.
 	ExhaustPermanentCredential
 	// ExhaustPermanentQuota is 402 / structured quota exhaustion.
-	// A 200 probe must not revive; wait for the next window or a manual MarkHealthy.
+	// A 200 probe may revive only after config.QuotaReviveAfter has
+	// elapsed since exhaustedAt.
 	ExhaustPermanentQuota
 )
 
@@ -83,6 +86,7 @@ type Account struct {
 	cooldownUntil    time.Time
 	lastExhaustClass ExhaustClass
 	lastProbeAt      time.Time
+	exhaustedAt      time.Time
 
 	// totalCap is the account-wide aggregate concurrency bound across ALL
 	// keys (0 = no aggregate bound). It is set at pool construction (see
@@ -145,6 +149,9 @@ func (a *Account) MarkExhaustedWithClass(c ExhaustClass) {
 		slog.Warn("account marked exhausted", "account", a.Name(), "in_flight", a.inFlight.Load(), "class", int(c))
 	}
 	a.lastExhaustClass = c
+	if c == ExhaustPermanentQuota {
+		a.exhaustedAt = time.Now()
+	}
 }
 
 // LastExhaustClass returns the recorded exhaust reason (zero if none).
@@ -158,6 +165,27 @@ func (a *Account) noteExhaustClass(c ExhaustClass) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.lastExhaustClass = c
+	if c == ExhaustPermanentQuota {
+		a.exhaustedAt = time.Now()
+	}
+}
+
+// quotaReviveReady reports whether a quota-exhausted account may be
+// revived by a probe HTTP 200: lastExhaustClass is Quota and at least
+// after has elapsed since exhaustedAt. after <= 0 revives immediately.
+func (a *Account) quotaReviveReady(after time.Duration) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.lastExhaustClass != ExhaustPermanentQuota {
+		return true
+	}
+	if after <= 0 {
+		return true
+	}
+	if a.exhaustedAt.IsZero() {
+		return true
+	}
+	return time.Since(a.exhaustedAt) >= after
 }
 
 func (a *Account) markProbed() {
@@ -221,6 +249,7 @@ func (a *Account) MarkHealthy() {
 		a.status = StatusHealthy
 		a.cooldownUntil = time.Time{}
 		a.lastExhaustClass = ExhaustTemporary
+		a.exhaustedAt = time.Time{}
 		slog.Info("account marked healthy", "account", a.Name())
 	}
 }

@@ -199,23 +199,35 @@ func ipTrusted(ip net.IP, trustedProxies []*net.IPNet) bool {
 	return false
 }
 
-// RateLimitMiddleware returns an HTTP middleware that rate-limits per client IP.
+// BucketKeyFunc returns the rate-limit bucket key for a request.
+// A nil func falls back to GetClientIP.
+type BucketKeyFunc func(r *http.Request) string
+
+// RateLimitMiddleware returns an HTTP middleware that rate-limits per bucket.
+// When bucketKey is non-nil its return value is the bucket (authenticated
+// api_keys use "key:<name>"); empty/nil falls back to GetClientIP.
 // /health and /ready are exempt: /health is the liveness endpoint used by
 // load balancers and deploy checks, and /ready is the readiness endpoint
 // used by deploy.sh — both must stay reachable when business traffic is
 // being limited. No other path is exempted — /v1/*, /metrics and /admin/*
 // remain limited.
-func RateLimitMiddleware(next http.Handler, rl *RateLimiter, trustedProxies []*net.IPNet) http.Handler {
+func RateLimitMiddleware(next http.Handler, rl *RateLimiter, trustedProxies []*net.IPNet, bucketKey BucketKeyFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if rl != nil {
 			if r.URL.Path == "/health" || r.URL.Path == "/ready" {
 				next.ServeHTTP(w, r)
 				return
 			}
-			ip := GetClientIP(r, trustedProxies)
-			if !rl.Allow(ip) {
+			key := ""
+			if bucketKey != nil {
+				key = bucketKey(r)
+			}
+			if key == "" {
+				key = GetClientIP(r, trustedProxies)
+			}
+			if !rl.Allow(key) {
 				util.RecordRateLimited()
-				slog.Warn("rate_limit.hit", "ip", ip, "path", r.URL.Path, "req", util.RequestIDFromCtx(r.Context()))
+				slog.Warn("rate_limit.hit", "bucket", key, "path", r.URL.Path, "req", util.RequestIDFromCtx(r.Context()))
 				util.WriteJSON(w, http.StatusTooManyRequests, map[string]any{
 					"error": map[string]any{"message": "Rate limit exceeded", "code": "rate_limited"},
 				})

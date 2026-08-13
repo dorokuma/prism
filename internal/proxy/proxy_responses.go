@@ -43,6 +43,8 @@ func proxyResponses(p *pool.Pool, w http.ResponseWriter, r *http.Request, cfg *c
 			reason = "multimodal_input"
 		} else if strings.Contains(errStr, "previous_response_id") {
 			reason = "previous_response_id"
+		} else if strings.Contains(errStr, "item_reference") {
+			reason = "item_reference"
 		} else if strings.Contains(errStr, "not supported") {
 			reason = "unsupported_input"
 		}

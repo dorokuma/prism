@@ -42,9 +42,12 @@ func directLegacyStream(t *testing.T, body io.ReadCloser, w responseCommitWriter
 		Header:     make(http.Header),
 		Body:       body,
 	}
-	done, _, _ := handleUpstreamResponse(acc, w, r, resp, nil, time.Now(), ChatForwardOpts{ResponsesOut: false, Stream: true}, "direct-legacy-1", ctx, cancel)
-	if !done {
-		t.Fatal("handleUpstreamResponse must report done for a terminal streaming response")
+	done, _, class := handleUpstreamResponse(acc, w, r, resp, nil, time.Now(), ChatForwardOpts{ResponsesOut: false, Stream: true}, "direct-legacy-1", ctx, cancel)
+	if !done && class != UpstreamErrorEmptyStream {
+		t.Fatalf("non-empty-stream handleUpstreamResponse must report done, class=%d", class)
+	}
+	if done && class == UpstreamErrorEmptyStream {
+		t.Fatal("empty stream must not be terminal")
 	}
 	return aud
 }
@@ -56,11 +59,10 @@ type errReadCloser struct{ err error }
 func (e *errReadCloser) Read([]byte) (int, error) { return 0, e.err }
 func (e *errReadCloser) Close() error             { return nil }
 
-// TestLegacyStream_EmptyStream502 pins the legacy chat streaming fix: an
-// upstream 200 whose body closes without a single SSE event must answer a
-// structured 502 upstream_stream_error — never an empty 200 — the status is
-// written exactly once, and the audit records the real delivered status.
-func TestLegacyStream_EmptyStream502(t *testing.T) {
+// TestLegacyStream_EmptyStreamRetries pins the empty-stream retry: an
+// upstream 200 whose body closes without a single SSE event must NOT write
+// 502. The caller retries another account while the response stays uncommitted.
+func TestLegacyStream_EmptyStreamRetries(t *testing.T) {
 	h := &capturingHandler{}
 	restore := stashSlog(h)
 	defer restore()
@@ -70,26 +72,17 @@ func TestLegacyStream_EmptyStream502(t *testing.T) {
 
 	aud := directLegacyStream(t, io.NopCloser(strings.NewReader("")), w) // empty stream: no event was written
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502 (empty stream must not become an empty 200)", rec.Code)
+	if rec.Body.Len() != 0 {
+		t.Errorf("empty stream must not write a body, got %q", rec.Body.String())
 	}
-	if code, _ := decodeErrorBody(t, rec.Body.String()); code != "upstream_stream_error" {
-		t.Errorf("error code = %q, want upstream_stream_error", code)
+	if w.headerCalls != 0 {
+		t.Errorf("WriteHeader must not be called on empty-stream retry, got %d calls", w.headerCalls)
 	}
-	if w.headerCalls != 1 {
-		t.Errorf("WriteHeader must be called exactly once, got %d calls", w.headerCalls)
+	if w.Committed() {
+		t.Error("commit wrapper must stay uncommitted so another account can still answer")
 	}
-	if w.code != http.StatusBadGateway {
-		t.Errorf("commit wrapper must record 502, got %d", w.code)
-	}
-	if aud.Status != http.StatusBadGateway {
-		t.Errorf("audit status = %d, want 502", aud.Status)
-	}
-	if aud.ErrorType != "upstream_stream_error" {
-		t.Errorf("audit error_type = %q, want upstream_stream_error", aud.ErrorType)
-	}
-	if aud.Account != "t" {
-		t.Errorf("audit account = %q, want t", aud.Account)
+	if aud.Status == http.StatusBadGateway {
+		t.Error("audit must not record 502 on a retryable empty stream")
 	}
 }
 

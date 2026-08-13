@@ -29,6 +29,9 @@ exit 0
 EOF
 cat > "$TMP/bin/curl" <<'EOF'
 #!/bin/bash
+if [ -n "${FAKE_CURL_ARGV:-}" ]; then
+  printf '%s\n' "$@" > "$FAKE_CURL_ARGV"
+fi
 exit "${FAKE_CURL:-0}"
 EOF
 chmod +x "$TMP/bin"/*
@@ -102,6 +105,124 @@ else
   fail "wait_healthy failed although service recovered within the window"
 fi
 wait 2>/dev/null || true
+
+# 5a. validate_health_curl_max_time：非法值全部拒绝
+for bad in "" abc -1 0 1.5 "12 " " 12"; do
+  if (
+    HEALTH_CURL_MAX_TIME="$bad"
+    source "$SRC"
+    validate_health_curl_max_time
+  ) 2>/dev/null; then
+    fail "validate accepted invalid HEALTH_CURL_MAX_TIME='$bad'"
+  else
+    pass "validate rejects HEALTH_CURL_MAX_TIME='$bad'"
+  fi
+done
+
+# 5b. validate_health_curl_max_time：合法值接受
+for good in 1 5 35; do
+  if (
+    HEALTH_CURL_MAX_TIME="$good"
+    source "$SRC"
+    validate_health_curl_max_time
+  ) 2>/dev/null; then
+    pass "validate accepts HEALTH_CURL_MAX_TIME=$good"
+  else
+    fail "validate rejected valid HEALTH_CURL_MAX_TIME=$good"
+  fi
+done
+
+# 5c. wait_healthy 调用 curl 时带 --max-time，且取 min(CURL_MAX, TIMEOUT)
+if (
+  HEALTH_TIMEOUT=10
+  HEALTH_CURL_MAX_TIME=5
+  HEALTH_URL=http://x/health
+  export FAKE_CURL_ARGV="$TMP/curl.argv"
+  SYSTEMCTL_BIN="$TMP/bin/systemctl"
+  CURL_BIN="$TMP/bin/curl"
+  source "$SRC"
+  wait_healthy
+); then
+  if grep -qx -- '--max-time' "$TMP/curl.argv" && grep -qx -- '5' "$TMP/curl.argv"; then
+    pass "wait_healthy curl uses --max-time 5 (min of 5 and 10)"
+  else
+    fail "wait_healthy curl argv missing --max-time 5: $(tr '\n' ' ' < "$TMP/curl.argv")"
+  fi
+else
+  fail "wait_healthy failed while recording curl argv"
+fi
+
+if (
+  HEALTH_TIMEOUT=2
+  HEALTH_CURL_MAX_TIME=30
+  HEALTH_URL=http://x/health
+  export FAKE_CURL_ARGV="$TMP/curl.argv2"
+  SYSTEMCTL_BIN="$TMP/bin/systemctl"
+  CURL_BIN="$TMP/bin/curl"
+  source "$SRC"
+  wait_healthy
+); then
+  if grep -qx -- '--max-time' "$TMP/curl.argv2" && grep -qx -- '2' "$TMP/curl.argv2"; then
+    pass "wait_healthy curl --max-time capped by HEALTH_TIMEOUT (min of 30 and 2)"
+  else
+    fail "wait_healthy curl argv missing --max-time 2: $(tr '\n' ' ' < "$TMP/curl.argv2")"
+  fi
+else
+  fail "wait_healthy failed while recording capped curl argv"
+fi
+
+# 5d. /ready → /health URL helpers
+if (
+  source "$SRC"
+  is_ready_health_url "http://127.0.0.1:18790/ready"
+); then
+  pass "is_ready_health_url accepts .../ready"
+else
+  fail "is_ready_health_url rejected default /ready URL"
+fi
+if (
+  source "$SRC"
+  is_ready_health_url "http://127.0.0.1:18790/health"
+); then
+  fail "is_ready_health_url accepted /health"
+else
+  pass "is_ready_health_url rejects /health"
+fi
+if (
+  source "$SRC"
+  is_ready_health_url "http://127.0.0.1:18790/custom"
+); then
+  fail "is_ready_health_url accepted custom path"
+else
+  pass "is_ready_health_url rejects custom path"
+fi
+got="$(
+  source "$SRC"
+  liveness_url_from_ready "http://127.0.0.1:18790/ready"
+)"
+if [ "$got" = "http://127.0.0.1:18790/health" ]; then
+  pass "liveness_url_from_ready maps /ready to /health"
+else
+  fail "liveness_url_from_ready = '$got', want http://127.0.0.1:18790/health"
+fi
+got="$(
+  source "$SRC"
+  liveness_url_from_ready "https://example:443/ready"
+)"
+if [ "$got" = "https://example:443/health" ]; then
+  pass "liveness_url_from_ready keeps host and scheme"
+else
+  fail "liveness_url_from_ready https = '$got'"
+fi
+got="$(
+  source "$SRC"
+  liveness_url_from_ready "http://127.0.0.1:18790/health"
+)"
+if [ "$got" = "http://127.0.0.1:18790/health" ]; then
+  pass "liveness_url_from_ready leaves /health unchanged"
+else
+  fail "liveness_url_from_ready /health = '$got'"
+fi
 
 # 5. 超时：一直不健康 → 窗口耗尽返回 1（HEALTH_TIMEOUT=2，约 2-3s）
 start=$(date +%s)

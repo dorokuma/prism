@@ -195,7 +195,7 @@ func responseItemToMessage(item json.RawMessage) (map[string]any, error) {
 		}
 		return map[string]any{"role": "assistant", "content": "", "reasoning_content": text}, nil
 	case "item_reference":
-		return nil, nil
+		return nil, errors.New("item_reference not supported by stateless prism proxy")
 	default:
 		if role, _ := util.RawStringField(obj, "role"); role != "" {
 			return map[string]any{"role": role, "content": contentFromRaw(obj["content"])}, nil

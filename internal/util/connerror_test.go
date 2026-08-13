@@ -75,3 +75,27 @@ func TestClassifyConnError_UnknownErrorNeverLeaksRawText(t *testing.T) {
 		}
 	}
 }
+
+func TestConnErrorRetryable(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("dial tcp 127.0.0.1:1: connect: connection refused"), true},
+		{errors.New("dial tcp: lookup nope: no such host"), true},
+		{errors.New("dial tcp: network is unreachable"), true},
+		{errors.New("dial tcp: no route to host"), true},
+		{errors.New("dial tcp: lookup api: temporary failure in name resolution"), true},
+		{errors.New("context deadline exceeded"), false},
+		{errors.New("read tcp: connection reset by peer"), false},
+		{errors.New("unexpected EOF"), false},
+		{errors.New("write: broken pipe"), false},
+		{errors.New("tls: handshake failure"), false},
+	}
+	for _, c := range cases {
+		if got := ConnErrorRetryable(c.err); got != c.want {
+			t.Errorf("ConnErrorRetryable(%v) = %v, want %v", c.err, got, c.want)
+		}
+	}
+}
