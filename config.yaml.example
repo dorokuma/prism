@@ -187,7 +187,7 @@ model_remap:
 #   default_key_id: anonymous
 
 # ---------------------------------------------------------------------------
-# 可选：quota —— 上游套餐用量快照（当前：OpenCode Go 的 5h / 周 / 月窗口）。
+# 可选：quota —— 上游套餐用量快照（当前：OpenCode Go 的短期 / 中期 / 长期窗口）。
 # 和上面的 usage 不是一层：usage 是本地 token 账本，quota 是官方限额百分比。
 # 关掉 usage.enabled 不影响 quota。
 #

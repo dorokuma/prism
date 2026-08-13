@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.17.1  Date: 2026-08-13  Status: living document
+> Version: v0.18.2  Date: 2026-08-13  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -189,6 +189,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-13** — v0.18.2 — fix: `prism quota` / `format=table` is one phone card per account (load-balanced plans are never merged). Window labels are 短期/中期/长期. Columns pad by terminal cell width (CJK = 2); 限流 sits at the end of the line so percent and countdown stay aligned.
 
 - **2026-08-13** — v0.18.1 — fix: `prism quota` / `format=table` is a stacked phone-width card (provider, accounts, then `5h`/`周`/`月` + percent + countdown). No header row, no ISO reset timestamps.
 
