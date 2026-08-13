@@ -1019,6 +1019,12 @@ accounts:
 	if !found {
 		t.Errorf("expected warning about listen change, got: %v", warnings)
 	}
+
+	// listen is not hot-applied: holder must keep the running address so
+	// SyncTools does not publish a port the process is not bound to.
+	if got := holder.Load().Listen; got != "127.0.0.1:8080" {
+		t.Errorf("holder listen = %q, want 127.0.0.1:8080 (running listen kept)", got)
+	}
 }
 
 func TestReloadConfig_NonLoopbackNoAuthRejected(t *testing.T) {
@@ -1068,6 +1074,79 @@ accounts:
 	curCfg := holder.Load()
 	if curCfg.Listen != "127.0.0.1:8080" {
 		t.Errorf("old config listen = %q, want 127.0.0.1:8080 (should be preserved)", curCfg.Listen)
+	}
+}
+
+// TestReloadConfig_RunningNonLoopbackCannotDropAPIKeys is the reverse of
+// TestReloadConfig_NonLoopbackNoAuthRejected: the process is already
+// bound to a public listen with api_keys. A SIGHUP that rewrites listen
+// to loopback and drops api_keys must fail. LoadConfig would accept the
+// new file (it only checks the new listen), but the running
+// http.Server.Addr stays public, so storing empty keys would fail-open.
+func TestReloadConfig_RunningNonLoopbackCannotDropAPIKeys(t *testing.T) {
+	content1 := `
+listen: 0.0.0.0:8080
+allow_insecure_http: true
+api_keys:
+  - name: ci-bot
+    token: sk-ci-111
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg1.Listen != "0.0.0.0:8080" || len(cfg1.APIKeys) != 1 || cfg1.APIKeys[0].Token != "sk-ci-111" {
+		t.Fatalf("initial config listen=%q keys=%+v, want 0.0.0.0:8080 + ci-bot/sk-ci-111", cfg1.Listen, cfg1.APIKeys)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	content2 := `
+listen: 127.0.0.1:8080
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cold-start LoadConfig still accepts loopback with no keys. The hole
+	// is ReloadConfig using that result against a public running bind.
+	if _, err := LoadConfig(f.Name()); err != nil {
+		t.Fatalf("LoadConfig of loopback-without-keys must still succeed: %v", err)
+	}
+
+	_, err = ReloadConfig(holder, f.Name())
+	if err == nil {
+		t.Fatal("expected error when dropping api_keys while still bound to a non-loopback listen, got nil")
+	}
+	if !strings.Contains(err.Error(), "non-loopback") {
+		t.Errorf("error = %q, want it to name the non-loopback running listen", err.Error())
+	}
+
+	curCfg := holder.Load()
+	if curCfg.Listen != "0.0.0.0:8080" {
+		t.Errorf("holder listen = %q, want 0.0.0.0:8080 (old listen preserved)", curCfg.Listen)
+	}
+	if len(curCfg.APIKeys) != 1 || curCfg.APIKeys[0].Name != "ci-bot" || curCfg.APIKeys[0].Token != "sk-ci-111" {
+		t.Errorf("holder APIKeys = %+v, want [{ci-bot sk-ci-111}] (old keys preserved)", curCfg.APIKeys)
 	}
 }
 

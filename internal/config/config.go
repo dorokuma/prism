@@ -1095,6 +1095,11 @@ func (h *ConfigHolder) Store(cfg *Config) {
 // the new config into holder, and returns any warnings about fields that
 // changed but require a process restart to take effect.
 //
+// Listen is not hot-applied: a listen change is warned and the running
+// Listen is kept in the holder. A non-loopback running listen also
+// refuses a reload that would drop api_keys (the process is still bound
+// to the public address).
+//
 // On error the old config is preserved.
 func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err error) {
 	oldCfg := holder.Load()
@@ -1103,11 +1108,25 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 		return nil, fmt.Errorf("reload config: %w", err)
 	}
 
+	// Auth must be judged against the listen the process is actually bound
+	// to. LoadConfig only sees the new file's listen, so a public bind
+	// (0.0.0.0) with api_keys can be rewritten to 127.0.0.1 with no keys —
+	// LoadConfig would accept that, but http.Server.Addr stays public and
+	// Authenticate fail-opens on an empty key set. Refuse the reload.
+	if !IsLoopbackListen(oldCfg.Listen) && len(newCfg.APIKeys) == 0 {
+		return nil, fmt.Errorf("reload config: non-loopback listen address %q requires auth_token, PRISM_AUTH_TOKEN, or api_keys", oldCfg.Listen)
+	}
+
 	// Compare fields that cannot be hot-reloaded and warn if changed.
+	// listen is NOT hot-applied: the process stays bound to the old
+	// http.Server.Addr. Keep the running listen in the holder so SyncTools
+	// and other readers do not publish an address the process is not
+	// listening on. The new listen applies on restart only.
 	if oldCfg.Listen != newCfg.Listen {
 		warnings = append(warnings, fmt.Sprintf(
 			"listen changed from %q to %q: restart required to take effect",
 			oldCfg.Listen, newCfg.Listen))
+		newCfg.Listen = oldCfg.Listen
 	}
 	// Accounts are NOT hot-reloaded: the pool is built once at startup, so
 	// publishing a config whose Accounts differ from the running pool would

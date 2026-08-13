@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
-	"sync"
 	"syscall"
 	"time"
 
@@ -145,8 +144,9 @@ func priceFor(cfg *config.Config, provider, model string) *usage.Price {
 // recorder drain runs afterwards under its own bounded budget
 // (usage.Recorder.Close: normally milliseconds; worst case 2×5s, only when
 // the store itself is stuck). The two phases are sequential, so the
-// worst-case total is 30s + 10s = 40s; the drain phase only ever starts
-// once the HTTP layer is quiescent.
+// worst-case total is 30s + 10s = 40s. systemd TimeoutStopSec must be at
+// least 45s so SIGKILL does not land during that window. The drain phase
+// only ever starts once the HTTP layer is quiescent.
 func shutdownHTTPAndDrainUsage(srv *http.Server, usageRec *usage.Recorder) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -288,6 +288,67 @@ func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *
 	}), rl, trustedProxies))
 }
 
+// startInitialAccountProbes launches the startup connectivity probes without
+// waiting. HTTP listen must not block on these: /health is 200 as soon as the
+// process is listening; /ready stays fail-closed until at least one account is
+// healthy. The semaphore lives inside each goroutine so launching N>10
+// accounts cannot stall Listen.
+func startInitialAccountProbes(p *pool.Pool) {
+	slog.Info("starting initial health check for all accounts")
+	sem := make(chan struct{}, 10)
+	for _, acc := range p.AllAccounts() {
+		go func(a *pool.Account) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("panic in startup health check", "account", a.Name(), "panic", r, "stack", string(debug.Stack()))
+				}
+			}()
+
+			statusCode, bodyBytes, skipped, err := pool.ProbeAccountOnce(a)
+			if skipped {
+				// probe_path: disabled → 不发探活请求、不改状态，只记 Info
+				slog.Info("startup check skipped, probe disabled", "account", a.Name())
+				return
+			}
+			if err != nil {
+				// Safe fields only: the raw *url.Error embeds the probe URL
+				// (query parameters, credentials) and must never reach logs.
+				slog.Warn("startup check request failed", "account", a.Name(), "error_type", util.ClassifyConnError(err))
+				a.SetCooldown(5 * time.Minute)
+				return
+			}
+			if statusCode == 200 {
+				slog.Info("startup check OK", "account", a.Name(), "status", 200)
+				return
+			}
+			// Shared classification (proxy.ClassifyUpstreamError): only
+			// 401/402 or a recognized structured permanent error body
+			// (credential or quota) marks the account exhausted. A bare
+			// 403 is NOT permanent — it cools down like any other
+			// temporary failure instead of waiting for the probe loop to
+			// recover the account.
+			switch proxy.ClassifyUpstreamError(statusCode, bodyBytes) {
+			case proxy.UpstreamErrorPermanentCredential:
+				slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", statusCode, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
+				a.MarkExhaustedWithClass(pool.ExhaustPermanentCredential)
+			case proxy.UpstreamErrorPermanentQuota:
+				slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", statusCode, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
+				a.MarkExhaustedWithClass(pool.ExhaustPermanentQuota)
+			default:
+				if statusCode == 429 {
+					slog.Warn("startup check temporary quota error, cooling down", "account", a.Name(), "status", 429, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
+					a.SetCooldown(2 * time.Minute)
+				} else {
+					slog.Warn("startup check temporary error, cooling down", "account", a.Name(), "status", statusCode, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
+					a.SetCooldown(5 * time.Minute)
+				}
+			}
+		}(acc)
+	}
+}
+
 func main() {
 	// 检查是否运行 setup
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
@@ -365,62 +426,9 @@ func main() {
 	// Initial health probe: check all accounts on startup, warn but don't block
 	pool.ProbeExhausted(p)
 
-	// 启动时验证所有账号的连通性——使用账号级 probe_path 探活
-	// （默认 GET /v1/models；probe_path: disabled 的账号跳过且保持 healthy）
-	slog.Info("starting initial health check for all accounts")
-	sem := make(chan struct{}, 10)
-	var startupWg sync.WaitGroup
-	for _, acc := range p.AllAccounts() {
-		sem <- struct{}{}
-		startupWg.Add(1)
-		go func(a *pool.Account) {
-			defer startupWg.Done()
-			defer func() { <-sem }()
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("panic in startup health check", "account", a.Name(), "panic", r, "stack", string(debug.Stack()))
-				}
-			}()
-
-			statusCode, bodyBytes, skipped, err := pool.ProbeAccountOnce(a)
-			if skipped {
-				// probe_path: disabled → 不发探活请求、不改状态，只记 Info
-				slog.Info("startup check skipped, probe disabled", "account", a.Name())
-				return
-			}
-			if err != nil {
-				// Safe fields only: the raw *url.Error embeds the probe URL
-				// (query parameters, credentials) and must never reach logs.
-				slog.Warn("startup check request failed", "account", a.Name(), "error_type", util.ClassifyConnError(err))
-				a.SetCooldown(5 * time.Minute)
-				return
-			}
-			if statusCode == 200 {
-				slog.Info("startup check OK", "account", a.Name(), "status", 200)
-			} else {
-				// Shared classification (proxy.ClassifyUpstreamError): only
-				// 401/402 or a recognized structured permanent error body
-				// (credential or quota) marks the account exhausted. A bare
-				// 403 is NOT permanent — it cools down like any other
-				// temporary failure instead of waiting for the probe loop to
-				// recover the account.
-				switch proxy.ClassifyUpstreamError(statusCode, bodyBytes) {
-				case proxy.UpstreamErrorPermanentCredential, proxy.UpstreamErrorPermanentQuota:
-					slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", statusCode, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
-					a.MarkExhausted()
-				default:
-					if statusCode == 429 {
-						slog.Warn("startup check temporary quota error, cooling down", "account", a.Name(), "status", 429, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
-						a.SetCooldown(2 * time.Minute)
-					} else {
-						slog.Warn("startup check temporary error, cooling down", "account", a.Name(), "status", statusCode, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
-						a.SetCooldown(5 * time.Minute)
-					}
-				}
-			}
-		}(acc)
-	}
-	startupWg.Wait()
+	// Startup probes must not delay Listen: /health is 200 as soon as the
+	// process is listening; /ready stays fail-closed until an account is healthy.
+	startInitialAccountProbes(p)
 
 	stop := make(chan struct{})
 	pool.StartProbeLoop(p, cfg.ProbeInterval, stop)

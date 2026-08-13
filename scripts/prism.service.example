@@ -10,7 +10,7 @@ WorkingDirectory=/var/lib/prism
 ExecStart=/usr/local/bin/prism
 Restart=always
 RestartSec=3
-TimeoutStopSec=35
+TimeoutStopSec=45
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=mixed
 

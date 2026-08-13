@@ -47,7 +47,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if snaps == nil {
 		snaps = []Snapshot{}
 	}
-	resp := Response{FetchedAt: time.Now().UTC(), Providers: snaps}
+	resp := Response{FetchedAt: oldestFetchedAt(snaps), Providers: snaps}
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	switch format {
 	case "", "json":
@@ -63,9 +63,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func oldestFetchedAt(snaps []Snapshot) time.Time {
+	var oldest time.Time
+	for i := range snaps {
+		ft := snaps[i].FetchedAt
+		if ft.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || ft.Before(oldest) {
+			oldest = ft
+		}
+	}
+	return oldest
+}
+
 // WriteJSON is a small helper for the CLI --json path.
 func WriteJSON(w io.Writer, snaps []Snapshot) error {
-	resp := Response{FetchedAt: time.Now().UTC(), Providers: snaps}
+	resp := Response{FetchedAt: oldestFetchedAt(snaps), Providers: snaps}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(resp)

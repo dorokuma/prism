@@ -13,14 +13,15 @@ import (
 )
 
 type fakeAcc struct {
-	name, provider, base, key string
-	client                    *http.Client
+	name, provider, base, key, authHeader string
+	client                                *http.Client
 }
 
 func (a fakeAcc) Name() string         { return a.name }
 func (a fakeAcc) Provider() string     { return a.provider }
 func (a fakeAcc) BaseURL() string      { return a.base }
 func (a fakeAcc) Key() string          { return a.key }
+func (a fakeAcc) AuthHeader() string   { return a.authHeader }
 func (a fakeAcc) Client() *http.Client { return a.client }
 
 func TestUsageURL(t *testing.T) {
@@ -93,6 +94,28 @@ func TestGoFetcherOK(t *testing.T) {
 	}
 	if snap.Windows[2].Status != "rate-limited" {
 		t.Errorf("monthly status = %q", snap.Windows[2].Status)
+	}
+}
+
+func TestGoFetcherCustomAuthHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Api-Key"); got != "raw-secret" {
+			t.Errorf("X-Api-Key = %q, want raw-secret", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want empty", got)
+		}
+		io.WriteString(w, `{"usage":{"rolling":{"status":"ok","percent":1}}}`)
+	}))
+	defer srv.Close()
+
+	f := GoFetcher{Timeout: time.Second}
+	if _, err := f.Fetch(context.Background(), fakeAcc{
+		name: "a", provider: "opencode-go", base: srv.URL + "/v1", key: "raw-secret",
+		authHeader: "x-api-key",
+		client:     srv.Client(),
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

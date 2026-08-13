@@ -41,6 +41,19 @@ type GoFetcher struct {
 	Timeout time.Duration
 }
 
+// applyAccountAuth writes the credential using the same rules as
+// pool.ApplyAuthHeader: empty or Authorization → Bearer token; any other
+// auth_header name → raw key and no Authorization header. The key is never
+// logged here.
+func applyAccountAuth(dst http.Header, acc AccountView) {
+	authHeader := strings.TrimSpace(acc.AuthHeader())
+	if authHeader == "" || http.CanonicalHeaderKey(authHeader) == "Authorization" {
+		dst.Set("Authorization", "Bearer "+acc.Key())
+		return
+	}
+	dst.Set(authHeader, acc.Key())
+}
+
 func (f GoFetcher) withDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
 	if f.Timeout > 0 {
 		return context.WithTimeout(ctx, f.Timeout)
@@ -114,7 +127,7 @@ func (f GoFetcher) Fetch(ctx context.Context, acc AccountView) (Snapshot, error)
 	if err != nil {
 		return snap, err
 	}
-	req.Header.Set("Authorization", "Bearer "+acc.Key())
+	applyAccountAuth(req.Header, acc)
 	req.Header.Set("Accept", "application/json")
 
 	client := acc.Client()

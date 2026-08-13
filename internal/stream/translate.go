@@ -397,11 +397,14 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 		return err
 	}
 
-	// The substantive-output check runs BEFORE the first write: an empty
-	// upstream stream (no content, no tool calls) must not commit an empty
-	// 200 — the caller returns a real HTTP error (502) instead. The
-	// response.created event is only emitted once there is at least one
-	// valid event to deliver.
+	// The substantive-output check runs BEFORE the first write: a true
+	// empty upstream stream (no events at all) must not commit an empty
+	// 200 — the caller returns a real HTTP error (502) instead. A stream
+	// that finished with [DONE] or a finish_reason is a legal empty
+	// completion even when there is no content/reasoning/tool output.
+	if lastFinishReason != "" {
+		completed = true
+	}
 	hasSubstantive := tr.reasoningBuf.Len() > 0 || tr.hadMessageContent
 	if !hasSubstantive {
 		for _, st := range tr.tools {
@@ -410,6 +413,9 @@ func TranslateChatStreamToResponses(w http.ResponseWriter, body io.Reader, model
 				break
 			}
 		}
+	}
+	if !hasSubstantive && completed {
+		hasSubstantive = true
 	}
 
 	if !hasSubstantive {

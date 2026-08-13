@@ -77,6 +77,49 @@ func TestPollerStopCancelsInFlight(t *testing.T) {
 	}
 }
 
+func TestPollerUnauthorizedClearsWindows(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusOK)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if status.Load() != http.StatusOK {
+			w.WriteHeader(int(status.Load()))
+			return
+		}
+		io.WriteString(w, `{"usage":{"rolling":{"status":"ok","percent":7}}}`)
+	}))
+	defer srv.Close()
+
+	p := NewPoller([]Fetcher{GoFetcher{}}, NewCache(), 30*time.Second, time.Second)
+	p.SetAccounts([]AccountView{fakeAcc{
+		name: "a", provider: "opencode-go", base: srv.URL + "/v1", key: "k",
+		client: srv.Client(),
+	}})
+	p.Refresh()
+	got := p.Cache().List()
+	if len(got) != 1 || len(got[0].Windows) != 1 || got[0].Windows[0].Percent != 7 {
+		t.Fatalf("first fetch: %+v", got)
+	}
+
+	status.Store(http.StatusUnauthorized)
+	p.Refresh()
+	got = p.Cache().List()
+	if len(got) != 1 {
+		t.Fatalf("after 401: list = %d", len(got))
+	}
+	if got[0].Stale || len(got[0].Windows) != 0 || got[0].Err != "unauthorized" {
+		t.Fatalf("after 401: %+v", got[0])
+	}
+
+	status.Store(http.StatusOK)
+	p.Refresh()
+	status.Store(http.StatusForbidden)
+	p.Refresh()
+	got = p.Cache().List()
+	if len(got) != 1 || got[0].Stale || len(got[0].Windows) != 0 || got[0].Err != "no_subscription" {
+		t.Fatalf("after 403: %+v", got)
+	}
+}
+
 func TestErrorCode(t *testing.T) {
 	if ErrorCode(ErrUnauthorized) != "unauthorized" {
 		t.Fatal(ErrorCode(ErrUnauthorized))

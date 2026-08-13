@@ -8,9 +8,9 @@
 #   CURL_BIN        覆盖 curl 命令（测试注入假命令，默认 curl）
 #
 # 本文件只做只读轮询：不编译、不安装、不重启、不写文件。
-# 设计依据：prism 启动时在 HTTP server 监听前等待全部账号的首轮健康探测
-# （单账号最长 ProbeTimeout=30s），因此部署后的健康窗口必须覆盖该值并留
-# 余量（默认 35s），且成功后立即继续、不空等。
+# 设计依据：prism 先 Listen 再跑启动探活。/health 进程起来就 200；deploy
+# 默认打 /ready（fail-closed）。默认 35s 覆盖单账号 ProbeTimeout=30s 加余量，
+# 成功后立即继续、不空等。
 # 检查目标为 /ready（readiness）：仅当至少一个账号 healthy 且不在
 # cooldown 时才返回 200；/health（liveness）进程起来就 200，无法区分
 # “服务已启动但所有账号不可用”。旧部署可用 HEALTH_URL 覆盖回 /health。

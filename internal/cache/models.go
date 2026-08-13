@@ -175,10 +175,14 @@ type upstreamModelsResponse struct {
 }
 
 // New creates a ModelCache with the given cache directory, pool, and config.
-// The cache directory is created if it doesn't exist.
+// The cache directory is created if it doesn't exist and is always set to
+// 0700 (owner-only): it may hold upstream metadata and model ids.
 func New(dir string, p *pool.Pool, cfg *config.Config) (*ModelCache, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return nil, fmt.Errorf("chmod cache dir: %w", err)
 	}
 	return &ModelCache{
 		dir:    dir,
@@ -665,6 +669,17 @@ func (mc *ModelCache) fetchLeader(ctx context.Context, provider string) error {
 // and any credentials in the base URL — which must not reach logs or
 // client-visible error text; only a short classification (upstream_timeout /
 // upstream_refused / ...) is kept (util.ClassifyConnError).
+// fetchCanceled returns ctx.Err() only when the context was cancelled
+// (Stop or an explicit cancel). A deadline is not a cancel: after
+// /v1/models succeeded the model list must still be persisted.
+func fetchCanceled(ctx context.Context) error {
+	err := ctx.Err()
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
 func (mc *ModelCache) fetchFromAccount(ctx context.Context, account *pool.Account, provider string, cfg *config.Config) error {
 	// Resolve and validate the cache file path up front (write-path defense
 	// for path traversal): an invalid provider name fails the fetch BEFORE
@@ -718,26 +733,30 @@ func (mc *ModelCache) fetchFromAccount(ctx context.Context, account *pool.Accoun
 		return fmt.Errorf("decode response: %w", err)
 	}
 
+	// /api/show uses an independent short budget (see fetchOllamaMeta). A
+	// show timeout must not discard the /v1/models list already obtained.
+	meta := mc.fetchOllamaMeta(ctx, account, upstream.Data, cfg)
+	// Only a Stop-driven cancel (context.Canceled) drops the whole result.
+	// context.DeadlineExceeded — the 30s fetch budget or the show budget —
+	// still persists Models; Meta may be partial or empty.
+	if err := fetchCanceled(ctx); err != nil {
+		return err
+	}
 	pc := &providerCache{
 		Models:    upstream.Data,
-		Meta:      mc.fetchOllamaMeta(ctx, account, upstream.Data, cfg), // ollama only; non-ollama returns nil
+		Meta:      meta,
 		UpdatedAt: time.Now(),
-	}
-	// A refresh cancelled by Stop() must not persist a half-observed result:
-	// the HTTP request may have completed just as the cancellation landed.
-	if ctx.Err() != nil {
-		return ctx.Err()
 	}
 
 	data, err := json.MarshalIndent(pc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal cache: %w", err)
 	}
-	// Final cancellation check immediately before the disk write: the
-	// marshal above takes time, and a fetch whose context was cancelled
-	// (Stop) must not write a cache file at all.
-	if ctx.Err() != nil {
-		return ctx.Err()
+	// Final Stop check immediately before the disk write: the marshal
+	// above takes time, and a fetch cancelled by Stop must not write a
+	// cache file at all. A deadline here still persists.
+	if err := fetchCanceled(ctx); err != nil {
+		return err
 	}
 
 	// Atomic cache write: the data goes to a temp file in the cache dir
@@ -769,12 +788,13 @@ func (mc *ModelCache) fetchFromAccount(ctx context.Context, account *pool.Accoun
 		os.Remove(tmpName)
 		return fmt.Errorf("close temp cache file: %w", err)
 	}
-	// Final cancellation check immediately before the rename: a fetch
-	// cancelled (Stop) between the write and the rename must not publish
-	// the cache file; the temp file is cleaned up instead.
-	if ctx.Err() != nil {
+	// Final Stop check immediately before the rename: a fetch cancelled
+	// by Stop between the write and the rename must not publish the
+	// cache file; the temp file is cleaned up instead. A deadline still
+	// publishes Models already obtained.
+	if err := fetchCanceled(ctx); err != nil {
 		os.Remove(tmpName)
-		return ctx.Err()
+		return err
 	}
 	if err := os.Rename(tmpName, cachePath); err != nil {
 		os.Remove(tmpName)
@@ -1150,14 +1170,19 @@ func (mc *ModelCache) SyncTools(cfg *config.Config) {
 		return
 	}
 
-	// Resolve the base URL: always 127.0.0.1 with the port from config.Listen.
+	// Resolve the base URL: 127.0.0.1 with the port from config.Listen.
+	// https when both TLS cert and key paths are set (same rule as ListenAndServeTLS).
 	port := "18790"
 	if hostPort := cfg.Listen; hostPort != "" {
 		if _, p, err := net.SplitHostPort(hostPort); err == nil {
 			port = p
 		}
 	}
-	baseURL := "http://127.0.0.1:" + port + "/v1"
+	scheme := "http"
+	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		scheme = "https"
+	}
+	baseURL := scheme + "://127.0.0.1:" + port + "/v1"
 
 	for toolName, toolPath := range cfg.Tools {
 		switch toolName {
@@ -1200,8 +1225,11 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 	pc := piConfig{Providers: make(map[string]piProvider)}
 	if data, err := os.ReadFile(path); err == nil {
 		if err := json.Unmarshal(data, &pc); err != nil {
-			slog.Warn("pi models.json parse error, overwriting", "path", path, "error", err)
-			pc = piConfig{Providers: make(map[string]piProvider)}
+			// Abort, never overwrite: a parse failure of an existing file
+			// would otherwise publish empty Providers and wipe non-Prism
+			// entries (same "leave the old file untouched" contract as a
+			// chown failure).
+			return fmt.Errorf("parse models.json: %w", err)
 		}
 	}
 
@@ -1297,10 +1325,16 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 			entries = append(entries, entry)
 		}
 
+		apiKey := "prism-dummy-key"
+		if old, ok := pc.Providers[provider]; ok && strings.TrimSpace(old.APIKey) != "" {
+			// Keep a hand-edited token (or an existing dummy). Only write
+			// the placeholder when the entry has no apiKey yet.
+			apiKey = old.APIKey
+		}
 		pc.Providers[provider] = piProvider{
 			BaseURL: baseURL,
 			API:     "openai-completions",
-			APIKey:  "prism-dummy-key",
+			APIKey:  apiKey,
 			Headers: map[string]string{"X-Prism-Provider": provider},
 			Models:  entries,
 		}
@@ -1429,14 +1463,63 @@ func deriveContextLength(modelInfo map[string]any) *int {
 	return nil
 }
 
+// ollamaShowPerRequest is the independent timeout for one /api/show call.
+// ollamaShowTotalMax caps the whole post-/v1/models show fan-out so show
+// cannot consume the parent fetch's 30s budget.
+const (
+	ollamaShowPerRequest = 4 * time.Second
+	ollamaShowTotalMax   = 8 * time.Second
+)
+
+// ollamaShowBudget is the independent budget for the /api/show fan-out.
+// When the parent fetch has a deadline, the budget is strictly shorter
+// than the remaining time so show cannot spend the rest of the 30s round.
+func ollamaShowBudget(parent context.Context) time.Duration {
+	budget := ollamaShowTotalMax
+	if dl, ok := parent.Deadline(); ok {
+		rem := time.Until(dl)
+		if rem <= 0 {
+			// Parent fetch budget already spent: still give one per-request
+			// window so a late show does not share the expired parent ctx
+			// (that would immediately cancel every show).
+			return ollamaShowPerRequest
+		}
+		shorter := rem / 2
+		if shorter < budget {
+			budget = shorter
+		}
+		if budget < time.Millisecond {
+			budget = time.Millisecond
+		}
+	}
+	return budget
+}
+
+// ollamaShowContext returns a context with an independent show deadline.
+// It is cancelled if parent is Canceled (Stop), but NOT if parent only
+// hits DeadlineExceeded — that is the 30s fetch budget, and Models must
+// still be persisted.
+func ollamaShowContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), ollamaShowBudget(parent))
+	stop := context.AfterFunc(parent, func() {
+		if errors.Is(parent.Err(), context.Canceled) {
+			cancel()
+		}
+	})
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
 // fetchOllamaShow queries ollama's /api/show endpoint for a single model and
 // extracts its metadata (currently just context_window from model_info).
 // A non-200, timeout, over-limit body, or parse error is returned as an
 // error so the caller can skip the model without failing the whole fetch.
-// ctx must be the enclosing fetch's context (cancellable for the background
-// refresh); the per-request 15s timeout is applied on top of it.
+// ctx is the independent show context (cancelled on Stop); a short
+// per-request timeout is applied on top of it.
 func (mc *ModelCache) fetchOllamaShow(ctx context.Context, acc *pool.Account, id string) (ModelMeta, error) {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, ollamaShowPerRequest)
 	defer cancel()
 
 	body, err := json.Marshal(map[string]string{"name": id})
@@ -1493,11 +1576,18 @@ func (mc *ModelCache) fetchOllamaShow(ctx context.Context, acc *pool.Account, id
 // endpoint. Only ollama providers (per cfg.EffortSchema) are queried; all other
 // providers return nil. A single model's failure is logged and skipped — it
 // never fails the enclosing Fetch. Up to 4 requests run concurrently.
+//
+// The show fan-out uses an independent short budget (see ollamaShowContext)
+// so a slow /api/show cannot spend the parent 30s /v1/models budget. A
+// show timeout returns whatever Meta was collected (possibly nil); only a
+// parent Cancel (Stop) discards the enclosing fetch.
 func (mc *ModelCache) fetchOllamaMeta(ctx context.Context, acc *pool.Account, models []ModelEntry, cfg *config.Config) map[string]ModelMeta {
 	if acc == nil || cfg == nil || cfg.EffortSchema(acc.Provider()) != "ollama" {
 		return nil
 	}
-	return mc.collectOllamaMeta(ctx, acc, models)
+	showCtx, cancel := ollamaShowContext(ctx)
+	defer cancel()
+	return mc.collectOllamaMeta(showCtx, acc, models)
 }
 
 // collectOllamaMeta performs the concurrent /api/show fan-out. It is the

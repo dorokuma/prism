@@ -618,7 +618,7 @@ func generateSystemdUnit(providers []providerConfig, tools []detectedTool) strin
 	sb.WriteString("ExecReload=/bin/kill -HUP $MAINPID\n")
 	sb.WriteString("Restart=always\n")
 	sb.WriteString("RestartSec=3\n")
-	sb.WriteString("TimeoutStopSec=35\n")
+	sb.WriteString("TimeoutStopSec=45\n")
 	sb.WriteString("KillMode=mixed\n\n")
 	sb.WriteString("# 安全加固（与 scripts/prism.service.example 保持一致）\n")
 	for _, d := range unitSecurityHardening {

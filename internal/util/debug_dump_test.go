@@ -377,3 +377,63 @@ func TestDebugModeConcurrentReadWrite(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestDumpDebugRefusesSymlinkFile(t *testing.T) {
+	prev := DebugMode.Load()
+	DebugMode.Store(true)
+	defer func() { DebugMode.Store(prev) }()
+
+	dir := filepath.Join(os.TempDir(), "prism-debug")
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	target := filepath.Join(t.TempDir(), "stolen")
+	if err := os.WriteFile(target, []byte("orig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "last-chat-request.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	DumpDebugChatBody([]byte(`{"model":"x"}`))
+
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "orig" {
+		t.Fatalf("followed symlink and overwrote target: %q", data)
+	}
+}
+
+func TestDumpDebugRefusesSymlinkDir(t *testing.T) {
+	prev := DebugMode.Load()
+	DebugMode.Store(true)
+	defer func() { DebugMode.Store(prev) }()
+
+	realDir := t.TempDir()
+	dir := filepath.Join(os.TempDir(), "prism-debug")
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(dir)
+
+	DumpDebugChatBody([]byte(`{"model":"x"}`))
+
+	entries, err := os.ReadDir(realDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("wrote through symlink dir: %v", entries)
+	}
+}

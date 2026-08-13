@@ -533,3 +533,74 @@ func TestResponsesToChat_DeepToolSchemaFails(t *testing.T) {
 		t.Fatalf("the conversion error must wrap ErrSchemaTooDeep (errors.Is chain), got: %v", err)
 	}
 }
+
+func TestResponsesToChat_ArraySummaryRestoresReasoningContent(t *testing.T) {
+	// ChatCompletionToResponse writes summary as
+	// [{type:summary_text,text:...}]. The reverse path must parse that
+	// array (not only a string summary) back into reasoning_content.
+	chatIn := []byte(`{"model":"gpt-4","choices":[{"message":{"role":"assistant","content":"hello","reasoning_content":"I reasoned this"}}]}`)
+	respBody, err := ChatCompletionToResponse(chatIn, "gpt-4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		t.Fatal(err)
+	}
+	output, ok := resp["output"].([]any)
+	if !ok {
+		t.Fatalf("missing output: %s", respBody)
+	}
+	reqJSON, err := json.Marshal(map[string]any{"model": "gpt-4", "input": output})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatOut, _, _, err := ResponsesToChatCompletions(reqJSON, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(chatOut, &m); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := m["messages"].([]any)
+	var got string
+	for _, msg := range msgs {
+		mm, _ := msg.(map[string]any)
+		if rc, ok := mm["reasoning_content"].(string); ok && rc != "" {
+			got = rc
+		}
+	}
+	if got != "I reasoned this" {
+		t.Fatalf("reasoning_content = %q, want %q (array summary must be parsed)", got, "I reasoned this")
+	}
+}
+
+func TestResponsesToChat_ArraySummaryDirect(t *testing.T) {
+	body := []byte(`{
+		"model": "m",
+		"input": [
+			{"type":"message","role":"user","content":"hi"},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"step one"},{"type":"reasoning_text","text":" step two"}]}
+		]
+	}`)
+	chat, _, _, err := ResponsesToChatCompletions(body, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(chat, &m); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := m["messages"].([]any)
+	var got string
+	for _, msg := range msgs {
+		mm, _ := msg.(map[string]any)
+		if rc, ok := mm["reasoning_content"].(string); ok && rc != "" {
+			got = rc
+		}
+	}
+	if got != "step one step two" {
+		t.Fatalf("reasoning_content = %q, want %q", got, "step one step two")
+	}
+}

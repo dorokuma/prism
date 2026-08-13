@@ -16,13 +16,14 @@ import (
 )
 
 type cliAccount struct {
-	name, provider, base, key string
+	name, provider, base, key, authHeader string
 }
 
 func (a cliAccount) Name() string         { return a.name }
 func (a cliAccount) Provider() string     { return a.provider }
 func (a cliAccount) BaseURL() string      { return a.base }
 func (a cliAccount) Key() string          { return a.key }
+func (a cliAccount) AuthHeader() string   { return a.authHeader }
 func (a cliAccount) Client() *http.Client { return nil }
 
 func runQuota(args []string) error {
@@ -63,7 +64,7 @@ flags:
 
 	var accs []planusage.AccountView
 	for _, a := range cfg.Accounts {
-		accs = append(accs, cliAccount{name: a.Name, provider: a.Provider, base: a.BaseURL, key: a.Key})
+		accs = append(accs, cliAccount{name: a.Name, provider: a.Provider, base: a.BaseURL, key: a.Key, authHeader: a.AuthHeader})
 	}
 	if *provider != "" {
 		var filtered []planusage.AccountView

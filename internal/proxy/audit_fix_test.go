@@ -318,6 +318,30 @@ func TestHandleUpstreamError429StructuredQuotaExhausts(t *testing.T) {
 	if acc.Status() != pool.StatusExhausted {
 		t.Fatalf("account status = %v, want exhausted (structured insufficient_quota is permanent)", acc.Status())
 	}
+	if got := acc.LastExhaustClass(); got != pool.ExhaustPermanentQuota {
+		t.Fatalf("LastExhaustClass() = %v, want ExhaustPermanentQuota", got)
+	}
+}
+
+// TestHandleUpstreamError402SetsPermanentQuotaClass pins the 402 path:
+// Payment Required is permanent quota exhaustion and must record
+// ExhaustPermanentQuota so a later HTTP 200 probe cannot revive it.
+func TestHandleUpstreamError402SetsPermanentQuotaClass(t *testing.T) {
+	p := pool.NewPool([]config.AccountConfig{{Name: "t", Key: "k", BaseURL: "http://localhost:1", Provider: "t"}})
+	acc := p.AllAccounts()[0]
+
+	resp := &http.Response{
+		StatusCode: http.StatusPaymentRequired,
+		Body:       io.NopCloser(bytes.NewReader([]byte(`{"error":{"code":"insufficient_quota","message":"quota"}}`))),
+	}
+	handleUpstreamError(acc, resp, "req-1", "m")
+
+	if acc.Status() != pool.StatusExhausted {
+		t.Fatalf("account status = %v, want exhausted (402 is permanent quota)", acc.Status())
+	}
+	if got := acc.LastExhaustClass(); got != pool.ExhaustPermanentQuota {
+		t.Fatalf("LastExhaustClass() = %v, want ExhaustPermanentQuota (bare MarkExhausted leaves class 0 and a 200 probe would revive)", got)
+	}
 }
 
 // --- Item 7: shared classification — bare 403 is temporary ---
@@ -348,8 +372,8 @@ func TestClassifyUpstreamError(t *testing.T) {
 	}
 }
 
-// --- Item 3: runtime 403 — structured permanent body exhausts but still
-// passes through; bare 403 does not exhaust ---
+// --- Item 3: runtime 403 — structured permanent body exhausts and
+// retries another account; bare 403 still passes through ---
 
 // proxyChatForStatus drives one chat request through the real proxy path
 // against an upstream that answers with status+body, and returns the
@@ -402,64 +426,127 @@ func TestUpstream403BarePassThrough(t *testing.T) {
 	}
 }
 
-// TestUpstream403StructuredCredentialExhaustsPassThrough: a 403 whose body
-// carries the structured invalid_api_key envelope is permanent: the account
-// is exhausted, but the client still receives the original 403 status and
-// body — the upstream's answer is passed through, not replaced.
-func TestUpstream403StructuredCredentialExhaustsPassThrough(t *testing.T) {
+// TestUpstream403StructuredCredentialRetries: a 403 whose body carries the
+// structured invalid_api_key envelope is permanent: the account is
+// exhausted and the 403 is NOT written to the client (same as 401). With
+// one account the terminal response is 502 upstream_auth_failed.
+func TestUpstream403StructuredCredentialRetries(t *testing.T) {
 	body := `{"error":{"code":"invalid_api_key","message":"forbidden"}}`
-	acc, rec, upstreamCalls := proxyChatForStatus(t, http.StatusForbidden, body)
+	acc, rec, _ := proxyChatForStatus(t, http.StatusForbidden, body)
 
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("client status = %d, want 403 (original status passed through)", rec.Code)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("client status = %d, want 502 (403 permanent credential must not pass through)", rec.Code)
 	}
-	var got struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("client body must stay valid JSON: %v (%q)", err, rec.Body.String())
-	}
-	if got.Error.Code != "invalid_api_key" || got.Error.Message != "forbidden" {
-		t.Errorf("client body = %+v, want the original structured 403 body passed through", got)
+	if code := decodeErrorCode(t, rec.Body.String()); code != "upstream_auth_failed" {
+		t.Errorf("error code = %q, want upstream_auth_failed", code)
 	}
 	if acc.Status() != pool.StatusExhausted {
 		t.Errorf("account status = %v, want exhausted (structured credential 403 is permanent)", acc.Status())
 	}
-	if n := atomic.LoadInt32(upstreamCalls); n != 1 {
-		t.Errorf("upstream calls = %d, want 1 (terminal 403 must not retry)", n)
-	}
 }
 
-// TestUpstream403StructuredQuotaExhaustsPassThrough: same rule for the
-// structured quota envelope — exhausted, original 403 body/status still
-// passed through.
-func TestUpstream403StructuredQuotaExhaustsPassThrough(t *testing.T) {
+// TestUpstream403StructuredQuotaRetries: same rule for the structured
+// quota envelope — exhausted, 403 not written, terminal 503
+// upstream_quota_exhausted when no other account remains.
+func TestUpstream403StructuredQuotaRetries(t *testing.T) {
 	body := `{"error":{"code":"insufficient_quota","message":"quota exceeded"}}`
-	acc, rec, upstreamCalls := proxyChatForStatus(t, http.StatusForbidden, body)
+	acc, rec, _ := proxyChatForStatus(t, http.StatusForbidden, body)
 
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("client status = %d, want 403 (original status passed through)", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("client status = %d, want 503 (403 permanent quota must not pass through)", rec.Code)
 	}
-	var got struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("client body must stay valid JSON: %v (%q)", err, rec.Body.String())
-	}
-	if got.Error.Code != "insufficient_quota" || got.Error.Message != "quota exceeded" {
-		t.Errorf("client body = %+v, want the original structured 403 body passed through", got)
+	if code := decodeErrorCode(t, rec.Body.String()); code != "upstream_quota_exhausted" {
+		t.Errorf("error code = %q, want upstream_quota_exhausted", code)
 	}
 	if acc.Status() != pool.StatusExhausted {
 		t.Errorf("account status = %v, want exhausted (structured quota 403 is permanent)", acc.Status())
 	}
-	if n := atomic.LoadInt32(upstreamCalls); n != 1 {
-		t.Errorf("upstream calls = %d, want 1 (terminal 403 must not retry)", n)
+	if got := acc.LastExhaustClass(); got != pool.ExhaustPermanentQuota {
+		t.Errorf("LastExhaustClass() = %v, want ExhaustPermanentQuota", got)
+	}
+}
+
+// proxyChatTwoAccountsFirstThenOK drives a chat request against two
+// accounts sharing one upstream: the first call returns status+body, later
+// calls return 200. Used to pin that a permanent 403 switches accounts.
+func proxyChatTwoAccountsFirstThenOK(t *testing.T, status int, errBody string) (*pool.Pool, *httptest.ResponseRecorder, *int32) {
+	t.Helper()
+	var upstreamCalls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&upstreamCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			w.WriteHeader(status)
+			w.Write([]byte(errBody))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{
+		{Name: "a", Key: "k1", BaseURL: upstream.URL, Provider: "test"},
+		{Name: "b", Key: "k2", BaseURL: upstream.URL, Provider: "test"},
+	}}
+	p := pool.NewPool(cfg.Accounts)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-4"}`)))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "test")
+
+	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
+	return p, rec, &upstreamCalls
+}
+
+// TestUpstream403InvalidAPIKeySwitchesAccount: 403 + invalid_api_key
+// exhausts the first account and the second account serves the request.
+func TestUpstream403InvalidAPIKeySwitchesAccount(t *testing.T) {
+	p, rec, upstreamCalls := proxyChatTwoAccountsFirstThenOK(t, http.StatusForbidden, `{"error":{"code":"invalid_api_key","message":"forbidden"}}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("client status = %d, want 200 after switching account (body %q)", rec.Code, rec.Body.String())
+	}
+	if n := atomic.LoadInt32(upstreamCalls); n < 2 {
+		t.Errorf("upstream calls = %d, want >= 2 (403+invalid_api_key must switch account)", n)
+	}
+	var exhausted, healthy int
+	for _, acc := range p.AllAccounts() {
+		switch acc.Status() {
+		case pool.StatusExhausted:
+			exhausted++
+		case pool.StatusHealthy:
+			healthy++
+		}
+	}
+	if exhausted != 1 || healthy != 1 {
+		t.Errorf("account states: exhausted=%d healthy=%d, want 1 exhausted and 1 healthy", exhausted, healthy)
+	}
+}
+
+// TestUpstream403InsufficientQuotaSwitchesAccount: 403 + insufficient_quota
+// exhausts the first account and the second account serves the request.
+func TestUpstream403InsufficientQuotaSwitchesAccount(t *testing.T) {
+	p, rec, upstreamCalls := proxyChatTwoAccountsFirstThenOK(t, http.StatusForbidden, `{"error":{"code":"insufficient_quota","message":"quota exceeded"}}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("client status = %d, want 200 after switching account (body %q)", rec.Code, rec.Body.String())
+	}
+	if n := atomic.LoadInt32(upstreamCalls); n < 2 {
+		t.Errorf("upstream calls = %d, want >= 2 (403+insufficient_quota must switch account)", n)
+	}
+	var exhausted, healthy int
+	for _, acc := range p.AllAccounts() {
+		switch acc.Status() {
+		case pool.StatusExhausted:
+			exhausted++
+		case pool.StatusHealthy:
+			healthy++
+		}
+	}
+	if exhausted != 1 || healthy != 1 {
+		t.Errorf("account states: exhausted=%d healthy=%d, want 1 exhausted and 1 healthy", exhausted, healthy)
 	}
 }
 

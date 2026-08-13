@@ -3985,3 +3985,261 @@ func TestFetch_ConnErrorNoURLLeak(t *testing.T) {
 		t.Errorf("fetch error = %q, want the safe upstream_refused classification", msg)
 	}
 }
+
+// TestNew_CacheDirMode0700 pins the cache directory as owner-only 0700
+// (it may hold upstream metadata). MkdirAll+Chmod so a wide umask cannot
+// leave the dir world-readable.
+func TestNew_CacheDirMode0700(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "models-cache")
+	mc, err := New(dir, pool.NewPool(nil), &config.Config{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if mc == nil {
+		t.Fatal("New returned nil cache")
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat cache dir: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0700 {
+		t.Errorf("cache dir mode = %o, want 0700", perm)
+	}
+}
+
+// TestSyncPIModelsJSON_ParseErrorAborts: a models.json that does not
+// unmarshal must abort the sync and leave the file byte-for-byte (and
+// inode) untouched — never treat parse failure as empty Providers and
+// wipe a non-Prism entry.
+func TestSyncPIModelsJSON_ParseErrorAborts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "models.json")
+	old := []byte(`{"providers":{"external":{"baseUrl":"https://keep.example","apiKey":"secret-token","models":[{"id":"x"}]}}`)
+	if err := os.WriteFile(path, old, 0644); err != nil {
+		t.Fatal(err)
+	}
+	fi0, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino0 := fi0.Sys().(*syscall.Stat_t).Ino
+
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{{Name: "a", Provider: "p", BaseURL: "http://127.0.0.1:1/v1"}},
+	}
+	mc := NewForTest(map[string]*providerCache{
+		"p": {Models: []ModelEntry{{ID: "m1", Object: "model", Created: 1, OwnedBy: "x"}}},
+	})
+	if err := mc.syncPIModelsJSON(path, "http://127.0.0.1:18790/v1", cfg); err == nil {
+		t.Fatal("syncPIModelsJSON must return an error when models.json cannot be parsed")
+	}
+	assertFileUntouched(t, path, old, ino0)
+}
+
+// TestSyncPIModelsJSON_PreservesExistingAPIKey: a hand-edited non-empty
+// apiKey (a real token) must survive rebuild. An entry with no apiKey
+// still gets the prism-dummy-key placeholder.
+func TestSyncPIModelsJSON_PreservesExistingAPIKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "models.json")
+	writePIModelsJSON(t, path, map[string]any{
+		"p": map[string]any{
+			"baseUrl": "http://127.0.0.1:18790/v1",
+			"api":     "openai-completions",
+			"apiKey":  "sk-user-real-token",
+			"models":  []map[string]any{{"id": "m1"}},
+		},
+	})
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a", Provider: "p", BaseURL: "http://127.0.0.1:1/v1"},
+			{Name: "b", Provider: "q", BaseURL: "http://127.0.0.1:1/v1"},
+		},
+	}
+	mc := NewForTest(map[string]*providerCache{
+		"p": {Models: []ModelEntry{{ID: "m1", Object: "model", Created: 1, OwnedBy: "x"}}},
+		"q": {Models: []ModelEntry{{ID: "m2", Object: "model", Created: 1, OwnedBy: "x"}}},
+	})
+	if err := mc.syncPIModelsJSON(path, "http://127.0.0.1:18790/v1", cfg); err != nil {
+		t.Fatalf("syncPIModelsJSON: %v", err)
+	}
+	got := readPIProvider(t, path)
+	if got["p"].APIKey != "sk-user-real-token" {
+		t.Errorf("provider p apiKey = %q, want the hand-edited token (must not be overwritten with prism-dummy-key)", got["p"].APIKey)
+	}
+	if got["q"].APIKey != "prism-dummy-key" {
+		t.Errorf("provider q apiKey = %q, want prism-dummy-key when no previous key exists", got["q"].APIKey)
+	}
+}
+
+func readPIProvider(t *testing.T, path string) map[string]struct {
+	BaseURL string `json:"baseUrl"`
+	APIKey  string `json:"apiKey"`
+} {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read synced file: %v", err)
+	}
+	var pc struct {
+		Providers map[string]struct {
+			BaseURL string `json:"baseUrl"`
+			APIKey  string `json:"apiKey"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(data, &pc); err != nil {
+		t.Fatalf("unmarshal synced file: %v", err)
+	}
+	return pc.Providers
+}
+
+// TestSyncTools_TLSUsesHTTPS writes https:// when both TLS cert and key
+// paths are set, and http:// when they are not. Port still comes from
+// cfg.Listen.
+func TestSyncTools_TLSUsesHTTPS(t *testing.T) {
+	dir := t.TempDir()
+	httpsPath := filepath.Join(dir, "https.json")
+	httpPath := filepath.Join(dir, "http.json")
+	mc := &ModelCache{
+		caches: map[string]*providerCache{
+			"p": {Models: []ModelEntry{{ID: "m1", Object: "model", Created: 1, OwnedBy: "x"}}},
+		},
+	}
+	base := config.Config{
+		Listen:   "127.0.0.1:9443",
+		Accounts: []config.AccountConfig{{Name: "a", Provider: "p", BaseURL: "http://x/v1"}},
+	}
+
+	cfgTLS := base
+	cfgTLS.TLSCertFile = "/tmp/cert.pem"
+	cfgTLS.TLSKeyFile = "/tmp/key.pem"
+	cfgTLS.Tools = map[string]string{"pi": httpsPath}
+	mc.SyncTools(&cfgTLS)
+	if got := readPIProvider(t, httpsPath)["p"].BaseURL; got != "https://127.0.0.1:9443/v1" {
+		t.Errorf("TLS baseUrl = %q, want https://127.0.0.1:9443/v1", got)
+	}
+
+	cfgPlain := base
+	cfgPlain.Tools = map[string]string{"pi": httpPath}
+	mc.SyncTools(&cfgPlain)
+	if got := readPIProvider(t, httpPath)["p"].BaseURL; got != "http://127.0.0.1:9443/v1" {
+		t.Errorf("plain baseUrl = %q, want http://127.0.0.1:9443/v1", got)
+	}
+
+	cfgOne := base
+	cfgOne.TLSCertFile = "/tmp/cert.pem"
+	cfgOne.Tools = map[string]string{"pi": filepath.Join(dir, "one.json")}
+	mc.SyncTools(&cfgOne)
+	if got := readPIProvider(t, cfgOne.Tools["pi"])["p"].BaseURL; got != "http://127.0.0.1:9443/v1" {
+		t.Errorf("cert-only baseUrl = %q, want http (both cert and key required)", got)
+	}
+}
+
+// TestOllamaShowBudgetShorterThanRemaining: the independent show budget
+// is capped below the parent fetch remaining time (and at ollamaShowTotalMax).
+func TestOllamaShowBudgetShorterThanRemaining(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	got := ollamaShowBudget(ctx)
+	if got != ollamaShowTotalMax {
+		t.Errorf("ollamaShowBudget(30s parent) = %v, want cap %v", got, ollamaShowTotalMax)
+	}
+	if got >= 30*time.Second {
+		t.Errorf("show budget %v must be shorter than the 30s parent fetch", got)
+	}
+
+	short, shortCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer shortCancel()
+	got = ollamaShowBudget(short)
+	if got >= 200*time.Millisecond {
+		t.Errorf("ollamaShowBudget(200ms parent) = %v, want strictly shorter than remaining", got)
+	}
+	if got <= 0 {
+		t.Errorf("ollamaShowBudget(200ms parent) = %v, want a positive independent budget", got)
+	}
+}
+
+// TestFetch_ShowTimeoutStillPersistsModels: after /v1/models succeeds, a
+// hung /api/show that burns the (short) fetch budget must still persist
+// the model list. Only Stop/cancel discards the whole result.
+func TestFetch_ShowTimeoutStillPersistsModels(t *testing.T) {
+	modelsHit := make(chan struct{})
+	showHit := make(chan struct{})
+	releaseShow := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			close(modelsHit)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"object": "list",
+				"data": []map[string]any{
+					{"id": "m1", "object": "model", "created": 1, "owned_by": "ollama"},
+					{"id": "m2", "object": "model", "created": 1, "owned_by": "ollama"},
+				},
+			})
+		case "/api/show":
+			select {
+			case <-showHit:
+			default:
+				close(showHit)
+			}
+			select {
+			case <-releaseShow:
+				_ = json.NewEncoder(w).Encode(map[string]any{"model_info": map[string]any{"x.context_length": 64000}})
+			case <-r.Context().Done():
+				return
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	mc := &ModelCache{
+		dir:    dir,
+		caches: map[string]*providerCache{},
+		cfg:    loadOllamaSchemaCfg(t),
+		pool: pool.NewPool([]config.AccountConfig{
+			{Name: "ollama-acc", Provider: "ollama-cloud", BaseURL: srv.URL + "/v1", Key: "k"},
+		}),
+		stop:        make(chan struct{}),
+		fetchBudget: 200 * time.Millisecond,
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mc.Fetch("ollama-cloud") }()
+
+	select {
+	case <-modelsHit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch never reached /v1/models")
+	}
+	select {
+	case <-showHit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch never reached /api/show")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("show-budget timeout must still persist /v1/models, Fetch err = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Fetch did not return after the independent show budget")
+	}
+
+	models := mc.GetModels("ollama-cloud")
+	if len(models) != 2 || models[0].ID != "m1" || models[1].ID != "m2" {
+		t.Errorf("cached models = %+v, want [m1 m2] (timeout during show must not drop the list)", models)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read cache dir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "ollama-cloud.json" {
+		t.Errorf("cache dir after show timeout = %v, want [ollama-cloud.json]", entries)
+	}
+	close(releaseShow) // let /api/show handlers return so the test server can shut down
+}

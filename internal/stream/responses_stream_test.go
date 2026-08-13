@@ -493,6 +493,46 @@ func TestTranslateStream_EmptyInputNoEventsWritten(t *testing.T) {
 	}
 }
 
+func TestTranslateStream_EmptyCompletionNotEmptyStream(t *testing.T) {
+	// A finished stream with role + finish_reason=stop and/or [DONE] and no
+	// content is a legal empty completion, not ErrEmptyUpstreamStream.
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name: "role_finish_stop_and_done",
+			input: "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\"}]}\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name:  "done_only",
+			input: "data: [DONE]\n\n",
+		},
+		{
+			name:  "finish_stop_no_done",
+			input: "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\"}]}\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			err := TranslateChatStreamToResponses(rec, strings.NewReader(tc.input), "gpt-5.5", nil, nil, context.Background())
+			if err != nil {
+				t.Fatalf("legal empty completion must not error, got %v", err)
+			}
+			events := parseSSE(t, rec.Body.String())
+			if len(events) == 0 {
+				t.Fatal("expected completed events for a legal empty completion")
+			}
+			last := events[len(events)-1]
+			if last.Type != "response.completed" {
+				t.Fatalf("last event = %q, want response.completed", last.Type)
+			}
+		})
+	}
+}
+
 func TestStreamUsageConversion(t *testing.T) {
 	// Stream with detailed usage including cache and reasoning fields.
 	input := `data: {"choices":[{"delta":{"content":"hi"}}]}

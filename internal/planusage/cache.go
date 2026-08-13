@@ -22,21 +22,33 @@ func (c *Cache) Store(fp string, snap Snapshot) {
 }
 
 // StoreFailed keeps the last good windows (if any) and marks the snapshot stale.
+// Unauthorized / no_subscription (401/403) clear windows and are not stale:
+// the previous plan is no longer a valid display.
 func (c *Cache) StoreFailed(fp string, provider string, accounts []string, errText string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	prev, ok := c.items[fp]
+	keepWindows := ok && len(prev.Windows) > 0 && !clearsQuotaWindows(errText)
 	snap := Snapshot{
 		Provider:  provider,
 		Accounts:  accounts,
 		FetchedAt: time.Now().UTC(),
 		Err:       errText,
-		Stale:     ok && len(prev.Windows) > 0,
+		Stale:     keepWindows,
 	}
-	if snap.Stale {
+	if keepWindows {
 		snap.Windows = prev.Windows
 	}
 	c.items[fp] = snap
+}
+
+func clearsQuotaWindows(errText string) bool {
+	switch errText {
+	case "unauthorized", "no_subscription":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Cache) ForgetMissing(live map[string]struct{}) {

@@ -264,7 +264,7 @@ func TestGenerateSystemdUnit_SecurityHardening(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Type=simple",
-		"TimeoutStopSec=35",
+		"TimeoutStopSec=45",
 		"KillMode=mixed",
 		"ReadOnlyPaths=" + strings.Join(unitReadOnlyPaths, " "),
 		"ReadWritePaths=" + modelCacheDir,

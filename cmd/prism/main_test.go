@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -1161,5 +1162,74 @@ func TestHTTPHandler_ResponsesDeepSchema400InvalidRequest(t *testing.T) {
 	}
 	if resp.Error.Code != "invalid_request" {
 		t.Errorf("error code = %q, want invalid_request", resp.Error.Code)
+	}
+}
+
+// TestStartInitialAccountProbes402SetsPermanentQuotaClass pins the
+// startup probe: HTTP 402 / insufficient_quota must record
+// ExhaustPermanentQuota so a later /v1/models 200 cannot revive it.
+func TestStartInitialAccountProbes402SetsPermanentQuotaClass(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"error":{"code":"insufficient_quota"}}`))
+	}))
+	defer srv.Close()
+
+	p := pool.NewPool([]config.AccountConfig{{
+		Name:    "acc-402",
+		Key:     "test-key",
+		BaseURL: srv.URL,
+	}})
+	startInitialAccountProbes(p)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		acc := p.AllAccounts()[0]
+		if acc.Status() == pool.StatusExhausted {
+			if got := acc.LastExhaustClass(); got != pool.ExhaustPermanentQuota {
+				t.Fatalf("LastExhaustClass() = %v, want ExhaustPermanentQuota", got)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("account status = %v, want exhausted after 402 startup probe", acc.Status())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestStartInitialAccountProbesDoesNotWait(t *testing.T) {
+	started := make(chan struct{}, 16)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	cfgs := make([]config.AccountConfig, 11)
+	for i := range cfgs {
+		cfgs[i] = config.AccountConfig{
+			Name:    fmt.Sprintf("acc-%d", i),
+			Key:     "test-key",
+			BaseURL: srv.URL,
+		}
+	}
+	p := pool.NewPool(cfgs)
+	begin := time.Now()
+	startInitialAccountProbes(p)
+	if elapsed := time.Since(begin); elapsed > 300*time.Millisecond {
+		t.Fatalf("startInitialAccountProbes waited %v; Listen must not wait for probes", elapsed)
+	}
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < 10; i++ {
+		select {
+		case <-started:
+		case <-deadline:
+			t.Fatalf("only saw %d probes start, want 10 in the first wave", i)
+		}
 	}
 }

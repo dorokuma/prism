@@ -48,9 +48,11 @@ var hopByHopHeaders = map[string]bool{
 }
 
 var sensitiveClientHeaders = map[string]bool{
-	http.CanonicalHeaderKey("Cookie"):       true,
-	http.CanonicalHeaderKey("X-Api-Key"):    true,
-	http.CanonicalHeaderKey("X-Auth-Token"): true,
+	http.CanonicalHeaderKey("Cookie"):         true,
+	http.CanonicalHeaderKey("X-Api-Key"):      true,
+	http.CanonicalHeaderKey("X-Auth-Token"):   true,
+	http.CanonicalHeaderKey("Api-Key"):        true,
+	http.CanonicalHeaderKey("X-Goog-Api-Key"): true,
 }
 
 // spoofableClientHeaders are client-supplied forwarding headers that must
@@ -152,9 +154,10 @@ const (
 // matching the real code:
 //   - Runtime (handleUpstreamResponse 4xx branch): a bare 403 is passed
 //     through to the client with its original status and redacted body —
-//     no cooldown, no retry. Only a 403 carrying a recognized structured
-//     permanent credential/quota body exhausts the account, and even then
-//     the original status/body still pass through unchanged.
+//     no cooldown, no retry. A 403 carrying a recognized structured
+//     permanent credential/quota body exhausts the account and is treated
+//     like 401: the 403 is not written to the client, and the caller
+//     selects another account.
 //   - Startup probe (cmd/prism initial health check): a bare 403 is treated
 //     as a temporary failure and the account is cooled down (5 minutes, or
 //     2 minutes for 429) without being exhausted.
@@ -280,11 +283,11 @@ func handleUpstreamError(acc *pool.Account, resp *http.Response, requestID strin
 
 	switch ClassifyUpstreamError(resp.StatusCode, bodyBytes) {
 	case UpstreamErrorPermanentCredential:
-		acc.MarkExhausted()
+		acc.MarkExhaustedWithClass(pool.ExhaustPermanentCredential)
 		slog.Error("upstream permanent credential error, marking exhausted", append(baseAttrs, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{acc.Key()})), "error_type", "auth_failed")...)
 		return UpstreamErrorPermanentCredential
 	case UpstreamErrorPermanentQuota:
-		acc.MarkExhausted()
+		acc.MarkExhaustedWithClass(pool.ExhaustPermanentQuota)
 		slog.Error("upstream permanent quota error, marking exhausted", append(baseAttrs, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{acc.Key()})), "error_type", "upstream_ratelimited")...)
 		return UpstreamErrorPermanentQuota
 	}
@@ -530,11 +533,9 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 	}
 
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		// 4xx client error (other than 401/402/429 handled above, plus
-		// 403 which is a permission error not helped by retry).
-		// Pass through with redacted body, no cooldown, no retry. The body
-		// is read exactly ONCE and reused for both classification and the
-		// passthrough below.
+		// 4xx client error (other than 401/402/429 handled above).
+		// The body is read exactly ONCE and reused for classification and
+		// any passthrough below.
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, config.MaxErrorBodyBytes))
 		if readErr != nil {
 			slog.Warn("failed to read upstream 4xx body", "req", requestID, "error", readErr)
@@ -542,20 +543,25 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 		// Shared classification (ClassifyUpstreamError, the same point
 		// handleUpstreamError and the startup probe use): a 403 whose body
 		// is a recognized structured permanent credential/quota error
-		// exhausts the account — but the original status and (redacted)
-		// body are still passed through unchanged, because the client's
-		// error is its own, not the gateway's. A bare 403 (no recognized
-		// envelope) stays temporary and does NOT exhaust.
+		// exhausts the account and is retried on another account — the
+		// 403 is not written to the client (same as 401). A bare 403 (no
+		// recognized envelope) stays temporary, is passed through
+		// unchanged, and does NOT exhaust.
 		var class UpstreamErrorClass
 		switch ClassifyUpstreamError(resp.StatusCode, errBody) {
 		case UpstreamErrorPermanentCredential:
 			class = UpstreamErrorPermanentCredential
-			acc.MarkExhausted()
+			acc.MarkExhaustedWithClass(pool.ExhaustPermanentCredential)
 			slog.Error("upstream 4xx permanent credential error, marking exhausted", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", string(util.RedactBodyBytesWithKeys(errBody, []string{acc.Key()})), "error_type", "auth_failed")
 		case UpstreamErrorPermanentQuota:
 			class = UpstreamErrorPermanentQuota
-			acc.MarkExhausted()
+			acc.MarkExhaustedWithClass(pool.ExhaustPermanentQuota)
 			slog.Error("upstream 4xx permanent quota error, marking exhausted", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", string(util.RedactBodyBytesWithKeys(errBody, []string{acc.Key()})), "error_type", "upstream_ratelimited")
+		}
+		if resp.StatusCode == http.StatusForbidden &&
+			(class == UpstreamErrorPermanentCredential || class == UpstreamErrorPermanentQuota) {
+			util.RecordUpstreamRetry()
+			return false, nil, class
 		}
 		errStr := string(util.RedactBodyBytesWithKeys(errBody, []string{acc.Key()}))
 		slog.Warn("upstream 4xx", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", errStr, "error_type", "upstream_4xx")

@@ -33,6 +33,7 @@ type AccountView interface {
 	Provider() string
 	BaseURL() string
 	Key() string
+	AuthHeader() string
 	Client() *http.Client
 }
 

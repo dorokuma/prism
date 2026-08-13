@@ -519,3 +519,90 @@ func TestMCPCache_SizeLimitDoesNotReplaceCountCap(t *testing.T) {
 		t.Errorf("tools after oversized write = %d, want 100 (oversized tool must not consume a slot)", got)
 	}
 }
+
+// TestMCPCache_SameNameReplacesSnapshot pins same-name writes: a second
+// cache of the same function name must replace the stored snapshot (a later
+// parameter schema is visible), not keep the first write forever. A replace
+// still works when the bucket is already at the 100-tool cap.
+func TestMCPCache_SameNameReplacesSnapshot(t *testing.T) {
+	snap := cacheSnapshot()
+	ClearMCPCache()
+	defer restoreCache(snap)
+
+	cacheMCPTool("key-a", map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name": "echo",
+			"parameters": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"old": map[string]any{"type": "string"}},
+			},
+		},
+	})
+	cacheMCPTool("key-a", map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name": "echo",
+			"parameters": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"new": map[string]any{"type": "string"}},
+			},
+		},
+	})
+
+	tools := getTenantMCPTools("key-a")
+	if len(tools) != 1 {
+		t.Fatalf("tools after same-name rewrite = %d, want 1", len(tools))
+	}
+	fn, ok := tools[0]["function"].(map[string]any)
+	if !ok {
+		t.Fatal("cached tool has no function object")
+	}
+	params, ok := fn["parameters"].(map[string]any)
+	if !ok {
+		t.Fatal("cached tool has no parameters object")
+	}
+	props, ok := params["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("cached tool has no properties object")
+	}
+	if _, ok := props["new"]; !ok {
+		t.Error("second write's schema (property \"new\") must be visible after same-name replace")
+	}
+	if _, ok := props["old"]; ok {
+		t.Error("first write's schema (property \"old\") must not survive a same-name replace")
+	}
+
+	ClearMCPCache()
+	for i := 0; i < 100; i++ {
+		cacheMCPTool("key-a", toolWithName(fmt.Sprintf("t%02d", i)))
+	}
+	cacheMCPTool("key-a", map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":   "t00",
+			"schema": "v2",
+		},
+	})
+	got := getTenantMCPTools("key-a")
+	if len(got) != 100 {
+		t.Fatalf("tools after in-cap replace = %d, want 100", len(got))
+	}
+	replaced := false
+	for _, tool := range got {
+		if toolFunctionName(tool) != "t00" {
+			continue
+		}
+		fn, ok := tool["function"].(map[string]any)
+		if !ok {
+			t.Fatal("t00 has no function object")
+		}
+		if fn["schema"] != "v2" {
+			t.Errorf("t00 schema = %v, want v2 (100-cap must not block a same-name replace)", fn["schema"])
+		}
+		replaced = true
+	}
+	if !replaced {
+		t.Fatal("t00 missing after same-name replace at the 100-tool cap")
+	}
+}

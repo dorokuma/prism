@@ -21,6 +21,24 @@ const (
 	StatusExhausted
 )
 
+// ExhaustClass is why an account was marked exhausted. Numeric values
+// match proxy.UpstreamErrorClass so a caller can store
+// ClassifyUpstreamError's result directly. Probe reads this to decide
+// whether an HTTP 200 may revive the account.
+type ExhaustClass int
+
+const (
+	// ExhaustTemporary is the zero value: no permanent class recorded
+	// (MarkExhausted without a class). A 200 probe may revive.
+	ExhaustTemporary ExhaustClass = iota
+	// ExhaustPermanentCredential is 401 / structured credential failure.
+	// A 200 probe may revive.
+	ExhaustPermanentCredential
+	// ExhaustPermanentQuota is 402 / structured quota exhaustion.
+	// A 200 probe must not revive; wait for the next window or a manual MarkHealthy.
+	ExhaustPermanentQuota
+)
+
 // Slot is the non-mismatchable lease for ONE acquired concurrency slot. It
 // is created by Account.TryAcquire and consumed by Account.Release / Pool.
 // Release takes the Slot — never a bare key/max pair — so a caller can
@@ -54,15 +72,17 @@ type Slot struct {
 // concurrency explicit and finite. The total in-flight count stays
 // observable via InFlightCount.
 type Account struct {
-	cfg           config.AccountConfig
-	status        AccountStatus
-	client        *http.Client
-	mu            sync.Mutex
-	inFlight      atomic.Int32
-	totalRequests atomic.Int64
-	cooldownCount atomic.Int64
-	exhaustCount  atomic.Int64
-	cooldownUntil time.Time
+	cfg              config.AccountConfig
+	status           AccountStatus
+	client           *http.Client
+	mu               sync.Mutex
+	inFlight         atomic.Int32
+	totalRequests    atomic.Int64
+	cooldownCount    atomic.Int64
+	exhaustCount     atomic.Int64
+	cooldownUntil    time.Time
+	lastExhaustClass ExhaustClass
+	lastProbeAt      time.Time
 
 	// totalCap is the account-wide aggregate concurrency bound across ALL
 	// keys (0 = no aggregate bound). It is set at pool construction (see
@@ -113,6 +133,51 @@ func (a *Account) MarkExhausted() {
 	}
 }
 
+// MarkExhaustedWithClass marks the account exhausted and records why.
+// Already-exhausted accounts still update lastExhaustClass so a later
+// probe (or a classified retry) can attach the permanent reason.
+func (a *Account) MarkExhaustedWithClass(c ExhaustClass) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.status == StatusHealthy {
+		a.status = StatusExhausted
+		a.exhaustCount.Add(1)
+		slog.Warn("account marked exhausted", "account", a.Name(), "in_flight", a.inFlight.Load(), "class", int(c))
+	}
+	a.lastExhaustClass = c
+}
+
+// LastExhaustClass returns the recorded exhaust reason (zero if none).
+func (a *Account) LastExhaustClass() ExhaustClass {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastExhaustClass
+}
+
+func (a *Account) noteExhaustClass(c ExhaustClass) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastExhaustClass = c
+}
+
+func (a *Account) markProbed() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastProbeAt = time.Now()
+}
+
+func (a *Account) recentlyProbed(window time.Duration) bool {
+	if window <= 0 {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.lastProbeAt.IsZero() {
+		return false
+	}
+	return time.Since(a.lastProbeAt) < window
+}
+
 func newHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: 0,
@@ -155,6 +220,7 @@ func (a *Account) MarkHealthy() {
 	if a.status == StatusExhausted {
 		a.status = StatusHealthy
 		a.cooldownUntil = time.Time{}
+		a.lastExhaustClass = ExhaustTemporary
 		slog.Info("account marked healthy", "account", a.Name())
 	}
 }

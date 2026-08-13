@@ -110,20 +110,21 @@ func cacheAdminTool(tool map[string]any) {
 // body itself is never logged).
 const MaxToolSerializedBytes = 1 << 20 // 1 MiB
 
-// cacheTool is the shared bucket-write implementation: it deduplicates by
-// function name, caps each bucket at 100 tools, and caps the serialized size
-// of a SINGLE tool (MaxToolSerializedBytes — an oversized tool is dropped,
-// never truncated, never logged in full). Must be called with the resolved
-// cache key (never empty).
+// cacheTool is the shared bucket-write implementation: it replaces an
+// existing tool of the same function name (so a later schema is visible),
+// caps each bucket at 100 tools, and caps the serialized size of a SINGLE
+// tool (MaxToolSerializedBytes — an oversized tool is dropped, never
+// truncated, never logged in full). Must be called with the resolved cache
+// key (never empty).
 //
 // Lock discipline: JSON serialization, the size check and the snapshot
 // copy all run BEFORE the global cache lock — marshaling a huge tool (giant
 // description or schema) is CPU/memory work that must not serialize every
 // other cache operation behind mcpCacheMu, and the snapshot copy is part of
 // the same pre-lock serialization stage. The lock is held only for the
-// final read-modify-write on the bucket (create, dedupe, 100-cap, append),
-// which keeps the concurrency semantics unchanged: the dedupe and capacity
-// decisions always observe the latest bucket state.
+// final read-modify-write on the bucket (create, same-name replace, 100-cap,
+// append), which keeps the concurrency semantics unchanged: the replace and
+// capacity decisions always observe the latest bucket state.
 //
 // The caller's map is NEVER stored by reference: flattenToolEntry (or the
 // admin config path) may keep mutating the tool map after this call, which
@@ -170,18 +171,19 @@ func cacheTool(key string, tool map[string]any) {
 	}
 	tc.lastAccess = time.Now()
 
+	// Same function name: replace the stored snapshot so a later schema
+	// is visible. Do this BEFORE the 100-cap check so an update of an
+	// already-cached tool is not dropped when the bucket is full.
+	for i, existing := range tc.tools {
+		fn, ok1 := existing["function"].(map[string]any)
+		nf, ok2 := snapshot["function"].(map[string]any)
+		if ok1 && ok2 && fn["name"] == nf["name"] {
+			tc.tools[i] = snapshot
+			return
+		}
+	}
 	if len(tc.tools) >= 100 {
 		return // limit to 100 tools per tenant to prevent memory exhaustion
-	}
-
-	for _, existing := range tc.tools {
-		if fn, ok := existing["function"].(map[string]any); ok {
-			if nf, ok := snapshot["function"].(map[string]any); ok {
-				if fn["name"] == nf["name"] {
-					return // already cached
-				}
-			}
-		}
 	}
 	tc.tools = append(tc.tools, snapshot)
 }
@@ -264,7 +266,7 @@ func snapshotTenantToolsLocked(identity string) []map[string]any {
 
 // toolFunctionName returns the "function.name" of a cached tool entry, or
 // "" when the entry has no function name (defensive: malformed entries are
-// skipped by the dedupe, never returned twice).
+// skipped by the same-name replace, never returned twice).
 func toolFunctionName(tool map[string]any) string {
 	if fn, ok := tool["function"].(map[string]any); ok {
 		if name, ok := fn["name"].(string); ok {

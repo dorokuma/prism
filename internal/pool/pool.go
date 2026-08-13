@@ -324,7 +324,6 @@ func (p *Pool) selectKeyed(ctx context.Context, key string, maxConcurrent int, p
 
 	for {
 		hasHealthy := false
-		allHealthyInCooldown := true
 		var minCooldown time.Duration
 		now := time.Now()
 
@@ -345,8 +344,6 @@ func (p *Pool) selectKeyed(ctx context.Context, key string, maxConcurrent int, p
 					if minCooldown == 0 || remaining < minCooldown {
 						minCooldown = remaining
 					}
-				} else {
-					allHealthyInCooldown = false
 				}
 			}
 		}
@@ -371,9 +368,15 @@ func (p *Pool) selectKeyed(ctx context.Context, key string, maxConcurrent int, p
 		elem := p.waiters.PushBack(w)
 		p.mu.Unlock()
 
+		// Arm a timer for the nearest matching healthy cooldown, even when
+		// another healthy sibling is only at capacity. Requiring every
+		// healthy account to be in cooldown left waiters parked until
+		// Release or the 2*AccountSelectTimeout safety net (429 cooldown
+		// mixed with a long-stream full slot). The timer does not close
+		// w.ch, so it cannot double-wake with Release/MarkHealthy.
 		var cooldownChan <-chan time.Time
 		var cooldownTimer *time.Timer
-		if allHealthyInCooldown && minCooldown > 0 {
+		if minCooldown > 0 {
 			cooldownTimer = time.NewTimer(minCooldown)
 			cooldownChan = cooldownTimer.C
 		}

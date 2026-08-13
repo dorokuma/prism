@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 )
 
 // DebugMode controls whether debug dumps are written. It is an atomic.Bool:
@@ -138,10 +139,48 @@ func omitDebugContent(v any, inContent bool) any {
 	return v
 }
 
-func initDebugDumpDir() string {
-	dir := filepath.Join(os.TempDir(), "prism-debug")
-	_ = os.MkdirAll(dir, 0o700)
-	return dir
+func debugDumpDir() string {
+	return filepath.Join(os.TempDir(), "prism-debug")
+}
+
+func initDebugDumpDir() (string, error) {
+	dir := debugDumpDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("debug dump path is not a directory")
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("debug dump dir stat unsupported")
+	}
+	if int(st.Uid) != os.Getuid() {
+		return "", fmt.Errorf("debug dump dir not owned by current user")
+	}
+	return dir, nil
+}
+
+func writeDebugDumpFile(name string, data []byte) error {
+	dir, err := initDebugDumpDir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, name)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	cerr := f.Close()
+	if err != nil {
+		return err
+	}
+	return cerr
 }
 
 // DumpDebugChatBody dumps the chat request body to a temp file for debugging.
@@ -149,14 +188,12 @@ func DumpDebugChatBody(chatBody []byte) {
 	if !DebugMode.Load() {
 		return
 	}
-	dir := initDebugDumpDir()
-	path := filepath.Join(dir, "last-chat-request.json")
 	sanitized := debugDumpSanitize([]byte(RedactBody(chatBody)))
-	if err := os.WriteFile(path, sanitized, 0o600); err != nil {
+	if err := writeDebugDumpFile("last-chat-request.json", sanitized); err != nil {
 		slog.Debug("debug dump failed", "error", err)
 		return
 	}
-	slog.Debug("debug wrote dump", "path", path, "bytes", len(sanitized))
+	slog.Debug("debug wrote dump", "path", filepath.Join(debugDumpDir(), "last-chat-request.json"), "bytes", len(sanitized))
 }
 
 // DumpDebugResponsesBody dumps the responses body to a temp file for debugging.
@@ -164,10 +201,8 @@ func DumpDebugResponsesBody(originalBody []byte) {
 	if !DebugMode.Load() {
 		return
 	}
-	dir := initDebugDumpDir()
-	path := filepath.Join(dir, "last-responses-request.json")
 	sanitized := debugDumpSanitize([]byte(RedactBody(originalBody)))
-	if err := os.WriteFile(path, sanitized, 0o600); err != nil {
+	if err := writeDebugDumpFile("last-responses-request.json", sanitized); err != nil {
 		slog.Debug("debug responses dump failed", "error", err)
 	}
 }
@@ -181,12 +216,10 @@ func DumpDebugUpstreamResponse(rawBody []byte, extraKeys []string) {
 	if !DebugMode.Load() {
 		return
 	}
-	dir := initDebugDumpDir()
-	path := filepath.Join(dir, "last-upstream-response.json")
 	sanitized := debugDumpSanitize(RedactBodyBytesWithKeys(rawBody, extraKeys))
-	if err := os.WriteFile(path, sanitized, 0o600); err != nil {
+	if err := writeDebugDumpFile("last-upstream-response.json", sanitized); err != nil {
 		slog.Debug("debug upstream response dump failed", "error", err)
 		return
 	}
-	slog.Debug("debug wrote upstream response dump", "path", path, "bytes", len(sanitized))
+	slog.Debug("debug wrote upstream response dump", "path", filepath.Join(debugDumpDir(), "last-upstream-response.json"), "bytes", len(sanitized))
 }

@@ -23,9 +23,11 @@ BACKUP="${BINARY}.bak"
 # 想要 liveness 级别的部署检查，显式设置 HEALTH_URL=http://127.0.0.1:18790/health
 # 覆盖即可；不要把 HEALTH_TIMEOUT 盲目延长到数分钟来“等”全账号恢复——
 # 那只会把一次注定失败的上线拖到很晚才回滚。
+# TLS 部署必须覆盖 HEALTH_URL=https://...；本脚本不猜测证书或协议。
+# 未确认证书时默认保持明文回环 http://127.0.0.1:18790/ready。
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18790/ready}"
-# 健康等待窗口（秒）：prism 启动时在 HTTP server 监听前等待全部账号的首轮
-# 健康探测（单账号最长 ProbeTimeout=30s），默认 35s 覆盖该值并留余量。
+# 健康等待窗口（秒）：进程先 Listen，启动探活在后台跑。/health 立刻 200，
+# /ready 仍 fail-closed。默认 35s 等 /ready（单账号 ProbeTimeout=30s 加余量）。
 # 可用环境变量覆盖；必须为正整数，非法值在任何副作用发生前 exit 3。
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-35}"
 # shellcheck disable=SC1091

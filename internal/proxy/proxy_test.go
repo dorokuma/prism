@@ -185,6 +185,8 @@ func TestCopyClientHeaders(t *testing.T) {
 	src.Header.Set("Cookie", "session=abc123")
 	src.Header.Set("X-Api-Key", "sk-test123")
 	src.Header.Set("X-Auth-Token", "token123")
+	src.Header.Set("Api-Key", "client-api-key")
+	src.Header.Set("X-Goog-Api-Key", "client-goog-key")
 	src.Header.Set("Authorization", "Bearer sk-test456")
 	src.Header.Set("Connection", "keep-alive")
 
@@ -200,6 +202,12 @@ func TestCopyClientHeaders(t *testing.T) {
 	}
 	if dst.Get("X-Auth-Token") != "" {
 		t.Error("X-Auth-Token header was copied, should have been filtered")
+	}
+	if dst.Get("Api-Key") != "" {
+		t.Error("Api-Key header was copied, should have been filtered")
+	}
+	if dst.Get("X-Goog-Api-Key") != "" {
+		t.Error("X-Goog-Api-Key header was copied, should have been filtered")
 	}
 	if dst.Get("Authorization") != "" {
 		t.Error("Authorization header was copied, should have been filtered")
@@ -506,6 +514,49 @@ func TestHandleUpstreamResponse_NoDoubleCount(t *testing.T) {
 
 	if util.MetricsRequestsTotal.Value() != 1 {
 		t.Errorf("requests_total = %d, want 1 (double counting detected)", util.MetricsRequestsTotal.Value())
+	}
+}
+
+// TestCopyClientHeaders_CredentialHeadersNotSentUpstream pins that client
+// credential headers (including Api-Key / X-Goog-Api-Key) never reach the
+// upstream; ApplyAuthHeader still writes the account credential.
+func TestCopyClientHeaders_CredentialHeadersNotSentUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, h := range []string{"Cookie", "X-Api-Key", "X-Auth-Token", "Api-Key", "X-Goog-Api-Key"} {
+			if got := r.Header.Get(h); got != "" {
+				t.Errorf("upstream received client credential header %s=%q", h, got)
+			}
+		}
+		if r.Header.Get("Authorization") != "Bearer acc-key" {
+			t.Errorf("upstream Authorization = %q, want Bearer acc-key (account credential)", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "test", Key: "acc-key", BaseURL: upstream.URL, Provider: "test"}}}
+	p := pool.NewPool(cfg.Accounts)
+	acc := p.AllAccounts()[0]
+
+	body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Cookie", "session=abc123")
+	r.Header.Set("X-Api-Key", "client-x-api")
+	r.Header.Set("X-Auth-Token", "client-token")
+	r.Header.Set("Api-Key", "client-api-key")
+	r.Header.Set("X-Goog-Api-Key", "client-goog-key")
+	r.Header.Set("Authorization", "Bearer client-secret")
+
+	res := doUpstreamRequest(acc, r, body, ChatForwardOpts{Model: "gpt-4"}, "req-cred-1")
+	if res.resp != nil {
+		res.resp.Body.Close()
+		res.cancel()
+	}
+	if res.fatalErr != nil {
+		t.Fatalf("doUpstreamRequest fatal: %v", res.fatalErr)
 	}
 }
 

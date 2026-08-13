@@ -3,6 +3,7 @@ package pool
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,7 +133,7 @@ func TestProbeExhausted_503Retries(t *testing.T) {
 	}
 }
 
-func TestProbeExhausted_401Retries(t *testing.T) {
+func TestProbeExhausted_401Stops(t *testing.T) {
 	callCount := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
@@ -147,22 +148,23 @@ func TestProbeExhausted_401Retries(t *testing.T) {
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
-	probeRetryDelay = time.Millisecond
 
 	ProbeExhausted(pool)
 
-	// 401 currently falls through to the retry path in ProbeExhausted
-	if callCount != maxProbeAttempts {
-		t.Errorf("expected %d attempts for 401 (retry logic), got %d", maxProbeAttempts, callCount)
+	// Permanent credential: stop this round, do not retry.
+	if callCount != 1 {
+		t.Errorf("401 should not retry, got %d calls", callCount)
 	}
 
-	// Should still be exhausted
 	if accs[0].IsHealthy() {
 		t.Error("account should NOT be marked healthy after 401")
 	}
+	if accs[0].LastExhaustClass() != ExhaustPermanentCredential {
+		t.Errorf("lastExhaustClass = %d, want credential", accs[0].LastExhaustClass())
+	}
 }
 
-func TestProbeExhausted_403Retries(t *testing.T) {
+func TestProbeExhausted_403Stops(t *testing.T) {
 	callCount := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
@@ -177,16 +179,14 @@ func TestProbeExhausted_403Retries(t *testing.T) {
 
 	accs := pool.AllAccounts()
 	accs[0].MarkExhausted()
-	probeRetryDelay = time.Millisecond
 
 	ProbeExhausted(pool)
 
-	// 403 currently falls through to the retry path in ProbeExhausted
-	if callCount != maxProbeAttempts {
-		t.Errorf("expected %d attempts for 403 (retry logic), got %d", maxProbeAttempts, callCount)
+	// Bare 403 is temporary (Classify) but not 5xx: stop, do not retry.
+	if callCount != 1 {
+		t.Errorf("bare 403 should not retry, got %d calls", callCount)
 	}
 
-	// Should still be exhausted
 	if accs[0].IsHealthy() {
 		t.Error("account should NOT be marked healthy after 403")
 	}
@@ -476,5 +476,188 @@ func TestProbeSendsAccountHeaders(t *testing.T) {
 
 	if !accs[0].IsHealthy() {
 		t.Error("account should be marked healthy after 200")
+	}
+}
+
+func TestProbeExhausted_402Stops(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(402)
+		w.Write([]byte(`{"error":{"message":"payment required"}}`))
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
+	accs := p.AllAccounts()
+	accs[0].MarkExhausted()
+
+	ProbeExhausted(p)
+
+	if callCount != 1 {
+		t.Errorf("402 should not retry, got %d calls", callCount)
+	}
+	if accs[0].IsHealthy() {
+		t.Error("account should NOT be marked healthy after 402")
+	}
+	if accs[0].LastExhaustClass() != ExhaustPermanentQuota {
+		t.Errorf("lastExhaustClass = %d, want quota", accs[0].LastExhaustClass())
+	}
+}
+
+func TestProbeExhausted_403QuotaBodyStops(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(403)
+		w.Write([]byte(`{"error":{"code":"insufficient_quota","message":"quota"}}`))
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
+	accs := p.AllAccounts()
+	accs[0].MarkExhausted()
+
+	ProbeExhausted(p)
+
+	if callCount != 1 {
+		t.Errorf("permanent quota 403 should not retry, got %d calls", callCount)
+	}
+	if accs[0].IsHealthy() {
+		t.Error("account should stay exhausted")
+	}
+	if accs[0].LastExhaustClass() != ExhaustPermanentQuota {
+		t.Errorf("lastExhaustClass = %d, want quota", accs[0].LastExhaustClass())
+	}
+}
+
+func TestProbeExhausted_200DoesNotReviveQuota(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(200)
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "quota1", Key: "k1", BaseURL: upstream.URL},
+	})
+	accs := p.AllAccounts()
+	accs[0].MarkExhaustedWithClass(ExhaustPermanentQuota)
+
+	ProbeExhausted(p)
+
+	if callCount != 1 {
+		t.Errorf("expected 1 probe, got %d", callCount)
+	}
+	if accs[0].IsHealthy() {
+		t.Error("quota-exhausted account must not revive on /v1/models 200")
+	}
+}
+
+func TestProbeExhausted_200RevivesCredential(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "cred1", Key: "k1", BaseURL: upstream.URL},
+	})
+	accs := p.AllAccounts()
+	accs[0].MarkExhaustedWithClass(ExhaustPermanentCredential)
+
+	ProbeExhausted(p)
+
+	if !accs[0].IsHealthy() {
+		t.Error("credential-exhausted account should revive on 200")
+	}
+}
+
+func TestProbeExhausted_SkipsRecentlyProbed(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(429)
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
+	accs := p.AllAccounts()
+	accs[0].MarkExhausted()
+
+	ProbeExhausted(p)
+	ProbeExhausted(p)
+
+	if callCount != 1 {
+		t.Errorf("second ProbeExhausted should skip recently probed account, got %d calls", callCount)
+	}
+}
+
+func TestProbeExhausted_ConcurrencyCap(t *testing.T) {
+	var inflight, maxSeen int32
+	block := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&inflight, 1)
+		for {
+			old := atomic.LoadInt32(&maxSeen)
+			if n <= old || atomic.CompareAndSwapInt32(&maxSeen, old, n) {
+				break
+			}
+		}
+		<-block
+		atomic.AddInt32(&inflight, -1)
+		w.WriteHeader(429)
+	}))
+	defer upstream.Close()
+
+	const nAcc = 25
+	cfgs := make([]config.AccountConfig, nAcc)
+	for i := 0; i < nAcc; i++ {
+		cfgs[i] = config.AccountConfig{
+			Name:    "acc-" + string(rune('a'+i%26)) + string(rune('0'+i/26)),
+			Key:     "k",
+			BaseURL: upstream.URL,
+		}
+	}
+	p := NewPool(cfgs)
+	for _, a := range p.AllAccounts() {
+		a.MarkExhausted()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		ProbeExhausted(p)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&maxSeen) < ProbeConcurrency && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	seen := atomic.LoadInt32(&maxSeen)
+	if seen > ProbeConcurrency {
+		close(block)
+		<-done
+		t.Fatalf("in-flight probes %d exceeded ProbeConcurrency %d", seen, ProbeConcurrency)
+	}
+	if seen != ProbeConcurrency {
+		close(block)
+		<-done
+		t.Fatalf("in-flight probes %d, want cap %d", seen, ProbeConcurrency)
+	}
+	close(block)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ProbeExhausted did not finish after releasing blockers")
 	}
 }

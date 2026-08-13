@@ -1237,3 +1237,83 @@ func TestCooldownExhaustCount(t *testing.T) {
 		t.Errorf("CooldownCount after exhaust = %d, want 3", got)
 	}
 }
+
+// TestSelect_MixedCooldownAndFullSlotWakesOnCooldown: account 1 is in a
+// short cooldown, account 2 holds the only slot. The waiter must return
+// account 1 when the cooldown expires, not wait for 2*AccountSelectTimeout.
+func TestSelect_MixedCooldownAndFullSlotWakesOnCooldown(t *testing.T) {
+	p := NewPool([]config.AccountConfig{
+		{Name: "acc-cool", Key: "k1", BaseURL: "http://127.0.0.1:1"},
+		{Name: "acc-full", Key: "k2", BaseURL: "http://127.0.0.1:1"},
+	})
+	var cool, full *Account
+	for _, a := range p.AllAccounts() {
+		switch a.Name() {
+		case "acc-cool":
+			cool = a
+		case "acc-full":
+			full = a
+		}
+	}
+	if cool == nil || full == nil {
+		t.Fatal("accounts not found")
+	}
+
+	slotFull := full.TryAcquire("m", 1)
+	if slotFull == nil {
+		t.Fatal("failed to occupy acc-full")
+	}
+	defer p.Release(slotFull)
+
+	cool.SetCooldown(150 * time.Millisecond)
+
+	type result struct {
+		acc *Account
+		err error
+	}
+	ch := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		acc, slot, err := p.Select(context.Background(), "m", 1)
+		if slot != nil {
+			// Keep the slot; the test only asserts selection.
+		}
+		ch <- result{acc: acc, err: err}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for p.WaitingCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if p.WaitingCount() == 0 {
+		select {
+		case r := <-ch:
+			t.Fatalf("Select returned before waiter parked: acc=%v err=%v elapsed=%v", r.acc, r.err, time.Since(start))
+		default:
+			t.Fatal("waiter never parked")
+		}
+	}
+
+	select {
+	case r := <-ch:
+		elapsed := time.Since(start)
+		if r.err != nil {
+			t.Fatalf("Select error: %v elapsed=%v", r.err, elapsed)
+		}
+		if r.acc == nil || r.acc.Name() != "acc-cool" {
+			got := "<nil>"
+			if r.acc != nil {
+				got = r.acc.Name()
+			}
+			t.Fatalf("got %q, want acc-cool (elapsed=%v)", got, elapsed)
+		}
+		if elapsed > 2*time.Second {
+			t.Fatalf("Select took %v; should return shortly after cooldown, not 2*AccountSelectTimeout", elapsed)
+		}
+		if elapsed < 100*time.Millisecond {
+			t.Fatalf("Select returned in %v; expected to wait for ~150ms cooldown", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Select still blocked after cooldown; waiter did not observe cooldown expiry")
+	}
+}

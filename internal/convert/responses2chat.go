@@ -275,22 +275,34 @@ func hasImagePart(content any) bool {
 	return false
 }
 
+func extractReasoningParts(raw json.RawMessage) string {
+	var parts []map[string]any
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		if t, _ := p["type"].(string); t == "reasoning_text" || t == "summary_text" {
+			if text, ok := p["text"].(string); ok {
+				b.WriteString(text)
+			}
+		}
+	}
+	return b.String()
+}
+
 func extractReasoningText(obj map[string]json.RawMessage) string {
 	if s, ok := util.RawStringField(obj, "summary"); ok && s != "" {
 		return s
 	}
+	if raw, ok := obj["summary"]; ok {
+		if text := extractReasoningParts(raw); text != "" {
+			return text
+		}
+	}
 	if raw, ok := obj["content"]; ok {
-		var parts []map[string]any
-		if err := json.Unmarshal(raw, &parts); err == nil {
-			var b strings.Builder
-			for _, p := range parts {
-				if t, _ := p["type"].(string); t == "reasoning_text" || t == "summary_text" {
-					if text, ok := p["text"].(string); ok {
-						b.WriteString(text)
-					}
-				}
-			}
-			return b.String()
+		if text := extractReasoningParts(raw); text != "" {
+			return text
 		}
 	}
 	return ""
