@@ -750,9 +750,15 @@ func validateProviderName(name string) error {
 // validateBaseURL checks that an account base_url is an absolute http(s)
 // URL with a non-empty host (see the LoadConfig call site for the
 // config-correctness rationale — deliberately NOT framed as SSRF
-// protection, since base_url is operator-controlled). The error names the
-// account but never echoes the URL value: a base_url may embed credentials
-// (user:pass@host) that must never reach logs.
+// protection, since base_url is operator-controlled). A query string or
+// fragment is rejected at load time: the upstream path is appended to the
+// base URL by a plain string join (util.JoinURLPath), so a query or
+// fragment would be silently swallowed into the joined URL (the endpoint
+// path would land IN the query, corrupting every upstream request), and a
+// query could carry a ?key=secret the operator never intended to send
+// upstream. The error names the account but never echoes the URL value: a
+// base_url may embed credentials (user:pass@host) that must never reach
+// logs.
 func validateBaseURL(name, baseURL string) error {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -763,6 +769,16 @@ func validateBaseURL(name, baseURL string) error {
 	}
 	if u.Host == "" {
 		return fmt.Errorf("account %q: base_url must include a non-empty host", name)
+	}
+	// u.ForceQuery covers a bare trailing "?" (e.g. "https://host/v1?"),
+	// which url.Parse accepts with an empty RawQuery but which corrupts the
+	// join exactly like a real query string. The error never echoes the
+	// query: it may embed credentials.
+	if u.RawQuery != "" || u.ForceQuery {
+		return fmt.Errorf("account %q: base_url must not contain a query string (the upstream path is appended to the base URL, so a query would corrupt the joined request URL)", name)
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("account %q: base_url must not contain a fragment", name)
 	}
 	return nil
 }

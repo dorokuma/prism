@@ -466,6 +466,53 @@ type responseCommitWriter interface {
 	middleware.StatusCommitter
 }
 
+// legacyStreamWriter delays the status commit of the legacy chat SSE
+// passthrough until the first event write (or Flush, which net/http would
+// commit as an implicit 200 anyway): the upstream status is preserved for a
+// healthy stream, but a failure or an empty upstream stream before the first
+// event leaves the response UNCOMMITTED, so the caller can still answer a
+// real HTTP 502 instead of committing an empty 200. The first WriteHeader
+// wins (net/http semantics); Flush is forwarded to the inner writer so SSE
+// streaming keeps working. Committed() delegates to the inner writer, which
+// is the single source of commit truth for the caller's pre-first-event
+// check.
+type legacyStreamWriter struct {
+	responseCommitWriter
+	status    int
+	committed bool
+}
+
+func (l *legacyStreamWriter) WriteHeader(code int) {
+	if l.committed {
+		return
+	}
+	l.committed = true
+	l.status = code
+}
+
+func (l *legacyStreamWriter) Write(p []byte) (int, error) {
+	l.commit()
+	return l.responseCommitWriter.Write(p)
+}
+
+func (l *legacyStreamWriter) Flush() {
+	l.commit()
+	if f, ok := l.responseCommitWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// commit writes the delayed status to the inner writer exactly once (on the
+// first write/flush). The inner writer then records the committed state that
+// Committed() reports.
+func (l *legacyStreamWriter) commit() {
+	if l.committed {
+		return
+	}
+	l.committed = true
+	l.responseCommitWriter.WriteHeader(l.status)
+}
+
 // handleUpstreamResponse processes the upstream HTTP response and writes the
 // result to the client. It owns the lifecycle of ctx (via the provided cancel)
 // and resp.Body. The third return value reports how the failure affected the
@@ -722,20 +769,65 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 		// Streaming token interception is complex and risks breaking
 		// the SSE stream; tokens_in/tokens_out remain 0 (acceptable).
 		copyUpstreamHeaders(w, resp.Header)
-		w.WriteHeader(resp.StatusCode)
+		// The HTTP status is deliberately NOT committed here: it is delayed
+		// until the first event write (legacyStreamWriter holds the upstream
+		// status and commits it on the first write/flush). A failure or an
+		// empty upstream stream before the first event therefore still
+		// leaves the response UNCOMMITTED, and this branch answers a real
+		// HTTP 502 instead of committing an empty 200 (net/http semantics:
+		// once the first byte reached the wire the status can never change).
+		lw := &legacyStreamWriter{responseCommitWriter: w, status: resp.StatusCode}
 		bodyReadStart := time.Now()
-		n, err := stream.StreamResponseBody(w, resp.Body, r, acc.Name())
+		n, err := stream.StreamResponseBody(lw, resp.Body, r, acc.Name())
 		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
+		// Commit state is captured ONCE, before any write below (after the
+		// 502 is written the same writer would report committed and the
+		// audit would misrecord the delivered status).
+		committed := lw.Committed()
 		if err != nil {
 			slog.Warn("legacy_stream body read error", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "body_ms", bodyReadElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
 			util.RecordError()
+			if !committed {
+				// Nothing reached the client (the upstream died before the
+				// first event): answer a structured 502 instead of leaving
+				// the connection without a real status.
+				util.WriteJSON(w, http.StatusBadGateway, map[string]any{
+					"error": map[string]any{"message": "upstream stream failed before any event", "code": "upstream_stream_error"},
+				})
+			}
 			if a := middleware.AuditFromCtx(r.Context()); a != nil {
-				a.Status = resp.StatusCode
+				// The audit status must match what was actually delivered:
+				// 502 when nothing was written, the committed upstream status
+				// when the stream was already under way.
+				if !committed {
+					a.Status = http.StatusBadGateway
+					a.ErrorType = "upstream_stream_error"
+				} else {
+					a.Status = resp.StatusCode
+					a.ErrorType = util.ClassifyConnError(err)
+				}
 				a.Account = acc.Name()
-				a.ErrorType = util.ClassifyConnError(err)
 				a.Error = err.Error()
 			}
 			return true, err, UpstreamErrorTemporary
+		}
+		if !committed {
+			// The upstream answered 2xx but closed the stream without a
+			// single event: an empty 200 would be indistinguishable from a
+			// successful stream to the client. Answer a structured 502 and
+			// audit the real status.
+			slog.Warn("legacy_stream empty stream", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "elapsed", time.Since(start), "error_type", "upstream_stream_error")
+			util.RecordError()
+			util.WriteJSON(w, http.StatusBadGateway, map[string]any{
+				"error": map[string]any{"message": "upstream stream closed before any event", "code": "upstream_stream_error"},
+			})
+			if a := middleware.AuditFromCtx(r.Context()); a != nil {
+				a.Status = http.StatusBadGateway
+				a.Account = acc.Name()
+				a.ErrorType = "upstream_stream_error"
+				a.Error = "upstream stream closed before any event"
+			}
+			return true, nil, UpstreamErrorTemporary
 		}
 		if cl := resp.Header.Get("Content-Length"); cl != "" {
 			slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "content_length", cl, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))

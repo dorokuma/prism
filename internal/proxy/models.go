@@ -46,7 +46,19 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 	models := mc.GetModels(provider)
 	if models == nil {
 		slog.Info("models cache miss, fetching", "provider", provider, "req", requestID)
-		if err := mc.Fetch(provider); err != nil {
+		// The request's context bounds only the WAIT for the fetch
+		// (FetchWithContext): a client that disconnects mid-fetch stops
+		// waiting immediately, while the shared fetch work itself keeps
+		// running on the cache's own work context (a concurrent request or
+		// a background fill still gets the result). The two checks below
+		// turn the cancelled wait into "answer nothing": a client that is
+		// gone must never receive a 200 empty list (it would cache "no
+		// models" forever) or an error JSON it can no longer read.
+		if err := mc.FetchWithContext(r.Context(), provider); err != nil {
+			if r.Context().Err() != nil {
+				slog.Debug("models fetch wait aborted by request cancellation", "provider", provider, "req", requestID)
+				return
+			}
 			slog.Error("models fetch failed", "provider", provider, "error", err, "req", requestID)
 			// A cache-miss fetch failure must never answer 200 with an empty
 			// list (a client would cache "no models" forever). Failures are
@@ -73,6 +85,12 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 		}
 		models = mc.GetModels(provider)
 		if models == nil {
+			// The fetch succeeded but published no models; the client may
+			// have disconnected while we waited — never answer a cancelled
+			// request (an empty list would be cached as "no models").
+			if r.Context().Err() != nil {
+				return
+			}
 			util.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []any{}})
 			return
 		}

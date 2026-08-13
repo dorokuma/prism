@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/util"
 )
 
@@ -62,11 +63,11 @@ func TestRedactBody(t *testing.T) {
 }
 
 func TestRedactJSONTooDeep(t *testing.T) {
-	// Build a JSON object with 21+ levels of nesting.
+	// Build a JSON object with config.RedactJSONMaxDepth+2 levels of nesting.
 	// The innermost level should become "<redacted:too deep>".
 	var build func(depth int) any
 	build = func(depth int) any {
-		if depth >= 22 {
+		if depth >= config.RedactJSONMaxDepth+2 {
 			return map[string]any{"secret": "sk-leak"}
 		}
 		return map[string]any{"a": build(depth + 1)}
@@ -79,7 +80,8 @@ func TestRedactJSONTooDeep(t *testing.T) {
 
 	result := util.RedactBody(raw)
 
-	// The innermost object at depth > 20 should be replaced.
+	// The innermost object at depth > config.RedactJSONMaxDepth should be
+	// replaced.
 	// json.Marshal escapes < and >, so look for the escaped form.
 	if !strings.Contains(result, `\u003credacted:too deep\u003e`) {
 		t.Fatalf("expected escaped '<redacted:too deep>' in output, got: %s", result)
@@ -94,59 +96,38 @@ func TestRedactJSONTooDeep(t *testing.T) {
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
 		t.Fatalf("redacted output is not valid JSON: %v", err)
 	}
+}
 
-	// Check that RedactBodyBytes handles depth > 20 via RedactJSON.
-	tooDeep := map[string]any{
-		"l1": map[string]any{
-			"l2": map[string]any{
-				"l3": map[string]any{
-					"l4": map[string]any{
-						"l5": map[string]any{
-							"l6": map[string]any{
-								"l7": map[string]any{
-									"l8": map[string]any{
-										"l9": map[string]any{
-											"l10": map[string]any{
-												"l11": map[string]any{
-													"l12": map[string]any{
-														"l13": map[string]any{
-															"l14": map[string]any{
-																"l15": map[string]any{
-																	"l16": map[string]any{
-																		"l17": map[string]any{
-																			"l18": map[string]any{
-																				"l19": map[string]any{
-																					"l20": map[string]any{
-																						"l21": map[string]any{
-																							"token": "abc",
-																						},
-																					},
-																				},
-																			},
-																		},
-																	},
-																},
-															},
-														},
-													},
-												},
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
+// TestRedactJSONDepthBoundaryUsesConfigConstant pins that the util redaction
+// cap is EXACTLY config.RedactJSONMaxDepth (the single shared constant, not
+// a package-local duplicate): the deepest RedactJSON call on N nested maps
+// runs at depth N-1, so maxDepth+1 levels are still walked and maxDepth+2
+// levels hit the too-deep replacement.
+func TestRedactJSONDepthBoundaryUsesConfigConstant(t *testing.T) {
+	build := func(levels int) any {
+		v := any("leaf")
+		for i := 0; i < levels; i++ {
+			v = map[string]any{"a": v}
+		}
+		return v
 	}
-	raw2, _ := json.Marshal(tooDeep)
-	result2 := util.RedactBody(raw2)
-	// The inner 21st level depth reaches > 20, so it should be redacted:too deep.
-	if !strings.Contains(result2, `\u003credacted:too deep\u003e`) {
-		t.Fatalf("nested literal: expected escaped '<redacted:too deep>' in output, got: %s", result2)
+	ok := util.RedactBodyBytes([]byte(mustMarshal(t, build(config.RedactJSONMaxDepth+1))))
+	if !bytes.Contains(ok, []byte("leaf")) {
+		t.Errorf("depth == config.RedactJSONMaxDepth must still be walked, got: %s", ok)
 	}
+	deep := util.RedactBodyBytes([]byte(mustMarshal(t, build(config.RedactJSONMaxDepth+2))))
+	if bytes.Contains(deep, []byte("leaf")) || !bytes.Contains(deep, []byte(`\u003credacted:too deep\u003e`)) {
+		t.Errorf("depth == config.RedactJSONMaxDepth+1 must be replaced, got: %s", deep)
+	}
+}
+
+func mustMarshal(t *testing.T, v any) string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 func TestRedact_AccountKey(t *testing.T) {

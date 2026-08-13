@@ -32,15 +32,15 @@ func TestRenderTableAtMobile(t *testing.T) {
 		},
 	}, now)
 	want := "" +
-		"go-1\n" +
-		"短期   12%  2h13m\n" +
-		"中期    8%  3d4h\n" +
-		"长期   40%  12d\n" +
+		"  go-1\n" +
+		"  短期   12%  2h13m\n" +
+		"  中期    8%  3d4h\n" +
+		"  长期   40%  12d\n" +
 		"\n" +
-		"go-2\n" +
-		"短期  100%  2h13m  限流\n" +
-		"中期   30%  3d4h\n" +
-		"长期   55%  12d\n"
+		"  go-2\n" +
+		"  短期  100%  2h13m  限流\n" +
+		"  中期   30%  3d4h\n" +
+		"  长期   55%  12d\n"
 	if got != want {
 		t.Fatalf("layout\ngot:\n%s\nwant:\n%s", got, want)
 	}
@@ -88,7 +88,7 @@ func TestRenderTableSplitsAccounts(t *testing.T) {
 		Accounts: []string{"a1", "a2"},
 		Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 1}},
 	}}, now)
-	want := "a1\n短期    1%  -\n\na2\n短期    1%  -\n"
+	want := "  a1\n  短期    1%  -\n\n  a2\n  短期    1%  -\n"
 	if got != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
 	}
@@ -109,7 +109,7 @@ func TestRenderTableAtErrorAndStale(t *testing.T) {
 		Accounts: []string{"a1"},
 		Err:      "unauthorized",
 	}}, now)
-	if got != "a1\nunauthorized\n" {
+	if got != "  a1\n  unauthorized\n" {
 		t.Fatalf("error card: %q", got)
 	}
 	h := now.Add(45 * time.Minute)
@@ -149,7 +149,7 @@ func TestFormatRemain(t *testing.T) {
 }
 
 func TestRenderTableEmpty(t *testing.T) {
-	if RenderTable(nil) != "没有套餐数据\n" {
+	if RenderTable(nil) != "  没有套餐数据\n" {
 		t.Fatal(RenderTable(nil))
 	}
 }

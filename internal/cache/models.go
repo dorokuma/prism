@@ -417,7 +417,45 @@ func (mc *ModelCache) Fetch(provider string) error {
 	return mc.fetchWithContext(ctx, provider)
 }
 
-// fetchWithContext is Fetch with a cancellable context. It snapshots mc.cfg
+// FetchWithContext is Fetch with a caller-supplied context that bounds ONLY
+// the wait for the result, never the shared fetch work: the request's
+// context (e.g. an HTTP request context from /v1/models) is used to wait —
+// a cancelled caller returns immediately — while the leader's upstream round
+// runs on the shared work context (the background lifecycle context, or a
+// plain Background when none exists yet), exactly like Fetch. A cancelled
+// request therefore never aborts a fetch that concurrent requests (or a
+// background fill) are sharing, and the caller can distinguish "the wait was
+// cancelled" (context error) from "the fetch failed" (upstream error). The
+// proxy maps the context error to "answer nothing" instead of writing an
+// empty model list to a client that is gone.
+func (mc *ModelCache) FetchWithContext(ctx context.Context, provider string) error {
+	return mc.fetchWait(ctx, mc.workContext(), provider)
+}
+
+// workContext returns the shared context for model-fetch WORK (the leader's
+// upstream round): the shared background lifecycle context when it exists
+// (so Stop aborts an in-flight request-triggered fetch like every other
+// refresh), otherwise a plain Background context. The caller's own context
+// never drives the work — only the wait (see FetchWithContext).
+func (mc *ModelCache) workContext() context.Context {
+	mc.refreshMu.Lock()
+	defer mc.refreshMu.Unlock()
+	if mc.lifecycleCtx != nil {
+		return mc.lifecycleCtx
+	}
+	return context.Background()
+}
+
+// fetchWithContext is fetchWait with a single context for both the wait and
+// the work: internal callers (Fetch, the refresh rounds in runRefresh) drive
+// the shared fetch with the shared lifecycle context, where cancelling the
+// wait must also cancel the work.
+func (mc *ModelCache) fetchWithContext(ctx context.Context, provider string) error {
+	return mc.fetchWait(ctx, ctx, provider)
+}
+
+// fetchWait is Fetch with explicit wait/work contexts (see FetchWithContext
+// and fetchWithContext for the two splittings). It snapshots mc.cfg
 // once (no race with UpdateConfig) and merges concurrent same-provider
 // fetches: at most one leader per provider performs the upstream round, and
 // every concurrent caller for the same provider — /v1/models cache misses,
@@ -425,6 +463,13 @@ func (mc *ModelCache) Fetch(provider string) error {
 // or error instead of issuing its own upstream call (see inflightFetch).
 // Different providers always run in parallel: the merge lock is never held
 // across the wait.
+//
+// waitCtx bounds the caller's wait: a follower parks on the leader's done
+// channel and returns ctx.Err() as soon as waitCtx is cancelled — the
+// leader is untouched. workCtx drives the leader's upstream round
+// (fetchLeader); a follower cancellation never cancels the leader, which
+// only observes workCtx (the shared lifecycle/Background context, or the
+// lifecycle context for internal refresh rounds).
 //
 // The leader's upstream round is fetchLeader: multi-account failover across
 // all healthy, non-cooldown accounts of the provider, sharing ONE 30-second
@@ -434,20 +479,20 @@ func (mc *ModelCache) Fetch(provider string) error {
 // SelectByProvider proceed with the freed slot — releasing the slot without
 // the wakeup would strand waiters until some business request happened to
 // release the same account.
-func (mc *ModelCache) fetchWithContext(ctx context.Context, provider string) (err error) {
+func (mc *ModelCache) fetchWait(waitCtx, workCtx context.Context, provider string) (err error) {
 	// Join an in-flight same-provider fetch when one exists. A follower
 	// waits on the leader's done channel OUTSIDE fetchMu (the lock never
-	// spans the wait) and can cancel its OWN context independently: a
-	// follower cancellation returns immediately and never cancels the
-	// leader, which only observes its own context.
+	// spans the wait) and can cancel its OWN wait independently: a follower
+	// cancellation returns immediately and never cancels the leader, which
+	// only observes its own work context.
 	mc.fetchMu.Lock()
 	if f, ok := mc.fetches[provider]; ok {
 		mc.fetchMu.Unlock()
 		select {
 		case <-f.done:
 			return f.err
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-waitCtx.Done():
+			return waitCtx.Err()
 		}
 	}
 	if mc.fetches == nil {
@@ -503,7 +548,7 @@ func (mc *ModelCache) fetchWithContext(ctx context.Context, provider string) (er
 		close(f.done)
 	}()
 
-	err = mc.fetchLeader(ctx, provider)
+	err = mc.fetchLeader(workCtx, provider)
 	normalExit = true
 	return err
 }

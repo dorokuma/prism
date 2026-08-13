@@ -12,6 +12,7 @@ import (
 const (
 	labelMinCols = 2
 	pctCols      = 4
+	reportIndent = "  "
 )
 
 // RenderTable is the default CLI / format=table report. It is stacked for
@@ -24,7 +25,7 @@ func RenderTable(snaps []Snapshot) string {
 // Each account is its own card. Load-balanced plans are never merged.
 func RenderTableAt(snaps []Snapshot, now time.Time) string {
 	if len(snaps) == 0 {
-		return "没有套餐数据\n"
+		return "  没有套餐数据\n"
 	}
 	var b strings.Builder
 	first := true
@@ -52,14 +53,17 @@ func writeCard(b *strings.Builder, title string, s Snapshot, now time.Time) {
 	if s.Stale {
 		title += "  旧"
 	}
+	b.WriteString(reportIndent)
 	b.WriteString(title)
 	b.WriteByte('\n')
 	if s.Err != "" && len(s.Windows) == 0 {
+		b.WriteString(reportIndent)
 		b.WriteString(s.Err)
 		b.WriteByte('\n')
 		return
 	}
 	if s.Err != "" {
+		b.WriteString(reportIndent)
 		b.WriteString(s.Err)
 		b.WriteByte('\n')
 	}
@@ -77,6 +81,7 @@ func writeCard(b *strings.Builder, title string, s Snapshot, now time.Time) {
 		if w.Status == "rate-limited" {
 			line += "  限流"
 		}
+		b.WriteString(reportIndent)
 		b.WriteString(line)
 		b.WriteByte('\n')
 	}

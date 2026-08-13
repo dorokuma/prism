@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -427,6 +428,78 @@ func TestProxyModels_FetchSizeError502(t *testing.T) {
 	}
 	if code != "model_fetch_failed" {
 		t.Errorf("error code = %q, want model_fetch_failed", code)
+	}
+}
+
+// TestProxyModels_CancelledRequestWritesNothing pins the request-context
+// wiring of the cache-miss path: /v1/models waits on the REQUEST context
+// (ModelCache.FetchWithContext), so a client that disconnects while the
+// fetch is running gets NO response at all — neither a 502 error nor a 200
+// empty list (a client would cache "no models" forever). The shared fetch
+// work itself is NOT cancelled with the request (it runs on the cache's own
+// work context) — a concurrent request still gets the result.
+func TestProxyModels_CancelledRequestWritesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"fetch failure", "boom"},                    // upstream 500
+		{"empty upstream list", `{"object":"list"}`}, // 200 without a data key → cache publishes no models
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case <-entered:
+				default:
+					close(entered)
+				}
+				<-release
+				if tc.name == "fetch failure" {
+					w.WriteHeader(http.StatusInternalServerError)
+				} else {
+					w.WriteHeader(http.StatusOK)
+				}
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer upstream.Close()
+
+			cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "a1", Provider: "p", BaseURL: upstream.URL, Key: "k"}}}
+			p := pool.NewPool(cfg.Accounts)
+			mc := emptyCacheMC(t, p, cfg)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			r := httptest.NewRequest(http.MethodGet, "/v1/models", nil).WithContext(ctx)
+			r.Header.Set("X-Prism-Provider", "p")
+			w := httptest.NewRecorder()
+
+			done := make(chan struct{})
+			go func() {
+				proxyModels(mc, w, r, cfg)
+				close(done)
+			}()
+
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("fetch never reached the upstream")
+			}
+			cancel()
+			close(release)
+
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("proxyModels never returned")
+			}
+			// Nothing may reach the wire: no body, no headers (WriteJSON sets
+			// Content-Type before the status, so any written response carries
+			// a header; the recorder's Code stays at its initial 200).
+			if w.Body.Len() != 0 || len(w.Header()) != 0 {
+				t.Errorf("cancelled request must not write a response, got headers=%v body=%q", w.Header(), w.Body.String())
+			}
+		})
 	}
 }
 

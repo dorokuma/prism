@@ -4,10 +4,9 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
-)
 
-// TODO batch2: change to config.RedactJSONMaxDepth
-const redactJSONMaxDepth = 20
+	"github.com/dorokuma/prism/internal/config"
+)
 
 var (
 	reAPIKey = regexp.MustCompile(`sk-[A-Za-z0-9_-]{10,}`)
@@ -67,11 +66,13 @@ func RedactBodyRegex(s string) string {
 // RedactJSON recursively walks a JSON value and replaces sensitive string
 // values with "*". Arrays and nested objects are recursed into.  String
 // leaf values also get regex redaction for embedded sk-/Bearer patterns.
-// depth is capped at 20 to prevent stack overflow from malicious nesting.
-// Returns the redacted value; when depth exceeds 20 the subtree is replaced
-// with "<redacted:too deep>" instead of being silently passed through.
+// depth is capped at config.RedactJSONMaxDepth (the single shared depth
+// constant, config/constants.go) to prevent stack overflow from malicious
+// nesting. Returns the redacted value; when depth exceeds the cap the
+// subtree is replaced with "<redacted:too deep>" instead of being silently
+// passed through.
 func RedactJSON(v any, depth int) any {
-	if depth > redactJSONMaxDepth {
+	if depth > config.RedactJSONMaxDepth {
 		return "<redacted:too deep>"
 	}
 	switch val := v.(type) {
@@ -128,9 +129,10 @@ func RedactBodyBytesWithKeys(body []byte, extraKeys []string) []byte {
 
 // RedactJSONWithKeys is like RedactJSON but additionally replaces any non-empty
 // key from extraKeys as a literal substring inside string leaf values (on top
-// of the existing regex redaction).
+// of the existing regex redaction). The depth cap is the shared
+// config.RedactJSONMaxDepth.
 func RedactJSONWithKeys(v any, extraKeys []string, depth int) any {
-	if depth > redactJSONMaxDepth {
+	if depth > config.RedactJSONMaxDepth {
 		return "<redacted:too deep>"
 	}
 	switch val := v.(type) {

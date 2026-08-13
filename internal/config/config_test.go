@@ -2183,6 +2183,46 @@ func TestLoadConfig_BaseURLValidation(t *testing.T) {
 			t.Fatal("an unparseable base_url must be rejected")
 		}
 	})
+	t.Run("query string rejected", func(t *testing.T) {
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: 'https://api.example.com/v1?foo=bar'\n    provider: test\n"
+		_, err := loadConfigFrom(t, content)
+		if err == nil {
+			t.Fatal("a base_url with a query string must be rejected")
+		}
+		if strings.Contains(err.Error(), "foo=bar") {
+			t.Errorf("error must never echo the query (it may embed credentials), got: %q", err.Error())
+		}
+	})
+	t.Run("bare trailing question mark rejected", func(t *testing.T) {
+		// url.Parse accepts "https://host/v1?" with ForceQuery=true and an
+		// empty RawQuery: it corrupts the join exactly like a real query.
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: 'https://api.example.com/v1?'\n    provider: test\n"
+		if _, err := loadConfigFrom(t, content); err == nil {
+			t.Fatal("a base_url with a bare trailing '?' must be rejected")
+		}
+	})
+	t.Run("fragment rejected", func(t *testing.T) {
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: 'https://api.example.com/v1#frag'\n    provider: test\n"
+		_, err := loadConfigFrom(t, content)
+		if err == nil {
+			t.Fatal("a base_url with a fragment must be rejected")
+		}
+		if strings.Contains(err.Error(), "api.example.com") {
+			t.Errorf("error must never echo the URL value, got: %q", err.Error())
+		}
+	})
+	t.Run("query-carrying credentials never echoed", func(t *testing.T) {
+		// A query string may embed credentials (?key=secret): the rejection
+		// must not leak them into the error.
+		content := "accounts:\n  - name: a\n" + keyLine + "    base_url: 'https://api.example.com/v1?key=supersecret'\n    provider: test\n"
+		_, err := loadConfigFrom(t, content)
+		if err == nil {
+			t.Fatal("a base_url with a query string must be rejected")
+		}
+		if strings.Contains(err.Error(), "supersecret") {
+			t.Errorf("error must never echo query credentials, got: %q", err.Error())
+		}
+	})
 	t.Run("credential-carrying URL never echoed", func(t *testing.T) {
 		// A base_url embedding credentials must be rejected on the scheme
 		// (here "file") without the credentials reaching the error.
