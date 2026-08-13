@@ -6,67 +6,100 @@ import (
 	"time"
 )
 
-// RenderTable is a plain-text report for CLI and format=table.
+// RenderTable is the default CLI / format=table report. It is stacked for
+// a ~40-column phone terminal: no header row, no ISO timestamps.
 func RenderTable(snaps []Snapshot) string {
+	return RenderTableAt(snaps, time.Now())
+}
+
+// RenderTableAt is RenderTable with an injectable clock (tests).
+func RenderTableAt(snaps []Snapshot, now time.Time) string {
 	if len(snaps) == 0 {
-		return "quota: 没有匹配的 provider（当前只支持 OpenCode Go）\n"
+		return "没有套餐数据\n"
 	}
 	var b strings.Builder
-	b.WriteString("provider      accounts              window    status         percent  ~usd     resets_at\n")
-	b.WriteString("---------------------------------------------------------------------------------------------\n")
-	for _, s := range snaps {
-		acc := strings.Join(s.Accounts, ",")
-		if acc == "" {
-			acc = "-"
+	for i, s := range snaps {
+		if i > 0 {
+			b.WriteByte('\n')
 		}
-		if len(s.Windows) == 0 {
-			fmt.Fprintf(&b, "%-13s %-21s %-9s %-14s %7s  %-7s  %s\n",
-				s.Provider, truncate(acc, 21), "-", s.Err, "-", "-", staleMark(s))
+		title := s.Provider
+		if title == "" {
+			title = "unknown"
+		}
+		if s.Stale {
+			title += "  旧"
+		}
+		b.WriteString(title)
+		b.WriteByte('\n')
+		if len(s.Accounts) > 0 {
+			b.WriteString(strings.Join(s.Accounts, ", "))
+			b.WriteByte('\n')
+		}
+		if s.Err != "" && len(s.Windows) == 0 {
+			b.WriteString(s.Err)
+			b.WriteByte('\n')
 			continue
 		}
-		for i, w := range s.Windows {
-			prov := s.Provider
-			accounts := acc
-			if i > 0 {
-				prov = ""
-				accounts = ""
+		if s.Err != "" {
+			b.WriteString(s.Err)
+			b.WriteByte('\n')
+		}
+		for _, w := range s.Windows {
+			label := windowLabel(w.Name)
+			remain := formatRemain(now, w.ResetsAt)
+			extra := ""
+			if w.Status == "rate-limited" {
+				extra = " 限流"
 			}
-			est := ""
-			if w.LimitUSDEstimate > 0 {
-				est = fmt.Sprintf("~%.2f", float64(w.Percent)/100*float64(w.LimitUSDEstimate))
-			}
-			reset := "-"
-			if w.ResetsAt != nil && !w.ResetsAt.IsZero() {
-				reset = w.ResetsAt.UTC().Format(time.RFC3339)
-			}
-			status := w.Status
-			if i == 0 && s.Err != "" {
-				status = status + "/" + s.Err
-			}
-			if i == 0 && s.Stale {
-				reset = reset + " (stale)"
-			}
-			fmt.Fprintf(&b, "%-13s %-21s %-9s %-14s %7d  %-7s  %s\n",
-				truncate(prov, 13), truncate(accounts, 21), w.Name, truncate(status, 14), w.Percent, est, reset)
+			fmt.Fprintf(&b, "%-3s %3d%%%s  %s\n", label, w.Percent, extra, remain)
 		}
 	}
-	b.WriteString("\npercent 是上游整数百分比；~usd 按文档额度估算（5h $12 / 周 $30 / 月 $60），不是账单。\n")
 	return b.String()
 }
 
-func staleMark(s Snapshot) string {
-	if s.Err != "" {
-		return s.Err
+func windowLabel(name string) string {
+	switch name {
+	case "rolling":
+		return "5h"
+	case "weekly":
+		return "周"
+	case "monthly":
+		return "月"
+	default:
+		if name == "" {
+			return "--"
+		}
+		return name
 	}
-	return "-"
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+func formatRemain(now time.Time, at *time.Time) string {
+	if at == nil || at.IsZero() {
+		return "-"
 	}
-	if n <= 1 {
-		return s[:n]
+	d := at.Sub(now)
+	if d <= 0 {
+		return "已到"
 	}
-	return s[:n-1] + "…"
+	if d < time.Minute {
+		return "<1m"
+	}
+	mins := int(d.Minutes())
+	if mins < 60 {
+		return fmt.Sprintf("%dm", mins)
+	}
+	hours := mins / 60
+	mins %= 60
+	if hours < 24 {
+		if mins == 0 {
+			return fmt.Sprintf("%dh", hours)
+		}
+		return fmt.Sprintf("%dh%dm", hours, mins)
+	}
+	days := hours / 24
+	hours %= 24
+	if hours == 0 {
+		return fmt.Sprintf("%dd", days)
+	}
+	return fmt.Sprintf("%dd%dh", days, hours)
 }
