@@ -21,6 +21,27 @@ func NewProxyHandler(pp *pool.Pool, wire config.WireAPIMode, holder *config.Conf
 			w.Write([]byte("ok"))
 			return
 		}
+		if r.URL.Path == "/ready" {
+			// Readiness (deploy.sh / load balancers): 200 only when at least
+			// one account is healthy AND out of cooldown — the process may be
+			// up (liveness) while every account is exhausted or cooling down.
+			// Deliberately distinct from /health (liveness: the process is
+			// serving). A nil pool (never wired) is not ready. The 503 is
+			// logged at DEBUG: deploy.sh and load balancers poll /ready every
+			// second while the pool is down, and an INFO/WARN line per poll
+			// would flood the log during every all-accounts-down window; the
+			// readiness STATE stays fully observable via the 503 itself and
+			// the per-account cooldown/exhaustion logs.
+			if pp != nil && pp.Ready() {
+				w.WriteHeader(200)
+				w.Write([]byte("ok"))
+				return
+			}
+			slog.Debug("not ready: no healthy account available")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("not ready"))
+			return
+		}
 		if r.URL.Path == "/v1/models" {
 			if r.Method != http.MethodGet {
 				util.WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{

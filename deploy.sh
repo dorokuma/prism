@@ -12,9 +12,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BINARY="/usr/local/bin/prism"
 BACKUP="${BINARY}.bak"
-# 健康检查地址：可用环境变量覆盖（如部署在非默认端口/远程探测），默认保持
-# http://127.0.0.1:18790/health。
-HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18790/health}"
+# 健康检查地址：可用环境变量覆盖（如部署在非默认端口/远程探测），默认
+# http://127.0.0.1:18790/ready（readiness：至少一个账号 healthy 且不在
+# cooldown 才 200；/health 只是 liveness，进程起来就 200，无法发现
+# “所有账号不可用”的部署）。
+#
+# /ready 是 fail-closed 的部署闸门：当所有账号都在 cooldown 或 exhausted
+# （例如上游密钥失效/上游故障）时，健康验证必然失败并自动回滚——这是
+# 设计意图，不是 bug：新版本把账号状态搞坏时绝不该被部署上线。若确实只
+# 想要 liveness 级别的部署检查，显式设置 HEALTH_URL=http://127.0.0.1:18790/health
+# 覆盖即可；不要把 HEALTH_TIMEOUT 盲目延长到数分钟来“等”全账号恢复——
+# 那只会把一次注定失败的上线拖到很晚才回滚。
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18790/ready}"
 # 健康等待窗口（秒）：prism 启动时在 HTTP server 监听前等待全部账号的首轮
 # 健康探测（单账号最长 ProbeTimeout=30s），默认 35s 覆盖该值并留余量。
 # 可用环境变量覆盖；必须为正整数，非法值在任何副作用发生前 exit 3。

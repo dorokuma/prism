@@ -176,13 +176,14 @@ func IsAuthenticated(ctx context.Context) bool {
 }
 
 // HasForwardedHeaders reports whether the request carries a forwarding
-// header (X-Forwarded-For or X-Real-IP). A same-machine reverse proxy
-// presents a loopback RemoteAddr AND adds one of these headers, so loopback
-// status alone cannot distinguish a direct local client from a proxied one.
-// Endpoints that allow loopback without a token (/metrics,
-// /admin/usage/summary) must require the token when this reports true.
+// header: X-Forwarded-For, X-Real-IP, or the RFC 7239 Forwarded header. A
+// same-machine reverse proxy presents a loopback RemoteAddr AND adds one of
+// these headers, so loopback status alone cannot distinguish a direct local
+// client from a proxied one. Endpoints that allow loopback without a token
+// (/metrics, /admin/usage/summary) must require the token when this reports
+// true.
 func HasForwardedHeaders(r *http.Request) bool {
-	return r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("X-Real-IP") != ""
+	return r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("X-Real-IP") != "" || r.Header.Get("Forwarded") != ""
 }
 
 // IsLocalhost returns true if the request's RemoteAddr is a loopback address.

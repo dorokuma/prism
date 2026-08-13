@@ -1,6 +1,8 @@
 package pool
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -120,6 +122,30 @@ func newHTTPClient() *http.Client {
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       90 * time.Second,
 		},
+		// Redirect policy: follow SAME-HOST redirects (e.g. http→https or a
+		// path move by the same upstream) but refuse CROSS-HOST redirects
+		// outright. The Go http.Client only strips the standard sensitive
+		// headers (Authorization/WWW-Authenticate/Cookie) on a cross-host
+		// hop; a custom auth_header (e.g. "x-api-key") and account-level
+		// custom headers would be forwarded to the redirect target VERBATIM,
+		// leaking the account credential to a foreign host (open-redirect
+		// credential leak). Refusing the hop is the only leak-proof answer:
+		// the request fails instead of sending the credential anywhere.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			// via[0] is the ORIGINAL request (Go passes the full chain): its
+			// host is the account's configured base URL host. Hosts are
+			// compared case-insensitively and port-less (Hostname), so
+			// "api.example.com:443" → "api.example.com" is the same host.
+			orig := via[0].URL.Hostname()
+			next := req.URL.Hostname()
+			if !strings.EqualFold(orig, next) {
+				return fmt.Errorf("refusing cross-host redirect to %q (account base host %q): account headers/credentials must never leave the configured host", next, orig)
+			}
+			return nil
+		},
 	}
 }
 
@@ -209,6 +235,24 @@ func (a *Account) reserveTotal() bool {
 	}
 }
 
+// returnTotal releases one account-wide total slot and NEVER lets the
+// counter go negative: it succeeds only when the total is positive, using
+// a CAS loop so concurrent releases can never overshoot below zero. It is
+// the single total-return path used by BOTH Release branches (the normal
+// path after its per-key CAS, and the abnormal zeroed-key path), so the
+// total can never underflow regardless of which branch ran.
+func (a *Account) returnTotal() bool {
+	for {
+		total := a.inFlight.Load()
+		if total <= 0 {
+			return false
+		}
+		if a.inFlight.CompareAndSwap(total, total-1) {
+			return true
+		}
+	}
+}
+
 // Release releases the concurrency slot identified by s — the lease
 // returned by TryAcquire — and reports whether the slot was actually
 // released. Because the slot carries the exact key and max of the
@@ -221,6 +265,25 @@ func (a *Account) reserveTotal() bool {
 // under concurrent duplicate calls: exactly one caller wins the CAS, so
 // N racing Releases of the same slot decrement the key and total counters
 // exactly once.
+//
+// Abnormal-path guarantee: a slot whose per-key counter was zeroed under
+// it (an invariant break elsewhere — Release is only ever called with a
+// genuine Slot, so per-key == 0 means the counter was reset out from under
+// the live slot) still returns its account-wide total unit via the
+// non-negative CAS (returnTotal), so the total can never permanently leak
+// and the return value still reports that capacity WAS freed — Pool.Release
+// wakes a waiter on the returned slot. Only when even the total is 0 is
+// there nothing to return (false, no wake). A duplicate Release of that
+// slot is still ignored by the one-shot gate and can never decrement
+// again.
+//
+// The NORMAL path is symmetric: the per-key CAS is followed by the SAME
+// non-negative total return, so a total that was reset to 0 out from under
+// a live slot (the per-key still holding its unit) can never be driven
+// negative by the release. In that broken-invariant case the per-key unit
+// is returned but no total unit exists to free: Release reports false, so
+// Pool.Release does not wake a waiter onto account-wide capacity that did
+// not change (no false wakeup).
 func (a *Account) Release(s *Slot) bool {
 	if s == nil {
 		slog.Warn("Release of nil slot ignored", "account", a.Name())
@@ -241,12 +304,34 @@ func (a *Account) Release(s *Slot) bool {
 	for {
 		cur := g.Load()
 		if cur <= 0 {
-			slog.Warn("Release on zero in-flight", "account", a.Name(), "key", s.key, "max", s.max)
+			// Abnormal: the per-key counter is already zero although this
+			// slot was genuinely acquired — it still holds its unit in the
+			// account-wide total. Return that unit (never below zero) so the
+			// total cannot leak permanently; report true when a unit was
+			// actually returned (capacity freed → Pool.Release wakes a
+			// waiter).
+			if a.returnTotal() {
+				slog.Warn("Release on zero in-flight: returned account-wide total slot", "account", a.Name(), "key", s.key, "max", s.max)
+				return true
+			}
+			slog.Warn("Release on zero in-flight (account total also zero), nothing to return", "account", a.Name(), "key", s.key, "max", s.max)
 			return false
 		}
 		if g.CompareAndSwap(cur, cur-1) {
-			a.inFlight.Add(-1)
-			return true
+			// Normal path: the per-key unit is returned. The account-wide
+			// total is returned with the same non-negative CAS as the
+			// abnormal path, so the total can never underflow. When the
+			// total was reset to 0 under this live slot (invariant break:
+			// total 0 while per-key still held its unit), there is no total
+			// unit to return: report false — nothing was freed at the total
+			// level, so Pool.Release must not wake a waiter onto capacity
+			// that did not change (false wakeup), and the counters stay
+			// non-negative.
+			if a.returnTotal() {
+				return true
+			}
+			slog.Warn("Release on zero account total after per-key return (invariant break: total reset under a live slot), nothing to return", "account", a.Name(), "key", s.key, "max", s.max)
+			return false
 		}
 	}
 }

@@ -153,6 +153,42 @@ func readPIModel(t *testing.T, path, provider, id string) map[string]any {
 	return nil
 }
 
+// TestLoadFromDiskTightensExistingCacheTo0600 pins the load-path file-mode
+// tightening: a pre-existing provider cache file (written by an older
+// version or created under a wide umask, 0644) is re-tightened to 0600 on
+// load — without waiting for the next fetch rename. Only prism's own
+// provider cache files are touched (LoadFromDisk never reads pi's
+// models.json).
+func TestLoadFromDiskTightensExistingCacheTo0600(t *testing.T) {
+	dir := t.TempDir()
+	provider := "p"
+	fp := filepath.Join(dir, provider+".json")
+	pc := providerCache{Models: []ModelEntry{{ID: "m1", Object: "model", Created: 1, OwnedBy: "p"}}, UpdatedAt: time.Now()}
+	data, err := json.Marshal(pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fp, data, 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "a", Provider: provider, BaseURL: "https://x.com/v1"}}}
+	mc := &ModelCache{dir: dir, caches: make(map[string]*providerCache), cfg: cfg}
+	mc.LoadFromDisk()
+
+	fi, err := os.Stat(fp)
+	if err != nil {
+		t.Fatalf("stat provider cache: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0600 {
+		t.Errorf("provider cache mode after load = %o, want 0600 (tightened on the load path)", perm)
+	}
+	models := mc.GetModels(provider)
+	if len(models) != 1 || models[0].ID != "m1" {
+		t.Errorf("cache content after load = %+v, want [m1]", models)
+	}
+}
+
 // TestSyncPIModelsJSON_ExistingModelGetsMetadata verifies the core 128k fix:
 // an already-existing model entry that previously had NO metadata now receives
 // metadata from config (e.g. glm-5.2 context_window=1M instead of default 128k).
@@ -1927,7 +1963,7 @@ func TestRefreshLoop_SkipsStaleWhileManualRoundInFlight(t *testing.T) {
 
 // TestFetch_WritesCacheAtomically pins the temp-file write path: a
 // successful fetch leaves exactly the provider cache file (no temp litter),
-// with the 0644 permission semantics of the previous direct write, and a
+// with 0600 owner-only permissions (the cache is not world-readable), and a
 // second fetch over it is idempotent (no error, file atomically replaced).
 func TestFetch_WritesCacheAtomically(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1962,8 +1998,8 @@ func TestFetch_WritesCacheAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0644 {
-		t.Errorf("cache file mode = %o, want 0644", perm)
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Errorf("cache file mode = %o, want 0600 (owner-only; the cache must not be world-readable)", perm)
 	}
 
 	// Idempotent rerun: a second fetch over the existing cache succeeds and

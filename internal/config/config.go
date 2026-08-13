@@ -384,6 +384,35 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("account %q: provider is empty; every account must declare a provider (set account.provider or put the account under a providers block) — a provider-less account can never be selected by business requests", acc.Name)
 		}
 	}
+	// Account NAMEs are the audit/usage account label, the expvar key
+	// (pool_account_<name>_*), and the seed of the LB_KEY_* credential /
+	// env / credstore file name. Validate them at load:
+	//   - non-empty, unique, ASCII alnum start, charset [A-Za-z0-9_-], at
+	//     most MaxAccountNameLen bytes (the name also seeds systemd
+	//     LoadCredential names and shell env names, so the charset excludes
+	//     dots — the expvar hierarchy separator — path separators and ".."
+	//     — the name seeds file names — spaces and unicode);
+	//   - no two names may FOLD to the same LB_KEY_* credential name
+	//     ("a-b" and "a_b" both fold to LB_KEY_A_B via
+	//     CredentialEnvName): getCredential would silently resolve both
+	//     accounts to the same secret, and the generated systemd unit
+	//     would emit duplicate LoadCredential lines.
+	seenAccountNames := make(map[string]bool, len(cfg.Accounts))
+	foldedCredNames := make(map[string]string, len(cfg.Accounts))
+	for _, acc := range cfg.Accounts {
+		if err := ValidateAccountName(acc.Name); err != nil {
+			return nil, fmt.Errorf("account %q: %w", acc.Name, err)
+		}
+		if seenAccountNames[acc.Name] {
+			return nil, fmt.Errorf("accounts: duplicate name %q; every account needs a unique name (it is the audit account label, the expvar key and the LB_KEY_* credential name)", acc.Name)
+		}
+		seenAccountNames[acc.Name] = true
+		envName := CredentialEnvName(acc.Name)
+		if prev, ok := foldedCredNames[envName]; ok {
+			return nil, fmt.Errorf("accounts %q and %q collide on credential name %s (hyphens fold to underscores); rename one account so the LB_KEY_* names differ", prev, acc.Name, envName)
+		}
+		foldedCredNames[envName] = acc.Name
+	}
 	// Every account base_url must be an absolute http(s) URL with a
 	// non-empty host. This is a CONFIG-CORRECTNESS check, not an SSRF
 	// defense: base_url is operator-controlled (never client-controlled), so
@@ -412,7 +441,7 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].Key == "" {
-			envVar := "LB_KEY_" + strings.ToUpper(strings.ReplaceAll(cfg.Accounts[i].Name, "-", "_"))
+			envVar := CredentialEnvName(cfg.Accounts[i].Name)
 			// Try systemd LoadCredential first, then env var
 			key := getCredential(envVar)
 			if key == "" {
@@ -516,7 +545,7 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	// Reject non-loopback listen without any credential (checked post-expansion).
-	if !isLoopbackListen(cfg.Listen) && len(cfg.APIKeys) == 0 {
+	if !IsLoopbackListen(cfg.Listen) && len(cfg.APIKeys) == 0 {
 		return nil, fmt.Errorf("non-loopback listen address %q requires auth_token, PRISM_AUTH_TOKEN, or api_keys", cfg.Listen)
 	}
 	// TLS cert/key fallback to env vars — MUST run BEFORE the TLS
@@ -542,7 +571,7 @@ func LoadConfig(path string) (*Config, error) {
 	//     the plaintext explicit (a warning is still logged so the exposure
 	//     stays visible);
 	//   - loopback listeners stay TLS-free (local development).
-	if !isLoopbackListen(cfg.Listen) {
+	if !IsLoopbackListen(cfg.Listen) {
 		if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
 			return nil, fmt.Errorf("non-loopback listen address %q has an incomplete TLS configuration (exactly one of tls_cert_file/tls_key_file is set): configure both or remove both", cfg.Listen)
 		}
@@ -555,18 +584,25 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	// Validate trusted proxies CIDRs. The 0.0.0.0/0 and ::/0 "trust every
 	// network" ranges are rejected outright: they make ipTrusted return true
-	// for EVERY RemoteAddr, so any client can claim an arbitrary
-	// X-Forwarded-For / X-Real-IP (every hop is "trusted", the chain walk
-	// skips all of them and falls back to the client-supplied X-Real-IP) and
-	// bypass per-IP rate limiting entirely. A trusted proxy must be a real,
-	// bounded network.
+	// for EVERY address, so the XFF chain walk skips every hop and the
+	// resolved client IP collapses to RemoteAddr — rate limiting keys on the
+	// proxy's address for every proxied client and the trusted-proxy feature
+	// silently degrades to no client-IP resolution at all. X-Real-IP never
+	// rescues it either: it is accepted ONLY when it parses as an UNtrusted
+	// valid IP, and with every network trusted it always falls back to
+	// RemoteAddr too (see ratelimit.GetClientIP). A trusted proxy must be a
+	// real, bounded network.
 	for _, s := range cfg.TrustedProxies {
 		_, cidr, err := net.ParseCIDR(s)
 		if err != nil {
 			return nil, fmt.Errorf("trusted_proxies: invalid CIDR %q: %v", s, err)
 		}
 		if ones, bits := cidr.Mask.Size(); ones == 0 {
-			return nil, fmt.Errorf("trusted_proxies: %q trusts the whole %d-bit address space; refusing to load (it would let arbitrary X-Forwarded-For hops bypass IP rate limiting) — configure the actual proxy network instead", s, bits)
+			// The text names the actual degradation, not a claim that the
+			// XFF chain is bypassable: with every address trusted the walk
+			// skips every hop, the real client cannot be located, and IP
+			// rate limiting degrades to keying on the proxy's RemoteAddr.
+			return nil, fmt.Errorf("trusted_proxies: %q trusts the whole %d-bit address space; refusing to load (every hop is trusted, so the real client cannot be located and IP rate limiting degrades to the proxy's RemoteAddr for all proxied traffic) — configure the actual proxy network instead", s, bits)
 		}
 	}
 	// Precompute the provider → effort schema map from account base_url hosts.
@@ -589,6 +625,54 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// MaxAccountNameLen is the maximum accepted upstream account-name length
+// (bytes). Account names seed the LB_KEY_* credential/env/credstore names
+// and the expvar keys, so a sane bound keeps the derived names bounded and
+// readable.
+const MaxAccountNameLen = 64
+
+// CredentialEnvName derives the credential/env/credstore name of an
+// account from its account name: "LB_KEY_" + the name uppercased with
+// hyphens folded to underscores ("a-b" and "a_b" both fold to
+// "LB_KEY_A_B"). It is the SINGLE implementation of the conversion,
+// shared by LoadConfig (the fold-collision check and the credential/env
+// lookup), `prism setup` (the interactive cross-provider conflict check
+// and the generated credstore/systemd names) and cmd/prism's wiring.
+func CredentialEnvName(accountName string) string {
+	return "LB_KEY_" + strings.ToUpper(strings.ReplaceAll(accountName, "-", "_"))
+}
+
+// ValidateAccountName validates an upstream account name: the audit/usage
+// account label, the expvar key prefix (pool_account_<name>_*), and the
+// seed of the LB_KEY_* credential / env / credstore file name. Rules:
+//   - non-empty;
+//   - at most MaxAccountNameLen bytes;
+//   - starts with an ASCII letter or digit;
+//   - contains only ASCII letters, digits, '_' and '-' — no dots (the
+//     expvar key would create a hierarchy), no path separators or ".."
+//     (the name seeds file/credstore names), no spaces or non-ASCII (the
+//     name appears in systemd unit and shell environment names).
+//
+// The same rule is enforced interactively by `prism setup` (promptAccounts)
+// so a generated config can never be rejected by LoadConfig.
+func ValidateAccountName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name is empty; every account needs a non-empty name (it is the audit account label and the LB_KEY_* credential name)")
+	}
+	if len(name) > MaxAccountNameLen {
+		return fmt.Errorf("name longer than %d bytes is not supported (it seeds the LB_KEY_* credential name and the expvar keys)", MaxAccountNameLen)
+	}
+	if c := name[0]; !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+		return fmt.Errorf("name %q must start with an ASCII letter or digit", name)
+	}
+	for _, c := range name {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return fmt.Errorf("name %q contains invalid character %q: only ASCII letters, digits, '_' and '-' are allowed", name, c)
+		}
+	}
+	return nil
 }
 
 // validateProviderName rejects provider names that cannot be used as a
@@ -653,7 +737,16 @@ func buildProviderSchema(accs []AccountConfig) map[string]string {
 
 func isOllamaHost(baseURL string) bool {
 	u, err := url.Parse(baseURL)
-	return err == nil && strings.HasSuffix(u.Host, "ollama.com")
+	if err != nil {
+		return false
+	}
+	// Hostname() strips the port; Parse already lowercases http(s) hosts,
+	// and the explicit ToLower makes the match robust for every other
+	// scheme/shape. Only the exact ollama.com domain and its subdomains
+	// qualify — a suffix match on the raw host would also accept
+	// "evilollama.com" and "ollama.com.evil.example".
+	host := strings.ToLower(u.Hostname())
+	return host == "ollama.com" || strings.HasSuffix(host, ".ollama.com")
 }
 
 // LookupModelMetadata resolves per-model metadata for (provider, model).
@@ -1111,16 +1204,24 @@ func equalStringSlices(a, b []string) bool {
 	return true
 }
 
-// isLoopbackListen returns true if addr binds to a loopback interface.
-// Uses fail-safe logic: parse errors, empty host, and non-IP hosts are
-// treated as non-loopback.
-func isLoopbackListen(addr string) bool {
+// IsLoopbackListen returns true if addr binds to a loopback interface.
+// Loopback IPs (127.0.0.0/8, ::1, IPv4-mapped forms) AND the hostname
+// "localhost" (any case — "LOCALHOST", "LocalHost", ...) count as
+// loopback. Empty hosts, "0.0.0.0", "::", hostnames other than localhost
+// and unparseable addresses are NOT loopback (fail-safe: a parse error
+// never relaxes a security check). It is the single listen-loopback
+// implementation shared by LoadConfig and `prism setup` (setup refuses to
+// generate a config for a non-loopback listen).
+func IsLoopbackListen(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return false
 	}
 	if host == "" {
 		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
@@ -1132,8 +1233,10 @@ func isLoopbackListen(addr string) bool {
 // ParseTrustedProxies parses a list of CIDR strings into *net.IPNet values.
 // This is a helper for main.go to use after loading config. The
 // whole-address-space ranges 0.0.0.0/0 and ::/0 are rejected (same rule as
-// LoadConfig): they would make every RemoteAddr "trusted", letting any
-// client spoof X-Forwarded-For / X-Real-IP past the IP rate limiter.
+// LoadConfig): with every address "trusted" the XFF chain walk finds no
+// untrusted client hop and client-IP resolution collapses to RemoteAddr
+// (the proxy itself), silently disabling per-client rate limiting for all
+// proxied traffic.
 func ParseTrustedProxies(proxies []string) ([]*net.IPNet, error) {
 	if len(proxies) == 0 {
 		return nil, nil
@@ -1145,7 +1248,7 @@ func ParseTrustedProxies(proxies []string) ([]*net.IPNet, error) {
 			return nil, err
 		}
 		if ones, _ := cidr.Mask.Size(); ones == 0 {
-			return nil, fmt.Errorf("trusted_proxies: %q trusts the whole address space; refusing (arbitrary X-Forwarded-For would bypass IP rate limiting)", s)
+			return nil, fmt.Errorf("trusted_proxies: %q trusts the whole address space; refusing (every hop is trusted, so the real client cannot be located and rate limiting degrades to RemoteAddr/proxy-address aggregation)", s)
 		}
 		parsed = append(parsed, cidr)
 	}

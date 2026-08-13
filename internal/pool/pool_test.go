@@ -5,8 +5,12 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -242,6 +246,106 @@ func TestNewHTTPClient_ResponseHeaderTimeout(t *testing.T) {
 
 	if tr.ResponseHeaderTimeout == 0 {
 		t.Error("ResponseHeaderTimeout is 0, want non-zero defence for stale upstream connections")
+	}
+}
+
+// TestNewHTTPClient_SameHostRedirectFollowed verifies the redirect policy
+// half that must keep working: a redirect to the SAME host (e.g. http→https
+// or a path move) is followed normally and the final response is returned.
+func TestNewHTTPClient_SameHostRedirectFollowed(t *testing.T) {
+	var finalHits int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/redirect", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/final", http.StatusFound)
+	})
+	mux.HandleFunc("/final", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&finalHits, 1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newHTTPClient()
+	resp, err := c.Get(srv.URL + "/redirect")
+	if err != nil {
+		t.Fatalf("same-host redirect must be followed, got error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("final status = %d, want 200", resp.StatusCode)
+	}
+	if n := atomic.LoadInt32(&finalHits); n != 1 {
+		t.Errorf("final endpoint hits = %d, want 1", n)
+	}
+}
+
+// TestNewHTTPClient_CrossHostRedirectRefused verifies the leak-prevention
+// half: a redirect to a DIFFERENT host is refused with an error, so the
+// account credential headers (custom auth_header / account headers, which
+// Go's client does NOT strip) can never be forwarded to a foreign host.
+func TestNewHTTPClient_CrossHostRedirectRefused(t *testing.T) {
+	var foreignHits int32
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&foreignHits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer foreign.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/redirect", func(w http.ResponseWriter, r *http.Request) {
+		// The redirect target is the foreign server under a DIFFERENT
+		// hostname (localhost vs 127.0.0.1 — both loopback, but a different
+		// host): the client must refuse the hop before contacting it.
+		foreignHost := strings.Replace(foreign.URL, "127.0.0.1", "localhost", 1)
+		http.Redirect(w, r, foreignHost+"/final", http.StatusFound)
+	})
+	local := httptest.NewServer(mux)
+	defer local.Close()
+
+	c := newHTTPClient()
+	resp, err := c.Get(local.URL + "/redirect")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("cross-host redirect must be refused with an error (credential leak prevention)")
+	}
+	// The foreign host must never have been reached.
+	if n := atomic.LoadInt32(&foreignHits); n != 0 {
+		t.Errorf("foreign host hits = %d, want 0 (the redirect target must never be contacted)", n)
+	}
+	var uerr *url.Error
+	if !errors.As(err, &uerr) {
+		t.Fatalf("error = %v, want a *url.Error wrapping the CheckRedirect refusal", err)
+	}
+	if !strings.Contains(uerr.Error(), "cross-host redirect") {
+		t.Errorf("error = %q, want a cross-host redirect refusal message", uerr.Error())
+	}
+}
+
+// TestNewHTTPClient_RedirectLoopCapped verifies the redirect-following
+// safety net: an endless same-host redirect loop stops after 10 hops with an
+// error instead of spinning forever.
+func TestNewHTTPClient_RedirectLoopCapped(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		http.Redirect(w, r, "/loop", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	c := newHTTPClient()
+	resp, err := c.Get(srv.URL + "/loop")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("an endless redirect loop must stop with an error")
+	}
+	// Go follows at most 10 redirects (the loop endpoint is hit once per
+	// hop plus the initial request).
+	if n := atomic.LoadInt32(&hits); n > 11 {
+		t.Errorf("redirect loop hits = %d, want <= 11 (10-hop cap)", n)
+	}
+	if !strings.Contains(err.Error(), "10 redirects") {
+		t.Errorf("error = %q, want the 10-redirect stop message", err.Error())
 	}
 }
 

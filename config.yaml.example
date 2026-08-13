@@ -61,19 +61,23 @@ listen: "127.0.0.1:18790"
 # Optional trusted reverse proxy CIDRs. When set, X-Forwarded-For is only
 # trusted for requests coming from these CIDRs. The XFF chain is walked
 # right-to-left skipping every trusted hop; the first untrusted valid IP is
-# the client (multi-hop chains resolve correctly). When empty, only
-# RemoteAddr is used for rate limiting (safest default).
+# the client (multi-hop chains resolve correctly). X-Real-IP is accepted
+# ONLY when XFF is absent AND the value is a valid IP outside the trusted
+# CIDRs; an all-trusted XFF or a trusted/invalid X-Real-IP falls back to
+# RemoteAddr. When empty, only RemoteAddr is used for rate limiting
+# (safest default).
 #
 # Whole-address-space ranges are REJECTED at load: 0.0.0.0/0 and ::/0 would
-# make every RemoteAddr "trusted", so any client could spoof
-# X-Forwarded-For/X-Real-IP past the per-IP rate limiter. Always configure
-# the actual proxy network.
+# make every address "trusted", so the XFF chain walk finds no untrusted
+# client hop and client-IP resolution collapses to RemoteAddr — per-client
+# rate limiting silently degrades to keying on the proxy's address for all
+# proxied traffic (X-Real-IP never rescues it: it is only accepted when
+# UNtrusted). Always configure the actual proxy network.
 # trusted_proxies:
 #   - "10.0.0.0/8"
 #   - "127.0.0.0/8"
 
 probe_interval: 10m
-probe_model: "deepseek-chat"
 # wire_api: legacy | responses | both
 wire_api: both
 
@@ -165,7 +169,8 @@ model_remap:
 #     - 鉴权（fail-closed）：配置了环境变量 PRISM_ADMIN_TOKEN 时，所有请求
 #       （含本机 loopback）都必须带 Authorization: Bearer <token>（常量时间
 #       比较）；仅当未配置 token 时，本机 loopback 且无 X-Forwarded-For/
-#       X-Real-IP 的直接请求才免鉴权（与 /metrics 一致）。
+#       X-Real-IP/Forwarded 的直接请求才免鉴权（与 /metrics 一致）。token
+#       每次请求都从环境变量重新读取，轮换后无需重启即生效。
 #     - 不走业务 api_keys 鉴权，挂载在全局鉴权之前。
 #     - 支持参数：from/to（unix 秒）、group_by（model/provider/account/
 #       key_id/stream/success/hour/day）、model/provider/account/key_id/
@@ -182,6 +187,11 @@ model_remap:
 #   default_key_id: anonymous
 
 accounts:
+  # name 规则（LoadConfig 强制，setup 交互同规则）：非空、唯一、以 ASCII
+  # 字母/数字开头，仅允许 A-Z a-z 0-9 _ -，最长 64 字节（名称用于
+  # LB_KEY_* 凭据/环境变量名、expvar 键、日志与 usage 标签；点、路径分隔符、
+  # 空格等均被拒绝）。两个名称折叠到同一个 LB_KEY_*（如 a-b 与 a_b）会
+  # 在加载时报错。
   # name "account-1" → credential/env LB_KEY_ACCOUNT_1
   # provider 必填（v0.17.0 起）：provider 为空的账号永远选不到（业务请求按
   # provider 路由），加载会直接报错。裸顶层 accounts 必须声明 provider，

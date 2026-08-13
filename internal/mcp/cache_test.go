@@ -3,6 +3,9 @@ package mcp
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dorokuma/prism/internal/config"
@@ -263,6 +266,82 @@ func TestMCPCache_UnauthenticatedBucketIsReadOnly(t *testing.T) {
 	}
 }
 
+// TestMCPCache_WriteSnapshotsCallerMap pins the write-path snapshot: the
+// cache must store an INDEPENDENT copy of the caller's tool map, not the
+// map by reference. Mutating the original map (or its nested "function"
+// schema) AFTER caching must not change the cached entry — otherwise a
+// caller's later edits would race with cache readers and could grow the
+// cached tool past the serialized-size gate that was passed at write time.
+func TestMCPCache_WriteSnapshotsCallerMap(t *testing.T) {
+	snap := cacheSnapshot()
+	ClearMCPCache()
+	defer restoreCache(snap)
+
+	// A tool with a nested schema, cached near the size cap.
+	tool := map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "snap_tool",
+			"description": strings.Repeat("d", MaxToolSerializedBytes-2048),
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query": map[string]any{"type": "string"},
+				},
+			},
+		},
+	}
+	cacheMCPTool("key-a", tool)
+
+	// Mutate the caller's map after the write: rename the function, add a
+	// nested property, and grow the description beyond the size cap.
+	fn := tool["function"].(map[string]any)
+	fn["name"] = "snap_mutated"
+	fn["description"] = strings.Repeat("x", MaxToolSerializedBytes+4096)
+	params := fn["parameters"].(map[string]any)
+	props := params["properties"].(map[string]any)
+	props["sneaky"] = map[string]any{"type": "string"}
+
+	cached := getTenantMCPTools("key-a")
+	if len(cached) != 1 {
+		t.Fatalf("cached tools = %d, want 1", len(cached))
+	}
+	cachedFn, ok := cached[0]["function"].(map[string]any)
+	if !ok {
+		t.Fatal("cached tool has no function object")
+	}
+	if name, _ := cachedFn["name"].(string); name != "snap_tool" {
+		t.Errorf("cached function name = %q, want %q (the cache must hold a snapshot, not the caller's map)", name, "snap_tool")
+	}
+	if desc, _ := cachedFn["description"].(string); len(desc) != MaxToolSerializedBytes-2048 {
+		t.Errorf("cached description length = %d, want %d (later caller edits must not change the cached entry)", len(desc), MaxToolSerializedBytes-2048)
+	}
+	cachedParams, ok := cachedFn["parameters"].(map[string]any)
+	if !ok {
+		t.Fatal("cached tool has no parameters object")
+	}
+	cachedProps, ok := cachedParams["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("cached tool has no properties object")
+	}
+	if _, ok := cachedProps["sneaky"]; ok {
+		t.Error("nested schema edits after the write leaked into the cache (shallow copy of the outer map is not enough)")
+	}
+	if _, ok := cachedProps["query"]; !ok {
+		t.Error("the original nested schema must survive the snapshot")
+	}
+
+	// The cached entry must stay under the serialized-size cap even though
+	// the caller grew its map far past it after the write.
+	raw, err := json.Marshal(cached[0])
+	if err != nil {
+		t.Fatalf("marshal cached tool: %v", err)
+	}
+	if len(raw) > MaxToolSerializedBytes {
+		t.Errorf("cached tool size = %d, want <= %d (caller edits after the write must not push the cache past the gate)", len(raw), MaxToolSerializedBytes)
+	}
+}
+
 // TestSanitizeTools_DeepSchemaFails pins item 5 at the mcp surface: a tool
 // parameter schema deeper than the limit fails fast with ErrSchemaTooDeep
 // (propagated to the caller → convert → 400 invalid_request) instead of
@@ -301,5 +380,142 @@ func TestSanitizeTools_NormalSchemaStillWorks(t *testing.T) {
 	}
 	if _, ok := props["query"]; !ok {
 		t.Error("legitimate key query must survive")
+	}
+}
+
+// TestMCPCache_SingleToolSizeLimit pins the per-tool serialized-size gate: a
+// tool whose JSON representation exceeds MaxToolSerializedBytes is NOT
+// cached (the per-tenant count cap alone cannot bound memory when one tool
+// carries a huge description/schema), smaller tools are unaffected, and the
+// oversized tool must not be visible to any identity.
+func TestMCPCache_SingleToolSizeLimit(t *testing.T) {
+	snap := cacheSnapshot()
+	ClearMCPCache()
+	defer restoreCache(snap)
+
+	// A tool over the 1 MiB cap (big description).
+	huge := map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "huge_tool",
+			"description": strings.Repeat("a", MaxToolSerializedBytes+1024),
+		},
+	}
+	cacheMCPTool("key-a", huge)
+	// A tool just under the cap still caches (exercises the boundary).
+	near := map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "near_tool",
+			"description": strings.Repeat("b", MaxToolSerializedBytes-2048),
+		},
+	}
+	cacheMCPTool("key-a", near)
+	cacheMCPTool("key-a", toolWithName("small_tool"))
+
+	a := toolNames(getTenantMCPTools("key-a"))
+	if a["huge_tool"] {
+		t.Error("the oversized tool must NOT be cached")
+	}
+	if !a["near_tool"] {
+		t.Error("a tool under the size cap must still be cached")
+	}
+	if !a["small_tool"] {
+		t.Error("a small tool must still be cached")
+	}
+	// The oversized tool must not leak into any other identity either.
+	if names := toolNames(getTenantMCPTools("key-b")); names["huge_tool"] {
+		t.Error("the oversized tool must not be visible to other identities")
+	}
+}
+
+// TestMCPCache_ConcurrentWrites pins the concurrency behavior of the
+// lock-scoped cacheTool: N goroutines caching distinct tools into one
+// bucket concurrently must all land (count == N, no lost updates — the
+// dedupe/cap/append all happen under the lock), and concurrent duplicate
+// writes of the SAME tool name must dedupe to exactly one entry. Run with
+// -race to prove the marshal-outside-the-lock refactor introduced no data
+// race.
+func TestMCPCache_ConcurrentWrites(t *testing.T) {
+	snap := cacheSnapshot()
+	ClearMCPCache()
+	defer restoreCache(snap)
+
+	const n = 50
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf("conc_tool_%02d", i)
+			cacheMCPTool("key-a", toolWithName(name))
+			// Concurrent duplicate of the same name: must dedupe to one.
+			cacheMCPTool("key-a", toolWithName(name))
+		}(i)
+	}
+	wg.Wait()
+
+	tools := getTenantMCPTools("key-a")
+	if len(tools) != n {
+		t.Fatalf("tools after %d concurrent writers = %d, want %d (no lost updates)", n, len(tools), n)
+	}
+	names := toolNames(tools)
+	for i := 0; i < n; i++ {
+		if !names[fmt.Sprintf("conc_tool_%02d", i)] {
+			t.Errorf("tool conc_tool_%02d missing after concurrent writes", i)
+		}
+	}
+
+	// Concurrent oversized writes are dropped without corrupting the bucket.
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			huge := map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        "conc_huge",
+					"description": strings.Repeat("x", MaxToolSerializedBytes+1024),
+				},
+			}
+			cacheMCPTool("key-a", huge)
+		}()
+	}
+	wg.Wait()
+	if got := len(getTenantMCPTools("key-a")); got != n {
+		t.Errorf("tools after concurrent oversized writes = %d, want %d (oversized tools must not consume slots)", got, n)
+	}
+}
+
+// TestMCPCache_SizeLimitDoesNotReplaceCountCap guards the interaction with
+// the per-tenant count cap: the size gate drops oversized tools, the count
+// cap (100 tools per tenant) still applies to the surviving tools, and an
+// oversized tool is simply skipped (count not consumed).
+func TestMCPCache_SizeLimitDoesNotReplaceCountCap(t *testing.T) {
+	snap := cacheSnapshot()
+	ClearMCPCache()
+	defer restoreCache(snap)
+
+	// Fill 100 small tools → the 101st is dropped by the COUNT cap.
+	for i := 0; i < 100; i++ {
+		cacheMCPTool("key-a", toolWithName(fmt.Sprintf("t%02d", i)))
+	}
+	cacheMCPTool("key-a", toolWithName("t101"))
+	if got := len(getTenantMCPTools("key-a")); got != 100 {
+		t.Fatalf("tools after count cap = %d, want 100 (count cap must still apply)", got)
+	}
+
+	// An oversized tool does not consume a count slot either: the bucket
+	// still holds exactly the 100 small tools.
+	huge := map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "huge_tool",
+			"description": strings.Repeat("a", MaxToolSerializedBytes+1024),
+		},
+	}
+	cacheMCPTool("key-a", huge)
+	if got := len(getTenantMCPTools("key-a")); got != 100 {
+		t.Errorf("tools after oversized write = %d, want 100 (oversized tool must not consume a slot)", got)
 	}
 }

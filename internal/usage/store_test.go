@@ -3,12 +3,17 @@ package usage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/dorokuma/prism/internal/util"
 )
 
 // openTestStore opens a SQLiteStore on a fresh temp file and applies
@@ -361,6 +366,134 @@ func TestDeleteBefore(t *testing.T) {
 	}
 }
 
+// TestInsertBatchCommitSurvivesTightenFailure pins the commit-vs-tighten
+// semantics: once the batch transaction has COMMITTED, a failure to
+// re-tighten the file modes must NOT be returned as a failed batch — the
+// events are already in the database and counted as written, and an error
+// return would make the writer count the whole batch dropped and retry it,
+// duplicating rows that are actually persisted (written + dropped identity
+// broken). The failure is surfaced loudly on its own channel instead:
+// error-level log + the write-error incident counter, while the data
+// result stays success. The write is exercised exactly once.
+func TestInsertBatchCommitSurvivesTightenFailure(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// Seed one batch so the -wal/-shm sidecars exist (production state).
+	if err := s.InsertBatch(ctx, []Event{testEvent(time.Now(), "seed", nil)}); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+
+	// Inject a failing tightening (simulates a chmod that cannot secure
+	// the files) and capture the log so the fail-loud channel is verified.
+	buf, restore := captureSlog(t)
+	defer restore()
+	oldTighten := tightenFileModes
+	tightenFileModes = func(string) error { return errors.New("simulated chmod failure") }
+	defer func() { tightenFileModes = oldTighten }()
+
+	writtenBefore := util.MetricsUsageEventsWritten.Value()
+	droppedBefore := util.MetricsUsageEventsDropped.Value()
+	writeErrsBefore := util.MetricsUsageWriteErrors.Value()
+
+	evs := []Event{
+		testEvent(time.Now(), "m1", nil),
+		testEvent(time.Now(), "m2", nil),
+		testEvent(time.Now(), "m3", nil),
+	}
+	if err := s.InsertBatch(ctx, evs); err != nil {
+		t.Fatalf("InsertBatch must return success when only the post-commit tightening failed, got: %v", err)
+	}
+
+	// The data is written EXACTLY once: three new rows, no duplicates
+	// (a writer retry after a false failure would have doubled them).
+	rows, err := s.Summary(ctx, SummaryQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].Requests != 4 {
+		t.Fatalf("persisted requests = %d, want 4 (seed + 3; the committed batch must not be duplicated)", rows[0].Requests)
+	}
+
+	// Accounting stays consistent with reality: the batch is written, not
+	// dropped, and the tightening failure is one loud incident.
+	if got := util.MetricsUsageEventsWritten.Value() - writtenBefore; got != 3 {
+		t.Errorf("usage_events_written delta = %d, want 3 (the committed batch is written, not dropped)", got)
+	}
+	if got := util.MetricsUsageEventsDropped.Value() - droppedBefore; got != 0 {
+		t.Errorf("usage_events_dropped delta = %d, want 0 (no event was lost)", got)
+	}
+	if got := util.MetricsUsageWriteErrors.Value() - writeErrsBefore; got != 1 {
+		t.Errorf("usage_write_errors delta = %d, want 1 (the tightening failure is one loud incident)", got)
+	}
+	if !strings.Contains(buf.String(), "file modes could not be secured") {
+		t.Errorf("tightening failure must be logged loudly, got log: %q", buf.String())
+	}
+
+	// The seam is restored: the next write re-tightens normally and still
+	// succeeds (the injected failure was scoped to the one batch).
+	tightenFileModes = oldTighten
+	if err := s.InsertBatch(ctx, []Event{testEvent(time.Now(), "m4", nil)}); err != nil {
+		t.Fatalf("insert after restoring tightening: %v", err)
+	}
+	rows, err = s.Summary(ctx, SummaryQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].Requests != 5 {
+		t.Fatalf("persisted requests after restore = %d, want 5", rows[0].Requests)
+	}
+}
+
+// TestDeleteBeforeCommitSurvivesTightenFailure pins the same
+// commit-vs-tighten semantics for DeleteBefore: the DELETE is committed
+// (autocommit) before the tightening runs, so a tightening failure must NOT
+// be reported as a failed delete — the rows ARE gone, and an error return
+// would make the retention loop retry (and re-report) a committed deletion.
+// The real row count is returned, the failure is logged loudly and counted
+// as one incident.
+func TestDeleteBeforeCommitSurvivesTightenFailure(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	old := now.Add(-48 * time.Hour)
+	mid := now.Add(-24 * time.Hour)
+	if err := s.InsertBatch(ctx, []Event{
+		testEvent(old, "old", nil), testEvent(mid, "mid", nil), testEvent(now, "now", nil),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	buf, restore := captureSlog(t)
+	defer restore()
+	oldTighten := tightenFileModes
+	tightenFileModes = func(string) error { return errors.New("simulated chmod failure") }
+	defer func() { tightenFileModes = oldTighten }()
+	writeErrsBefore := util.MetricsUsageWriteErrors.Value()
+
+	// Deletes events older than now-36h: exactly the "old" row.
+	n, err := s.DeleteBefore(ctx, now.Add(-36*time.Hour).Unix())
+	if err != nil {
+		t.Fatalf("DeleteBefore must return success when only the post-commit tightening failed, got: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("deleted rows = %d, want 1 (the committed deletion must be reported as executed, not as 0)", n)
+	}
+	rows, err := s.Summary(ctx, SummaryQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].Requests != 2 {
+		t.Fatalf("remaining requests = %d, want 2 (the delete is committed)", rows[0].Requests)
+	}
+	if got := util.MetricsUsageWriteErrors.Value() - writeErrsBefore; got != 1 {
+		t.Errorf("usage_write_errors delta = %d, want 1 (the tightening failure is one loud incident)", got)
+	}
+	if !strings.Contains(buf.String(), "file modes could not be secured") {
+		t.Errorf("tightening failure must be logged loudly, got log: %q", buf.String())
+	}
+}
+
 // TestConcurrentWriteReadNoLocked is the acceptance test for the two-pool WAL
 // design: several writers hammer InsertBatch while readers run Summary, and
 // no SQLITE_BUSY / "database is locked" may surface.
@@ -435,5 +568,186 @@ func TestConcurrentWriteReadNoLocked(t *testing.T) {
 	want := writers * batches * perBatch
 	if rows[0].Requests != int64(want) {
 		t.Fatalf("persisted %d events, want %d", rows[0].Requests, want)
+	}
+}
+
+// TestWritableFileModesTightenedTo0600 pins the 0600 file-mode tightening:
+// a writable open + migrate must leave the main database 0600, and the
+// WAL/SHM sidecars created by the first write transaction must be 0600 too
+// (SQLite creates them with the process umask, typically 0644 — the usage
+// rows carry model/key_id/cost data that must not be world-readable).
+func TestWritableFileModesTightenedTo0600(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	s := &SQLiteStore{path: path}
+	if err := s.Open(); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	assertMode := func(p string, want os.FileMode) {
+		t.Helper()
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if perm := fi.Mode().Perm(); perm != want {
+			t.Errorf("%s mode = %o, want %o", p, perm, want)
+		}
+	}
+
+	// The writable open creates the main database file: it must already be
+	// 0600 (Open tightens before any data is written).
+	assertMode(path, 0600)
+
+	// Migrate: the first schema write may create the WAL sidecar.
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	assertMode(path, 0600)
+
+	// A real write transaction creates/uses the -wal journal (and -shm on
+	// shared-memory setups): both must be 0600 when present.
+	if err := s.InsertBatch(context.Background(), []Event{testEvent(time.Now(), "m", nil)}); err != nil {
+		t.Fatalf("insert batch: %v", err)
+	}
+	wal := path + "-wal"
+	if fi, err := os.Stat(wal); err != nil {
+		t.Errorf("expected a -wal sidecar after a write in WAL mode, stat: %v", err)
+	} else if perm := fi.Mode().Perm(); perm != 0600 {
+		t.Errorf("%s mode = %o, want 0600", wal, perm)
+	}
+	for _, suffix := range []string{"-shm"} {
+		if fi, err := os.Stat(path + suffix); err == nil {
+			if perm := fi.Mode().Perm(); perm != 0600 {
+				t.Errorf("%s%s mode = %o, want 0600", path, suffix, perm)
+			}
+		}
+	}
+}
+
+// TestWritableFileModesRetightenedAfterWrite simulates SQLite recreating
+// the main database or its -wal/-shm sidecars at runtime under a WIDE
+// umask (0644): the files are chmod'd back to the umask-typical 0644 and
+// the next successful write transaction must re-tighten them to 0600 —
+// both InsertBatch and DeleteBefore run the post-commit tighten, and an
+// error there is returned (never silently swallowed).
+func TestWritableFileModesRetightenedAfterWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	s := &SQLiteStore{path: path}
+	if err := s.Open(); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if err := s.InsertBatch(ctx, []Event{testEvent(time.Now(), "m", nil)}); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+
+	// Simulate wide-umask recreation of every file (the state a runtime
+	// sidecar rebuild would leave behind).
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if fi, err := os.Stat(p); err == nil {
+			if err := os.Chmod(p, fi.Mode().Perm()|0644); err != nil {
+				t.Fatalf("chmod %s: %v", p, err)
+			}
+		}
+	}
+
+	// InsertBatch re-tightens after its successful commit.
+	if err := s.InsertBatch(ctx, []Event{testEvent(time.Now(), "m2", nil)}); err != nil {
+		t.Fatalf("insert after chmod: %v", err)
+	}
+	for _, p := range []string{path, path + "-wal"} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0600 {
+			t.Errorf("%s mode after insert = %o, want 0600 (re-tightened after write)", p, perm)
+		}
+	}
+
+	// DeleteBefore re-tightens after its successful write too.
+	for _, p := range []string{path, path + "-wal"} {
+		if err := os.Chmod(p, 0644); err != nil {
+			t.Fatalf("chmod %s: %v", p, err)
+		}
+	}
+	if _, err := s.DeleteBefore(ctx, time.Now().Add(time.Hour).Unix()); err != nil {
+		t.Fatalf("delete before: %v", err)
+	}
+	for _, p := range []string{path, path + "-wal"} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0600 {
+			t.Errorf("%s mode after delete = %o, want 0600 (re-tightened after delete)", p, perm)
+		}
+	}
+}
+
+// TestWritableFileModesWideUmask runs the whole create path (open →
+// migrate → insert) under a WIDE umask (0), proving that files SQLite
+// CREATES during runtime (main db, -wal, -shm) never stay at the
+// umask-derived 0644: the post-open/post-migrate/post-write tightening
+// must bring every one of them to 0600. The umask is process-global, so
+// it is saved and restored around this test (the usage test package runs
+// tests sequentially — no t.Parallel).
+func TestWritableFileModesWideUmask(t *testing.T) {
+	old := syscall.Umask(0)
+	defer syscall.Umask(old)
+
+	path := filepath.Join(t.TempDir(), "usage.db")
+	s := &SQLiteStore{path: path}
+	if err := s.Open(); err != nil {
+		t.Fatalf("open under umask 0: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate under umask 0: %v", err)
+	}
+	if err := s.InsertBatch(context.Background(), []Event{testEvent(time.Now(), "m", nil)}); err != nil {
+		t.Fatalf("insert under umask 0: %v", err)
+	}
+
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Errorf("stat %s under umask 0: %v", p, err)
+			continue
+		}
+		if perm := fi.Mode().Perm(); perm != 0600 {
+			t.Errorf("%s mode under umask 0 = %o, want 0600 (files created at runtime must be tightened)", p, perm)
+		}
+	}
+}
+
+// TestReadOnlyStoreDoesNotTouchFileModes: a read-only store must never
+// chmod anything (the live service owns the file; a chmod from a reader
+// could race or fail). Opening a read-only store on an existing 0600 file
+// leaves the mode untouched.
+func TestReadOnlyStoreDoesNotTouchFileModes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	if err := os.WriteFile(path, []byte("not a db"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := &SQLiteStore{path: path, readOnly: true}
+	if err := s.Open(); err == nil {
+		// The file is not a database; opening read-only may fail on ping —
+		// that is fine and unrelated. Only assert that a SUCCESSFUL
+		// read-only open (or any open attempt) never chmods: close and
+		// check the mode directly.
+		_ = s.Close()
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0644 {
+		t.Errorf("read-only open changed the file mode to %o, want 0644 untouched", perm)
 	}
 }

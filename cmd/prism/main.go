@@ -237,7 +237,7 @@ func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *
 			return
 		}
 		curCfg := holder.Load()
-		if r.URL.Path != "/health" {
+		if r.URL.Path != "/health" && r.URL.Path != "/ready" {
 			keyName, ok := middleware.Authenticate(r, curCfg.APIKeys)
 			if !ok {
 				slog.Warn("auth_failed", "req", util.RequestIDFromCtx(r.Context()), "path", r.URL.Path, "remote_addr", r.RemoteAddr)

@@ -1,14 +1,33 @@
 #!/bin/bash
+# pre-commit hook: block commits whose STAGED diff adds a line containing a
+# common credential pattern. Only ADDED lines are scanned (removals and
+# context are ignored); new files are covered because their whole content is
+# an addition. File names are read NUL-delimited (-z), so names with spaces
+# or quotes are handled correctly.
+#
+# 保留的规则：常见的密钥形态（sk-* / AWS AKIA / GitHub PAT / Google OAuth /
+# JWT / 私钥块）。明显误报的长 hex / base64 规则已删除：任何 diff 都可能
+# 合法包含长十六进制串（hash、uuid、测试数据）或 base64（编码内容），
+# 而真正的密钥已被上面的具体形态规则覆盖。
+
+set -u
 
 RED="\033[0;31m"
 NC="\033[0m"
 
-# 检查暂存区中新增或修改的文件
-FILES=$(git diff --cached --name-only --diff-filter=ACM)
+# NUL-delimited staged file list (safe for spaces/quotes/newlines).
+FILES=()
+while IFS= read -r -d '' f; do
+    FILES+=("$f")
+done < <(git diff --cached --name-only -z --diff-filter=ACM)
 
-if [ -z "$FILES" ]; then
+if [ ${#FILES[@]} -eq 0 ]; then
     exit 0
 fi
+
+# Staged diff with zero context; keep only ADDED lines, dropping the
+# "+++ b/file" header lines (the file names are already known from FILES).
+DIFF="$(git diff --cached -U0 -- "${FILES[@]}" | grep -E '^\+' | grep -v '^+++' || true)"
 
 FOUND=0
 
@@ -16,9 +35,7 @@ check_pattern() {
     local pattern="$1"
     local description="$2"
     local matches
-    
-    matches=$(git diff --cached -U0 -- $FILES | grep -nE "^\+\+.*" -e "^\+.*${pattern}" | grep -v '^+++')
-    
+    matches=$(printf '%s\n' "$DIFF" | grep -nE -- "$pattern" || true)
     if [ -n "$matches" ]; then
         echo -e "${RED}[BLOCKED] ${description}${NC}"
         echo "$matches"
@@ -34,8 +51,6 @@ check_pattern "github_pat_[a-zA-Z0-9_]{22,}" "GitHub Personal Access Token (fine
 check_pattern "ya29\.[a-zA-Z0-9_-]{50,}" "Google OAuth Token"
 check_pattern "eyJ[a-zA-Z0-9_-]{50,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}" "JWT Token"
 check_pattern "-----BEGIN (RSA |EC )?PRIVATE KEY-----" "Private Key Block"
-check_pattern "[a-zA-Z0-9+/]{40,}={0,2}" "Base64 string (possible encoded secret, check manually)"
-check_pattern "[0-9a-fA-F]{32,}" "Long hex string"
 
 if [ $FOUND -eq 1 ]; then
     echo ""

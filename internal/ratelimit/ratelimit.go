@@ -34,10 +34,13 @@ func NewRateLimiter(rate, burst int) *RateLimiter {
 }
 
 // NewRateLimiterWithMaxBuckets creates a RateLimiter with a deterministic
-// cap on the number of tracked IP buckets. When the cap is reached, the
-// bucket with the oldest lastCheck is evicted to make room for a new IP, so
-// a flood of distinct IPs cannot grow the map without bound. Tests inject a
-// small cap; production uses config.RateLimitMaxBuckets (100000).
+// cap on the number of tracked IP buckets. When the cap is reached, a NEW
+// IP is rejected outright (Allow returns false) — the map can never grow
+// without bound and the hot path never scans the whole map under the lock
+// (the old oldest-bucket eviction was an O(n) scan per new IP). Existing
+// buckets are untouched and keep their tokens; the background cleanup loop
+// frees space by removing idle buckets. Tests inject a small cap;
+// production uses config.RateLimitMaxBuckets (100000).
 func NewRateLimiterWithMaxBuckets(rate, burst, maxBuckets int) *RateLimiter {
 	if maxBuckets <= 0 {
 		maxBuckets = config.RateLimitMaxBuckets
@@ -61,7 +64,12 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	b, ok := rl.buckets[ip]
 	if !ok {
 		if len(rl.buckets) >= rl.maxBuckets {
-			evictOldestBucket(rl.buckets)
+			// Bucket cap reached: reject the new IP outright. No eviction
+			// scan (O(n) under the lock), no stealing from existing buckets
+			// — a flood of distinct IPs cannot grow the map, cannot slow
+			// the hot path, and cannot degrade the buckets that are already
+			// being served. The cleanup loop eventually frees a slot.
+			return false
 		}
 		b = &tokenBucket{
 			tokens:    float64(rl.burst),
@@ -108,33 +116,28 @@ func (rl *RateLimiter) StartCleanupLoop(ctx context.Context) {
 	}()
 }
 
-// evictOldestBucket removes the bucket with the oldest lastCheck (ties are
-// broken arbitrarily). Must be called with rl.mu held; the evicted entry is
-// always one of the oldest-lastCheck buckets, never a recently active IP.
-func evictOldestBucket(buckets map[string]*tokenBucket) {
-	var oldestIP string
-	var oldestTime time.Time
-	for ip, b := range buckets {
-		if oldestIP == "" || b.lastCheck.Before(oldestTime) {
-			oldestIP = ip
-			oldestTime = b.lastCheck
-		}
-	}
-	if oldestIP != "" {
-		delete(buckets, oldestIP)
-	}
-}
-
 // GetClientIP extracts the client IP from the request using trusted proxy
 // awareness. If trustedProxies is empty, X-Forwarded-For and X-Real-IP are
 // ignored entirely (only RemoteAddr is used) to prevent IP spoofing. If
-// trustedProxies is non-empty and RemoteAddr is within a trusted CIDR, the
-// X-Forwarded-For chain is walked right-to-left skipping every trusted proxy
-// hop, and the first valid IP that is NOT trusted is returned (the original
-// client). This makes multi-hop chains (client → trusted proxy 1 → trusted
-// proxy 2 → prism) resolve to the client, not to the innermost proxy. If no
-// untrusted valid IP is found, X-Real-IP is tried, then RemoteAddr. If
-// RemoteAddr is not trusted, XFF/X-Real-IP are ignored.
+// trustedProxies is non-empty and RemoteAddr is within a trusted CIDR:
+//
+//   - when X-Forwarded-For is non-empty, the chain is walked right-to-left
+//     skipping every trusted proxy hop, and the first valid IP that is NOT
+//     trusted is returned (the original client). This makes multi-hop
+//     chains (client → trusted proxy 1 → trusted proxy 2 → prism) resolve
+//     to the client, not to the innermost proxy. X-Real-IP is NEVER
+//     consulted while XFF is present — a proxy that appends its own hop to
+//     XFF can still be relied on, but X-Real-IP would be a second,
+//     independently client-controlled claim. When every XFF hop is trusted
+//     (or all are invalid), the chain carries no client: fall back to
+//     RemoteAddr.
+//   - only when X-Forwarded-For is EMPTY is X-Real-IP accepted, and only
+//     if it parses as a valid IP that is NOT inside trustedProxies (a
+//     trusted X-Real-IP is a proxy's own address, not a client).
+//   - everything else falls back to RemoteAddr.
+//
+// If RemoteAddr is not trusted, XFF/X-Real-IP are ignored entirely (they
+// are client-spoofable).
 func GetClientIP(r *http.Request, trustedProxies []*net.IPNet) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -152,7 +155,12 @@ func GetClientIP(r *http.Request, trustedProxies []*net.IPNet) string {
 	}
 
 	// RemoteAddr is trusted — walk X-Forwarded-For right-to-left, skipping
-	// trusted hops, and return the first untrusted valid IP.
+	// trusted hops, and return the first untrusted valid IP. X-Real-IP is
+	// deliberately NOT consulted while XFF is present: XFF is the
+	// hop-by-hop chain the trusted proxy maintains, X-Real-IP is an
+	// independent claim the same proxy could have been fed by the client.
+	// An all-trusted (or all-invalid) XFF therefore falls back to
+	// RemoteAddr, never to X-Real-IP.
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		for i := len(parts) - 1; i >= 0; i-- {
@@ -165,10 +173,13 @@ func GetClientIP(r *http.Request, trustedProxies []*net.IPNet) string {
 			}
 			return ip.String()
 		}
+		return host
 	}
-	// No XFF, or every XFF hop is trusted: fall back to X-Real-IP, then host.
+	// XFF is empty: X-Real-IP is accepted ONLY when it is a valid IP that is
+	// NOT itself a trusted proxy address (a trusted value is the proxy's own
+	// IP, not a client). Otherwise fall back to RemoteAddr.
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil {
+		if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil && !ipTrusted(ip, trustedProxies) {
 			return ip.String()
 		}
 	}
@@ -189,14 +200,15 @@ func ipTrusted(ip net.IP, trustedProxies []*net.IPNet) bool {
 }
 
 // RateLimitMiddleware returns an HTTP middleware that rate-limits per client IP.
-// /health is exempt: it is the liveness endpoint used by load balancers and
-// deploy checks, so it must stay reachable when business traffic is being
-// limited. No other path is exempted — /v1/*, /metrics and /admin/* remain
-// limited.
+// /health and /ready are exempt: /health is the liveness endpoint used by
+// load balancers and deploy checks, and /ready is the readiness endpoint
+// used by deploy.sh — both must stay reachable when business traffic is
+// being limited. No other path is exempted — /v1/*, /metrics and /admin/*
+// remain limited.
 func RateLimitMiddleware(next http.Handler, rl *RateLimiter, trustedProxies []*net.IPNet) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if rl != nil {
-			if r.URL.Path == "/health" {
+			if r.URL.Path == "/health" || r.URL.Path == "/ready" {
 				next.ServeHTTP(w, r)
 				return
 			}

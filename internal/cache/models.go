@@ -243,7 +243,14 @@ func providerSkipPISync(cfg *config.Config, provider string) bool {
 }
 
 // LoadFromDisk reads all cached provider model lists from disk.
-// Missing files are silently skipped.
+// Missing files are silently skipped. Each successfully loaded provider
+// cache file is re-tightened to 0600 (owner-only): an existing cache file
+// written by an older prism version (or created under a wide umask) must
+// not stay world-readable until the next fetch rename — the cache may
+// embed upstream metadata that is not meant to be world-readable. Only
+// prism's OWN provider cache files are touched, never pi's models.json.
+// A tightening failure is logged loudly but does not abort the load (the
+// file stays usable; the next fetch rewrite secures it).
 func (mc *ModelCache) LoadFromDisk() {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
@@ -267,6 +274,12 @@ func (mc *ModelCache) LoadFromDisk() {
 		if err := json.Unmarshal(data, &pc); err != nil {
 			slog.Warn("cache file corrupt, will fetch async", "provider", provider, "error", err)
 			continue
+		}
+		// The file is adopted into the running cache: tighten it now (see
+		// the doc comment). Failure is loud, never silent, but does not
+		// discard the cached data.
+		if err := os.Chmod(fp, 0600); err != nil {
+			slog.Error("model cache: cannot tighten provider cache file to 0600", "provider", provider, "path", fp, "error", err)
 		}
 		mc.caches[provider] = &pc
 		slog.Info("model cache loaded from disk", "provider", provider, "models", len(pc.Models), "updated", pc.UpdatedAt.Format(time.RFC3339))
@@ -687,9 +700,10 @@ func (mc *ModelCache) fetchFromAccount(ctx context.Context, account *pool.Accoun
 	// final path only after a final cancellation check, so a concurrent
 	// reader never observes a partial file and a cancelled fetch (Stop)
 	// never publishes a cache file. The temp file is removed on every
-	// failure/cancellation path; the final file keeps the 0644 permission
-	// semantics of the previous direct write. Repeated runs are idempotent:
-	// the rename atomically replaces any previous cache file.
+	// failure/cancellation path; the final file is 0600 (owner-only): the
+	// cache may embed upstream metadata and model ids that are not meant
+	// to be world-readable. Repeated runs are idempotent: the rename
+	// atomically replaces any previous cache file.
 	tmp, err := os.CreateTemp(mc.dir, provider+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp cache file: %w", err)
@@ -703,7 +717,7 @@ func (mc *ModelCache) fetchFromAccount(ctx context.Context, account *pool.Accoun
 	if _, err := tmp.Write(data); err != nil {
 		return abort(fmt.Errorf("write temp cache file: %w", err))
 	}
-	if err := tmp.Chmod(0644); err != nil {
+	if err := tmp.Chmod(0600); err != nil {
 		return abort(fmt.Errorf("chmod temp cache file: %w", err))
 	}
 	if err := tmp.Close(); err != nil {

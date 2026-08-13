@@ -590,11 +590,20 @@ max_concurrent_per_account_total: 16
 
 // TestParseTrustedProxiesRejectsWholeNet pins the audit round 6 item 8
 // rule: 0.0.0.0/0 and ::/0 ("trust every network") are rejected by the
-// parser itself, while bounded IPv4 and IPv6 CIDRs still parse.
+// parser itself, while bounded IPv4 and IPv6 CIDRs still parse. The error
+// text explains the ACTUAL degradation (all hops trusted → the real client
+// cannot be located → rate limiting degrades to RemoteAddr/proxy-address
+// aggregation), never a claim that arbitrary X-Forwarded-For hops bypass
+// the limiter.
 func TestParseTrustedProxiesRejectsWholeNet(t *testing.T) {
 	for _, bad := range []string{"0.0.0.0/0", "::/0"} {
-		if _, err := ParseTrustedProxies([]string{bad}); err == nil {
+		_, err := ParseTrustedProxies([]string{bad})
+		if err == nil {
 			t.Errorf("ParseTrustedProxies(%q) must be rejected (whole-address-space trust)", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "real client cannot be located") {
+			t.Errorf("ParseTrustedProxies(%q) error = %q, want it to explain the degradation (all hops trusted → no client-IP resolution)", bad, err.Error())
 		}
 	}
 	for _, good := range []string{"10.0.0.0/8", "192.168.1.0/24", "fd00::/8", "2001:db8::/32"} {
@@ -606,15 +615,25 @@ func TestParseTrustedProxiesRejectsWholeNet(t *testing.T) {
 
 // TestLoadConfig_RejectsWholeNetTrustedProxies pins the same rule at the
 // config-load stage (fail fast): a trusted_proxies entry covering the whole
-// address space would let any client spoof X-Forwarded-For / X-Real-IP past
-// the IP rate limiter, so loading must fail instead of silently trusting
-// every network. Bounded IPv4/IPv6 ranges still load.
+// address space makes every address "trusted", so the XFF chain walk finds
+// no untrusted client hop and client-IP resolution collapses to RemoteAddr
+// — per-client rate limiting silently degrades to keying on the proxy's
+// address for all proxied traffic — and X-Real-IP never rescues it (it is
+// only accepted when UNtrusted). Loading must fail instead of silently
+// trusting every network. The error text describes this degradation, not a
+// claim that arbitrary XFF can bypass the limiter. Bounded IPv4/IPv6 ranges
+// still load.
 func TestLoadConfig_RejectsWholeNetTrustedProxies(t *testing.T) {
 	base := "accounts:\n  - name: t\n    key: k\n    base_url: https://api.example.com\n    provider: p\n"
 	for _, bad := range []string{"0.0.0.0/0", "::/0"} {
 		path := writeConfig(t, base+"trusted_proxies:\n  - \""+bad+"\"\n")
-		if _, err := LoadConfig(path); err == nil {
+		_, err := LoadConfig(path)
+		if err == nil {
 			t.Errorf("trusted_proxies %q must fail loading (whole-address-space trust)", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "real client cannot be located") {
+			t.Errorf("trusted_proxies %q error = %q, want it to explain the degradation (all hops trusted → no client-IP resolution)", bad, err.Error())
 		}
 	}
 	for _, good := range []string{"10.0.0.0/8", "192.168.1.0/24", "fd00::/8", "2001:db8::/32"} {
@@ -2478,4 +2497,207 @@ accounts:
 	if !found {
 		t.Errorf("expected a default_provider rollback warning, got: %v", warnings)
 	}
+}
+
+// TestIsOllamaHost pins the ollama-host detection: only the exact
+// ollama.com domain and its subdomains qualify (case-insensitive, port
+// stripped); suffix-matching lookalikes (evilollama.com, ollama.com.evil.example)
+// and every other host are rejected.
+func TestIsOllamaHost(t *testing.T) {
+	tests := []struct {
+		baseURL string
+		want    bool
+	}{
+		{"https://ollama.com/v1", true},
+		{"https://ollama.com", true},
+		{"https://ollama.com:8443/v1", true},
+		{"https://sub.ollama.com/v1", true},
+		{"https://a.b.ollama.com/v1", true},
+		{"https://OLLAMA.COM/v1", true},      // case-normalized
+		{"https://Ollama.Com/V1", true},      // case-normalized
+		{"https://SUB.OLLAMA.COM/v1", true},  // case-normalized subdomain
+		{"http://ollama.com/v1", true},       // http scheme is fine
+		{"https://evilollama.com/v1", false}, // suffix lookalike
+		{"https://ollama.com.evil.example/v1", false},
+		{"https://notollama.com/v1", false},
+		{"https://ollama.com.evil.com/v1", false},
+		{"https://opencode.ai/zen/v1", false},
+		{"https://openai.com/v1", false},
+		{"not a url", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		if got := isOllamaHost(tc.baseURL); got != tc.want {
+			t.Errorf("isOllamaHost(%q) = %v, want %v", tc.baseURL, got, tc.want)
+		}
+	}
+}
+
+// TestIsLoopbackListen pins the listen-loopback classification: loopback
+// IPs and the localhost hostname (any case) are loopback; empty hosts,
+// wildcard binds, other hostnames and unparseable addresses are not.
+func TestIsLoopbackListen(t *testing.T) {
+	tests := []struct {
+		addr string
+		want bool
+	}{
+		{"127.0.0.1:18790", true},
+		{"127.0.0.1:0", true},
+		{"[::1]:18790", true},
+		{"localhost:18790", true},
+		{"LOCALHOST:18790", true},
+		{"LocalHost:18790", true},
+		{"localhost", false}, // no port: SplitHostPort fails
+		{"", false},
+		{":18790", false},        // empty host
+		{"0.0.0.0:18790", false}, // wildcard IPv4
+		{"[::]:18790", false},    // wildcard IPv6
+		{"0.0.0.0", false},       // no port
+		{"192.168.1.1:18790", false},
+		{"10.0.0.1:8080", false},
+		{"example.com:18790", false},
+		{"garbage", false},
+	}
+	for _, tc := range tests {
+		if got := IsLoopbackListen(tc.addr); got != tc.want {
+			t.Errorf("IsLoopbackListen(%q) = %v, want %v", tc.addr, got, tc.want)
+		}
+	}
+}
+
+// TestLoadConfig_LocalhostListenIsLoopback verifies the localhost
+// hostname (case-insensitive) counts as a loopback listen for the
+// auth/TLS gates: a config listening on LOCALHOST without api_keys and
+// without TLS loads fine (loopback listeners stay credential-free).
+func TestLoadConfig_LocalhostListenIsLoopback(t *testing.T) {
+	content := `
+listen: "LOCALHOST:18790"
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`
+	cfg, err := loadConfigFrom(t, content)
+	if err != nil {
+		t.Fatalf("LoadConfig with LOCALHOST listen must succeed (localhost is loopback): %v", err)
+	}
+	if cfg.Listen != "LOCALHOST:18790" {
+		t.Errorf("listen = %q, want the configured value preserved", cfg.Listen)
+	}
+}
+
+// TestValidateAccountName pins the account-name rule (shared by LoadConfig
+// and `prism setup`): non-empty, ASCII alnum start, charset [A-Za-z0-9_-],
+// at most MaxAccountNameLen bytes.
+func TestValidateAccountName(t *testing.T) {
+	valid := []string{
+		"a", "1", "account-1", "agentrouter_oai_1", "A-B_c9",
+		"go-plan-1", strings.Repeat("a", MaxAccountNameLen),
+	}
+	for _, name := range valid {
+		if err := ValidateAccountName(name); err != nil {
+			t.Errorf("ValidateAccountName(%q) = %v, want nil", name, err)
+		}
+	}
+	invalid := []string{
+		"",
+		"-lead", // starts with '-'
+		"_lead", // starts with '_'
+		".dot",  // starts with '.'
+		"with space",
+		"with.dot",   // dots are the expvar hierarchy separator
+		"with/slash", // path separator (cache/credstore file names)
+		"with\\backslash",
+		"..", // path traversal
+		"中文",
+		"emoji😀",
+		"a\u0000b",                               // NUL byte
+		strings.Repeat("a", MaxAccountNameLen+1), // too long
+	}
+	for _, name := range invalid {
+		if err := ValidateAccountName(name); err == nil {
+			t.Errorf("ValidateAccountName(%q) = nil, want an error", name)
+		}
+	}
+}
+
+// TestLoadConfig_AccountNameValidation pins the load-time account-name
+// gates: invalid names, duplicate names and names that fold to the same
+// LB_KEY_* credential name are all rejected.
+func TestLoadConfig_AccountNameValidation(t *testing.T) {
+	base := `
+accounts:
+  - name: %s
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`
+	t.Run("invalid name rejected", func(t *testing.T) {
+		_, err := loadConfigFrom(t, fmt.Sprintf(base, "bad name"))
+		if err == nil {
+			t.Fatal("an account name with a space must be rejected")
+		}
+		if !strings.Contains(err.Error(), "account") {
+			t.Errorf("error = %q, want it to name the account", err)
+		}
+	})
+	t.Run("duplicate names rejected", func(t *testing.T) {
+		_, err := loadConfigFrom(t, `
+accounts:
+  - name: dup
+    key: test-key-1
+    base_url: https://api1.example.com
+    provider: test
+  - name: dup
+    key: test-key-2
+    base_url: https://api2.example.com
+    provider: test
+`)
+		if err == nil {
+			t.Fatal("duplicate account names must be rejected")
+		}
+		if !strings.Contains(err.Error(), "duplicate name") {
+			t.Errorf("error = %q, want it to mention the duplicate name", err)
+		}
+	})
+	t.Run("credential folding collision rejected", func(t *testing.T) {
+		// "a-b" and "a_b" both fold to LB_KEY_A_B: getCredential would
+		// silently resolve both accounts to the same secret.
+		_, err := loadConfigFrom(t, `
+accounts:
+  - name: a-b
+    key: test-key-1
+    base_url: https://api1.example.com
+    provider: test
+  - name: a_b
+    key: test-key-2
+    base_url: https://api2.example.com
+    provider: test
+`)
+		if err == nil {
+			t.Fatal("account names folding to the same LB_KEY_* credential name must be rejected")
+		}
+		if !strings.Contains(err.Error(), "LB_KEY_A_B") {
+			t.Errorf("error = %q, want it to name the colliding credential", err)
+		}
+	})
+	t.Run("case-folding collision rejected", func(t *testing.T) {
+		// "A-b" and "a-b" fold identically (ToUpper) and are also
+		// distinct names that would collide on the credential.
+		_, err := loadConfigFrom(t, `
+accounts:
+  - name: A-b
+    key: test-key-1
+    base_url: https://api1.example.com
+    provider: test
+  - name: a-b
+    key: test-key-2
+    base_url: https://api2.example.com
+    provider: test
+`)
+		if err == nil {
+			t.Fatal("account names folding to the same credential must be rejected (case folding)")
+		}
+	})
 }

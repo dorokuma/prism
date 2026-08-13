@@ -476,3 +476,72 @@ func TestHandlerAuth_ForwardHeadersRequireToken(t *testing.T) {
 		}
 	}
 }
+
+// TestHandlerAuth_ForwardedHeaderRequiresToken extends the forwarding-header
+// gate to the RFC 7239 Forwarded header: a loopback request carrying
+// Forwarded is a proxied request and must present PRISM_ADMIN_TOKEN even
+// when the token-free loopback path would otherwise apply.
+func TestHandlerAuth_ForwardedHeaderRequiresToken(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "")
+	s := openTestStore(t)
+	h := NewSummaryHandler(s)
+
+	// Token unset + direct loopback: allowed.
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:5555", ""); rec.Code != http.StatusOK {
+		t.Fatalf("direct loopback without token: got %d, want 200", rec.Code)
+	}
+
+	// Token unset + loopback with the Forwarded header: denied (proxied
+	// request cannot be distinguished from remote without a token).
+	for _, val := range []string{"for=10.0.0.9;proto=https", "for=10.0.0.9"} {
+		req := httptest.NewRequest(http.MethodGet, "/admin/usage/summary", nil)
+		req.RemoteAddr = "127.0.0.1:5555"
+		req.Header.Set("Forwarded", val)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("loopback with Forwarded=%q and no token: got %d, want 401", val, rec.Code)
+		}
+	}
+}
+
+// TestHandlerAuth_TokenHotReload pins the per-request PRISM_ADMIN_TOKEN
+// read: a token set or rotated AFTER the handler was constructed takes
+// effect immediately (no restart, no stale-token window) — the same
+// behavior as the /metrics METRICS_TOKEN path.
+func TestHandlerAuth_TokenHotReload(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "")
+	s := openTestStore(t)
+	h := NewSummaryHandler(s)
+
+	// No token configured: direct loopback passes without one.
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:5555", ""); rec.Code != http.StatusOK {
+		t.Fatalf("no token: direct loopback got %d, want 200", rec.Code)
+	}
+
+	// Configure the token AFTER construction: every request must now
+	// present it (fail-closed), even direct loopback.
+	t.Setenv("PRISM_ADMIN_TOKEN", "hot-token")
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:5555", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("token set after construction: direct loopback without it got %d, want 401", rec.Code)
+	}
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:5555", "Bearer hot-token"); rec.Code != http.StatusOK {
+		t.Fatalf("token set after construction: request with it got %d, want 200", rec.Code)
+	}
+
+	// Rotate the token: the old token stops working, the new one works.
+	t.Setenv("PRISM_ADMIN_TOKEN", "rotated-token")
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:5555", "Bearer hot-token"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("token rotated: stale token got %d, want 401", rec.Code)
+	}
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:5555", "Bearer rotated-token"); rec.Code != http.StatusOK {
+		t.Fatalf("token rotated: new token got %d, want 200", rec.Code)
+	}
+
+	// Unset the token again: direct loopback passes without one (the
+	// loopback shortcut returns).
+	t.Setenv("PRISM_ADMIN_TOKEN", "")
+	if rec := doRequest(h, http.MethodGet, "/admin/usage/summary", "127.0.0.1:5555", ""); rec.Code != http.StatusOK {
+		t.Fatalf("token unset: direct loopback got %d, want 200 (loopback shortcut restored)", rec.Code)
+	}
+}

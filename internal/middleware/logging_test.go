@@ -707,6 +707,73 @@ func TestEmitAudit_RealKeyIDNotOverridden(t *testing.T) {
 	}
 }
 
+// TestSetUsageDefaultKeyID_ConcurrentSafe runs concurrent setters and
+// EmitAudit readers (via a recorder) to pin the atomic.Value conversion: the
+// SIGHUP reload path calls SetUsageDefaultKeyID while request goroutines
+// read the default in EmitAudit. Under -race this test fails on a plain
+// variable; with the atomic value every observed key_id is either the
+// previous or the new default, never "" and never a torn read.
+func TestSetUsageDefaultKeyID_ConcurrentSafe(t *testing.T) {
+	SetUsageDefaultKeyID("anonymous") // reset to the zero state
+	defer SetUsageDefaultKeyID("anonymous")
+
+	fake := &fakeUsageRecorder{}
+	SetUsageRecorder(fake)
+	defer SetUsageRecorder(nil)
+
+	const writers = 4
+	const perWriter = 50
+	const readers = 8
+	const perReader = 50
+
+	var wg sync.WaitGroup
+	// Writers: flip between two configured defaults (and the empty value,
+	// which must be ignored — the observed default can never become "").
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				if (w+i)%2 == 0 {
+					SetUsageDefaultKeyID("default-a")
+				} else {
+					SetUsageDefaultKeyID("default-b")
+				}
+				SetUsageDefaultKeyID("") // must be a no-op, never store ""
+			}
+		}(w)
+	}
+	// Readers: emit audits with an empty KeyID so the fallback reads the
+	// live default concurrently with the writers.
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perReader; i++ {
+				EmitAudit(&RequestAudit{Req: fmt.Sprintf("conc-%d-%d", r, i), Path: "/v1/chat/completions"})
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Every recorded key_id must be a real value: never "", and only one of
+	// the values writers ever stored (the empty setter is ignored). Only the
+	// READER goroutines produce events (writers only call the setter).
+	total := readers * perReader
+	evs := fake.events()
+	if len(evs) != total {
+		t.Fatalf("recorded events = %d, want %d", len(evs), total)
+	}
+	for i, ev := range evs {
+		if ev.KeyID == "" {
+			t.Fatalf("event %d has an EMPTY key_id — the default can never be \"\"", i)
+		}
+		if ev.KeyID != "anonymous" && ev.KeyID != "default-a" && ev.KeyID != "default-b" {
+			t.Fatalf("event %d key_id = %q, want one of the values ever stored (anonymous/default-a/default-b)", i, ev.KeyID)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Round-3 audit: StatusCapture implicit-200 recording (item 8)
 // ---------------------------------------------------------------------------

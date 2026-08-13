@@ -3,12 +3,15 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/dorokuma/prism/internal/config"
 )
 
 // builtinProviders lists the providers that prism ships with.
@@ -140,6 +143,14 @@ func runSetup() error {
 	listen := promptDefault(reader, "监听地址", "127.0.0.1:18790")
 	fmt.Printf("  → 使用 %s\n\n", listen)
 
+	// 非回环监听直接拒绝生成配置：setup 生成的配置没有 TLS、没有 api_keys，
+	// 把服务暴露在非回环地址上等于裸奔。回环判断复用 config.IsLoopbackListen
+	// （localhost 大小写不敏感视为回环；空 host、0.0.0.0、:: 及其他地址
+	// 仍非回环），与 LoadConfig 的 TLS/鉴权检查用同一实现。
+	if err := validateSetupListen(listen); err != nil {
+		return err
+	}
+
 	fmt.Println("=== 上游选择 ===")
 	fmt.Println()
 	for i, p := range builtinProviders {
@@ -158,11 +169,18 @@ func runSetup() error {
 
 	var providers []providerConfig
 
+	// 账号名全局注册表：跨 provider 拒绝重名与 LB_KEY_* 折叠冲突（与
+	// LoadConfig 同一规则），保证生成的配置一定能被加载。
+	registry := newAccountNameRegistry()
+
 	for _, idx := range selected {
 		if idx >= 1 && idx <= 3 {
 			bp := builtinProviders[idx-1]
 			fmt.Printf("\n=== %s ===\n", bp.Label)
-			accts := promptAccounts(reader, bp.Name)
+			accts, err := promptAccounts(reader, bp.Name, registry)
+			if err != nil {
+				return err
+			}
 			providers = append(providers, providerConfig{
 				Name:     bp.Name,
 				BaseURL:  bp.BaseURL,
@@ -176,7 +194,10 @@ func runSetup() error {
 		fmt.Println("\n=== 自定义 ===")
 		name := prompt(reader, "名称（用于 provider 标识）:")
 		baseURL := prompt(reader, "接口地址:")
-		accts := promptAccounts(reader, name)
+		accts, err := promptAccounts(reader, name, registry)
+		if err != nil {
+			return err
+		}
 		providers = append(providers, providerConfig{
 			Name:     name,
 			BaseURL:  baseURL,
@@ -222,7 +243,7 @@ func runSetup() error {
 	credstoreDir := "/etc/credstore/prism"
 	for _, pv := range providers {
 		for _, acct := range pv.Accounts {
-			fmt.Printf("  %s/LB_KEY_%s  新\n", credstoreDir, strings.ToUpper(strings.ReplaceAll(acct.Name, "-", "_")))
+			fmt.Printf("  %s/%s  新\n", credstoreDir, config.CredentialEnvName(acct.Name))
 		}
 	}
 	fmt.Println("  /var/lib/prism/config.yaml                    新")
@@ -247,7 +268,7 @@ func runSetup() error {
 	}
 	for _, pv := range providers {
 		for _, acct := range pv.Accounts {
-			envName := "LB_KEY_" + strings.ToUpper(strings.ReplaceAll(acct.Name, "-", "_"))
+			envName := config.CredentialEnvName(acct.Name)
 			credPath := filepath.Join(credstoreDir, envName)
 			if err := os.WriteFile(credPath, []byte(acct.Key+"\n"), 0600); err != nil {
 				return fmt.Errorf("写入 %s: %w", credPath, err)
@@ -281,6 +302,22 @@ func runSetup() error {
 	fmt.Println("\n✓ 完成。启动服务：")
 	fmt.Println("  systemctl daemon-reload")
 	fmt.Println("  systemctl enable --now prism")
+	return nil
+}
+
+// validateSetupListen is the setup-side listen gate: only loopback
+// addresses (via config.IsLoopbackListen — the same implementation
+// LoadConfig uses for its TLS/auth gates) may be generated into a config.
+// A listen without a port (e.g. a bare "127.0.0.1") is rejected with an
+// explicit host:port error BEFORE the loopback classification, so it is
+// never misreported as "not a loopback address".
+func validateSetupListen(listen string) error {
+	if _, _, err := net.SplitHostPort(listen); err != nil {
+		return fmt.Errorf("监听地址 %q 不是 host:port 形式（如 127.0.0.1:18790 或 [::1]:18790），缺少端口: %v", listen, err)
+	}
+	if !config.IsLoopbackListen(listen) {
+		return fmt.Errorf("拒绝为非回环监听地址 %q 生成配置：setup 只生成本地回环配置（127.0.0.1 / ::1 / localhost）；如需对外提供服务，请手动配置 TLS 与 api_keys", listen)
+	}
 	return nil
 }
 
@@ -324,7 +361,43 @@ func containsIndex(arr []int, target int) bool {
 	return false
 }
 
-func promptAccounts(reader *bufio.Reader, providerName string) []accountConfig {
+// accountNameRegistry tracks the account names already entered across ALL
+// providers during one setup run. It mirrors the two account-name gates of
+// LoadConfig — exact duplicates and folded LB_KEY_* credential collisions
+// ("a-b" vs "a_b") are rejected GLOBALLY, not per provider — so the
+// generated config is guaranteed to load: LoadConfig rejects a duplicate
+// name or a folded credential collision anywhere in the flattened account
+// list.
+type accountNameRegistry struct {
+	names       map[string]bool
+	foldedCreds map[string]string
+}
+
+func newAccountNameRegistry() *accountNameRegistry {
+	return &accountNameRegistry{
+		names:       make(map[string]bool),
+		foldedCreds: make(map[string]string),
+	}
+}
+
+// check validates a new account name against every name entered so far
+// (across providers) and records it on success. The credential name uses
+// config.CredentialEnvName — the same public conversion LoadConfig uses —
+// so the setup-side conflict rule can never drift from the load-side rule.
+func (r *accountNameRegistry) check(name string) error {
+	if r.names[name] {
+		return fmt.Errorf("账号名 %q 重复：账号名必须在所有 provider 间唯一（它是审计账号标签、expvar 键和 LB_KEY_* 凭据名）", name)
+	}
+	envName := config.CredentialEnvName(name)
+	if prev, ok := r.foldedCreds[envName]; ok {
+		return fmt.Errorf("账号名 %q 与 %q 冲突：凭据名 %s 相同（连字符折叠为下划线）；请改名使 LB_KEY_* 名称不同", prev, name, envName)
+	}
+	r.names[name] = true
+	r.foldedCreds[envName] = name
+	return nil
+}
+
+func promptAccounts(reader *bufio.Reader, providerName string, registry *accountNameRegistry) ([]accountConfig, error) {
 	nStr := promptDefault(reader, "  几个账号？", "1")
 	n, err := strconv.Atoi(nStr)
 	if err != nil || n < 1 {
@@ -334,10 +407,23 @@ func promptAccounts(reader *bufio.Reader, providerName string) []accountConfig {
 	for i := 1; i <= n; i++ {
 		defaultName := fmt.Sprintf("%s-%d", providerName, i)
 		name := promptDefault(reader, fmt.Sprintf("    账号 %d 名称", i), defaultName)
+		// 交互校验复用 config.ValidateAccountName（与 LoadConfig 同一规则）：
+		// 生成阶段就拒绝非法账号名（fail fast），保证生成的配置一定能被加载。
+		if err := config.ValidateAccountName(name); err != nil {
+			return nil, fmt.Errorf("账号名 %q 不合法（账号名仅允许 ASCII 字母/数字/_/-，且必须以字母或数字开头）: %w", name, err)
+		}
+		// 跨 provider 的全局唯一性与凭据名折叠冲突（与 LoadConfig 同一规则，
+		// 凭据名转换复用 config.CredentialEnvName）：
+		// “opencode-go” 的默认名与自定义 provider 同名时，或某 provider 的
+		// “a-b” 与另一 provider 的 “a_b” 折叠到同一 LB_KEY_* 时，生成的配置
+		// 会被 LoadConfig 拒绝——在这里就拦住。
+		if err := registry.check(name); err != nil {
+			return nil, err
+		}
 		key := prompt(reader, fmt.Sprintf("    账号 %d API Key:", i))
 		accounts = append(accounts, accountConfig{Name: name, Key: key})
 	}
-	return accounts
+	return accounts, nil
 }
 
 func generateConfigYAML(listen string, providers []providerConfig, tools []detectedTool) string {
@@ -546,7 +632,7 @@ func generateSystemdUnit(providers []providerConfig, tools []detectedTool) strin
 	sb.WriteString("\n# Credential 注入\n")
 	for _, pv := range providers {
 		for _, acct := range pv.Accounts {
-			envName := "LB_KEY_" + strings.ToUpper(strings.ReplaceAll(acct.Name, "-", "_"))
+			envName := config.CredentialEnvName(acct.Name)
 			sb.WriteString(fmt.Sprintf("LoadCredential=%s:/etc/credstore/prism/%s\n", envName, envName))
 		}
 	}

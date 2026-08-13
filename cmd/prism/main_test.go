@@ -811,8 +811,9 @@ func TestHTTPHandler_MetricsRequiresTokenBehindForwardHeaders(t *testing.T) {
 		t.Errorf("direct loopback /metrics with token: status = %d, want 200", rrOK.Code)
 	}
 
-	// Loopback + X-Forwarded-For (same-machine reverse proxy): token required.
-	for name, hdr := range map[string]string{"X-Forwarded-For": "10.0.0.9", "X-Real-IP": "10.0.0.9"} {
+	// Loopback + X-Forwarded-For / X-Real-IP / Forwarded (same-machine
+	// reverse proxy): token required.
+	for name, hdr := range map[string]string{"X-Forwarded-For": "10.0.0.9", "X-Real-IP": "10.0.0.9", "Forwarded": "for=10.0.0.9"} {
 		req2 := httptest.NewRequest("GET", "/metrics", nil)
 		req2.RemoteAddr = "127.0.0.1:12345"
 		req2.Header.Set(name, hdr)
@@ -1018,6 +1019,45 @@ func TestHTTPHandler_HealthBypassesRateLimit(t *testing.T) {
 	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`)))
 	if rec2.Code != http.StatusTooManyRequests {
 		t.Errorf("/v1/chat/completions: status = %d, want 429 (only /health is exempt)", rec2.Code)
+	}
+}
+
+// TestHTTPHandler_ReadyBypassesRateLimitAndAuth pins the /ready wiring:
+// readiness is exempt from BOTH the business rate limiter and the api_keys
+// gate (like /health) and is answered by the proxy handler from the real
+// pool state — an all-exhausted pool answers 503 not ready even without an
+// auth header and with a zero-token rate limiter (nothing masked the
+// handler's answer).
+func TestHTTPHandler_ReadyBypassesRateLimitAndAuth(t *testing.T) {
+	cfg := testConfig(t, func(c *config.Config) {
+		c.Accounts = []config.AccountConfig{{Name: "t", Key: "k", BaseURL: "http://localhost:1", Provider: "t"}}
+		c.APIKeys = []config.APIKey{{Name: "ci-bot", Token: "sk-ci-111"}}
+	})
+	holder := config.NewConfigHolder(cfg)
+	p := pool.NewPool(cfg.Accounts)
+	p.AllAccounts()[0].MarkExhausted()
+
+	// rate 0 / burst 0: every non-exempt request would be limited; with
+	// api_keys configured every non-exempt request would need auth.
+	rl := ratelimit.NewRateLimiter(0, 0)
+	h := newHTTPHandler(holder, proxy.NewProxyHandler(p, config.WireAPIBoth, holder, nil), rl, nil, usage.NewSummaryHandler(nil))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("/ready with all accounts exhausted: status = %d, want 503 (auth+rate-limit bypassed, pool answer reached)", rec.Code)
+	}
+	if rec.Body.String() != "not ready" {
+		t.Errorf("/ready body = %q, want %q", rec.Body.String(), "not ready")
+	}
+
+	// Control: the same no-auth request on a BUSINESS path is 429 (rate
+	// limiter runs before auth and has no tokens) — proving the exemption
+	// is not widened.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`)))
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Errorf("/v1/chat/completions: status = %d, want 429 (only /health and /ready are exempt)", rec2.Code)
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"os"
 	"os/exec"
 	"os/user"
@@ -368,5 +369,156 @@ func TestGenerateSystemdUnit_SystemdAnalyzeVerify(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("systemd-analyze verify failed: %v\n%s", err, out)
+	}
+}
+
+// TestSetup_NonLoopbackListenRefused pins the setup safety gate: a
+// non-loopback listen address is refused outright (before any config is
+// generated) — setup only ever produces a local-loopback config, and the
+// loopback classification is the exported config.IsLoopbackListen (localhost
+// case-insensitive counts; empty host / 0.0.0.0 / :: and other addresses
+// do not).
+func TestSetup_NonLoopbackListenRefused(t *testing.T) {
+	for _, addr := range []string{"0.0.0.0:18790", "[::]:18790", ":18790", "192.168.1.5:18790", "example.com:18790"} {
+		err := validateSetupListen(addr)
+		if err == nil {
+			t.Errorf("validateSetupListen(%q) = nil, want a refusal", addr)
+		}
+	}
+	for _, addr := range []string{"127.0.0.1:18790", "[::1]:18790", "localhost:18790", "LOCALHOST:18790", "LocalHost:18790"} {
+		if err := validateSetupListen(addr); err != nil {
+			t.Errorf("validateSetupListen(%q) = %v, want nil (loopback listen is accepted)", addr, err)
+		}
+	}
+}
+
+// TestSetup_ListenWithoutPortRejected pins the port-less listen gate: a
+// bare host ("127.0.0.1") must be rejected with an explicit host:port
+// error — never misreported as "not a loopback address" (127.0.0.1 IS
+// loopback; the problem is the missing port, and the error must say so).
+func TestSetup_ListenWithoutPortRejected(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1", "localhost", "::1", "0.0.0.0", "example.com"} {
+		err := validateSetupListen(addr)
+		if err == nil {
+			t.Errorf("validateSetupListen(%q) = nil, want a host:port refusal", addr)
+			continue
+		}
+		if !strings.Contains(err.Error(), "host:port") {
+			t.Errorf("validateSetupListen(%q) error = %q, want it to say the listen must be host:port (missing port)", addr, err)
+		}
+	}
+}
+
+// TestSetup_PromptAccountsRejectsInvalidName pins the interactive reuse of
+// config.ValidateAccountName: a name that LoadConfig would reject (e.g.
+// with a space) fails the setup prompt with an explicit error instead of
+// generating a config that can never be loaded.
+func TestSetup_PromptAccountsRejectsInvalidName(t *testing.T) {
+	// 1 account, invalid name, then a valid key (never reached).
+	input := "1\nbad name\nsk-abc\n"
+	reader := bufio.NewReader(strings.NewReader(input))
+	_, err := promptAccounts(reader, "prov", newAccountNameRegistry())
+	if err == nil {
+		t.Fatal("promptAccounts must reject an account name with a space (same rule as LoadConfig)")
+	}
+	if !strings.Contains(err.Error(), "不合法") && !strings.Contains(err.Error(), "name") {
+		t.Errorf("error = %q, want it to mention the invalid name", err)
+	}
+}
+
+// TestSetup_PromptAccountsAcceptsValidName guards the happy path: valid
+// names are accepted and the key prompt is consumed.
+func TestSetup_PromptAccountsAcceptsValidName(t *testing.T) {
+	input := "2\nacc-1\nsk-1\nacc_2\nsk-2\n"
+	reader := bufio.NewReader(strings.NewReader(input))
+	accounts, err := promptAccounts(reader, "prov", newAccountNameRegistry())
+	if err != nil {
+		t.Fatalf("promptAccounts with valid names: %v", err)
+	}
+	if len(accounts) != 2 || accounts[0].Name != "acc-1" || accounts[1].Name != "acc_2" {
+		t.Errorf("accounts = %+v, want [acc-1 acc_2]", accounts)
+	}
+	if accounts[0].Key != "sk-1" || accounts[1].Key != "sk-2" {
+		t.Errorf("keys = [%s %s], want [sk-1 sk-2]", accounts[0].Key, accounts[1].Key)
+	}
+}
+
+// TestSetup_PromptAccountsRejectsCrossProviderDuplicate pins the global
+// (cross-provider) duplicate-name gate: the same account name in two
+// different providers must be rejected at the second prompt — LoadConfig
+// rejects duplicate account names anywhere in the flattened account list,
+// so a per-provider-only check would generate a config that can never
+// load.
+func TestSetup_PromptAccountsRejectsCrossProviderDuplicate(t *testing.T) {
+	reg := newAccountNameRegistry()
+
+	// Provider A: 1 account named "acc-1".
+	readerA := bufio.NewReader(strings.NewReader("1\nacc-1\nsk-a\n"))
+	if _, err := promptAccounts(readerA, "provA", reg); err != nil {
+		t.Fatalf("first provider's account must be accepted: %v", err)
+	}
+
+	// Provider B: 1 account with the SAME name → must be rejected.
+	readerB := bufio.NewReader(strings.NewReader("1\nacc-1\nsk-b\n"))
+	_, err := promptAccounts(readerB, "provB", reg)
+	if err == nil {
+		t.Fatal("the same account name in a second provider must be rejected (account names are globally unique)")
+	}
+	if !strings.Contains(err.Error(), "重复") {
+		t.Errorf("error = %q, want it to mention the duplicate name", err)
+	}
+}
+
+// TestSetup_PromptAccountsRejectsFoldedCredentialCollision pins the
+// cross-provider CredentialEnvName fold gate: "a-b" in one provider and
+// "a_b" in another both fold to LB_KEY_A_B — LoadConfig rejects that
+// collision anywhere in the flattened account list, so setup must reject
+// it at the second prompt too (same conversion function, same rule).
+func TestSetup_PromptAccountsRejectsFoldedCredentialCollision(t *testing.T) {
+	reg := newAccountNameRegistry()
+
+	readerA := bufio.NewReader(strings.NewReader("1\na-b\nsk-a\n"))
+	if _, err := promptAccounts(readerA, "provA", reg); err != nil {
+		t.Fatalf("first provider's account a-b must be accepted: %v", err)
+	}
+
+	// Second provider, same name: must be rejected (exact duplicate).
+	readerDup := bufio.NewReader(strings.NewReader("1\na-b\nsk-b\n"))
+	if _, err := promptAccounts(readerDup, "provB", reg); err == nil {
+		t.Fatal("exact duplicate a-b in a second provider must be rejected")
+	}
+
+	// Second provider, FOLDED collision a_b → LB_KEY_A_B: must be rejected
+	// with the credential-name message.
+	readerB := bufio.NewReader(strings.NewReader("1\na_b\nsk-b\n"))
+	_, err := promptAccounts(readerB, "provB", reg)
+	if err == nil {
+		t.Fatal("a_b in a second provider must be rejected (folds to LB_KEY_A_B like a-b)")
+	}
+	if !strings.Contains(err.Error(), "LB_KEY_A_B") {
+		t.Errorf("error = %q, want it to name the folded credential LB_KEY_A_B", err)
+	}
+}
+
+// TestSetup_AccountNameRegistryAllowsDistinctFoldNames guards the
+// converse: names that fold to DIFFERENT credential names stay accepted
+// across providers (a-b vs a-c → LB_KEY_A_B vs LB_KEY_A_C).
+func TestSetup_AccountNameRegistryAllowsDistinctFoldNames(t *testing.T) {
+	reg := newAccountNameRegistry()
+	for _, tc := range []struct{ name, provider string }{
+		{"a-b", "p1"},
+		{"a-c", "p2"},
+		{"a_b", "p3"}, // folds to LB_KEY_A_B — collides with a-b!
+	} {
+		err := reg.check(tc.name)
+		if tc.name == "a_b" {
+			if err == nil {
+				t.Error("a_b after a-b must be rejected (both fold to LB_KEY_A_B)")
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("reg.check(%q) = %v, want nil (distinct folded credential name)", tc.name, err)
+		}
 	}
 }

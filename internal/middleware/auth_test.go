@@ -32,6 +32,40 @@ func TestIsLocalhost(t *testing.T) {
 	}
 }
 
+// TestHasForwardedHeaders pins the forwarding-header detection: any of
+// X-Forwarded-For, X-Real-IP or the RFC 7239 Forwarded header marks a
+// request as proxied (a same-machine reverse proxy presents a loopback
+// RemoteAddr AND adds one of these), and absence means a direct client.
+func TestHasForwardedHeaders(t *testing.T) {
+	for name, hdr := range map[string]string{
+		"X-Forwarded-For": "10.0.0.9",
+		"X-Real-IP":       "10.0.0.9",
+		"Forwarded":       "for=10.0.0.9;proto=https",
+		"forwarded":       "for=10.0.0.9", // case-insensitive header lookup
+	} {
+		r := httptest.NewRequest("GET", "/metrics", nil)
+		r.RemoteAddr = "127.0.0.1:12345"
+		r.Header.Set(name, hdr)
+		if !middleware.HasForwardedHeaders(r) {
+			t.Errorf("HasForwardedHeaders(%s=%q) = false, want true (proxied request)", name, hdr)
+		}
+	}
+
+	// A direct local request carries none of them.
+	r := httptest.NewRequest("GET", "/metrics", nil)
+	r.RemoteAddr = "127.0.0.1:12345"
+	if middleware.HasForwardedHeaders(r) {
+		t.Error("HasForwardedHeaders(direct loopback) = true, want false")
+	}
+	// An empty header value does not count.
+	r2 := httptest.NewRequest("GET", "/metrics", nil)
+	r2.RemoteAddr = "127.0.0.1:12345"
+	r2.Header.Set("Forwarded", "")
+	if middleware.HasForwardedHeaders(r2) {
+		t.Error("HasForwardedHeaders with an empty Forwarded value = true, want false")
+	}
+}
+
 func TestCheckAuth(t *testing.T) {
 	// Auth disabled (empty token) → always pass
 	if !middleware.CheckAuth(httptest.NewRequest("GET", "/", nil), "") {

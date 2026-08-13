@@ -331,6 +331,14 @@ func copyClientHeaders(dst http.Header, src http.Header) {
 		if ck == "Accept-Encoding" {
 			continue
 		}
+		// Host, Content-Length and Expect are NEVER forwarded: the upstream
+		// request is built by prism (Host must be the upstream's own, the
+		// body is re-created so the client's Content-Length would be wrong
+		// or a lie, and Expect: 100-continue is a client→first-hop
+		// negotiation that must not reach the upstream).
+		if ck == "Host" || ck == "Content-Length" || ck == "Expect" {
+			continue
+		}
 		if sensitiveClientHeaders[ck] {
 			continue
 		}

@@ -2,7 +2,7 @@
 # deploy_health.sh — deploy.sh 的健康轮询 helper（可独立测试，无副作用）
 #
 # 用法：被 deploy.sh source 后调用两个函数；参数经环境变量传入：
-#   HEALTH_URL      健康检查 URL（默认 http://127.0.0.1:18790/health）
+#   HEALTH_URL      健康检查 URL（默认 http://127.0.0.1:18790/ready）
 #   HEALTH_TIMEOUT  健康等待窗口秒数（默认 35；正整数）
 #   SYSTEMCTL_BIN   覆盖 systemctl 命令（测试注入假命令，默认 systemctl）
 #   CURL_BIN        覆盖 curl 命令（测试注入假命令，默认 curl）
@@ -11,6 +11,14 @@
 # 设计依据：prism 启动时在 HTTP server 监听前等待全部账号的首轮健康探测
 # （单账号最长 ProbeTimeout=30s），因此部署后的健康窗口必须覆盖该值并留
 # 余量（默认 35s），且成功后立即继续、不空等。
+# 检查目标为 /ready（readiness）：仅当至少一个账号 healthy 且不在
+# cooldown 时才返回 200；/health（liveness）进程起来就 200，无法区分
+# “服务已启动但所有账号不可用”。旧部署可用 HEALTH_URL 覆盖回 /health。
+#
+# /ready 是 fail-closed 的部署闸门：所有账号 cooldown/exhausted 时健康
+# 验证失败 → deploy.sh 自动回滚（设计意图：把账号状态搞坏的新版本绝不
+# 该上线）。只想要 liveness 级检查时显式设 HEALTH_URL=/health 覆盖；
+# 不要靠把 HEALTH_TIMEOUT 拉到数分钟来“等”全账号恢复。
 
 # validate_health_timeout: HEALTH_TIMEOUT 必须为正整数。非法返回 1，
 # 由调用方决定退出码（deploy.sh 在前置阶段校验失败时 exit 3，发生在任何

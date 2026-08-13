@@ -82,8 +82,9 @@ const (
 	MaxUpstreamResponseBytesLimit = 256 << 20
 
 	// RateLimitMaxBuckets is the production default cap on rate-limiter
-	// buckets (distinct client IPs). At the cap the bucket with the oldest
-	// lastCheck is evicted to make room for a new IP.
+	// buckets (distinct client IPs). At the cap a new IP is rejected
+	// outright (no O(n) eviction scan under the lock); existing buckets are
+	// untouched and idle ones are reaped by the cleanup loop.
 	RateLimitMaxBuckets = 100000
 
 	// RedactJSONMaxDepth is the maximum depth for JSON redaction.

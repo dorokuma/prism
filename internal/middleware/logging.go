@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/dorokuma/prism/internal/usagemeta"
 	"github.com/dorokuma/prism/internal/util"
@@ -206,17 +207,37 @@ func SetUsageRecorder(r UsageRecorder) {
 // wiring stage; the zero state is "anonymous", matching the historical
 // auth-disabled behavior. prism deliberately does not hard-code any client
 // name: a deployment that wants a specific label configures it.
-var usageDefaultKeyID = "anonymous"
+//
+// It is an atomic.Value (holding a string) because the SIGHUP reload path
+// (cmd/prism) calls SetUsageDefaultKeyID while request goroutines read it in
+// EmitAudit — a plain variable would be a data race. The zero state is
+// installed in init below; a Load on an uninitialized Value would panic, so
+// the value is never left empty.
+var usageDefaultKeyID atomic.Value
+
+func init() {
+	usageDefaultKeyID.Store("anonymous")
+}
 
 // SetUsageDefaultKeyID installs the key_id used for requests without an
-// authenticated key name. Called once by the wiring stage from
-// config.UsageConfig.DefaultKeyID. An empty value is ignored so the recorded
-// key_id can never be forced to "" (an empty key_id would split one GROUP BY
-// group into two).
+// authenticated key name. Called by the wiring stage from
+// config.UsageConfig.DefaultKeyID (and again on SIGHUP reload). An empty
+// value is ignored so the recorded key_id can never be forced to "" (an
+// empty key_id would split one GROUP BY group into two). Concurrently safe
+// with EmitAudit readers.
 func SetUsageDefaultKeyID(id string) {
 	if id != "" {
-		usageDefaultKeyID = id
+		usageDefaultKeyID.Store(id)
 	}
+}
+
+// usageDefaultKeyIDValue returns the current default key_id (never "").
+func usageDefaultKeyIDValue() string {
+	v, _ := usageDefaultKeyID.Load().(string)
+	if v == "" {
+		return "anonymous"
+	}
+	return v
 }
 
 // UsagePricer computes the USD cost for one audit record on the synchronous
@@ -253,7 +274,7 @@ func EmitAudit(a *RequestAudit) {
 	// log and the usage row agree. A real authenticated key NAME is always
 	// non-empty and is never overwritten.
 	if a.KeyID == "" {
-		a.KeyID = usageDefaultKeyID
+		a.KeyID = usageDefaultKeyIDValue()
 	}
 	// Compute the cost BEFORE the log line so the amount is visible in the
 	// audit log; the same value is forwarded with the usage event below, so

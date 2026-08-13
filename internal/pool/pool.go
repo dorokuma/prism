@@ -80,12 +80,16 @@ func newPool(cfgs []config.AccountConfig, totalCap int) *Pool {
 // and re-park at the back while a later usable waiter stays parked — the
 // mixed-key lost wakeup.
 //
-// The wake scan runs ONLY when the slot was actually released: a nil
-// slot, a duplicate release (the slot's one-shot gate was already
-// consumed) or a release on zero in-flight frees no capacity, so no
-// waiter can be woken — a duplicate release must never trigger a false
-// waiter wakeup (the woken waiter would re-park on capacity that was
-// never freed).
+// The wake scan runs ONLY when the slot was actually released (Account.
+// Release returned true — a unit was returned to the account-wide total,
+// on the normal path or on the abnormal zeroed-key path that returns its
+// total unit): capacity was freed, so the first usable waiter is woken. A
+// nil slot, a duplicate release (the slot's one-shot gate was already
+// consumed) or a release with nothing to return (even the account total is
+// already 0 — whether the per-key was zeroed or the total was reset under
+// a live slot) frees no capacity, so no waiter can be woken — a duplicate
+// or empty release must never trigger a false waiter wakeup (the woken
+// waiter would re-park on capacity that was never freed).
 //
 // s must be the *Slot returned by the acquisition (TryAcquire via Select /
 // SelectByProvider); the slot carries the exact account, key and max, so a
@@ -249,6 +253,32 @@ func (p *Pool) trySelectLocked(provider, key string, maxConcurrent int) (*Accoun
 		}
 	}
 	return nil, nil
+}
+
+// Ready reports whether the pool can serve at least one request right now:
+// some account is healthy AND out of cooldown. It is the readiness probe
+// behind /ready (deploy.sh), deliberately distinct from liveness: the
+// process may be up (liveness) while every account is exhausted or cooling
+// down — ready=false tells the load balancer / deploy script to hold
+// traffic until at least one account can actually serve it.
+//
+// The cooldown boundary matches Select/IsInCooldown exactly: an account is
+// selectable when cooldownUntil is NOT after now (!now.Before(cooldownUntil),
+// i.e. now == cooldownUntil counts as expired), so /ready can never report
+// ready=false for an account that Select would pick right now.
+func (p *Pool) Ready() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	for _, a := range p.accounts {
+		a.mu.Lock()
+		ok := a.status == StatusHealthy && !now.Before(a.cooldownUntil)
+		a.mu.Unlock()
+		if ok {
+			return true
+		}
+	}
+	return false
 }
 
 // AccountCount returns the number of accounts in the pool.

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -176,11 +177,53 @@ func roDSN(path string) string {
 		"?mode=ro&_pragma=busy_timeout(5000)"
 }
 
+// tightenWritableFileModes chmods the usage database and its WAL/SHM
+// sidecar files to 0600 (owner-only). SQLite creates files with the
+// process umask (typically 0644), which would leave per-request token
+// usage — model, key_id, cost — world-readable. It is called after a
+// successful writable Open and again after Migrate (which is when the
+// schema_migrations write actually creates the -wal/-shm sidecars on
+// first run). Missing files are skipped (ENOENT is normal before the
+// first write); every other error is returned — a store that cannot be
+// secured must fail loudly, not serve with loose permissions. Read-only
+// stores never call this: they must not touch a file owned by the live
+// service.
+func tightenWritableFileModes(path string) error {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0600); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("usage: chmod %s to 0600: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// tightenFileModes is the file-mode tightening step used after successful
+// write transactions (see tightenWritableFileModes). It is a variable so
+// tests can inject a failing tightening and pin the commit-vs-tighten
+// semantics; the production value is unchanged.
+var tightenFileModes = tightenWritableFileModes
+
+// reportTightenFailureAfterCommit is the post-commit failure path shared by
+// InsertBatch and DeleteBefore: the data change is ALREADY durable, so the
+// failure must not be returned as a failed write (the writer would count
+// the batch dropped / the retention loop would retry a committed delete,
+// contradicting what is actually in the database). It fails loud instead:
+// an error-level log plus the write-error incident counter keep the
+// security problem observable without lying about the data.
+func reportTightenFailureAfterCommit(err error, path, op string) {
+	slog.Error("usage: "+op+" committed but file modes could not be secured", "error", err, "path", path)
+	util.RecordUsageWriteErrors()
+}
+
 // Open creates the connection pools. Both are pinged so a bad path or
 // pragma fails fast here instead of on the first query. A read-only store
 // opens only the read pool (mode=ro); the write pool stays nil so
 // Migrate/InsertBatch/DeleteBefore fail with "store not open" instead of
-// ever touching the file.
+// ever touching the file. A successful writable open tightens the file
+// modes to 0600 (see tightenWritableFileModes).
 func (s *SQLiteStore) Open() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -228,6 +271,17 @@ func (s *SQLiteStore) Open() error {
 	}
 	s.writeDB = writeDB
 	s.readDB = readDB
+	// The file exists now: tighten the main database (and any sidecars
+	// already created) to owner-only BEFORE any data is written. A failure
+	// here aborts the open — a usage database with loose permissions is a
+	// real leak, not a degradation.
+	if err := tightenFileModes(s.path); err != nil {
+		writeDB.Close()
+		readDB.Close()
+		s.writeDB = nil
+		s.readDB = nil
+		return err
+	}
 	return nil
 }
 
@@ -264,6 +318,9 @@ func (s *SQLiteStore) readPool() *sql.DB {
 // Migrate creates the schema_migrations bookkeeping table and applies every
 // pending migration inside its own transaction, recording the version. Runs
 // on every startup and is idempotent: already-applied versions are skipped.
+// On success the file modes are re-tightened (see
+// tightenWritableFileModes): the first migration's transaction is what
+// creates the -wal/-shm sidecars on a fresh database.
 func (s *SQLiteStore) Migrate(ctx context.Context) error {
 	db := s.writePool()
 	if db == nil {
@@ -288,7 +345,7 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 		}
 		applied = m.Version
 	}
-	return nil
+	return tightenFileModes(s.path)
 }
 
 func (s *SQLiteStore) applyMigration(ctx context.Context, db *sql.DB, m Migration) error {
@@ -387,12 +444,33 @@ func (s *SQLiteStore) InsertBatch(ctx context.Context, events []Event) error {
 	for i := 0; i < written; i++ {
 		util.RecordUsageEventsWritten()
 	}
+	// The write transaction may have CREATED or RECREATED the main database
+	// or its -wal/-shm sidecars (SQLite creates them with the process
+	// umask, typically 0644 — e.g. after a checkpoint or when the journal
+	// was reset), so re-tighten the file modes after every successful write
+	// transaction, not just at Open/Migrate.
+	//
+	// A tightening failure here must NOT be returned as a batch failure:
+	// the batch IS committed and counted as written, and an error return
+	// would make the writer treat the whole batch as lost (dropped + write
+	// error) and retry it — duplicating rows that are already in the
+	// database and breaking the written+dropped accounting identity. The
+	// failure is reported loudly on its own channel instead (error-level
+	// log + write-error incident counter); the data result stays success.
+	if err := tightenFileModes(s.path); err != nil {
+		reportTightenFailureAfterCommit(err, s.path, "batch insert")
+	}
 	return nil
 }
 
 // DeleteBefore removes events with ts_unix < tsUnix and returns the number of
 // deleted rows. VACUUM is deliberately not run automatically: it would block
-// the whole file; the OS reclaims the space over time.
+// the whole file; the OS reclaims the space over time. Like InsertBatch, the
+// file modes are re-tightened after the successful delete (SQLite may have
+// recreated the -wal/-shm sidecars); a tightening failure is reported loudly
+// (error-level log + incident counter) but never returned as a failed
+// delete — the rows ARE already gone, and reporting an error would make the
+// retention loop retry (and re-report) a committed deletion.
 func (s *SQLiteStore) DeleteBefore(ctx context.Context, tsUnix int64) (int64, error) {
 	db := s.writePool()
 	if db == nil {
@@ -402,7 +480,14 @@ func (s *SQLiteStore) DeleteBefore(ctx context.Context, tsUnix int64) (int64, er
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tightenFileModes(s.path); err != nil {
+		reportTightenFailureAfterCommit(err, s.path, "delete")
+	}
+	return n, nil
 }
 
 func boolInt(b bool) int64 {

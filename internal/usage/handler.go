@@ -22,22 +22,23 @@ import (
 // Auth (fail-closed): when PRISM_ADMIN_TOKEN is configured, EVERY request —
 // loopback included — must present it as a Bearer token (compared in
 // constant time). Only when NO token is configured is a direct local request
-// (loopback RemoteAddr without X-Forwarded-For / X-Real-IP) allowed without
-// one; a loopback request carrying a forwarding header (same-machine reverse
-// proxy) and all other clients are denied. METRICS_TOKEN and business API
-// keys are deliberately not accepted.
+// (loopback RemoteAddr without X-Forwarded-For / X-Real-IP / Forwarded)
+// allowed without one; a loopback request carrying a forwarding header
+// (same-machine reverse proxy) and all other clients are denied.
+// METRICS_TOKEN and business API keys are deliberately not accepted.
+//
+// The token is read from the environment on EVERY request (like the
+// /metrics METRICS_TOKEN path), so a token set or rotated while the process
+// runs takes effect immediately — no restart, no stale-token window.
 type SummaryHandler struct {
 	Store Store
-	token string
 }
 
-// NewSummaryHandler reads PRISM_ADMIN_TOKEN from the environment once at
-// construction time.
+// NewSummaryHandler creates a summary handler. The admin token is NOT read
+// here: authorized() reads PRISM_ADMIN_TOKEN per request (hot-reload of the
+// env var without a restart).
 func NewSummaryHandler(store Store) *SummaryHandler {
-	return &SummaryHandler{
-		Store: store,
-		token: os.Getenv("PRISM_ADMIN_TOKEN"),
-	}
+	return &SummaryHandler{Store: store}
 }
 
 func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -145,17 +146,20 @@ const adminTokenPadLen = 256
 
 // authorized decides admin access. Fail-closed: a configured
 // PRISM_ADMIN_TOKEN means loopback is NOT trusted and every request must
-// present the correct Bearer token. Loopback is decided by
+// present the correct Bearer token. The token is re-read from the
+// environment on every call, so a rotation takes effect without a restart
+// (identical to the /metrics METRICS_TOKEN behavior). Loopback is decided by
 // middleware.IsLocalhost — the same single implementation the business auth
 // and /metrics paths use (any 127.0.0.0/8 or ::1 address); there is no
 // second, divergent loopback check here. Only when the token is unset does
 // the loopback shortcut apply, and even then only for DIRECT local
 // requests: a same-machine reverse proxy also presents a loopback RemoteAddr
-// but adds X-Forwarded-For / X-Real-IP, so a loopback request carrying a
-// forwarding header is denied (mirrors the /metrics rule). An unset
-// PRISM_ADMIN_TOKEN means remote access is denied entirely.
+// but adds X-Forwarded-For / X-Real-IP / Forwarded, so a loopback request
+// carrying a forwarding header is denied (mirrors the /metrics rule). An
+// unset PRISM_ADMIN_TOKEN means remote access is denied entirely.
 func (h *SummaryHandler) authorized(r *http.Request) bool {
-	if h.token != "" {
+	token := os.Getenv("PRISM_ADMIN_TOKEN")
+	if token != "" {
 		// Shared Bearer semantics with the business auth path
 		// (middleware.SplitBearerToken): case-insensitive scheme, token bytes
 		// returned verbatim (never trimmed or folded), and an empty or
@@ -169,13 +173,13 @@ func (h *SummaryHandler) authorized(r *http.Request) bool {
 		// unequal lengths must not short-circuit the comparison and leak the
 		// expected length via timing. Length-based rejection leaks only the
 		// input's own length class, never anything about the configured token.
-		if len(got) > adminTokenPadLen || len(h.token) > adminTokenPadLen {
+		if len(got) > adminTokenPadLen || len(token) > adminTokenPadLen {
 			return false
 		}
 		pb := make([]byte, adminTokenPadLen)
 		eb := make([]byte, adminTokenPadLen)
 		copy(pb, got)
-		copy(eb, h.token)
+		copy(eb, token)
 		return subtle.ConstantTimeCompare(pb, eb) == 1
 	}
 	return middleware.IsLocalhost(r) && !middleware.HasForwardedHeaders(r)

@@ -10,9 +10,13 @@ backend can see them.
 
 Usage:
   python3 scripts/generate_mcp_tools.py [out.json] [config.toml]
+
+TOML parsing uses the Python 3.11+ standard-library tomllib: any legal TOML
+(including complex forms: arrays, inline tables, quoted/multiline strings)
+is parsed correctly, and a malformed TOML fails fast with a non-zero exit.
 """
 
-import json, os, subprocess, sys, time
+import json, os, subprocess, sys, time, tomllib
 
 
 # ---------------------------------------------------------------------------
@@ -151,48 +155,35 @@ MULTI_AGENT_V1_TOOLS = {
 
 
 def parse_toml_mcp_servers(path):
+    """Parse mcp_servers.* definitions from a config.toml using tomllib.
+
+    Returns {name: {"command": str, "args": list, "env": dict}} for every
+    mcp_servers.<name> table that declares a command. A malformed TOML file
+    raises tomllib.TOMLDecodeError (the caller fails fast with a non-zero
+    exit). Complex legal TOML — arrays of args, inline/dotted env tables,
+    quoted and multiline strings — is handled by the parser itself.
+    """
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
     servers = {}
-    current = None
-    in_env = False
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("[") and line.endswith("]"):
-                rest = line[1:-1]
-                if rest.startswith("mcp_servers."):
-                    name = rest[len("mcp_servers."):]
-                    if "." not in name:
-                        current = name
-                        in_env = False
-                        servers[current] = {"args": [], "env": {}}
-                    elif name == current + ".env" if current else False:
-                        in_env = True
-                    elif current and name.startswith(current + "."):
-                        in_env = False
-                    else:
-                        current = None
-                        in_env = False
-                else:
-                    current = None
-                    in_env = False
-                continue
-            if current is None or "=" not in line:
-                continue
-            key, val = line.split("=", 1)
-            key = key.strip()
-            val = val.strip().strip('"').strip("'")
-            if in_env:
-                servers[current]["env"][key] = val
-            elif key == "command":
-                servers[current]["command"] = val
-            elif key == "args":
-                try:
-                    servers[current]["args"] = json.loads(val)
-                except Exception:
-                    pass
-    return {k: v for k, v in servers.items() if v.get("command")}
+    for name, cfg in (data.get("mcp_servers") or {}).items():
+        if not isinstance(cfg, dict):
+            continue
+        command = cfg.get("command")
+        if not command:
+            continue
+        args = cfg.get("args", [])
+        if not isinstance(args, list):
+            args = []
+        env = cfg.get("env", {})
+        if not isinstance(env, dict):
+            env = {}
+        servers[name] = {
+            "command": command,
+            "args": [str(a) for a in args],
+            "env": {str(k): str(v) for k, v in env.items()},
+        }
+    return servers
 
 
 def discover_tools(server_name, cfg, timeout=15):
@@ -292,7 +283,11 @@ def main():
         print(f"Config not found: {config_path}", file=sys.stderr)
         sys.exit(1)
 
-    servers = parse_toml_mcp_servers(config_path)
+    try:
+        servers = parse_toml_mcp_servers(config_path)
+    except tomllib.TOMLDecodeError as e:
+        print(f"Invalid TOML in {config_path}: {e}", file=sys.stderr)
+        sys.exit(1)
     if not servers:
         print("No MCP servers found", file=sys.stderr)
         sys.exit(1)

@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -100,10 +102,64 @@ func cacheAdminTool(tool map[string]any) {
 	cacheTool(config.McpAdminIdentity, tool)
 }
 
+// MaxToolSerializedBytes caps the serialized size of ONE cached MCP tool
+// (JSON). A tool whose definition (description + parameter schema) exceeds
+// the cap is NOT cached — the per-tenant tool-count limit (100) alone is not
+// a memory bound, because a single tool can carry a huge description or
+// schema. Oversized tools are dropped with a size-only warning (the tool
+// body itself is never logged).
+const MaxToolSerializedBytes = 1 << 20 // 1 MiB
+
 // cacheTool is the shared bucket-write implementation: it deduplicates by
-// function name and caps each bucket at 100 tools to prevent memory
-// exhaustion. Must be called with the resolved cache key (never empty).
+// function name, caps each bucket at 100 tools, and caps the serialized size
+// of a SINGLE tool (MaxToolSerializedBytes — an oversized tool is dropped,
+// never truncated, never logged in full). Must be called with the resolved
+// cache key (never empty).
+//
+// Lock discipline: JSON serialization, the size check and the snapshot
+// copy all run BEFORE the global cache lock — marshaling a huge tool (giant
+// description or schema) is CPU/memory work that must not serialize every
+// other cache operation behind mcpCacheMu, and the snapshot copy is part of
+// the same pre-lock serialization stage. The lock is held only for the
+// final read-modify-write on the bucket (create, dedupe, 100-cap, append),
+// which keeps the concurrency semantics unchanged: the dedupe and capacity
+// decisions always observe the latest bucket state.
+//
+// The caller's map is NEVER stored by reference: flattenToolEntry (or the
+// admin config path) may keep mutating the tool map after this call, which
+// would race with cache readers and could grow the cached entry past the
+// serialized-size gate that was just passed. The tool is therefore
+// snapshotted into an independent map (a JSON round-trip — the same codec
+// the size gate measured, so the snapshot is exactly what was checked)
+// before anything is appended.
 func cacheTool(key string, tool map[string]any) {
+	// Single-tool serialized-size gate BEFORE the lock and before anything
+	// is stored: a huge tool (giant description or parameter schema) would
+	// otherwise defeat the per-tenant count cap — 100 tools × unbounded
+	// size is unbounded memory. Serialization also validates that the tool
+	// is JSON-safe.
+	raw, err := json.Marshal(tool)
+	if err != nil {
+		slog.Warn("mcp tool not cacheable (serialization failed), not cached", "identity", key, "error", err)
+		return
+	}
+	if len(raw) > MaxToolSerializedBytes {
+		// Size-only log: the tool name is safe metadata, the tool BODY
+		// (description/schema, potentially huge or sensitive) is never
+		// written to the log.
+		slog.Warn("mcp tool too large, not cached", "identity", key, "tool", toolFunctionName(tool), "size_bytes", len(raw), "max_bytes", MaxToolSerializedBytes)
+		return
+	}
+	// Snapshot the tool into an independent map (full JSON decode — a
+	// shallow copy of the outer map would still share the nested
+	// "function" schema with the caller). Still outside the lock: the copy
+	// is the same order of work as the marshal above.
+	snapshot := make(map[string]any)
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		slog.Warn("mcp tool not cacheable (snapshot failed), not cached", "identity", key, "error", err)
+		return
+	}
+
 	mcpCacheMu.Lock()
 	defer mcpCacheMu.Unlock()
 
@@ -120,14 +176,14 @@ func cacheTool(key string, tool map[string]any) {
 
 	for _, existing := range tc.tools {
 		if fn, ok := existing["function"].(map[string]any); ok {
-			if nf, ok := tool["function"].(map[string]any); ok {
+			if nf, ok := snapshot["function"].(map[string]any); ok {
 				if fn["name"] == nf["name"] {
 					return // already cached
 				}
 			}
 		}
 	}
-	tc.tools = append(tc.tools, tool)
+	tc.tools = append(tc.tools, snapshot)
 }
 
 // ClearMCPCache clears all cached MCP tools for all tenants.

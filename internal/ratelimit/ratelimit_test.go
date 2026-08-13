@@ -1,6 +1,7 @@
 package ratelimit_test
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -9,9 +10,10 @@ import (
 	"github.com/dorokuma/prism/internal/ratelimit"
 )
 
-// TestRateLimitMiddleware_HealthExempt pins item 7: /health bypasses the
-// business-wide rate limiter (a liveness endpoint must stay reachable under
-// load) while every other path stays limited — the exemption is not widened.
+// TestRateLimitMiddleware_HealthExempt pins item 7: /health and /ready
+// bypass the business-wide rate limiter (liveness and readiness endpoints
+// must stay reachable under load) while every other path stays limited —
+// the exemption is not widened.
 func TestRateLimitMiddleware_HealthExempt(t *testing.T) {
 	// rate 0 / burst 0: no tokens are ever granted — every non-exempt
 	// request is limited, so the test is deterministic.
@@ -21,11 +23,14 @@ func TestRateLimitMiddleware_HealthExempt(t *testing.T) {
 	})
 	h := ratelimit.RateLimitMiddleware(next, rl, nil)
 
-	// /health always passes, even from an IP whose bucket is exhausted.
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
-	if rec.Code != http.StatusOK {
-		t.Errorf("/health: status = %d, want 200 (must bypass the rate limiter)", rec.Code)
+	// /health and /ready always pass, even from an IP whose bucket is
+	// exhausted.
+	for _, path := range []string{"/health", "/ready"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200 (must bypass the rate limiter)", path, rec.Code)
+		}
 	}
 
 	// Every other path stays limited (the exemption must not widen).
@@ -33,7 +38,7 @@ func TestRateLimitMiddleware_HealthExempt(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusTooManyRequests {
-			t.Errorf("%s: status = %d, want 429 (only /health is exempt)", path, rec.Code)
+			t.Errorf("%s: status = %d, want 429 (only /health and /ready are exempt)", path, rec.Code)
 		}
 	}
 }
@@ -173,13 +178,16 @@ func TestGetClientIP_MultiHopXFF(t *testing.T) {
 		t.Errorf("one-hop chain: got %q, want 203.0.113.8", ip)
 	}
 
-	// All XFF hops trusted and no untrusted IP: fall back to X-Real-IP.
+	// All XFF hops trusted and no untrusted IP: the chain carries no
+	// client — fall back to RemoteAddr, and NEVER to X-Real-IP (X-Real-IP
+	// is an independent client-spoofable claim that must not be consulted
+	// while XFF is present).
 	r4 := httptest.NewRequest("GET", "/", nil)
 	r4.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
 	r4.Header.Set("X-Real-IP", "203.0.113.9")
 	r4.RemoteAddr = "10.0.0.3:34567"
-	if ip := ratelimit.GetClientIP(r4, trusted); ip != "203.0.113.9" {
-		t.Errorf("all-trusted XFF: got %q, want 203.0.113.9 (X-Real-IP fallback)", ip)
+	if ip := ratelimit.GetClientIP(r4, trusted); ip != "10.0.0.3" {
+		t.Errorf("all-trusted XFF: got %q, want 10.0.0.3 (RemoteAddr fallback; X-Real-IP must be ignored while XFF is present)", ip)
 	}
 
 	// Untrusted RemoteAddr: XFF ignored entirely (spoofing guard).
@@ -191,12 +199,71 @@ func TestGetClientIP_MultiHopXFF(t *testing.T) {
 	}
 }
 
-// TestRateLimiterBucketCapEvictsOldest verifies the deterministic bucket cap:
-// with a cap of 2, inserting a third distinct IP evicts the bucket with the
-// oldest lastCheck (the first IP). The evicted IP's next request starts with
-// a fresh burst, proving it was evicted (rate 0: no refill, so a surviving
-// bucket with 4 tokens left could never serve 5 more requests).
-func TestRateLimiterBucketCapEvictsOldest(t *testing.T) {
+// TestGetClientIP_XRealIPRules pins the X-Real-IP acceptance rules: it is
+// consulted ONLY when XFF is empty, and ONLY when it parses as a valid IP
+// that is NOT itself a trusted proxy address; every other case falls back
+// to RemoteAddr.
+func TestGetClientIP_XRealIPRules(t *testing.T) {
+	_, proxyCIDR, _ := net.ParseCIDR("10.0.0.0/8")
+	trusted := []*net.IPNet{proxyCIDR}
+
+	// (a) XFF empty + valid untrusted X-Real-IP → accepted.
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("X-Real-IP", "203.0.113.6")
+	r.RemoteAddr = "10.0.0.3:34567"
+	if ip := ratelimit.GetClientIP(r, trusted); ip != "203.0.113.6" {
+		t.Errorf("empty XFF + untrusted X-Real-IP: got %q, want 203.0.113.6", ip)
+	}
+
+	// (b) XFF empty + X-Real-IP is a TRUSTED proxy address → it is the
+	// proxy's own IP, not a client: fall back to RemoteAddr.
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.Header.Set("X-Real-IP", "10.0.0.9")
+	r2.RemoteAddr = "10.0.0.3:34567"
+	if ip := ratelimit.GetClientIP(r2, trusted); ip != "10.0.0.3" {
+		t.Errorf("X-Real-IP inside trusted CIDR: got %q, want 10.0.0.3 (trusted X-Real-IP is the proxy itself, not a client)", ip)
+	}
+
+	// (c) XFF empty + invalid X-Real-IP → fall back to RemoteAddr.
+	r3 := httptest.NewRequest("GET", "/", nil)
+	r3.Header.Set("X-Real-IP", "not-an-ip")
+	r3.RemoteAddr = "10.0.0.3:34567"
+	if ip := ratelimit.GetClientIP(r3, trusted); ip != "10.0.0.3" {
+		t.Errorf("invalid X-Real-IP: got %q, want 10.0.0.3", ip)
+	}
+
+	// (d) XFF PRESENT (even all-trusted) + untrusted X-Real-IP: X-Real-IP
+	// must be ignored — XFF is the authoritative chain while present.
+	r4 := httptest.NewRequest("GET", "/", nil)
+	r4.Header.Set("X-Forwarded-For", "10.0.0.1")
+	r4.Header.Set("X-Real-IP", "203.0.113.9")
+	r4.RemoteAddr = "10.0.0.3:34567"
+	if ip := ratelimit.GetClientIP(r4, trusted); ip != "10.0.0.3" {
+		t.Errorf("XFF present + X-Real-IP: got %q, want 10.0.0.3 (X-Real-IP must never be consulted while XFF is present)", ip)
+	}
+
+	// (e) Untrusted RemoteAddr: X-Real-IP ignored entirely.
+	r5 := httptest.NewRequest("GET", "/", nil)
+	r5.Header.Set("X-Real-IP", "203.0.113.6")
+	r5.RemoteAddr = "100.64.0.1:34567"
+	if ip := ratelimit.GetClientIP(r5, trusted); ip != "100.64.0.1" {
+		t.Errorf("untrusted remote + X-Real-IP: got %q, want 100.64.0.1", ip)
+	}
+
+	// (f) No trusted proxies configured: X-Real-IP ignored entirely.
+	r6 := httptest.NewRequest("GET", "/", nil)
+	r6.Header.Set("X-Real-IP", "203.0.113.6")
+	r6.RemoteAddr = "198.51.100.1:34567"
+	if ip := ratelimit.GetClientIP(r6, nil); ip != "198.51.100.1" {
+		t.Errorf("no trusted proxies + X-Real-IP: got %q, want 198.51.100.1", ip)
+	}
+}
+
+// TestRateLimiterBucketCapRejectsNew pins the bucket-cap behavior: with a
+// cap of 2, a third distinct IP is REJECTED outright (no O(n) eviction scan
+// under the lock, no stealing from existing buckets), and the existing
+// buckets keep their tokens untouched.
+func TestRateLimiterBucketCapRejectsNew(t *testing.T) {
 	rl := ratelimit.NewRateLimiterWithMaxBuckets(0, 5, 2)
 
 	if !rl.Allow("10.0.0.1") {
@@ -205,23 +272,39 @@ func TestRateLimiterBucketCapEvictsOldest(t *testing.T) {
 	if !rl.Allow("10.0.0.2") {
 		t.Fatal("second IP must be allowed")
 	}
-	// Third IP: cap reached → evict the oldest (10.0.0.1, created first).
-	if !rl.Allow("10.0.0.3") {
-		t.Fatal("third IP must be allowed (evicting the oldest bucket)")
+	// Third IP: cap reached → new IP is rejected outright.
+	if rl.Allow("10.0.0.3") {
+		t.Fatal("third IP must be rejected when the bucket cap is reached (no eviction)")
 	}
-
-	// 10.0.0.1 was evicted: its bucket is recreated with a full burst of 5.
-	for i := 0; i < 5; i++ {
-		if !rl.Allow("10.0.0.1") {
-			t.Fatalf("evicted IP request %d denied: bucket was not recreated with a fresh burst", i+1)
-		}
+	// The rejection must not consume anything from the existing buckets:
+	// both existing IPs keep their remaining 4 tokens (1 consumed each).
+	if !rl.Allow("10.0.0.1") {
+		t.Error("10.0.0.1 must keep its bucket across the rejection of a new IP")
+	}
+	if !rl.Allow("10.0.0.2") {
+		t.Error("10.0.0.2 must keep its bucket across the rejection of a new IP")
+	}
+	// After 4 more Allow calls the two buckets are exhausted; the third IP
+	// is still rejected (its bucket was never created).
+	for i := 0; i < 4; i++ {
+		rl.Allow("10.0.0.1")
+		rl.Allow("10.0.0.2")
 	}
 	if rl.Allow("10.0.0.1") {
-		t.Error("6th request of the recreated bucket must be denied (fresh burst exhausted)")
+		t.Error("10.0.0.1 must be limited after its burst is exhausted")
 	}
+	if rl.Allow("10.0.0.3") {
+		t.Error("10.0.0.3 must still be rejected (never evicted into the map)")
+	}
+}
 
-	// 10.0.0.2 survived the eviction: it still has 4 tokens (1 consumed).
-	if !rl.Allow("10.0.0.2") {
-		t.Error("10.0.0.2 must keep its bucket across the eviction")
+// TestRateLimiterBucketCapSparseAllow guards the under-cap path: while the
+// map is below the cap new IPs are still admitted normally.
+func TestRateLimiterBucketCapSparseAllow(t *testing.T) {
+	rl := ratelimit.NewRateLimiterWithMaxBuckets(10, 5, 100)
+	for i := 0; i < 3; i++ {
+		if !rl.Allow(fmt.Sprintf("10.0.0.%d", i+1)) {
+			t.Errorf("IP %d must be allowed while under the cap", i+1)
+		}
 	}
 }
