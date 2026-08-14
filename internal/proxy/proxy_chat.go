@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -56,6 +57,12 @@ const maxRequestBodyBytes = 10 << 20
 // anyway). Usage recording is the only reason this runs: without it, an
 // OpenAI-compatible upstream stream would never report usage to the audit
 // and usage store.
+//
+// When the body must be rewritten, the top-level KEY ORDER and every other
+// value's original bytes are preserved (rebuildBodyWithStreamOptions): the
+// old whole-body re-marshal scrambled the top-level key order randomly on
+// every call, an unnecessary nondeterminism for a proxy that otherwise
+// passes client bodies through byte-for-byte.
 func ensureStreamOptionsIncludeUsage(body []byte) []byte {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -74,15 +81,77 @@ func ensureStreamOptionsIncludeUsage(body []byte) []byte {
 	} else {
 		so["include_usage"] = true
 	}
-	out, err := json.Marshal(so)
+	return rebuildBodyWithStreamOptions(body, so)
+}
+
+// rebuildBodyWithStreamOptions re-encodes the request body with the new
+// stream_options value while preserving the top-level key order and every
+// other value's original bytes. It walks the original JSON tokens: each key
+// is written back in its original position with its original raw value, and
+// only the stream_options value is swapped (a missing stream_options is
+// appended at the end — JSON object key order is semantically irrelevant, so
+// appending is the smallest possible change). The rewritten stream_options
+// value itself is marshaled from a map, so its internal key order is not
+// guaranteed — that value is the object this function exists to modify, and
+// no client may depend on its key order. Any structural surprise (top level
+// not an object, malformed tokens) falls back to the input unchanged — never
+// a partial rewrite.
+func rebuildBodyWithStreamOptions(body []byte, so map[string]any) []byte {
+	replacement, err := json.Marshal(so)
 	if err != nil {
 		return body
 	}
-	raw["stream_options"] = json.RawMessage(out)
-	if re, err := json.Marshal(raw); err == nil {
-		return re
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return body // not a top-level object: leave untouched
 	}
-	return body
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	first, sawStreamOptions := true, false
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return body
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return body
+		}
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return body
+		}
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+		keyBytes, err := json.Marshal(key)
+		if err != nil {
+			return body
+		}
+		buf.Write(keyBytes)
+		buf.WriteByte(':')
+		if key == "stream_options" {
+			sawStreamOptions = true
+			buf.Write(replacement)
+		} else {
+			buf.Write(val)
+		}
+	}
+	// Consume the closing brace; trailing content after the top-level
+	// object is ignored, matching json.Unmarshal semantics.
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return body
+	}
+	if !sawStreamOptions {
+		if !first {
+			buf.WriteByte(',')
+		}
+		buf.WriteString(`"stream_options":`)
+		buf.Write(replacement)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes()
 }
 
 // rejectAudit emits exactly ONE request.complete audit line for a request
@@ -471,6 +540,17 @@ func writeUpstreamExhausted(w http.ResponseWriter, aud *middleware.RequestAudit,
 		aud.ErrorType = "upstream_quota_exhausted"
 		util.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": map[string]any{"message": "All upstream accounts exhausted quota or balance", "code": "upstream_quota_exhausted"},
+		})
+	default:
+		// Defensive fallback: called with no permanent class recorded (a
+		// future caller reaching this function without credential/quota
+		// evidence). Never leave the client without a terminal response or
+		// the audit without a status — answer the generic exhaustion the
+		// retry loop would have produced.
+		aud.Error = "all upstream accounts exhausted after retries"
+		aud.ErrorType = "all_exhausted"
+		util.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]any{"message": "All accounts exhausted after retries", "code": "all_exhausted"},
 		})
 	}
 }

@@ -23,6 +23,19 @@ import (
 // on the audit logger.
 func directLegacyStream(t *testing.T, body io.ReadCloser, w responseCommitWriter) *middleware.RequestAudit {
 	t.Helper()
+	return directLegacyStreamResp(t, &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       body,
+	}, w)
+}
+
+// directLegacyStreamResp is the header/body-controllable variant of
+// directLegacyStream: the caller supplies the full synthetic upstream
+// response (e.g. to set Content-Encoding: gzip). handleUpstreamResponse
+// owns and closes resp.Body.
+func directLegacyStreamResp(t *testing.T, resp *http.Response, w responseCommitWriter) *middleware.RequestAudit {
+	t.Helper()
 
 	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: "http://upstream.invalid", Provider: "t"}}}
 	p := pool.NewPool(cfg.Accounts)
@@ -37,11 +50,6 @@ func directLegacyStream(t *testing.T, body io.ReadCloser, w responseCommitWriter
 	r = r.WithContext(context.WithValue(r.Context(), middleware.AuditKey{}, aud))
 
 	ctx, cancel := context.WithCancel(r.Context())
-	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     make(http.Header),
-		Body:       body,
-	}
 	done, _, class := handleUpstreamResponse(acc, w, r, resp, nil, time.Now(), ChatForwardOpts{ResponsesOut: false, Stream: true}, "direct-legacy-1", ctx, cancel)
 	if !done {
 		t.Fatalf("handleUpstreamResponse must report done, class=%d", class)

@@ -62,6 +62,19 @@ func (c *commitTrackWriter) Flush() {
 // depending on the audit logger.
 func directResponsesStream(t *testing.T, upstreamBody string, w responseCommitWriter) *middleware.RequestAudit {
 	t.Helper()
+	return directResponsesStreamResp(t, &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
+	}, w)
+}
+
+// directResponsesStreamResp is the header/body-controllable variant of
+// directResponsesStream: the caller supplies the full synthetic upstream
+// response (e.g. to set Content-Encoding: gzip or a non-string body).
+// handleUpstreamResponse owns and closes resp.Body.
+func directResponsesStreamResp(t *testing.T, resp *http.Response, w responseCommitWriter) *middleware.RequestAudit {
+	t.Helper()
 
 	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "t", Key: "k", BaseURL: "http://upstream.invalid", Provider: "t"}}}
 	p := pool.NewPool(cfg.Accounts)
@@ -76,11 +89,6 @@ func directResponsesStream(t *testing.T, upstreamBody string, w responseCommitWr
 	r = r.WithContext(context.WithValue(r.Context(), middleware.AuditKey{}, aud))
 
 	ctx, cancel := context.WithCancel(r.Context())
-	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
-	}
 	done, _, class := handleUpstreamResponse(acc, w, r, resp, nil, time.Now(), ChatForwardOpts{ResponsesOut: true, Stream: true}, "direct-commit-1", ctx, cancel)
 	if !done {
 		t.Fatalf("handleUpstreamResponse must report done for a terminal streaming response, class=%d", class)

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -351,10 +352,95 @@ func copyClientHeaders(dst http.Header, src http.Header) {
 		if spoofableClientHeaders[ck] || strings.HasPrefix(ck, "X-Forwarded-") {
 			continue
 		}
+		// X-Prism-Provider is prism's OWN routing header (the client uses it
+		// to select the provider): it must never reach the upstream — the
+		// upstream is not a prism router, and forwarding it would let a
+		// client steer a header the upstream might interpret or echo back.
+		// Prism's own internally-built upstream requests (model cache
+		// fetch) set it explicitly when they need it.
+		if ck == "X-Prism-Provider" {
+			continue
+		}
 		for _, v := range vs {
 			dst.Add(k, v)
 		}
 	}
+}
+
+// upstreamResponseBody returns a reader over the upstream response body.
+// A Content-Encoding: gzip response is transparently decompressed so the
+// bytes written to the client match the headers the client sees: the body
+// cap, the redaction, the SSE parsing and the JSON parsing all operate on
+// the DECODED content, and the gzip header itself is never copied to the
+// client (copyUpstreamHeaders' allowlist does not include Content-Encoding).
+// Without this, a gzip-encoded upstream response would reach the client as
+// compressed bytes labeled application/json with no Content-Encoding
+// header — unparseable garbage, and the 4xx redaction would corrupt the
+// compressed stream on top of that. The returned reader is valid only for
+// the lifetime of resp.Body, which remains owned by the caller (closed by
+// the caller's own defer, never by this function). When the returned
+// reader is NOT resp.Body itself (a gzip reader), the caller closes it
+// once done — gzip.Reader.Close does not close the underlying resp.Body,
+// so closing it releases the decompressor without touching the connection
+// lifecycle. A decompression failure (e.g. a body that is not valid gzip
+// despite the header) is reported either here or on the first read and
+// flows through the caller's existing body-read error path (structured
+// 502 / warn), never as garbage bytes to the client. Multi-valued or
+// non-gzip encodings are left alone.
+func upstreamResponseBody(resp *http.Response) (io.ReadCloser, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, errors.New("nil upstream response body")
+	}
+	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("Content-Encoding")), "gzip") {
+		return gzip.NewReader(resp.Body)
+	}
+	return resp.Body, nil
+}
+
+// closeUpstreamBodyReader releases a body reader returned by
+// upstreamResponseBody once reading is complete. The identity case — the
+// reader IS resp.Body — is a deliberate no-op: resp.Body is owned by the
+// caller and closed by the caller's own top-level defer, so closing it here
+// would double-close the same object (a NopCloser-style body tolerates it
+// silently at best, a tracked body double-frees at worst). A gzip reader is
+// a separate object: closing it releases the decompressor, and
+// gzip.Reader.Close does NOT close the underlying resp.Body, so the
+// connection lifecycle stays with the caller. Callers must invoke it after
+// the read returns — on success AND on read error, so a truncated gzip
+// stream cannot leak its decompressor.
+func closeUpstreamBodyReader(resp *http.Response, bodyReader io.ReadCloser) {
+	if resp == nil || bodyReader == nil || bodyReader == resp.Body {
+		return
+	}
+	_ = bodyReader.Close()
+}
+
+// readUpstreamBodyLimited reads at most maxBytes+1 bytes from the upstream
+// response body (transparently decompressing a Content-Encoding: gzip body
+// via upstreamResponseBody) and closes the body reader once the read
+// completes — on success AND on read error, so a truncated gzip stream
+// cannot leak its decompressor. The identity reader (resp.Body itself) is
+// NOT closed here: resp.Body stays owned by the caller and is closed by the
+// caller's own defer (see closeUpstreamBodyReader). Returns
+// ErrUpstreamResponseTooLarge when the body exceeds maxBytes.
+func readUpstreamBodyLimited(resp *http.Response, maxBytes int64) ([]byte, error) {
+	bodyReader, err := upstreamResponseBody(resp)
+	if err != nil {
+		return nil, err
+	}
+	defer closeUpstreamBodyReader(resp, bodyReader)
+	return readResponseBodyLimited(bodyReader, maxBytes)
+}
+
+// clearResponsesStreamHeaders removes the SSE-only headers the Responses
+// streaming branch set for a stream that never started: a pre-first-event
+// failure answers a JSON 502, and that error response must not carry
+// Cache-Control: no-cache or Connection: keep-alive (stream semantics) —
+// its headers must describe the error, not a stream. Content-Type is
+// overwritten by util.WriteJSON, so it needs no clearing here.
+func clearResponsesStreamHeaders(w http.ResponseWriter) {
+	w.Header().Del("Cache-Control")
+	w.Header().Del("Connection")
 }
 
 // copyUpstreamHeaders copies only allowed response headers from the upstream
@@ -563,8 +649,24 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		// 4xx client error (other than 401/402/429 handled above).
 		// The body is read exactly ONCE and reused for classification and
-		// any passthrough below.
-		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, config.MaxErrorBodyBytes))
+		// any passthrough below. A gzip-encoded upstream body is
+		// decompressed first: the redacted passthrough body is then plain
+		// text and the Content-Encoding header is dropped below, keeping
+		// body and headers semantically consistent.
+		bodyReader, bodyErr := upstreamResponseBody(resp)
+		var errBody []byte
+		var readErr error
+		if bodyErr != nil {
+			readErr = bodyErr
+		} else {
+			errBody, readErr = io.ReadAll(io.LimitReader(bodyReader, config.MaxErrorBodyBytes))
+			// The read is done (success or error): release the decompressor
+			// now. closeUpstreamBodyReader skips the identity reader (resp.Body
+			// stays owned by the top-level defer) and closes a gzip reader
+			// without touching resp.Body — a truncated gzip 4xx body cannot
+			// leak its decompressor.
+			closeUpstreamBodyReader(resp, bodyReader)
+		}
 		if readErr != nil {
 			slog.Warn("failed to read upstream 4xx body", "req", requestID, "error", readErr)
 		}
@@ -653,7 +755,30 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 		// the translator emits when it can still write.
 		translateStart := time.Now()
 		slog.Debug("responses_stream translate start", "request_id", requestID, "account", acc.Name(), "translate_start", translateStart.Format(time.RFC3339Nano))
-		err := stream.TranslateChatStreamToResponses(w, resp.Body, opts.Model, opts.ReqTools, mcp.GetSearchToolCache(opts.TenantID), ctx)
+		// A Content-Encoding: gzip upstream body is decompressed BEFORE the
+		// SSE translator: the client never receives a Content-Encoding header
+		// (copyUpstreamHeaders' allowlist does not include it), so the bytes
+		// the translator parses must already be decoded — the compressed
+		// stream would otherwise be consumed as SSE garbage. The gzip header
+		// is validated HERE while the status is still uncommitted (it is
+		// delayed until the first event): an upstream that claims gzip but
+		// sends a non-gzip body fails closed through the same pre-first-event
+		// 502 path below, never as garbage bytes to the client. A stream that
+		// corrupts AFTER the header surfaces on the first read and flows
+		// through the translator's scanner error path (502 before the first
+		// event, response.failed after it). The gzip reader is closed when
+		// the translation returns; resp.Body stays owned by this function
+		// (deferred close at the top) — gzip.Reader.Close does not close it.
+		bodyReader, bodyErr := upstreamResponseBody(resp)
+		var err error
+		if bodyErr != nil {
+			err = bodyErr
+		} else {
+			if gz, ok := bodyReader.(*gzip.Reader); ok {
+				defer gz.Close()
+			}
+			err = stream.TranslateChatStreamToResponses(w, bodyReader, opts.Model, opts.ReqTools, mcp.GetSearchToolCache(opts.TenantID), ctx)
+		}
 		translateElapsed := time.Since(translateStart).Milliseconds()
 		if err != nil {
 			slog.Error("responses_stream translate error", "req", requestID, "model", opts.Model, "account", acc.Name(), "error", err, "translate_ms", translateElapsed, "elapsed", time.Since(start), "error_type", "upstream_5xx")
@@ -695,6 +820,10 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 				// already have been billed. Do not switch accounts.
 				// RecordError ran above; do not count this as a retry.
 				slog.Warn("responses_stream empty stream", "req", requestID, "model", opts.Model, "account", acc.Name(), "error_type", "upstream_stream_error")
+				// The JSON 502 must not carry the SSE-only headers
+				// (Cache-Control: no-cache, Connection: keep-alive) that were
+				// set for the stream that never started.
+				clearResponsesStreamHeaders(w)
 				writeEmptyUpstreamStream(w, r, acc)
 				return true, err, UpstreamErrorTemporary
 			}
@@ -703,7 +832,11 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 				// failure): return a structured 502 instead of an empty 200.
 				// util.WriteJSON writes the status exactly once — the response
 				// is still uncommitted, so this is the first and only
-				// WriteHeader on the wire.
+				// WriteHeader on the wire. The SSE-only headers set for the
+				// stream that never started are cleared first so the error
+				// response headers are consistent (no Cache-Control: no-cache
+				// / Connection: keep-alive on a JSON error).
+				clearResponsesStreamHeaders(w)
 				util.WriteJSON(w, http.StatusBadGateway, map[string]any{
 					"error": map[string]any{"message": errMsg, "code": errCode},
 				})
@@ -744,7 +877,13 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 
 	if opts.ResponsesOut && !opts.Stream {
 		bodyReadStart := time.Now()
-		rawBody, err := readResponseBodyLimited(resp.Body, responseBodyCap(opts))
+		// Decompress a gzip-encoded upstream body before the cap check and
+		// the conversion: the translation parses real JSON, and the client
+		// must receive decoded content with no Content-Encoding header. The
+		// unified helper also closes the body reader when the read completes
+		// (success or error), so a truncated gzip body cannot leak its
+		// decompressor.
+		rawBody, err := readUpstreamBodyLimited(resp, responseBodyCap(opts))
 		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 		if err != nil {
 			if errors.Is(err, ErrUpstreamResponseTooLarge) {
@@ -833,7 +972,32 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 		// once the first byte reached the wire the status can never change).
 		lw := &legacyStreamWriter{responseCommitWriter: w, status: resp.StatusCode}
 		bodyReadStart := time.Now()
-		n, err := stream.StreamResponseBody(lw, resp.Body, r, acc.Name())
+		// A Content-Encoding: gzip upstream body is decompressed BEFORE the
+		// stream copier: the client never receives a Content-Encoding header
+		// (copyUpstreamHeaders' allowlist does not include it), so the bytes
+		// copied to the client must already be decoded — the compressed
+		// stream would otherwise reach the client as garbage. The gzip header
+		// is validated HERE while the response is still uncommitted (the
+		// legacy writer delays the status until the first event): an upstream
+		// that claims gzip but sends a non-gzip body fails closed through the
+		// same pre-first-event 502 path below, never as garbage bytes to the
+		// client. A stream that corrupts AFTER the header surfaces on the
+		// first read and flows through the io.Copy error path (502 before the
+		// first byte, the broken stream simply cut after it). The gzip reader
+		// is closed when the copy returns; resp.Body stays owned by this
+		// function (deferred close at the top) — gzip.Reader.Close does not
+		// close it.
+		bodyReader, bodyErr := upstreamResponseBody(resp)
+		var n int64
+		var err error
+		if bodyErr != nil {
+			err = bodyErr
+		} else {
+			if gz, ok := bodyReader.(*gzip.Reader); ok {
+				defer gz.Close()
+			}
+			n, err = stream.StreamResponseBody(lw, bodyReader, r, acc.Name())
+		}
 		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 		// Commit state is captured ONCE, before any write below (after the
 		// 502 is written the same writer would report committed and the
@@ -890,7 +1054,13 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 
 	// Non-streaming legacy: read full body, capture token usage, write to client.
 	bodyReadStart := time.Now()
-	rawBody, err := readResponseBodyLimited(resp.Body, responseBodyCap(opts))
+	// Decompress a gzip-encoded upstream body before the cap check, usage
+	// parsing and the passthrough write: the client must receive decoded
+	// content (no Content-Encoding header is copied), so the body it gets
+	// matches the headers it sees. The unified helper also closes the body
+	// reader when the read completes (success or error), so a truncated
+	// gzip body cannot leak its decompressor.
+	rawBody, err := readUpstreamBodyLimited(resp, responseBodyCap(opts))
 	bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
 	if err != nil {
 		if errors.Is(err, ErrUpstreamResponseTooLarge) {

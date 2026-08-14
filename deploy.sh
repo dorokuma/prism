@@ -6,7 +6,7 @@
 # 写死在脚本里无意义。调用方负责：部署前改 README+commit+tag（本地），部署成功后再 push。
 #
 # 部署前提：代码改动已 commit + tag（本地）。本脚本编译当前工作区代码。
-# 退出码：0 成功；1 新版失败已回退旧版；2 回退后仍不健康或恢复失败（需人工）；3 前置失败（编译/备份/安装/参数校验，prism 未受影响）。
+# 退出码：0 成功；1 新版失败已回退旧版；2 回退后仍不健康或恢复失败（需人工）；3 前置失败（编译/备份/安装/restart 失败/参数校验，部署中止；restart 失败时服务状态未知，备份保留在 $BACKUP 供人工回退）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -91,7 +91,14 @@ if is_ready_health_url "$HEALTH_URL"; then
 fi
 
 echo "=== systemctl restart 加载新二进制（停机窗口仅 restart 瞬间，不单独 stop）==="
-systemctl restart prism || true
+# restart 失败绝不静默继续（旧版 `|| true` 会带着可能已停止的服务跑健康检查）：
+# 新二进制已 install，服务状态未知，立即停止部署并保留备份供人工回退/诊断。
+if ! systemctl restart prism; then
+  echo "RESTART FAILED — systemctl restart prism 失败；新二进制已 install，备份保留在 $BACKUP。停止部署，请人工诊断：" >&2
+  echo "  systemctl status prism --no-pager" >&2
+  echo "  journalctl -u prism -n 50 --no-pager" >&2
+  exit 3
+fi
 
 echo "=== 健康验证（每 1 秒轮询 systemctl active + $HEALTH_URL，最长 ${HEALTH_TIMEOUT}s）==="
 if wait_healthy; then
@@ -106,7 +113,12 @@ if ! install -m 755 "$BACKUP" "$BINARY"; then
   echo "CRITICAL: 回退安装失败，$BINARY 可能缺失或损坏，需人工介入"
   exit 2
 fi
-systemctl restart prism || true
+# 回退后的 restart 同样不能吞失败：失败意味着服务可能已停机，需人工。
+if ! systemctl restart prism; then
+  echo "CRITICAL: 回退后 systemctl restart prism 失败，prism 可能已停机，需人工介入" >&2
+  echo "journalctl -u prism -n 50 --no-pager" >&2
+  exit 2
+fi
 # 回退后的健康验证使用同一轮询：旧版立即健康则尽快收口，不再固定 sleep。
 if wait_healthy; then
   echo "ROLLBACK OK: 已回退旧版本（新版本启动失败）。代码未 push，可 git reset 撤销"

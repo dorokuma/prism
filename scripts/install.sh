@@ -79,7 +79,12 @@ if is_ready_health_url "$HEALTH_URL"; then
 fi
 
 echo "=== systemctl restart 加载新二进制 ==="
-"$SYSTEMCTL_BIN" restart prism || true
+# restart 失败绝不静默继续：新二进制已 install，服务状态未知，立即停止安装
+# 并保留备份供人工回退/诊断（旧版 `|| true` 会带着可能已停止的服务跑健康检查）。
+if ! "$SYSTEMCTL_BIN" restart prism; then
+  echo "RESTART FAILED — systemctl restart prism 失败；新二进制已 install，备份保留在 $BACKUP。停止安装，请人工诊断：systemctl status prism / journalctl -u prism -n 50" >&2
+  exit 3
+fi
 
 echo "=== 健康验证（每 1 秒轮询 systemctl active + $HEALTH_URL，最长 ${HEALTH_TIMEOUT}s）==="
 if wait_healthy; then
@@ -100,7 +105,11 @@ if ! install -m 755 "$BACKUP" "$BINARY"; then
   echo "CRITICAL: 回退安装失败，$BINARY 可能缺失或损坏，需人工介入" >&2
   exit 2
 fi
-"$SYSTEMCTL_BIN" restart prism || true
+# 回退后的 restart 同样不能吞失败：失败意味着服务可能已停机，需人工。
+if ! "$SYSTEMCTL_BIN" restart prism; then
+  echo "CRITICAL: 回退后 systemctl restart prism 失败，prism 可能已停机，需人工介入" >&2
+  exit 2
+fi
 if wait_healthy; then
   echo "ROLLBACK OK: 已回退旧版本（新版本启动失败）"
   exit 1

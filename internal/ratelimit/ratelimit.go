@@ -15,11 +15,14 @@ import (
 
 // RateLimiter implements a simple per-IP token bucket rate limiter.
 type RateLimiter struct {
-	mu         sync.Mutex
-	buckets    map[string]*tokenBucket
-	rate       int // tokens per second
-	burst      int // max burst
-	maxBuckets int // hard cap on distinct IP buckets
+	mu              sync.Mutex
+	buckets         map[string]*tokenBucket
+	rate            int          // tokens per second
+	burst           int          // max burst
+	maxBuckets      int          // hard cap on distinct IP buckets
+	overflow        *tokenBucket // shared bucket for NEW IPs once the cap is reached
+	idleTTL         time.Duration
+	cleanupInterval time.Duration
 }
 
 type tokenBucket struct {
@@ -35,22 +38,35 @@ func NewRateLimiter(rate, burst int) *RateLimiter {
 
 // NewRateLimiterWithMaxBuckets creates a RateLimiter with a deterministic
 // cap on the number of tracked IP buckets. When the cap is reached, a NEW
-// IP is rejected outright (Allow returns false) — the map can never grow
-// without bound and the hot path never scans the whole map under the lock
-// (the old oldest-bucket eviction was an O(n) scan per new IP). Existing
-// buckets are untouched and keep their tokens; the background cleanup loop
-// frees space by removing idle buckets. Tests inject a small cap;
-// production uses config.RateLimitMaxBuckets (100000).
+// IP is NOT rejected outright: it is served from a single shared overflow
+// bucket (see Allow) — the map can never grow without bound, the hot path
+// never scans the whole map under the lock (no O(n) oldest-bucket
+// eviction), existing buckets keep their tokens, and a flood of distinct
+// IPs is rate-limited (the shared tokens drain quickly) instead of being
+// hard-rejected for the whole idle TTL. The background cleanup loop frees
+// map space and resets the overflow bucket once they go idle. Tests inject
+// a small cap; production uses config.RateLimitMaxBuckets (100000).
 func NewRateLimiterWithMaxBuckets(rate, burst, maxBuckets int) *RateLimiter {
 	if maxBuckets <= 0 {
 		maxBuckets = config.RateLimitMaxBuckets
 	}
 	return &RateLimiter{
-		buckets:    make(map[string]*tokenBucket),
-		rate:       rate,
-		burst:      burst,
-		maxBuckets: maxBuckets,
+		buckets:         make(map[string]*tokenBucket),
+		rate:            rate,
+		burst:           burst,
+		maxBuckets:      maxBuckets,
+		idleTTL:         config.RateLimitIdleTTL,
+		cleanupInterval: 30 * time.Second,
 	}
+}
+
+// SetCleanupForTest overrides the idle TTL and cleanup-loop interval. It
+// must be called before StartCleanupLoop and is never used in production.
+func (rl *RateLimiter) SetCleanupForTest(idleTTL, interval time.Duration) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.idleTTL = idleTTL
+	rl.cleanupInterval = interval
 }
 
 // Allow checks if the given IP is allowed to proceed. If allowed, one token
@@ -64,18 +80,29 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	b, ok := rl.buckets[ip]
 	if !ok {
 		if len(rl.buckets) >= rl.maxBuckets {
-			// Bucket cap reached: reject the new IP outright. No eviction
-			// scan (O(n) under the lock), no stealing from existing buckets
-			// — a flood of distinct IPs cannot grow the map, cannot slow
-			// the hot path, and cannot degrade the buckets that are already
-			// being served. The cleanup loop eventually frees a slot.
-			return false
+			// Bucket cap reached: serve the NEW IP from the shared overflow
+			// bucket instead of rejecting it outright. The map cannot grow (no
+			// new entries), the hot path never scans the whole map under the
+			// lock (no O(n) eviction), and existing buckets keep their tokens
+			// untouched. New IPs share one bucket's rate/burst, so a flood of
+			// distinct IPs drains the shared tokens quickly and is then
+			// rate-limited like everyone else — never hard-rejected for the
+			// whole idle TTL. The cleanup loop resets the overflow bucket once
+			// it goes idle.
+			if rl.overflow == nil {
+				rl.overflow = &tokenBucket{
+					tokens:    float64(rl.burst),
+					lastCheck: now,
+				}
+			}
+			b = rl.overflow
+		} else {
+			b = &tokenBucket{
+				tokens:    float64(rl.burst),
+				lastCheck: now,
+			}
+			rl.buckets[ip] = b
 		}
-		b = &tokenBucket{
-			tokens:    float64(rl.burst),
-			lastCheck: now,
-		}
-		rl.buckets[ip] = b
 	}
 
 	elapsed := now.Sub(b.lastCheck).Seconds()
@@ -93,10 +120,12 @@ func (rl *RateLimiter) Allow(ip string) bool {
 }
 
 // StartCleanupLoop starts a background goroutine that periodically cleans up
-// stale buckets.
+// stale buckets. Idle per-IP buckets are removed (freeing map slots for new
+// IPs) and an idle overflow bucket is reset (so new IPs get a fresh shared
+// allowance instead of a permanently drained one).
 func (rl *RateLimiter) StartCleanupLoop(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(rl.cleanupInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -106,9 +135,12 @@ func (rl *RateLimiter) StartCleanupLoop(ctx context.Context) {
 				rl.mu.Lock()
 				now := time.Now()
 				for ip, b := range rl.buckets {
-					if now.Sub(b.lastCheck) > config.RateLimitIdleTTL {
+					if now.Sub(b.lastCheck) > rl.idleTTL {
 						delete(rl.buckets, ip)
 					}
+				}
+				if rl.overflow != nil && now.Sub(rl.overflow.lastCheck) > rl.idleTTL {
+					rl.overflow = nil
 				}
 				rl.mu.Unlock()
 			}

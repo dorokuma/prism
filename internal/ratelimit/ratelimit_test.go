@@ -1,11 +1,13 @@
 package ratelimit_test
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/middleware"
@@ -261,11 +263,13 @@ func TestGetClientIP_XRealIPRules(t *testing.T) {
 	}
 }
 
-// TestRateLimiterBucketCapRejectsNew pins the bucket-cap behavior: with a
-// cap of 2, a third distinct IP is REJECTED outright (no O(n) eviction scan
-// under the lock, no stealing from existing buckets), and the existing
-// buckets keep their tokens untouched.
-func TestRateLimiterBucketCapRejectsNew(t *testing.T) {
+// TestRateLimiterBucketCapOverflowShared pins the bucket-cap behavior: with
+// a cap of 2, a third distinct IP is NOT rejected outright — it is served
+// from a single shared overflow bucket. The map never grows beyond the cap,
+// existing buckets keep their tokens untouched, and a flood of new IPs
+// drains the shared burst and is then rate-limited (never hard-rejected for
+// the whole idle TTL).
+func TestRateLimiterBucketCapOverflowShared(t *testing.T) {
 	rl := ratelimit.NewRateLimiterWithMaxBuckets(0, 5, 2)
 
 	if !rl.Allow("10.0.0.1") {
@@ -274,29 +278,110 @@ func TestRateLimiterBucketCapRejectsNew(t *testing.T) {
 	if !rl.Allow("10.0.0.2") {
 		t.Fatal("second IP must be allowed")
 	}
-	// Third IP: cap reached → new IP is rejected outright.
-	if rl.Allow("10.0.0.3") {
-		t.Fatal("third IP must be rejected when the bucket cap is reached (no eviction)")
+	// Cap reached: new IPs share one overflow bucket with the full burst.
+	// .3 through .7 are five distinct new IPs consuming the 5 shared tokens.
+	for i := 3; i <= 7; i++ {
+		if !rl.Allow(fmt.Sprintf("10.0.0.%d", i)) {
+			t.Fatalf("new IP 10.0.0.%d must be served from the shared overflow bucket (not hard-rejected)", i)
+		}
+	}
+	// The overflow bucket is drained: the 6th new IP is rate-limited
+	// (shared-token exhaustion), not permanently rejected.
+	if rl.Allow("10.0.0.8") {
+		t.Error("overflow bucket must be drained after 5 new IPs shared its burst")
 	}
 	// The rejection must not consume anything from the existing buckets:
-	// both existing IPs keep their remaining 4 tokens (1 consumed each).
+	// 10.0.0.1 keeps its remaining 4 tokens (1 consumed earlier).
 	if !rl.Allow("10.0.0.1") {
-		t.Error("10.0.0.1 must keep its bucket across the rejection of a new IP")
+		t.Error("10.0.0.1 must keep its bucket across the overflow traffic")
 	}
-	if !rl.Allow("10.0.0.2") {
-		t.Error("10.0.0.2 must keep its bucket across the rejection of a new IP")
-	}
-	// After 4 more Allow calls the two buckets are exhausted; the third IP
-	// is still rejected (its bucket was never created).
+	// After 4 more Allow calls the 10.0.0.1 bucket is exhausted.
 	for i := 0; i < 4; i++ {
 		rl.Allow("10.0.0.1")
-		rl.Allow("10.0.0.2")
 	}
 	if rl.Allow("10.0.0.1") {
 		t.Error("10.0.0.1 must be limited after its burst is exhausted")
 	}
+}
+
+// TestRateLimiterCleanupResetsOverflowOnly pins the cleanup interaction
+// with the overflow bucket: while the per-IP buckets stay ACTIVE (their
+// lastCheck keeps refreshing during the whole wait), the map stays at the
+// cap and ONLY the idle overflow bucket is reset — so a NEW IP is served
+// from a refreshed shared allowance instead of inheriting a permanently
+// drained one. This test directly guards the `rl.overflow = nil` reset in
+// StartCleanupLoop: delete that line and the first post-cleanup Allow
+// fails, because at rate=0 nothing ever refills the drained overflow
+// bucket. (To confirm: remove the overflow reset from StartCleanupLoop and
+// run `go test -run TestRateLimiterCleanupResetsOverflowOnly ./internal/ratelimit/`
+// — the test fails on the 10.0.0.4 assertion.) The OLD test let the
+// per-IP buckets go idle too, so its fresh-allowance assertions could not
+// tell whether the map-slot freeing or the overflow reset had produced
+// the result; here the map MUST stay full (the 10.0.0.5 and 10.0.0.1
+// assertions pin it), so a pass can only come from the overflow reset.
+func TestRateLimiterCleanupResetsOverflowOnly(t *testing.T) {
+	rl := ratelimit.NewRateLimiterWithMaxBuckets(0, 5, 2)
+	rl.SetCleanupForTest(50*time.Millisecond, 10*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rl.StartCleanupLoop(ctx)
+
+	// Fill the map to the cap (2 buckets) and push a third IP into the
+	// shared overflow bucket.
+	if !rl.Allow("10.0.0.1") || !rl.Allow("10.0.0.2") || !rl.Allow("10.0.0.3") {
+		t.Fatal("setup allows must succeed")
+	}
+	// Drain the overflow bucket (rate=0 → no refill): without a reset a
+	// later new IP would be rate-limited forever.
+	for i := 0; i < 4; i++ {
+		rl.Allow("10.0.0.3")
+	}
 	if rl.Allow("10.0.0.3") {
-		t.Error("10.0.0.3 must still be rejected (never evicted into the map)")
+		t.Fatal("overflow bucket must be drained before the cleanup wait")
+	}
+
+	// Keep the per-IP buckets ACTIVE across the whole idle TTL (touch them
+	// every few ms): they must NOT be cleaned up, so the map stays full
+	// and the cleanup can only reset the overflow bucket.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		rl.Allow("10.0.0.1")
+		rl.Allow("10.0.0.2")
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Final touch keeps both buckets fresh past any remaining cleanup tick.
+	rl.Allow("10.0.0.1")
+	rl.Allow("10.0.0.2")
+
+	// The idle overflow bucket was reset: a new IP gets the full shared
+	// burst (the map is still full, so it lands in the overflow bucket, not
+	// a fresh per-IP bucket). This is the assertion that fails when the
+	// `rl.overflow = nil` reset is deleted.
+	if !rl.Allow("10.0.0.4") {
+		t.Error("after cleanup, a new IP must be served (the idle overflow bucket was reset)")
+	}
+	for i := 0; i < 4; i++ {
+		rl.Allow("10.0.0.4")
+	}
+	if rl.Allow("10.0.0.4") {
+		t.Error("10.0.0.4 must drain the refreshed overflow burst")
+	}
+
+	// The map is STILL at the cap: another new IP cannot get its own
+	// bucket — it shares the (now drained) overflow bucket and is
+	// rate-limited. This pins that the active per-IP buckets survived
+	// cleanup: if they had been freed, 10.0.0.5 would get a fresh bucket
+	// and this Allow would succeed.
+	if rl.Allow("10.0.0.5") {
+		t.Error("map must stay full: 10.0.0.5 must share the drained overflow bucket")
+	}
+
+	// The ACTIVE buckets were neither deleted nor recreated: 10.0.0.1 is
+	// still the drained bucket from the touch loop (rate=0 → no refill), so
+	// it is still limited. A deleted-and-recreated bucket would carry a
+	// fresh 5-token burst and this Allow would succeed.
+	if rl.Allow("10.0.0.1") {
+		t.Error("active bucket must survive cleanup untouched (still drained, not recreated)")
 	}
 }
 
