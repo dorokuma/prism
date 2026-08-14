@@ -284,7 +284,7 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 	// real cause from a generic 503 all_exhausted: the gateway's own
 	// credentials or balance are broken — the operator, not the client,
 	// must fix them.
-	var sawCredential, sawQuota, sawEmptyStream bool
+	var sawCredential, sawQuota bool
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
 		if attempts > 0 {
@@ -316,10 +316,6 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 			// failures (timeout, client cancel) are reported as before.
 			if errors.Is(err, pool.ErrNoHealthyAccounts) && (sawCredential || sawQuota) {
 				writeUpstreamExhausted(sc, aud, sawCredential, sawQuota)
-				return
-			}
-			if errors.Is(err, pool.ErrNoHealthyAccounts) && sawEmptyStream {
-				writeEmptyStreamExhausted(sc, aud)
 				return
 			}
 			aud.Error = err.Error()
@@ -379,8 +375,6 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 					sawCredential = true
 				} else if upClass == UpstreamErrorPermanentQuota {
 					sawQuota = true
-				} else if upClass == UpstreamErrorEmptyStream {
-					sawEmptyStream = true
 				}
 				return
 			}
@@ -441,24 +435,10 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		writeUpstreamExhausted(sc, aud, sawCredential, sawQuota)
 		return
 	}
-	if sawEmptyStream {
-		writeEmptyStreamExhausted(sc, aud)
-		return
-	}
 	aud.Error = "all accounts exhausted after retries"
 	aud.ErrorType = "all_exhausted"
 	util.WriteJSON(sc, 503, map[string]any{
 		"error": map[string]any{"message": "All accounts exhausted after retries", "code": "all_exhausted"},
-	})
-}
-
-// writeEmptyStreamExhausted writes the terminal 502 when every retry saw
-// an uncommitted empty upstream SSE and nothing else produced a response.
-func writeEmptyStreamExhausted(w http.ResponseWriter, aud *middleware.RequestAudit) {
-	aud.Error = "upstream stream closed before any event"
-	aud.ErrorType = "upstream_stream_error"
-	util.WriteJSON(w, http.StatusBadGateway, map[string]any{
-		"error": map[string]any{"message": "upstream stream closed before any event", "code": "upstream_stream_error"},
 	})
 }
 

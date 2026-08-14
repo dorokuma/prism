@@ -140,10 +140,6 @@ const (
 	// UpstreamErrorPermanentQuota: recognized structured quota exhaustion
 	// (insufficient_quota / gousagelimiterror) — mark the account exhausted.
 	UpstreamErrorPermanentQuota
-	// UpstreamErrorEmptyStream: upstream 200 with no SSE events before
-	// commit. The caller retries another account; a terminal all-empty
-	// loop answers 502 upstream_stream_error, not 503 all_exhausted.
-	UpstreamErrorEmptyStream
 )
 
 // ClassifyUpstreamError is the single classification point for how an
@@ -530,6 +526,24 @@ func (l *legacyStreamWriter) commit() {
 	l.responseCommitWriter.WriteHeader(l.status)
 }
 
+// writeEmptyUpstreamStream writes the terminal 502 for an uncommitted empty
+// upstream SSE. The account is cooled down so the next request does not
+// immediately reselect it. The client and audit get a fixed safe message
+// (no upstream body or URL).
+func writeEmptyUpstreamStream(w http.ResponseWriter, r *http.Request, acc *pool.Account) {
+	acc.SetCooldown(upstreamCooldown)
+	const msg = "upstream stream closed before any event"
+	util.WriteJSON(w, http.StatusBadGateway, map[string]any{
+		"error": map[string]any{"message": msg, "code": "upstream_stream_error"},
+	})
+	if a := middleware.AuditFromCtx(r.Context()); a != nil {
+		a.Status = http.StatusBadGateway
+		a.Account = acc.Name()
+		a.ErrorType = "upstream_stream_error"
+		a.Error = msg
+	}
+}
+
 // handleUpstreamResponse processes the upstream HTTP response and writes the
 // result to the client. It owns the lifecycle of ctx (via the provided cancel)
 // and resp.Body. The third return value reports how the failure affected the
@@ -601,15 +615,28 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 		return true, nil, class
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// 5xx server error or other non-2xx: cooldown and retry.
+		// 5xx / 1xx / 3xx: cool the account down but do not switch accounts.
+		// The request may already have been accepted upstream; retrying the
+		// same POST on another account would double-submit. Same rule as
+		// util.ConnErrorRetryable for timeout/reset/EOF.
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if readErr != nil {
 			slog.Warn("failed to read upstream 5xx body", "req", requestID, "error", readErr)
 		}
 		acc.SetCooldown(upstreamCooldown)
 		slog.Warn("upstream 5xx error, cooling down", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", string(util.RedactBodyBytesWithKeys(errBody, []string{acc.Key()})), "error_type", "upstream_5xx")
-		util.RecordUpstreamRetry()
-		return false, nil, UpstreamErrorTemporary
+		util.RecordError()
+		const msg = "upstream returned a server error"
+		util.WriteJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]any{"message": msg, "code": "upstream_5xx"},
+		})
+		if a := middleware.AuditFromCtx(r.Context()); a != nil {
+			a.Status = http.StatusBadGateway
+			a.Account = acc.Name()
+			a.ErrorType = "upstream_5xx"
+			a.Error = msg
+		}
+		return true, nil, UpstreamErrorTemporary
 	}
 
 	if opts.ResponsesOut && opts.Stream {
@@ -664,13 +691,12 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 				errMsg = err.Error()
 			}
 			if !committed && errors.Is(err, stream.ErrEmptyUpstreamStream) {
-				// Empty upstream SSE before any event: the request is
-				// still uncommitted, so another account can still answer.
-				// Do not write 502 here — the retry loop decides.
-				acc.SetCooldown(upstreamCooldown)
-				slog.Warn("responses_stream empty stream, retrying another account", "req", requestID, "model", opts.Model, "account", acc.Name(), "error_type", "upstream_stream_error")
-				util.RecordUpstreamRetry()
-				return false, nil, UpstreamErrorEmptyStream
+				// Empty upstream SSE before any event: the request may
+				// already have been billed. Do not switch accounts.
+				// RecordError ran above; do not count this as a retry.
+				slog.Warn("responses_stream empty stream", "req", requestID, "model", opts.Model, "account", acc.Name(), "error_type", "upstream_stream_error")
+				writeEmptyUpstreamStream(w, r, acc)
+				return true, err, UpstreamErrorTemporary
 			}
 			if !committed {
 				// Nothing was written to the client yet (pre-first-event
@@ -842,13 +868,12 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 		}
 		if !committed {
 			// The upstream answered 2xx but closed the stream without a
-			// single event. The response is still uncommitted: cool the
-			// account down and let the caller retry another account
-			// instead of writing a terminal 502 here.
-			slog.Warn("legacy_stream empty stream, retrying another account", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "elapsed", time.Since(start), "error_type", "upstream_stream_error")
-			acc.SetCooldown(upstreamCooldown)
-			util.RecordUpstreamRetry()
-			return false, nil, UpstreamErrorEmptyStream
+			// single event. The request may already have been billed:
+			// write a terminal 502 and do not switch accounts.
+			slog.Warn("legacy_stream empty stream", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "elapsed", time.Since(start), "error_type", "upstream_stream_error")
+			util.RecordError()
+			writeEmptyUpstreamStream(w, r, acc)
+			return true, nil, UpstreamErrorTemporary
 		}
 		if cl := resp.Header.Get("Content-Length"); cl != "" {
 			slog.Debug("legacy_stream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "content_length", cl, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))

@@ -24,9 +24,8 @@ const (
 // ExhaustClass is why an account was marked exhausted. Values 0–2 match
 // proxy.UpstreamErrorClass (Temporary / PermanentCredential /
 // PermanentQuota) so ClassifyUpstreamError's exhaust outcomes can be
-// stored directly. proxy.UpstreamErrorEmptyStream is not an exhaust
-// class and must not be stored here. Probe reads this to decide
-// whether an HTTP 200 may revive the account.
+// stored directly. Probe reads this to decide whether an HTTP 200 may
+// revive the account.
 type ExhaustClass int
 
 const (

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -344,28 +345,24 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 		restore := stashSlog(h)
 		defer restore()
 
-		// Both accounts return 500, so each attempt cools the used account
-		// down for upstreamCooldown (default 30s). With the default values
-		// every retry's SelectByProvider would wait out the 30s cooldown,
-		// making this subtest ~30s (and the package >120s overall). Shrink
-		// both the cooldown and the select timeout to milliseconds: all four
-		// attempts now drain in ~600ms and the error_type stays determinis-
-		// tically all_exhausted (select timeout never fires).
-		restoreCooldown := SetUpstreamCooldownForTest(10 * time.Millisecond)
+		restoreCooldown := SetUpstreamCooldownForTest(5 * time.Second)
 		defer restoreCooldown()
-		restoreSelect := SetAccountSelectTimeoutForTest(100 * time.Millisecond)
-		defer restoreSelect()
 
-		// Two accounts so that when the first cools down, the second
-		// is available immediately — test completes in ms not seconds.
-		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var a1Hits, a2Hits int32
+		up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&a1Hits, 1)
 			w.WriteHeader(http.StatusInternalServerError)
 		}))
-		defer upstream.Close()
+		defer up1.Close()
+		up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&a2Hits, 1)
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer up2.Close()
 
 		cfg := &config.Config{Accounts: []config.AccountConfig{
-			{Name: "a1", Key: "k1", BaseURL: upstream.URL, Provider: "a"},
-			{Name: "a2", Key: "k2", BaseURL: upstream.URL, Provider: "a"},
+			{Name: "a1", Key: "k1", BaseURL: up1.URL, Provider: "a"},
+			{Name: "a2", Key: "k2", BaseURL: up2.URL, Provider: "a"},
 		}}
 		p := pool.NewPool(cfg.Accounts)
 
@@ -376,12 +373,21 @@ func TestAuditLog_ErrorTypeClassification(t *testing.T) {
 
 		ProxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
-		out := h.output()
-		if !strings.Contains(out, `"error_type":"all_exhausted"`) {
-			t.Errorf("expected error_type=all_exhausted, got: %s", out)
+		if rec.Code != http.StatusBadGateway {
+			t.Errorf("expected status 502, got %d", rec.Code)
 		}
-		if !strings.Contains(out, `"status":503`) {
-			t.Errorf("expected status=503, got: %s", out)
+		out := h.output()
+		if !strings.Contains(out, `"error_type":"upstream_5xx"`) {
+			t.Errorf("expected error_type=upstream_5xx, got: %s", out)
+		}
+		if !strings.Contains(out, `"status":502`) {
+			t.Errorf("expected status=502, got: %s", out)
+		}
+		if atomic.LoadInt32(&a2Hits) != 0 {
+			t.Errorf("second account hits = %d, want 0", a2Hits)
+		}
+		if atomic.LoadInt32(&a1Hits) != 1 {
+			t.Errorf("first account hits = %d, want 1", a1Hits)
 		}
 	})
 

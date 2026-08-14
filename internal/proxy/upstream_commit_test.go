@@ -82,25 +82,16 @@ func directResponsesStream(t *testing.T, upstreamBody string, w responseCommitWr
 		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
 	}
 	done, _, class := handleUpstreamResponse(acc, w, r, resp, nil, time.Now(), ChatForwardOpts{ResponsesOut: true, Stream: true}, "direct-commit-1", ctx, cancel)
-	if upstreamBody == "" {
-		if done {
-			t.Fatal("empty upstream stream must not be terminal; the caller retries another account")
-		}
-		if class != UpstreamErrorEmptyStream {
-			t.Fatalf("empty stream class = %d, want UpstreamErrorEmptyStream", class)
-		}
-		return aud
-	}
 	if !done {
-		t.Fatal("handleUpstreamResponse must report done for a terminal streaming response")
+		t.Fatalf("handleUpstreamResponse must report done for a terminal streaming response, class=%d", class)
 	}
 	return aud
 }
 
-// TestHandleUpstreamResponse_EmptyStreamRetries_NonConcreteWrapper
-// proves an uncommitted empty Responses stream does not write 502: the
-// handler returns retry so proxyChatWithBody can try another account.
-func TestHandleUpstreamResponse_EmptyStreamRetries_NonConcreteWrapper(t *testing.T) {
+// TestHandleUpstreamResponse_EmptyStream502_NonConcreteWrapper proves an
+// uncommitted empty Responses stream writes a terminal 502 and commits it
+// so proxyChatWithBody cannot try another account.
+func TestHandleUpstreamResponse_EmptyStream502_NonConcreteWrapper(t *testing.T) {
 	h := &capturingHandler{}
 	restore := stashSlog(h)
 	defer restore()
@@ -108,19 +99,27 @@ func TestHandleUpstreamResponse_EmptyStreamRetries_NonConcreteWrapper(t *testing
 	rec := httptest.NewRecorder()
 	w := &commitTrackWriter{inner: rec}
 
-	_ = directResponsesStream(t, "", w) // empty stream: no event was written
+	aud := directResponsesStream(t, "", w) // empty stream: no event was written
 
-	if rec.Code != 0 && rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want uncommitted (empty stream retries, no 502 yet)", rec.Code)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", rec.Code, rec.Body.String())
 	}
-	if rec.Body.Len() != 0 {
-		t.Errorf("empty stream must not write a body, got %q", rec.Body.String())
+	if code, msg := decodeErrorBody(t, rec.Body.String()); code != "upstream_stream_error" {
+		t.Errorf("error code = %q, want upstream_stream_error", code)
+	} else if msg != "upstream stream closed before any event" {
+		t.Errorf("error message = %q, want empty-stream text", msg)
 	}
-	if w.headerCalls != 0 {
-		t.Errorf("WriteHeader must not be called on empty-stream retry, got %d calls", w.headerCalls)
+	if w.headerCalls != 1 {
+		t.Errorf("WriteHeader must be called exactly once, got %d calls", w.headerCalls)
 	}
-	if w.Committed() {
-		t.Error("commit wrapper must stay uncommitted so another account can still answer")
+	if !w.Committed() {
+		t.Error("empty stream must commit the 502 so the retry loop cannot switch accounts")
+	}
+	if aud.Status != http.StatusBadGateway {
+		t.Errorf("audit status = %d, want 502", aud.Status)
+	}
+	if aud.ErrorType != "upstream_stream_error" {
+		t.Errorf("audit error_type = %q, want upstream_stream_error", aud.ErrorType)
 	}
 }
 

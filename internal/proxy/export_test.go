@@ -8,10 +8,10 @@ import (
 
 // SetUpstreamCooldownForTest overrides the upstream temporary-failure
 // cooldown (upstreamCooldown) for the duration of a test and returns a
-// restore function. Tests that drive the retry loop (5xx / connection error /
-// 429) use this to shrink the cooldown to milliseconds so the pool select
-// does not wait ~30s for cooldown expiry. Production behavior is untouched:
-// the default remains 30s.
+// restore function. Tests that drive the retry loop (connection error /
+// 429) or assert cooldown after a terminal 5xx/empty-stream use this to
+// shrink or pin the cooldown. Production behavior is untouched: the
+// default remains 30s.
 func SetUpstreamCooldownForTest(d time.Duration) func() {
 	old := upstreamCooldown
 	upstreamCooldown = d

@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.20.2  Date: 2026-08-13  Status: living document
+> Version: v0.20.3  Date: 2026-08-14  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -190,6 +190,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-14** — v0.20.3 — fix: non-idempotent POST no longer switches accounts on HTTP 5xx/1xx/3xx (same rule as `ConnErrorRetryable` for timeout/reset/EOF). The failing account still cools down; the client gets 502 `upstream_5xx` with a fixed message, not a second POST and not `all_exhausted` 503. An uncommitted empty upstream SSE (legacy and Responses) also writes a terminal 502 `upstream_stream_error` and does not fail over. `scripts/install.sh` now backups the previous binary, probes `/ready` (falling back to `/health` when the old process is already unready), and rolls back on a failed health check; `scripts/test_install.sh` covers the success, rollback, and invalid-timeout paths without touching a live unit.
 
 - **2026-08-13** — v0.20.2 — fix: eight audit follow-ups. Quota-exhausted accounts record `exhaustedAt`; a probe HTTP 200 revives them only after `QuotaReviveAfter` (default 6h; tests may set 0). SIGHUP TLS path changes warn and keep the running `tls_cert_file`/`tls_key_file` in the holder so SyncTools scheme matches the live listener. `deploy.sh` curl probes take `--max-time` (`HEALTH_CURL_MAX_TIME`, default 5, positive integer, actual timeout `min(HEALTH_CURL_MAX_TIME, HEALTH_TIMEOUT)`); a pre-restart `/ready` failure switches this round to `/health` to avoid a false rollback plus a second restart. Responses `item_reference` is rejected (same style as `previous_response_id`), not dropped. Non-idempotent POST no longer switches accounts on timeout/reset/EOF/broken pipe (`ConnErrorRetryable`); refused/DNS still fail over; a non-retryable transport error writes 502 instead of an empty body. An uncommitted empty upstream SSE cools the account and retries another; a whole loop of empty streams ends as 502 `upstream_stream_error`, not 503 `all_exhausted`. Authenticated `api_keys` rate-limit per `key:<name>` (live `holder.Load()`); missing/bad tokens stay on the IP bucket; `/health` and `/ready` remain exempt. A 499 client-disconnect audit stores a fixed `client disconnected` string, never the raw `*url.Error`.
 

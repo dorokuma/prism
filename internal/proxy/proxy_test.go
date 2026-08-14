@@ -295,15 +295,14 @@ func TestUpstreamError4xxPassthrough(t *testing.T) {
 }
 
 func TestUpstream5xxCooldown(t *testing.T) {
-	// Shrink the cooldown/select timeout so the retry loop drains in ms
-	// instead of waiting ~30s per cooldown expiry (see audit_test.go 5xx).
-	restoreCooldown := SetUpstreamCooldownForTest(10 * time.Millisecond)
+	// Keep cooldown long enough that IsInCooldown is still true after the
+	// single terminal 5xx (no retry loop).
+	restoreCooldown := SetUpstreamCooldownForTest(5 * time.Second)
 	defer restoreCooldown()
-	restoreSelect := SetAccountSelectTimeoutForTest(100 * time.Millisecond)
-	defer restoreSelect()
 
-	// Mock upstream returning 503
+	var hits int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(503)
 		w.Write([]byte(`{"error":{"message":"service unavailable"}}`))
@@ -320,15 +319,68 @@ func TestUpstream5xxCooldown(t *testing.T) {
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-4"}`), time.Now(), ChatForwardOpts{}, cfg)
 
-	// After retries, should get 503 (all accounts exhausted)
-	if rec.Code != 503 {
-		t.Errorf("expected status 503, got %d", rec.Code)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected status 502, got %d", rec.Code)
+	}
+	if code := decodeErrorCode(t, rec.Body.String()); code != "upstream_5xx" {
+		t.Errorf("error code = %q, want upstream_5xx", code)
+	}
+	if strings.Contains(rec.Body.String(), "service unavailable") {
+		t.Error("client body must not include upstream 5xx text")
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Errorf("upstream hits = %d, want 1", hits)
 	}
 
-	// Account should be in cooldown
 	accs := p.AllAccounts()
 	if !accs[0].IsInCooldown() {
 		t.Error("account should be in cooldown after 5xx")
+	}
+}
+
+func TestUpstream5xxDoesNotFailover(t *testing.T) {
+	restoreCooldown := SetUpstreamCooldownForTest(5 * time.Second)
+	defer restoreCooldown()
+
+	var aHits, bHits int32
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&aHits, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":{"message":"upstream boom"}}`))
+	}))
+	defer upA.Close()
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&bHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upB.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{
+		{Name: "a", Key: "ka", BaseURL: upA.URL, Provider: "p"},
+		{Name: "b", Key: "kb", BaseURL: upB.URL, Provider: "p"},
+	}}
+	p := pool.NewPool(cfg.Accounts)
+	rec := httptest.NewRecorder()
+	body := []byte(`{"model":"gpt-4"}`)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "p")
+
+	proxyChatWithBody(p, rec, r, body, time.Now(), ChatForwardOpts{Model: "gpt-4"}, cfg)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", rec.Code, rec.Body.String())
+	}
+	if code := decodeErrorCode(t, rec.Body.String()); code != "upstream_5xx" {
+		t.Errorf("error code = %q, want upstream_5xx", code)
+	}
+	if atomic.LoadInt32(&aHits) != 1 {
+		t.Errorf("account A hits = %d, want 1", aHits)
+	}
+	if atomic.LoadInt32(&bHits) != 0 {
+		t.Errorf("account B hits = %d, want 0", bHits)
 	}
 }
 
