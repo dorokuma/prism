@@ -123,8 +123,10 @@ func segment(requests, hits, input int64) *render.CacheStats {
 }
 
 // renderUsageTable builds the aligned detail table: one column per group_by
-// key, then 请求 / Prompt / Completion / Total / 缓存 / 费用, plus an
-// 未计价 column when at least one group contains rows without a price.
+// key (the model group uses the "模型" title, other group keys keep their
+// dynamic name), then 请求数 / 输入 tokens / 缓存命中 / 命中率 / 输出
+// tokens / 花费, plus an 未计价 column when at least one group contains
+// rows without a price. The Total column is deliberately not rendered.
 func renderUsageTable(rows []SummaryRow, groupBy []string, color bool) string {
 	hasMissing := false
 	for _, r := range rows {
@@ -135,15 +137,19 @@ func renderUsageTable(rows []SummaryRow, groupBy []string, color bool) string {
 	}
 	cols := make([]render.Column, 0, len(groupBy)+7)
 	for _, g := range groupBy {
-		cols = append(cols, render.Column{Title: g, Align: render.AlignLeft})
+		title := g
+		if g == "model" {
+			title = "模型"
+		}
+		cols = append(cols, render.Column{Title: title, Align: render.AlignLeft})
 	}
 	cols = append(cols,
-		render.Column{Title: "请求", Align: render.AlignRight},
-		render.Column{Title: "Prompt", Align: render.AlignRight},
-		render.Column{Title: "Completion", Align: render.AlignRight},
-		render.Column{Title: "Total", Align: render.AlignRight},
-		render.Column{Title: "缓存", Align: render.AlignRight},
-		render.Column{Title: "费用", Align: render.AlignRight},
+		render.Column{Title: "请求数", Align: render.AlignRight},
+		render.Column{Title: "输入 tokens", Align: render.AlignRight},
+		render.Column{Title: "缓存命中", Align: render.AlignRight},
+		render.Column{Title: "命中率", Align: render.AlignRight},
+		render.Column{Title: "输出 tokens", Align: render.AlignRight},
+		render.Column{Title: "花费", Align: render.AlignRight},
 	)
 	if hasMissing {
 		cols = append(cols, render.Column{Title: "未计价", Align: render.AlignRight})
@@ -162,9 +168,9 @@ func renderUsageTable(rows []SummaryRow, groupBy []string, color bool) string {
 		cells = append(cells,
 			render.FormatInt(r.Requests),
 			render.FormatInt(r.PromptTokens),
-			render.FormatInt(r.CompletionTokens),
-			render.FormatInt(r.TotalTokens),
 			render.FormatInt(r.CachedTokens),
+			cacheHitRate(r.CachedTokens, r.PromptTokens),
+			render.FormatInt(r.CompletionTokens),
 			render.FormatCost(r.CostUSD),
 		)
 		if hasMissing {
@@ -173,6 +179,16 @@ func renderUsageTable(rows []SummaryRow, groupBy []string, color bool) string {
 		t.Rows = append(t.Rows, cells)
 	}
 	return t.Render()
+}
+
+// cacheHitRate renders the CachedTokens/PromptTokens hit ratio with one
+// decimal ("66.7%"). A zero prompt total must show a stable "0.0%" — the
+// guard avoids NaN/Inf from a division by zero.
+func cacheHitRate(cached, prompt int64) string {
+	if prompt == 0 {
+		return "0.0%"
+	}
+	return render.FormatPercent(float64(cached), float64(prompt))
 }
 
 // formatGroupValue renders one group key value for the table. Time buckets

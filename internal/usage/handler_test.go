@@ -329,9 +329,9 @@ func TestHandlerTableFormat(t *testing.T) {
 		"  流式 2 (100.0%)   缓存命中(openai) 0 (0.0%)\n" +
 		"  ⚠ 有 1 个请求未算出金额（模型未配置单价），总费用可能偏低\n" +
 		"\n" +
-		"  model   请求   Prompt   Completion   Total   缓存     费用   未计价\n" +
-		"  a          1      100           50     150      0   $0.150        0\n" +
-		"  b          1      100           50     150      0        -        1\n"
+		"  模型   请求数   输入 tokens   缓存命中   命中率   输出 tokens     花费   未计价\n" +
+		"  a           1           100          0     0.0%            50   $0.150        0\n" +
+		"  b           1           100          0     0.0%            50        -        1\n"
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("table body mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}

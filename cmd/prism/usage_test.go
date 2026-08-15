@@ -445,7 +445,7 @@ func TestRunUsageTable(t *testing.T) {
 		t.Errorf("missing-price warning missing:\n%s", out)
 	}
 	// table: header + the three models, nil cost as dash
-	for _, want := range []string{"model", "请求", "alpha", "beta", "gamma", "  -"} {
+	for _, want := range []string{"模型", "请求数", "alpha", "beta", "gamma", "  -"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("table missing %q:\n%s", want, out)
 		}

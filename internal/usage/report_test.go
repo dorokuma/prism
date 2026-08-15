@@ -150,11 +150,15 @@ func TestRenderUsageReportStructure(t *testing.T) {
 	if !strings.Contains(got, "\n\n") {
 		t.Errorf("no blank line between summary and table:\n%s", got)
 	}
-	// Table headers.
-	for _, h := range []string{"model", "请求", "Prompt", "Completion", "Total", "缓存", "费用", "未计价"} {
+	// Table headers: model view uses the 模型 title; the Total column is
+	// gone; the 未计价 column appears because a row has unpriced requests.
+	for _, h := range []string{"模型", "请求数", "输入 tokens", "缓存命中", "命中率", "输出 tokens", "花费", "未计价"} {
 		if !strings.Contains(got, h) {
 			t.Errorf("table header %q missing:\n%s", h, got)
 		}
+	}
+	if strings.Contains(got, "Total") {
+		t.Errorf("Total column must be removed from the table:\n%s", got)
 	}
 	// nil cost renders as "-", not $0.000.
 	var glmLine string
@@ -178,9 +182,10 @@ func TestRenderUsageReportStructure(t *testing.T) {
 
 func TestRenderUsageReportAlignment(t *testing.T) {
 	// Exact-output test: the table must be aligned (CJK headers, right-
-	// aligned numbers, dashes for nil cost) and the FormatTokens trailing-
-	// zero rule must show in cells. The expected strings were verified
-	// visually for column alignment.
+	// aligned numbers, dashes for nil cost) and the hit-rate column must
+	// show cached/prompt with one decimal (deepseek 1,000,000/1,500,000 =
+	// 66.7%, glm 100,000/500,000 = 20.0%). The expected strings were
+	// verified visually for column alignment.
 	ov := &Overview{Requests: 1783, PromptTokens: 2_000_000, CompletionTokens: 230_000, TotalTokens: 2_230_000, CachedTokens: 1_100_000, TotalCost: ptr64(0.836), CostMissingRequests: 3, FailedRequests: 12, StreamingRequests: 1690, OpenAIRequests: 1783, OpenAIPromptTokens: 2_000_000, OpenAICachedTokens: 1_100_000}
 	rows := []SummaryRow{
 		{Groups: map[string]any{"model": "deepseek-v4-pro"}, Requests: 1500, PromptTokens: 1_500_000, CompletionTokens: 200_000, TotalTokens: 1_700_000, CachedTokens: 1_000_000, CostUSD: ptr64(0.65)},
@@ -190,9 +195,9 @@ func TestRenderUsageReportAlignment(t *testing.T) {
 		"  失败 12 (0.7%)   流式 1,690 (94.8%)   缓存命中(openai) 1.1M (55.0%)\n" +
 		"  ⚠ 有 3 个请求未算出金额（模型未配置单价），总费用可能偏低\n" +
 		"\n" +
-		"  model              请求      Prompt   Completion       Total        缓存     费用   未计价\n" +
-		"  deepseek-v4-pro   1,500   1,500,000      200,000   1,700,000   1,000,000   $0.650        0\n" +
-		"  glm-5.2             283     500,000       30,000     530,000     100,000        -        3\n"
+		"  模型              请求数   输入 tokens    缓存命中   命中率   输出 tokens     花费   未计价\n" +
+		"  deepseek-v4-pro    1,500     1,500,000   1,000,000    66.7%       200,000   $0.650        0\n" +
+		"  glm-5.2              283       500,000     100,000    20.0%        30,000        -        3\n"
 	if got := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{Period: "今天"}); got != want {
 		t.Fatalf("RenderUsageReport mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}
@@ -223,6 +228,60 @@ func TestRenderUsageReportColor(t *testing.T) {
 	// Both render the same visible text once ANSI is stripped.
 	if render.StripANSI(colored) != plain {
 		t.Errorf("color must not change the visible text\nplain: %q\ncolored: %q", plain, colored)
+	}
+}
+
+// TestRenderUsageTableHitRateAndGroupTitles pins the per-view table
+// contract: the model view titles its first column 模型, every other group_by
+// view keeps the dynamic first-column name, the hit-rate column shows
+// CachedTokens/PromptTokens with one decimal, and a zero prompt total
+// renders a stable 0.0% — never NaN/Inf.
+func TestRenderUsageTableHitRateAndGroupTitles(t *testing.T) {
+	rows := []SummaryRow{
+		{Groups: map[string]any{"model": "m1"}, Requests: 1, PromptTokens: 1000, CachedTokens: 968, CompletionTokens: 100, CostUSD: ptr64(0.1)},
+	}
+	// Model view: 模型 title, hit rate 968/1000 = 96.8%, no Total column.
+	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{Period: "x"})
+	for _, want := range []string{"模型", "请求数", "输入 tokens", "缓存命中", "96.8%", "输出 tokens", "花费"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("model view missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Total") {
+		t.Errorf("Total column must be gone from the model view:\n%s", got)
+	}
+
+	// Other group views keep the dynamic first-column name.
+	got = RenderUsageReport(&Overview{}, rows, []string{"provider"}, ReportOptions{Period: "x"})
+	if !strings.Contains(got, "provider") {
+		t.Errorf("provider view must keep the dynamic first column:\n%s", got)
+	}
+	if strings.Contains(got, "模型") {
+		t.Errorf("provider view must not use the 模型 title:\n%s", got)
+	}
+
+	// Zero prompt tokens: stable 0.0% regardless of cached tokens, never
+	// NaN/Inf (cached=5 with prompt=0 would otherwise divide by zero).
+	rows = []SummaryRow{
+		{Groups: map[string]any{"model": "m0"}, Requests: 1, PromptTokens: 0, CachedTokens: 5, CompletionTokens: 0},
+	}
+	got = RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{Period: "x"})
+	for _, bad := range []string{"NaN", "Inf"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("zero-prompt hit rate must not render %q:\n%s", bad, got)
+		}
+	}
+	if !strings.Contains(got, "0.0%") {
+		t.Errorf("zero-prompt hit rate must render 0.0%%:\n%s", got)
+	}
+
+	// Zero cached with a non-zero prompt also renders one-decimal 0.0%.
+	rows = []SummaryRow{
+		{Groups: map[string]any{"model": "m1"}, Requests: 1, PromptTokens: 100, CachedTokens: 0, CompletionTokens: 10},
+	}
+	got = RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{Period: "x"})
+	if !strings.Contains(got, "0.0%") {
+		t.Errorf("zero-cached hit rate must render 0.0%%:\n%s", got)
 	}
 }
 
