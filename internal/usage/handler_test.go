@@ -310,10 +310,11 @@ func seedTableEvents(t *testing.T) *SummaryHandler {
 }
 
 // TestHandlerTableFormat is the acceptance test for format=table: the
-// response is text/plain with the aligned table, the summary header comes
-// from Overview (total 300 tokens across both models), the missing-price
-// request is warned about, the nil cost renders as a dash, and the JSON
-// default behavior is untouched (the existing JSON tests still pass).
+// response is text/plain with the compact single-line table, the summary
+// header comes from Overview (total 300 tokens across both models), the
+// missing-price request is warned about, the nil cost renders as a dash,
+// and the JSON default behavior is untouched (the existing JSON tests
+// still pass).
 func TestHandlerTableFormat(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	h := seedTableEvents(t)
@@ -325,20 +326,21 @@ func TestHandlerTableFormat(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
 		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
-	want := "  全部时间  ·  2 请求  ·  300 token  ·  $0.150\n" +
+	// widths: 模型 4 | 请求 4 | 输入词元 8 | 缓存 4 | 命中率 6 | 输出词元 8 | 花费 5 | 未计价 6
+	want := "  全部时间  ·  2 请求  ·  300 词元  ·  $0.150\n" +
 		"  流式 2 (100.0%)   缓存命中(openai) 0 (0.0%)\n" +
 		"  ⚠ 有 1 个请求未算出金额（模型未配置单价），总费用可能偏低\n" +
 		"\n" +
-		"  模型   请求数   输入 tokens   缓存命中   命中率   输出 tokens     花费   未计价\n" +
-		"  a           1           100          0     0.0%            50   $0.150        0\n" +
-		"  b           1           100          0     0.0%            50        -        1\n"
+		"  模型" + strings.Repeat(" ", 1) + "请求 输入词元 缓存 命中率 输出词元  花费 未计价\n" +
+		"  a" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 6) + "100" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%" + strings.Repeat(" ", 7) + "50 $0.15" + strings.Repeat(" ", 6) + "0\n" +
+		"  b" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 6) + "100" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%" + strings.Repeat(" ", 7) + "50" + strings.Repeat(" ", 5) + "-" + strings.Repeat(" ", 6) + "1\n"
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("table body mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}
 
 	// format=table must be equivalent to the CLI renderer: the summary
 	// counts come from Overview (not from the LIMIT-truncated rows).
-	if !strings.Contains(rec.Body.String(), "2 请求  ·  300 token") {
+	if !strings.Contains(rec.Body.String(), "2 请求  ·  300 词元") {
 		t.Errorf("table summary must come from Overview:\n%s", rec.Body.String())
 	}
 }
@@ -412,6 +414,9 @@ func TestHandlerTableNoData(t *testing.T) {
 	}
 }
 
+// TestHandlerTableFormatValidation pins format=table validation: the
+// format value is case-insensitive, anything else is a 400, an invalid
+// group_by still 400s, and auth is unchanged for table output.
 func TestHandlerTableFormatValidation(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	h := seedTableEvents(t)

@@ -163,6 +163,9 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 			return writeUsageJSON(out, q, period, ov, rows)
 		}
 		color := wantColor(out, o.noColor)
+		// The compact single-line table is the default and only layout: it
+		// never depends on the terminal width, so --watch redraws are
+		// stable and non-TTY output (e.g. a π panel capture) is identical.
 		_, err = io.WriteString(out, usage.RenderUsageReport(ov, rows, q.GroupBy, usage.ReportOptions{
 			Period: period,
 			Color:  color,
@@ -430,7 +433,7 @@ func wantColor(out io.Writer, noColor bool) bool {
 func printUsageHelp(fs *flag.FlagSet) {
 	fmt.Fprintf(fs.Output(), `用法: prism usage [preset] [flags]
 
-统计 token 用量。直接以只读方式读取 usage 数据库（WAL + mode=ro），
+统计词元用量。直接以只读方式读取 usage 数据库（WAL + mode=ro），
 prism 服务未运行也能查询历史，服务运行中查询不干扰写入。
 
 preset（预设分组，不用记 group_by）:

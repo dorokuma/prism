@@ -44,7 +44,7 @@ type Summary struct {
 
 // RenderSummary renders s as two indented lines:
 //
-//	{Period}  ·  {requests} 请求  ·  {tokens} token  ·  {cost}
+//	{Period}  ·  {requests} 请求  ·  {tokens} 词元  ·  {cost}
 //	失败 {n} ({pct})   流式 {n} ({pct})   缓存命中(openai) {tokens} ({pct})   缓存命中(anthropic) {tokens} ({pct})
 //
 // The failure segment is omitted when Failures is zero. The failure and
@@ -60,7 +60,7 @@ func RenderSummary(s Summary) string {
 	b.WriteString(FormatInt(s.Requests))
 	b.WriteString(" 请求  ·  ")
 	b.WriteString(FormatTokens(s.Tokens))
-	b.WriteString(" token  ·  ")
+	b.WriteString(" 词元  ·  ")
 	b.WriteString(FormatCost(s.Cost))
 	b.WriteByte('\n')
 

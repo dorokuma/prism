@@ -41,7 +41,7 @@ func runQuotaWith(args []string, out io.Writer) error {
 
 查询上游套餐用量（当前：OpenCode Go 的短期 / 中期 / 长期窗口）。
 不依赖 prism 服务进程，直接用 config 里的账号 key 请求上游。
-这不是 prism usage 的本地 token 账本。
+这不是 prism usage 的本地词元账本。
 
 flags:
 `)

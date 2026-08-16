@@ -16,7 +16,7 @@ func TestRenderSummaryExample(t *testing.T) {
 		Streaming: 1690,
 		OpenAI:    &CacheStats{Hits: 1_100_000, Input: 2_200_000},
 	}
-	want := "  今天 08-10  ·  1,783 请求  ·  2.23M token  ·  $0.836\n" +
+	want := "  今天 08-10  ·  1,783 请求  ·  2.23M 词元  ·  $0.836\n" +
 		"  失败 12 (0.7%)   流式 1,690 (94.8%)   缓存命中(openai) 1.1M (50.0%)\n"
 	if got := RenderSummary(s); got != want {
 		t.Fatalf("RenderSummary mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
@@ -34,7 +34,7 @@ func TestRenderSummarySkipsZeroFailures(t *testing.T) {
 	if strings.Contains(got, "缓存命中") {
 		t.Errorf("families with no requests must render no cache segment, got %q", got)
 	}
-	want := "  x  ·  100 请求  ·  0 token  ·  -\n  流式 10 (10.0%)\n"
+	want := "  x  ·  100 请求  ·  0 词元  ·  -\n  流式 10 (10.0%)\n"
 	if got != want {
 		t.Fatalf("RenderSummary mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}

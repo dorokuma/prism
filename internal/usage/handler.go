@@ -97,8 +97,10 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // serveTable renders the format=table response: the summary header comes
 // from Overview (never from summing the LIMIT-truncated rows) and the detail
-// table shares RenderUsageReport with the CLI, so both outputs are produced
-// by the same code.
+// section shares RenderUsageReport with the CLI, so both outputs are
+// produced by the same code. The compact single-line table is the only
+// layout — there are no layout/width params and no terminal-width
+// dependency.
 func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q SummaryQuery) {
 	ov, err := h.Store.Overview(r.Context(), q)
 	if err != nil {

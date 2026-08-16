@@ -76,9 +76,12 @@ type ReportOptions struct {
 // RenderUsageReport renders the summary block (taken from Overview — never
 // from summing the grouped rows, because a truncated LIMIT would make the
 // totals look small), an optional missing-cost warning line, a blank line
-// and the grouped detail table. It is the single implementation behind both
-// the prism usage CLI and the HTTP format=table output, so the two outputs
-// can never drift apart.
+// and the grouped detail table. The detail section is the compact
+// single-line table by default — one row per group, short headers, a
+// one-space column gap and compact numbers — and never depends on the
+// terminal width or switches to another layout. It is the single
+// implementation behind both the prism usage CLI and the HTTP format=table
+// output, so the two outputs can never drift apart.
 func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts ReportOptions) string {
 	var b strings.Builder
 	b.WriteString(render.RenderSummary(render.Summary{
@@ -106,7 +109,8 @@ func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts R
 			render.FormatInt(ov.CostMissingRequests))
 	}
 	b.WriteByte('\n')
-	b.WriteString(renderUsageTable(rows, groupBy, opts.Color))
+	cols, cells := usageTableData(rows, groupBy)
+	b.WriteString(renderUsageTable(cols, cells, opts.Color))
 	return b.String()
 }
 
@@ -122,12 +126,17 @@ func segment(requests, hits, input int64) *render.CacheStats {
 	return &render.CacheStats{Hits: hits, Input: input}
 }
 
-// renderUsageTable builds the aligned detail table: one column per group_by
-// key (the model group uses the "模型" title, other group keys keep their
-// dynamic name), then 请求数 / 输入 tokens / 缓存命中 / 命中率 / 输出
-// tokens / 花费, plus an 未计价 column when at least one group contains
-// rows without a price. The Total column is deliberately not rendered.
-func renderUsageTable(rows []SummaryRow, groupBy []string, color bool) string {
+// usageTableData builds the detail section's column definitions and cell
+// rows from the summary rows: one column per group_by key (the model group
+// uses the "模型" title, other group keys keep their short name), then
+// 请求 / 输入词元 / 缓存 / 命中率 / 输出词元 / 花费, plus an 未计价 column
+// when at least one group contains rows without a price. The Total column
+// is deliberately not rendered. Request/token cells use the compact k/M
+// notation (display precision only — the stored aggregates are unchanged),
+// the cost cell uses the compact cost format. Group values are never
+// truncated: the group column is sized to its widest cell, so model names
+// and other group values render in full.
+func usageTableData(rows []SummaryRow, groupBy []string) ([]render.Column, [][]string) {
 	hasMissing := false
 	for _, r := range rows {
 		if r.CostMissingRequests > 0 {
@@ -144,40 +153,57 @@ func renderUsageTable(rows []SummaryRow, groupBy []string, color bool) string {
 		cols = append(cols, render.Column{Title: title, Align: render.AlignLeft})
 	}
 	cols = append(cols,
-		render.Column{Title: "请求数", Align: render.AlignRight},
-		render.Column{Title: "输入 tokens", Align: render.AlignRight},
-		render.Column{Title: "缓存命中", Align: render.AlignRight},
+		render.Column{Title: "请求", Align: render.AlignRight},
+		render.Column{Title: "输入词元", Align: render.AlignRight},
+		render.Column{Title: "缓存", Align: render.AlignRight},
 		render.Column{Title: "命中率", Align: render.AlignRight},
-		render.Column{Title: "输出 tokens", Align: render.AlignRight},
+		render.Column{Title: "输出词元", Align: render.AlignRight},
 		render.Column{Title: "花费", Align: render.AlignRight},
 	)
 	if hasMissing {
 		cols = append(cols, render.Column{Title: "未计价", Align: render.AlignRight})
 	}
+	cells := make([][]string, 0, len(rows))
+	for _, r := range rows {
+		row := make([]string, 0, len(cols))
+		for _, g := range groupBy {
+			row = append(row, formatGroupValue(g, r.Groups[g]))
+		}
+		row = append(row,
+			formatRequests(r.Requests),
+			render.FormatTokens(r.PromptTokens),
+			render.FormatTokens(r.CachedTokens),
+			cacheHitRate(r.CachedTokens, r.PromptTokens),
+			render.FormatTokens(r.CompletionTokens),
+			render.FormatCostCompact(r.CostUSD),
+		)
+		if hasMissing {
+			row = append(row, render.FormatInt(r.CostMissingRequests))
+		}
+		cells = append(cells, row)
+	}
+	return cols, cells
+}
+
+// formatRequests renders a request count with the same compact k/M
+// notation render.FormatTokens uses. The shared formatter is token-named,
+// but its algorithm is a generic count formatter; this wrapper gives the
+// request column a semantically honest name without duplicating the
+// algorithm.
+func formatRequests(n int64) string {
+	return render.FormatTokens(n)
+}
+
+// renderUsageTable renders the compact single-line detail table from
+// pre-built columns and cells: a two-space left indent (aligned with the
+// summary and warning lines above) and a one-space column gap.
+func renderUsageTable(cols []render.Column, cells [][]string, color bool) string {
 	if color {
 		for i := range cols {
 			cols[i].Title = "\x1b[1m" + cols[i].Title + "\x1b[0m"
 		}
 	}
-	t := &render.Table{Columns: cols, Color: color}
-	for _, r := range rows {
-		cells := make([]string, 0, len(cols))
-		for _, g := range groupBy {
-			cells = append(cells, formatGroupValue(g, r.Groups[g]))
-		}
-		cells = append(cells,
-			render.FormatInt(r.Requests),
-			render.FormatInt(r.PromptTokens),
-			render.FormatInt(r.CachedTokens),
-			cacheHitRate(r.CachedTokens, r.PromptTokens),
-			render.FormatInt(r.CompletionTokens),
-			render.FormatCost(r.CostUSD),
-		)
-		if hasMissing {
-			cells = append(cells, render.FormatInt(r.CostMissingRequests))
-		}
-		t.Rows = append(t.Rows, cells)
-	}
+	t := &render.Table{Columns: cols, Color: color, Rows: cells, Indent: "  ", Gap: " "}
 	return t.Render()
 }
 

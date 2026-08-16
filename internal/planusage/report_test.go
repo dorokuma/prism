@@ -4,9 +4,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dorokuma/prism/internal/render"
 )
 
-func TestRenderTableAtMobile(t *testing.T) {
+func TestRenderTableTable(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h2 := now.Add(2*time.Hour + 13*time.Minute)
 	d3 := now.Add(3*24*time.Hour + 4*time.Hour)
@@ -32,15 +34,13 @@ func TestRenderTableAtMobile(t *testing.T) {
 		},
 	}, now)
 	want := "" +
-		"  go-1\n" +
-		"  短期   12%  2h13m\n" +
-		"  中期    8%  3d4h\n" +
-		"  长期   40%  12d\n" +
-		"\n" +
-		"  go-2\n" +
-		"  短期  100%  2h13m  限流\n" +
-		"  中期   30%  3d4h\n" +
-		"  长期   55%  12d\n"
+		"  账号 窗口 状态 占用  重置 限额估算\n" +
+		"  go-1 短期 ok    12% 2h13m        -\n" +
+		"  go-1 中期 ok     8%  3d4h        -\n" +
+		"  go-1 长期 ok    40%   12d        -\n" +
+		"  go-2 短期 限流 100% 2h13m        -\n" +
+		"  go-2 中期 ok    30%  3d4h        -\n" +
+		"  go-2 长期 ok    55%   12d        -\n"
 	if got != want {
 		t.Fatalf("layout\ngot:\n%s\nwant:\n%s", got, want)
 	}
@@ -49,9 +49,6 @@ func TestRenderTableAtMobile(t *testing.T) {
 	}
 	var winLines []string
 	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
-		if dw := dispWidth(line); dw > 40 {
-			t.Errorf("line too wide for phone (%d cols): %q", dw, line)
-		}
 		if strings.Contains(line, "%") {
 			winLines = append(winLines, line)
 		}
@@ -60,8 +57,10 @@ func TestRenderTableAtMobile(t *testing.T) {
 		t.Fatalf("window lines: %q", winLines)
 	}
 	pctCol := colOf(winLines[0], "%")
-	remainCol := colOf(winLines[0], "2h13m")
-	if pctCol < 0 || remainCol < 0 {
+	// The remain column is right-aligned, so the token's right edge is the
+	// stable anchor, not its start.
+	remainEnd := colOf(winLines[0], "2h13m") + render.DisplayWidth("2h13m")
+	if pctCol < 0 || remainEnd < 0 {
 		t.Fatalf("anchor missing: %q", winLines[0])
 	}
 	for _, line := range winLines {
@@ -75,8 +74,8 @@ func TestRenderTableAtMobile(t *testing.T) {
 			t.Errorf("%q: no remain", line)
 			continue
 		}
-		if c := colOf(line, tok[0]); c != remainCol {
-			t.Errorf("%q: remain %q at col %d, want %d", line, tok[0], c, remainCol)
+		if end := colOf(line, tok[0]) + render.DisplayWidth(tok[0]); end != remainEnd {
+			t.Errorf("%q: remain %q ends at col %d, want %d", line, tok[0], end, remainEnd)
 		}
 	}
 }
@@ -88,7 +87,10 @@ func TestRenderTableSplitsAccounts(t *testing.T) {
 		Accounts: []string{"a1", "a2"},
 		Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 1}},
 	}}, now)
-	want := "  a1\n  短期    1%  -\n\n  a2\n  短期    1%  -\n"
+	want := "" +
+		"  账号 窗口 状态 占用 重置 限额估算\n" +
+		"  a1   短期 ok     1%    -        -\n" +
+		"  a2   短期 ok     1%    -        -\n"
 	if got != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
 	}
@@ -99,7 +101,7 @@ func colOf(s, sub string) int {
 	if i < 0 {
 		return -1
 	}
-	return dispWidth(s[:i])
+	return render.DisplayWidth(s[:i])
 }
 
 func TestRenderTableAtErrorAndStale(t *testing.T) {
@@ -109,8 +111,15 @@ func TestRenderTableAtErrorAndStale(t *testing.T) {
 		Accounts: []string{"a1"},
 		Err:      "unauthorized",
 	}}, now)
-	if got != "  a1\n  unauthorized\n" {
+	if got != "  a1\n  a1: unauthorized\n" {
 		t.Fatalf("error card: %q", got)
+	}
+	got = RenderTableAt([]Snapshot{{
+		Provider: "opencode-go",
+		Accounts: []string{"a1"},
+	}}, now)
+	if got != "  a1\n" {
+		t.Fatalf("empty-window snapshot: %q", got)
 	}
 	h := now.Add(45 * time.Minute)
 	got = RenderTableAt([]Snapshot{{
@@ -120,6 +129,62 @@ func TestRenderTableAtErrorAndStale(t *testing.T) {
 	}}, now)
 	if !strings.Contains(got, "旧") || !strings.Contains(got, "45m") {
 		t.Fatalf("stale card: %q", got)
+	}
+	got = RenderTableAt([]Snapshot{{
+		Provider: "opencode-go",
+		Accounts: []string{"a1"},
+		Err:      "fetch_failed",
+		Stale:    true,
+		Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 3, ResetsAt: &h}},
+	}}, now)
+	if !strings.Contains(got, "a1 旧: fetch_failed") || !strings.Contains(got, "3%") {
+		t.Fatalf("stale+error attribution: %q", got)
+	}
+}
+
+// TestRenderTableErrorAttribution pins the per-account error ownership:
+// stale snapshots that still carry windows must not degrade into bare,
+// indistinguishable error lines — each error keeps its provider/account.
+func TestRenderTableErrorAttribution(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	h := now.Add(45 * time.Minute)
+	got := RenderTableAt([]Snapshot{
+		{
+			Provider: "opencode-go",
+			Accounts: []string{"a1"},
+			Stale:    true,
+			Err:      "fetch_failed",
+			Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 3, ResetsAt: &h}},
+		},
+		{
+			Provider: "acme",
+			Accounts: []string{"b2"},
+			Stale:    true,
+			Err:      "timeout",
+			Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 7, ResetsAt: &h}},
+		},
+	}, now)
+	// Each error line carries its own provider/account attribution.
+	for _, s := range []string{"opencode-go/a1 旧: fetch_failed", "acme/b2 旧: timeout"} {
+		if !strings.Contains(got, s) {
+			t.Fatalf("error attribution %q missing:\n%s", s, got)
+		}
+	}
+	// No bare error line may survive without its attribution.
+	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
+		if strings.Contains(line, "fetch_failed") && !strings.Contains(line, "opencode-go/a1 旧: ") {
+			t.Fatalf("bare error line: %q", line)
+		}
+		if strings.Contains(line, "timeout") && !strings.Contains(line, "acme/b2 旧: ") {
+			t.Fatalf("bare error line: %q", line)
+		}
+	}
+	// Normal window rows and the stale markers are preserved.
+	if !strings.Contains(got, "opencode-go/a1 旧") || !strings.Contains(got, "acme/b2 旧") {
+		t.Fatalf("stale markers missing:\n%s", got)
+	}
+	if !strings.Contains(got, "3%") || !strings.Contains(got, "7%") {
+		t.Fatalf("window rows missing:\n%s", got)
 	}
 }
 
@@ -148,17 +213,75 @@ func TestFormatRemain(t *testing.T) {
 	}
 }
 
-func TestRenderTableEmpty(t *testing.T) {
-	if RenderTable(nil) != "  没有套餐数据\n" {
-		t.Fatal(RenderTable(nil))
+func TestRenderTableEstimateColumn(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	got := RenderTableAt([]Snapshot{{
+		Provider: "opencode-go",
+		Accounts: []string{"a1"},
+		Windows: []Window{
+			{Name: "rolling", Status: "ok", Percent: 12, LimitUSDEstimate: 12, USDStatus: "estimated"},
+			{Name: "weekly", Status: "ok", Percent: 8, LimitUSDEstimate: 30, USDStatus: "estimated"},
+			{Name: "monthly", Status: "ok", Percent: 40, LimitUSDEstimate: 60, USDStatus: "confirmed"},
+			{Name: "custom", Status: "ok", Percent: 5},
+		},
+	}}, now)
+	if !strings.Contains(got, "$12.00") || !strings.Contains(got, "$30.00") {
+		t.Fatalf("estimates missing:\n%s", got)
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
+		if strings.Contains(line, "长期") || strings.Contains(line, "custom") {
+			if strings.Contains(line, "$") {
+				t.Fatalf("non-estimated window showed dollars: %q", line)
+			}
+		}
 	}
 }
 
-func TestDispWidthAndPad(t *testing.T) {
-	if dispWidth("短期") != 4 || dispWidth("中期") != 4 || dispWidth("长期") != 4 || dispWidth("限流") != 4 {
-		t.Fatalf("widths 短期=%d 中期=%d 长期=%d 限流=%d", dispWidth("短期"), dispWidth("中期"), dispWidth("长期"), dispWidth("限流"))
+func TestRenderTableProviderPrefix(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	win := []Window{{Name: "rolling", Status: "ok", Percent: 1}}
+	got := RenderTableAt([]Snapshot{
+		{Provider: "opencode-go", Accounts: []string{"a1"}, Windows: win},
+		{Provider: "acme", Accounts: []string{"a1"}, Windows: win},
+	}, now)
+	if !strings.Contains(got, "opencode-go/a1") || !strings.Contains(got, "acme/a1") {
+		t.Fatalf("provider prefix missing:\n%s", got)
 	}
-	if padRight("中期", 4) != "中期" || padLeft("8%", 4) != "  8%" {
-		t.Fatalf("pad %q %q", padRight("中期", 4), padLeft("8%", 4))
+	// Same provider: account names alone are enough.
+	got = RenderTableAt([]Snapshot{
+		{Provider: "opencode-go", Accounts: []string{"a1"}, Windows: win},
+		{Provider: "opencode-go", Accounts: []string{"b2"}, Windows: win},
+	}, now)
+	if strings.Contains(got, "opencode-go/a1") || strings.Contains(got, "opencode-go/b2") {
+		t.Fatalf("unneeded provider prefix:\n%s", got)
+	}
+	if !strings.Contains(got, "a1") || !strings.Contains(got, "b2") {
+		t.Fatalf("accounts missing:\n%s", got)
+	}
+}
+
+func TestRenderTableLongNamesInFull(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	got := RenderTableAt([]Snapshot{{
+		Provider: "opencode-go",
+		Accounts: []string{"账户名称很长很长很长"},
+		Windows: []Window{
+			{Name: "super-long-window-name-for-testing", Status: "ok", Percent: 1},
+			{Name: "", Status: "ok", Percent: 2},
+		},
+	}}, now)
+	for _, s := range []string{"账户名称很长很长很长", "super-long-window-name-for-testing", "--"} {
+		if !strings.Contains(got, s) {
+			t.Fatalf("%q not rendered in full:\n%s", s, got)
+		}
+	}
+	if strings.Contains(got, "…") {
+		t.Fatalf("truncated: %s", got)
+	}
+}
+
+func TestRenderTableEmpty(t *testing.T) {
+	if RenderTable(nil) != "  没有套餐数据\n" {
+		t.Fatal(RenderTable(nil))
 	}
 }

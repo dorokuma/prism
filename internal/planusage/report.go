@@ -4,31 +4,45 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode"
+
+	"github.com/dorokuma/prism/internal/render"
 )
 
-// Phone cards stay inside ~40 display columns. Columns are padded by
-// terminal cell width (CJK = 2), not by Go's %s rune count.
-const (
-	labelMinCols = 2
-	pctCols      = 4
-	reportIndent = "  "
-)
+const reportIndent = "  "
 
-// RenderTable is the default CLI / format=table report. It is stacked for
-// a ~40-column phone terminal: no header row, no ISO timestamps.
+// RenderTable is the default CLI / format=table report. It is a compact
+// single-line table with the same visual rules as the usage report: every
+// output block is indented two spaces, columns are separated by one space,
+// each window is one row, names render in full (never truncated) and the
+// layout never depends on the terminal width.
 func RenderTable(snaps []Snapshot) string {
 	return RenderTableAt(snaps, time.Now())
 }
 
-// RenderTableAt is RenderTable with an injectable clock (tests).
-// Each account is its own card. Load-balanced plans are never merged.
+// RenderTableAt is RenderTable with an injectable clock (tests). Each
+// window is one row with the account repeated; load-balanced plans are
+// never merged. Snapshots without windows keep the account line and the
+// error line, if any. Error lines always carry the account attribution
+// ("  provider/account: fetch_failed") so failures from different
+// accounts stay distinguishable.
 func RenderTableAt(snaps []Snapshot, now time.Time) string {
 	if len(snaps) == 0 {
 		return "  没有套餐数据\n"
 	}
-	var b strings.Builder
-	first := true
+
+	cols := []render.Column{
+		{Title: "账号", Align: render.AlignLeft},
+		{Title: "窗口", Align: render.AlignLeft},
+		{Title: "状态", Align: render.AlignLeft},
+		{Title: "占用", Align: render.AlignRight},
+		{Title: "重置", Align: render.AlignRight},
+		{Title: "限额估算", Align: render.AlignRight},
+	}
+
+	var rows [][]string
+	var notes strings.Builder
+
+	multiProvider := hasMultipleProviders(snaps)
 	for _, s := range snaps {
 		titles := s.Accounts
 		if len(titles) == 0 {
@@ -39,52 +53,69 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 			titles = []string{title}
 		}
 		for _, title := range titles {
-			if !first {
-				b.WriteByte('\n')
+			account := accountCell(s, title, multiProvider)
+			if len(s.Windows) == 0 {
+				notes.WriteString(reportIndent + account + "\n")
+				if s.Err != "" {
+					notes.WriteString(reportIndent + account + ": " + s.Err + "\n")
+				}
+				continue
 			}
-			first = false
-			writeCard(&b, title, s, now)
+			if s.Err != "" {
+				notes.WriteString(reportIndent + account + ": " + s.Err + "\n")
+			}
+			for _, w := range s.Windows {
+				rows = append(rows, []string{
+					account,
+					windowLabel(w.Name),
+					statusLabel(w.Status),
+					fmt.Sprintf("%d%%", w.Percent),
+					formatRemain(now, w.ResetsAt),
+					formatEstimate(w),
+				})
+			}
 		}
 	}
+
+	var b strings.Builder
+	if len(rows) > 0 {
+		t := &render.Table{Columns: cols, Rows: rows, Indent: reportIndent, Gap: " "}
+		b.WriteString(t.Render())
+	}
+	b.WriteString(notes.String())
 	return b.String()
 }
 
-func writeCard(b *strings.Builder, title string, s Snapshot, now time.Time) {
+// hasMultipleProviders reports whether the snapshots span more than one
+// provider; the account cell then prefixes the provider so sources stay
+// distinguishable.
+func hasMultipleProviders(snaps []Snapshot) bool {
+	seen := ""
+	for _, s := range snaps {
+		if s.Provider == "" {
+			continue
+		}
+		if seen != "" && s.Provider != seen {
+			return true
+		}
+		if seen == "" {
+			seen = s.Provider
+		}
+	}
+	return false
+}
+
+// accountCell is the first-column value for one account. A stale snapshot
+// keeps the 旧 marker, and a multi-provider report prefixes the provider.
+func accountCell(s Snapshot, title string, multiProvider bool) string {
+	account := title
+	if multiProvider && s.Provider != "" {
+		account = s.Provider + "/" + title
+	}
 	if s.Stale {
-		title += "  旧"
+		account += " 旧"
 	}
-	b.WriteString(reportIndent)
-	b.WriteString(title)
-	b.WriteByte('\n')
-	if s.Err != "" && len(s.Windows) == 0 {
-		b.WriteString(reportIndent)
-		b.WriteString(s.Err)
-		b.WriteByte('\n')
-		return
-	}
-	if s.Err != "" {
-		b.WriteString(reportIndent)
-		b.WriteString(s.Err)
-		b.WriteByte('\n')
-	}
-	labelW := labelMinCols
-	for _, w := range s.Windows {
-		if dw := dispWidth(windowLabel(w.Name)); dw > labelW {
-			labelW = dw
-		}
-	}
-	for _, w := range s.Windows {
-		label := padRight(windowLabel(w.Name), labelW)
-		pct := padLeft(fmt.Sprintf("%d%%", w.Percent), pctCols)
-		remain := formatRemain(now, w.ResetsAt)
-		line := label + "  " + pct + "  " + remain
-		if w.Status == "rate-limited" {
-			line += "  限流"
-		}
-		b.WriteString(reportIndent)
-		b.WriteString(line)
-		b.WriteByte('\n')
-	}
+	return account
 }
 
 func windowLabel(name string) string {
@@ -101,6 +132,30 @@ func windowLabel(name string) string {
 		}
 		return name
 	}
+}
+
+// statusLabel keeps the established 限流 marker for rate-limited windows
+// and passes every other upstream status through unchanged.
+func statusLabel(status string) string {
+	switch status {
+	case "rate-limited":
+		return "限流"
+	case "":
+		return "-"
+	default:
+		return status
+	}
+}
+
+// formatEstimate renders the window quota limit: LimitUSDEstimate is the
+// upstream's documented dollar limit for the window, not the current
+// spend. It shows the field only when the upstream marks it estimated —
+// never a real spend figure.
+func formatEstimate(w Window) string {
+	if w.LimitUSDEstimate > 0 && w.USDStatus == "estimated" {
+		return fmt.Sprintf("$%d.00", w.LimitUSDEstimate)
+	}
+	return "-"
 }
 
 func formatRemain(now time.Time, at *time.Time) string {
@@ -132,50 +187,4 @@ func formatRemain(now time.Time, at *time.Time) string {
 		return fmt.Sprintf("%dd", days)
 	}
 	return fmt.Sprintf("%dd%dh", days, hours)
-}
-
-func dispWidth(s string) int {
-	n := 0
-	for _, r := range s {
-		n += runeDispWidth(r)
-	}
-	return n
-}
-
-func runeDispWidth(r rune) int {
-	switch {
-	case r == 0 || r < ' ':
-		return 0
-	case r < 0x7F:
-		return 1
-	case unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || unicode.Is(unicode.Cf, r):
-		return 0
-	case unicode.Is(unicode.Han, r),
-		unicode.Is(unicode.Hangul, r),
-		unicode.Is(unicode.Hiragana, r),
-		unicode.Is(unicode.Katakana, r):
-		return 2
-	case r >= 0x3000 && r <= 0x303F, // CJK punctuation
-		r >= 0xFF01 && r <= 0xFF60, // fullwidth forms
-		r >= 0xFFE0 && r <= 0xFFE6:
-		return 2
-	default:
-		return 1
-	}
-}
-
-func padRight(s string, w int) string {
-	n := dispWidth(s)
-	if n >= w {
-		return s
-	}
-	return s + strings.Repeat(" ", w-n)
-}
-
-func padLeft(s string, w int) string {
-	n := dispWidth(s)
-	if n >= w {
-		return s
-	}
-	return strings.Repeat(" ", w-n) + s
 }

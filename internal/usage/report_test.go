@@ -130,7 +130,7 @@ func TestRenderUsageReportStructure(t *testing.T) {
 
 	// Summary header comes from Overview (2.23M total), not from summing the
 	// rows (which would be fine here, but the point is the source is Overview).
-	if !strings.Contains(got, "  今天  ·  1,783 请求  ·  2.23M token  ·  $0.836\n") {
+	if !strings.Contains(got, "  今天  ·  1,783 请求  ·  2.23M 词元  ·  $0.836\n") {
 		t.Errorf("summary line missing or wrong:\n%s", got)
 	}
 	// Failure + streaming counts from Overview; the cache-hit segment is the
@@ -150,15 +150,16 @@ func TestRenderUsageReportStructure(t *testing.T) {
 	if !strings.Contains(got, "\n\n") {
 		t.Errorf("no blank line between summary and table:\n%s", got)
 	}
-	// Table headers: model view uses the 模型 title; the Total column is
-	// gone; the 未计价 column appears because a row has unpriced requests.
-	for _, h := range []string{"模型", "请求数", "输入 tokens", "缓存命中", "命中率", "输出 tokens", "花费", "未计价"} {
+	// Compact table headers: model view uses the 模型 title, the Total
+	// column is gone, the 未计价 column appears because a row has unpriced
+	// requests, and the request/cache headers are the short 请求/缓存.
+	for _, h := range []string{"模型", "请求", "输入词元", "缓存", "命中率", "输出词元", "花费", "未计价"} {
 		if !strings.Contains(got, h) {
 			t.Errorf("table header %q missing:\n%s", h, got)
 		}
 	}
-	if strings.Contains(got, "Total") {
-		t.Errorf("Total column must be removed from the table:\n%s", got)
+	if strings.Contains(got, "请求数") || strings.Contains(got, "Total") {
+		t.Errorf("the long 请求数 header and the Total column must be gone:\n%s", got)
 	}
 	// nil cost renders as "-", not $0.000.
 	var glmLine string
@@ -174,30 +175,28 @@ func TestRenderUsageReportStructure(t *testing.T) {
 	if strings.Contains(got, "$0.000") {
 		t.Errorf("nil cost must not render as $0.000:\n%s", got)
 	}
-	// FormatTokens trailing-zero behavior: the summary line already shows
-	// "2.23M"; token cells in the table use FormatInt (thousands
-	// separators), the FormatTokens rule itself is covered by the render
-	// package tests.
 }
-
 func TestRenderUsageReportAlignment(t *testing.T) {
 	// Exact-output test: the table must be aligned (CJK headers, right-
-	// aligned numbers, dashes for nil cost) and the hit-rate column must
-	// show cached/prompt with one decimal (deepseek 1,000,000/1,500,000 =
-	// 66.7%, glm 100,000/500,000 = 20.0%). The expected strings were
-	// verified visually for column alignment.
+	// aligned numbers, one-space column gaps, two-space left indent matching
+	// the summary and warning lines, dashes for nil cost), and the hit-rate
+	// column must show cached/prompt with one decimal (deepseek
+	// 1,000,000/1,500,000 = 66.7%, glm 100,000/500,000 = 20.0%). Counts/tokens
+	// use the compact k/M form, the cost cell the compact cost form. The
+	// expected strings were verified visually for column alignment.
 	ov := &Overview{Requests: 1783, PromptTokens: 2_000_000, CompletionTokens: 230_000, TotalTokens: 2_230_000, CachedTokens: 1_100_000, TotalCost: ptr64(0.836), CostMissingRequests: 3, FailedRequests: 12, StreamingRequests: 1690, OpenAIRequests: 1783, OpenAIPromptTokens: 2_000_000, OpenAICachedTokens: 1_100_000}
 	rows := []SummaryRow{
 		{Groups: map[string]any{"model": "deepseek-v4-pro"}, Requests: 1500, PromptTokens: 1_500_000, CompletionTokens: 200_000, TotalTokens: 1_700_000, CachedTokens: 1_000_000, CostUSD: ptr64(0.65)},
 		{Groups: map[string]any{"model": "glm-5.2"}, Requests: 283, PromptTokens: 500_000, CompletionTokens: 30_000, TotalTokens: 530_000, CachedTokens: 100_000, CostUSD: nil, CostMissingRequests: 3},
 	}
-	want := "  今天  ·  1,783 请求  ·  2.23M token  ·  $0.836\n" +
+	// widths: 模型 15 (deepseek-v4-pro) | 请求 4 | 输入词元 8 | 缓存 4 | 命中率 6 | 输出词元 8 | 花费 5 | 未计价 6
+	want := "  今天  ·  1,783 请求  ·  2.23M 词元  ·  $0.836\n" +
 		"  失败 12 (0.7%)   流式 1,690 (94.8%)   缓存命中(openai) 1.1M (55.0%)\n" +
 		"  ⚠ 有 3 个请求未算出金额（模型未配置单价），总费用可能偏低\n" +
 		"\n" +
-		"  模型              请求数   输入 tokens    缓存命中   命中率   输出 tokens     花费   未计价\n" +
-		"  deepseek-v4-pro    1,500     1,500,000   1,000,000    66.7%       200,000   $0.650        0\n" +
-		"  glm-5.2              283       500,000     100,000    20.0%        30,000        -        3\n"
+		"  模型" + strings.Repeat(" ", 12) + "请求 输入词元 缓存 命中率 输出词元  花费 未计价\n" +
+		"  deepseek-v4-pro" + strings.Repeat(" ", 3) + "1k" + strings.Repeat(" ", 5) + "1.5M" + strings.Repeat(" ", 3) + "1M" + strings.Repeat(" ", 2) + "66.7%" + strings.Repeat(" ", 5) + "200k $0.65" + strings.Repeat(" ", 6) + "0\n" +
+		"  glm-5.2" + strings.Repeat(" ", 10) + "283" + strings.Repeat(" ", 5) + "500k 100k" + strings.Repeat(" ", 2) + "20.0%" + strings.Repeat(" ", 6) + "30k" + strings.Repeat(" ", 5) + "-" + strings.Repeat(" ", 6) + "3\n"
 	if got := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{Period: "今天"}); got != want {
 		t.Fatalf("RenderUsageReport mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}
@@ -232,9 +231,9 @@ func TestRenderUsageReportColor(t *testing.T) {
 }
 
 // TestRenderUsageTableHitRateAndGroupTitles pins the per-view table
-// contract: the model view titles its first column 模型, every other group_by
-// view keeps the dynamic first-column name, the hit-rate column shows
-// CachedTokens/PromptTokens with one decimal, and a zero prompt total
+// contract: the model view titles its first column 模型, every other
+// group_by view keeps the dynamic first-column name, the hit-rate column
+// shows CachedTokens/PromptTokens with one decimal, and a zero prompt total
 // renders a stable 0.0% — never NaN/Inf.
 func TestRenderUsageTableHitRateAndGroupTitles(t *testing.T) {
 	rows := []SummaryRow{
@@ -242,13 +241,19 @@ func TestRenderUsageTableHitRateAndGroupTitles(t *testing.T) {
 	}
 	// Model view: 模型 title, hit rate 968/1000 = 96.8%, no Total column.
 	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{Period: "x"})
-	for _, want := range []string{"模型", "请求数", "输入 tokens", "缓存命中", "96.8%", "输出 tokens", "花费"} {
+	for _, want := range []string{"模型", "请求", "输入词元", "缓存", "96.8%", "输出词元", "花费"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("model view missing %q:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "Total") {
-		t.Errorf("Total column must be gone from the model view:\n%s", got)
+	if strings.Contains(got, "Total") || strings.Contains(got, "请求数") {
+		t.Errorf("Total column and the long 请求数 header must be gone from the model view:\n%s", got)
+	}
+	// No cache segments in the summary here (zero requests in Overview), so
+	// 缓存命中 may only appear as the old long header — its absence pins
+	// the short 缓存 header.
+	if strings.Contains(got, "缓存命中") {
+		t.Errorf("the header must be 缓存, not 缓存命中:\n%s", got)
 	}
 
 	// Other group views keep the dynamic first-column name.
@@ -364,5 +369,134 @@ func TestRenderUsageReportSplitCacheSegments(t *testing.T) {
 	got = RenderUsageReport(&Overview{}, nil, []string{"model"}, ReportOptions{Period: "x"})
 	if strings.Contains(got, "缓存命中") {
 		t.Errorf("no requests: cache segments must be omitted:\n%s", got)
+	}
+}
+
+// TestRenderUsageReportCompactNumbers pins the compact number contract of
+// the detail table: request/token cells use the k/M notation and the cost
+// cell the compact cost format, so the acceptance values 938,553,722 /
+// 908,356,736 / 50,913,334 / 12,322 / $21.0267 render as 938.6M / 908.4M /
+// 50.91M / 12k / $21.03 — and the long forms never appear.
+func TestRenderUsageReportCompactNumbers(t *testing.T) {
+	rows := []SummaryRow{
+		{
+			Groups:           map[string]any{"model": "big"},
+			Requests:         938_553_722,
+			PromptTokens:     908_356_736,
+			CachedTokens:     50_913_334,
+			CompletionTokens: 12_322,
+			CostUSD:          ptr64(21.0267),
+		},
+	}
+	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{Period: "x"})
+	for _, want := range []string{"938.6M", "908.4M", "50.91M", "12k", "$21.03"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("compact number %q missing:\n%s", want, got)
+		}
+	}
+	for _, gone := range []string{"938,553,722", "908,356,736", "50,913,334", "12,322", "$21.0267", "…"} {
+		if strings.Contains(got, gone) {
+			t.Errorf("%q must not appear in compact output:\n%s", gone, got)
+		}
+	}
+}
+
+// TestRenderUsageReportCostCompact pins the compact cost cell: nil stays
+// "-", amounts under $0.01 keep three decimals (a small fee never shows as
+// "$0.00" or "$0"), larger amounts use at most two decimals.
+func TestRenderUsageReportCostCompact(t *testing.T) {
+	rows := []SummaryRow{
+		{Groups: map[string]any{"model": "nil"}, Requests: 1, PromptTokens: 10, CompletionTokens: 5, CostUSD: nil},
+		{Groups: map[string]any{"model": "tiny"}, Requests: 1, PromptTokens: 10, CompletionTokens: 5, CostUSD: ptr64(0.005)},
+		{Groups: map[string]any{"model": "sub"}, Requests: 1, PromptTokens: 10, CompletionTokens: 5, CostUSD: ptr64(0.004)},
+		{Groups: map[string]any{"model": "mid"}, Requests: 1, PromptTokens: 10, CompletionTokens: 5, CostUSD: ptr64(0.6)},
+		{Groups: map[string]any{"model": "big"}, Requests: 1, PromptTokens: 10, CompletionTokens: 5, CostUSD: ptr64(21.0267)},
+	}
+	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{Period: "x"})
+	for _, want := range []string{"-", "$0.005", "$0.004", "$0.60", "$21.03"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("cost cell %q missing:\n%s", want, got)
+		}
+	}
+	// The cost cells are exactly the compact forms; no cell may collapse a
+	// small fee to "$0.00" or "$0".
+	for _, line := range strings.Split(got, "\n") {
+		for _, tok := range strings.Fields(line) {
+			if strings.HasPrefix(tok, "$") && (tok == "$0.00" || tok == "$0") {
+				t.Errorf("small fees must never render as %q:\n%s", tok, got)
+			}
+		}
+	}
+}
+
+// TestRenderUsageReportLongGroupFull pins the full-width group rule: the
+// model/group column is never capped, so an over-long model name renders
+// in full with no ellipsis anywhere, the long row still carries every
+// numeric value, the normal model name also renders in full, and the
+// summary line, the missing-cost warning and every table line all start
+// at the same third column (a two-space indent).
+func TestRenderUsageReportLongGroupFull(t *testing.T) {
+	rows := []SummaryRow{
+		{Groups: map[string]any{"model": "anthropic/claude-sonnet-4-20250514"}, Requests: 938_553_722, PromptTokens: 908_356_736, CachedTokens: 50_913_334, CompletionTokens: 12_322, CostUSD: ptr64(21.0267)},
+		{Groups: map[string]any{"model": "glm-5.2"}, Requests: 283, PromptTokens: 500_000, CompletionTokens: 30_000, CachedTokens: 100_000},
+	}
+	got := RenderUsageReport(&Overview{CostMissingRequests: 1}, rows, []string{"model"}, ReportOptions{Period: "x"})
+	// The over-long model name renders in full — no ellipsis anywhere.
+	if !strings.Contains(got, "anthropic/claude-sonnet-4-20250514") {
+		t.Errorf("over-long model name must render in full:\n%s", got)
+	}
+	if strings.Contains(got, "…") {
+		t.Errorf("no group value may be truncated with an ellipsis:\n%s", got)
+	}
+	// Summary, warning and table header/rows all start at the same third
+	// column: exactly two leading spaces (the blank separator is skipped).
+	for i, line := range strings.Split(strings.TrimRight(got, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "   ") {
+			t.Errorf("line %d must start with exactly two spaces: %q", i, line)
+		}
+	}
+	// The long row still carries every numeric value.
+	var longLine string
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, "anthropic/claude-sonnet-4-20250514") {
+			longLine = line
+			break
+		}
+	}
+	for _, v := range []string{"938.6M", "908.4M", "50.91M", "12k", "$21.03"} {
+		if !strings.Contains(longLine, v) {
+			t.Errorf("long row must keep value %q: %q", v, longLine)
+		}
+	}
+	// The normal model name also renders in full.
+	if !strings.Contains(got, "glm-5.2") {
+		t.Errorf("normal model name must render in full:\n%s", got)
+	}
+}
+
+// TestRenderUsageReportFitsPiPanel pins the width budget for realistic
+// model names: with representative data (realistic-length model names, big
+// compact counts, a priced and an unpriced row → the widest usual column
+// set including 未计价) every detail-table line fits 72 display columns —
+// the π panel budget — with the one-space gap and the two-space indent.
+// Names longer than ~22 display columns render in full (see
+// TestRenderUsageReportLongGroupFull) and may exceed the budget by design.
+func TestRenderUsageReportFitsPiPanel(t *testing.T) {
+	rows := []SummaryRow{
+		{Groups: map[string]any{"model": "deepseek-v4-pro"}, Requests: 938_553_722, PromptTokens: 908_356_736, CachedTokens: 50_913_334, CompletionTokens: 12_322, CostUSD: ptr64(21.0267)},
+		{Groups: map[string]any{"model": "glm-5.2"}, Requests: 283, PromptTokens: 500_000, CompletionTokens: 30_000, CachedTokens: 100_000, CostUSD: nil, CostMissingRequests: 3},
+	}
+	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{Period: "x"})
+	table := got[strings.Index(got, "\n\n")+2:]
+	for _, line := range strings.Split(strings.TrimRight(table, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		if dw := render.DisplayWidth(line); dw > 72 {
+			t.Errorf("table line exceeds 72 columns (%d): %q", dw, line)
+		}
 	}
 }

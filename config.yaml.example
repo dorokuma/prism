@@ -134,7 +134,7 @@ model_remap:
 #       cache_write: 0.6
 
 # ---------------------------------------------------------------------------
-# 可选：usage —— 每次请求的 token 用量与费用落 SQLite，供
+# 可选：usage —— 每次请求的词元用量与费用落 SQLite，供
 # GET /admin/usage/summary 聚合查询。默认关闭（enabled: false，opt-in：
 # 不配 usage 段时现有部署行为完全不变）。
 #
@@ -166,7 +166,7 @@ model_remap:
 #
 #   计价：成本单价取 model_metadata[].cost（USD per 1M tokens，见上），
 #   按请求当时的配置（provider + model）解析；查不到单价的模型成本记为
-#   NULL / cost_status=missing_price，token 照常入库。
+#   NULL / cost_status=missing_price，词元照常入库。
 #   口径：OpenAI 口径的 prompt_tokens 包含缓存部分（cached 按 cache_read
 #   单价另计）；Anthropic 口径的 input_tokens 不含缓存（cache_read /
 #   cache_creation 平级另算，input 全额计价）。每行落库 usage_source
@@ -195,7 +195,7 @@ model_remap:
 
 # ---------------------------------------------------------------------------
 # 可选：quota —— 上游套餐用量快照（当前：OpenCode Go 的短期 / 中期 / 长期窗口）。
-# 和上面的 usage 不是一层：usage 是本地 token 账本，quota 是官方限额百分比。
+# 和上面的 usage 不是一层：usage 是本地词元账本，quota 是官方限额百分比。
 # 关掉 usage.enabled 不影响 quota。
 #
 #   enabled:           缺省 true。显式 false 关闭 poller，GET /admin/quota 返回 503。

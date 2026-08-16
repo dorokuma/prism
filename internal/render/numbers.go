@@ -1,6 +1,7 @@
 package render
 
 import (
+	"math"
 	"strconv"
 	"strings"
 )
@@ -65,6 +66,31 @@ func FormatCost(v *float64) string {
 		return "-"
 	}
 	s := strconv.FormatFloat(*v, 'f', 3, 64)
+	sign := ""
+	if strings.HasPrefix(s, "-") {
+		sign = "-"
+		s = s[1:]
+	}
+	intPart, frac, _ := strings.Cut(s, ".")
+	return sign + "$" + groupDigits(intPart) + "." + frac
+}
+
+// FormatCostCompact formats a USD amount with the compact precision used
+// by the usage detail table: amounts of $0.01 and above show at most two
+// decimals ("$21.03", "$0.60"), amounts below $0.01 keep three decimals
+// ("$0.005") so a small fee never collapses to "$0.00" or "$0". A nil
+// pointer renders as "-": nil means the model has no unit price
+// configured, which is different from a zero cost. Only the display is
+// rounded — the underlying cost value is never modified.
+func FormatCostCompact(v *float64) string {
+	if v == nil {
+		return "-"
+	}
+	prec := 2
+	if a := math.Abs(*v); a < 0.01 {
+		prec = 3
+	}
+	s := strconv.FormatFloat(*v, 'f', prec, 64)
 	sign := ""
 	if strings.HasPrefix(s, "-") {
 		sign = "-"

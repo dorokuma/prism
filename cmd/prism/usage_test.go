@@ -434,7 +434,7 @@ func TestRunUsageTable(t *testing.T) {
 	out := buf.String()
 	// summary from Overview: all 5 requests, 750 total tokens, 4 priced
 	// events × $0.15 (price 1000/1000 on 150 tokens each)
-	if !strings.Contains(out, "今天  ·  5 请求  ·  750 token  ·  $0.600") {
+	if !strings.Contains(out, "今天  ·  5 请求  ·  750 词元  ·  $0.600") {
 		t.Errorf("summary line missing/wrong:\n%s", out)
 	}
 	// the failed + missing-price hints
@@ -444,10 +444,40 @@ func TestRunUsageTable(t *testing.T) {
 	if !strings.Contains(out, "⚠ 有 1 个请求未算出金额") {
 		t.Errorf("missing-price warning missing:\n%s", out)
 	}
-	// table: header + the three models, nil cost as dash
-	for _, want := range []string{"模型", "请求数", "alpha", "beta", "gamma", "  -"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("table missing %q:\n%s", want, out)
+	// compact table: one header line carrying both token labels, with the
+	// short 请求/缓存 headers (never the long 请求数/缓存命中)
+	h := usageTableHeader(out)
+	if h == "" {
+		t.Fatalf("default output must be the compact single-line table:\n%s", out)
+	}
+	for _, want := range []string{"模型", "请求", "输入词元", "缓存", "命中率", "输出词元", "花费", "未计价"} {
+		if !strings.Contains(h, want) {
+			t.Errorf("table header missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "请求数") {
+		t.Errorf("the long 请求数 header must be gone:\n%s", out)
+	}
+	// one row per model, each row carrying all its values; nil cost as dash
+	rows := map[string][]string{
+		"alpha": {"2", "200", "0.0%", "100", "$0.30"},
+		"beta":  {"1", "100", "0.0%", "50", "-"},
+		"gamma": {"2", "200", "0.0%", "100", "$0.30"},
+	}
+	for m, vals := range rows {
+		lines := 0
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, m) {
+				lines++
+				for _, v := range vals {
+					if !strings.Contains(line, v) {
+						t.Errorf("%s row missing %q: %q", m, v, line)
+					}
+				}
+			}
+		}
+		if lines != 1 {
+			t.Errorf("%s must appear exactly once, got %d lines", m, lines)
 		}
 	}
 	// non-TTY output (a buffer) must never contain ANSI escapes
@@ -756,5 +786,46 @@ func TestRunUsageSplitCacheSegments(t *testing.T) {
 	}
 	if ov.AnthropicRequests != 1 || ov.AnthropicPromptTokens != 1 || ov.AnthropicCachedTokens != 500 || ov.AnthropicCacheWriteTokens != 0 {
 		t.Errorf("anthropic split = %+v, want 1/1/500/0", ov)
+	}
+}
+
+// usageTableHeader returns the header line of the CLI usage report (the
+// compact single-line table is the only layout), or "" when the report has
+// no single header line carrying both token labels.
+func usageTableHeader(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, "输入词元") && strings.Contains(line, "输出词元") {
+			return line
+		}
+	}
+	return ""
+}
+
+// TestRunUsageDefaultCompactNonTTY pins the π-first default: a non-TTY
+// bytes.Buffer receives the compact single-line table regardless of COLUMNS
+// (the env var is never consulted), every model appears exactly once on a
+// row carrying all its values, and the output is uncolored.
+func TestRunUsageDefaultCompactNonTTY(t *testing.T) {
+	base := time.Date(2026, 3, 10, 15, 4, 5, 0, time.Local)
+	path := seedUsageDB(t, base)
+	render := func(columns string) string {
+		t.Setenv("COLUMNS", columns)
+		var buf bytes.Buffer
+		if err := runUsageWith([]string{"--db", path}, &buf, base); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+	narrow, wide := render("40"), render("200")
+	if narrow != wide {
+		t.Errorf("COLUMNS must not affect the default output:\n--- COLUMNS=40 ---\n%s\n--- COLUMNS=200 ---\n%s", narrow, wide)
+	}
+	out := narrow
+	if h := usageTableHeader(out); h == "" {
+		t.Fatalf("default non-TTY output must be the compact single-line table:\n%s", out)
+	}
+	// The piped output is also uncolored, as before.
+	if strings.Contains(out, "\x1b[") {
+		t.Errorf("piped output must not be colored:\n%q", out)
 	}
 }
