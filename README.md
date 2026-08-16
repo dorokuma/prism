@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.20.6  Date: 2026-08-16  Status: living document
+> Version: v0.20.7  Date: 2026-08-16  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -190,6 +190,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-16** — v0.20.7 — fix: `prism quota` and `/admin/quota?format=table` render each account name once per window group, vertically centered: on the weekly window row whenever a weekly window exists (even when that is not the group's middle row), otherwise on the middle row of the actual window count (the lower middle for even counts). The 短期/长期 rows of a three-window group leave the account cell empty; the provider prefix and the stale 旧 marker ride the single account cell, and error lines keep their full `provider/account` attribution. Column layout, indentation and JSON are unchanged.
 
 - **2026-08-16** — v0.20.6 — fix: compact usage/quota tables and 词元 wording. `prism usage` and `/admin/usage/summary?format=table` always render the same single-line compact table (no vertical card layout, no terminal-width probe): one row per model/group, short headers (模型/请求/输入词元/缓存/命中率/输出词元/花费, plus 未计价 when present), a one-space column gap with the same two-space left indent as the summary and warning lines, request and token cells in the existing k/M compact notation (unpriced counts remain exact), and the cost cell in a compact format (at most two decimals, tiny amounts keep three so a small fee never shows as $0; nil stays `-`) — display precision only, the stored aggregates are unchanged. Model/group names render in full and are never truncated; numbers never truncate either. The `COLUMNS`/`TIOCGWINSZ` width probe, the `format=table` `layout`/`width` params and the vertical card renderer are removed. User-visible English token wording is unified to 词元: the table headers are 输入词元/输出词元 and the summary line's `token` is now `词元`; JSON field names (`prompt_tokens`/`completion_tokens` etc.) are unchanged. `prism quota` and `/admin/quota?format=table` switch from per-account phone cards to the same compact single-line table rules (两空格 indent, one-space column gap, no terminal-width dependency): columns 账号/窗口/状态/占用/重置/限额估算, one row per window with the account repeated, names always in full; error lines now carry account attribution (`provider/account: fetch_failed`), multi-provider reports prefix the provider in the account column, and the rate-limited marker stays 限流. The 限额估算 column shows the upstream's documented window limit as `$N.00` only when the snapshot marks it estimated (never a real spend figure); the previous `(估算)` suffix is dropped, and confirmed/unset windows render `-`. The old display-width/pad helpers are removed in favor of the shared `render` package.
 

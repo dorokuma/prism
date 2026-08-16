@@ -35,12 +35,12 @@ func TestRenderTableTable(t *testing.T) {
 	}, now)
 	want := "" +
 		"  账号 窗口 状态 占用  重置 限额估算\n" +
-		"  go-1 短期 ok    12% 2h13m        -\n" +
+		"       短期 ok    12% 2h13m        -\n" +
 		"  go-1 中期 ok     8%  3d4h        -\n" +
-		"  go-1 长期 ok    40%   12d        -\n" +
-		"  go-2 短期 限流 100% 2h13m        -\n" +
+		"       长期 ok    40%   12d        -\n" +
+		"       短期 限流 100% 2h13m        -\n" +
 		"  go-2 中期 ok    30%  3d4h        -\n" +
-		"  go-2 长期 ok    55%   12d        -\n"
+		"       长期 ok    55%   12d        -\n"
 	if got != want {
 		t.Fatalf("layout\ngot:\n%s\nwant:\n%s", got, want)
 	}
@@ -102,6 +102,171 @@ func colOf(s, sub string) int {
 		return -1
 	}
 	return render.DisplayWidth(s[:i])
+}
+
+// TestRenderTableAccountRowPlacement pins where the account name sits
+// inside one window group: the weekly row whenever a weekly window
+// exists (even when that is not the group's middle row), otherwise the
+// middle row of the actual window count — the lower middle (len/2,
+// 0-based) for even counts. Every other window row leaves the account
+// cell empty.
+func TestRenderTableAccountRowPlacement(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	h2 := now.Add(2*time.Hour + 13*time.Minute)
+	d3 := now.Add(3*24*time.Hour + 4*time.Hour)
+	d12 := now.Add(12 * 24 * time.Hour)
+	header := "  账号 窗口 状态 占用  重置 限额估算\n"
+	cases := []struct {
+		name    string
+		windows []Window
+		want    string
+	}{
+		{
+			name: "three windows, weekly is the middle row",
+			windows: []Window{
+				{Name: "rolling", Status: "ok", Percent: 12, ResetsAt: &h2},
+				{Name: "weekly", Status: "ok", Percent: 8, ResetsAt: &d3},
+				{Name: "monthly", Status: "ok", Percent: 40, ResetsAt: &d12},
+			},
+			want: header +
+				"       短期 ok    12% 2h13m        -\n" +
+				"  a1   中期 ok     8%  3d4h        -\n" +
+				"       长期 ok    40%   12d        -\n",
+		},
+		{
+			name: "weekly present but not the middle row",
+			windows: []Window{
+				{Name: "rolling", Status: "ok", Percent: 12, ResetsAt: &h2},
+				{Name: "monthly", Status: "ok", Percent: 40, ResetsAt: &d12},
+				{Name: "weekly", Status: "ok", Percent: 8, ResetsAt: &d3},
+			},
+			want: header +
+				"       短期 ok    12% 2h13m        -\n" +
+				"       长期 ok    40%   12d        -\n" +
+				"  a1   中期 ok     8%  3d4h        -\n",
+		},
+		{
+			name: "two windows, no weekly: lower middle row",
+			windows: []Window{
+				{Name: "rolling", Status: "ok", Percent: 12, ResetsAt: &h2},
+				{Name: "monthly", Status: "ok", Percent: 40, ResetsAt: &d12},
+			},
+			want: header +
+				"       短期 ok    12% 2h13m        -\n" +
+				"  a1   长期 ok    40%   12d        -\n",
+		},
+		{
+			name:    "single window",
+			windows: []Window{{Name: "rolling", Status: "ok", Percent: 12, ResetsAt: &h2}},
+			want: header +
+				"  a1   短期 ok    12% 2h13m        -\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RenderTableAt([]Snapshot{{
+				Provider: "opencode-go",
+				Accounts: []string{"a1"},
+				Windows:  tc.windows,
+			}}, now)
+			if got != tc.want {
+				t.Fatalf("got:\n%s\nwant:\n%s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRenderTableAccountOncePerGroup pins that with several accounts on
+// one snapshot each name still renders exactly once, on its own weekly
+// row — never repeated across the group's other windows.
+func TestRenderTableAccountOncePerGroup(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	got := RenderTableAt([]Snapshot{{
+		Provider: "opencode-go",
+		Accounts: []string{"a1", "a2"},
+		Windows: []Window{
+			{Name: "rolling", Status: "ok", Percent: 12},
+			{Name: "weekly", Status: "ok", Percent: 8},
+			{Name: "monthly", Status: "ok", Percent: 40},
+		},
+	}}, now)
+	for _, acct := range []string{"a1", "a2"} {
+		var hits []string
+		for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
+			if strings.Contains(line, "%") && strings.Contains(line, acct) {
+				hits = append(hits, line)
+			}
+		}
+		if len(hits) != 1 {
+			t.Fatalf("%s appears in %d window rows, want exactly 1: %q\n%s", acct, len(hits), hits, got)
+		}
+		if !strings.Contains(hits[0], "中期") {
+			t.Fatalf("%s not on the weekly row: %q", acct, hits[0])
+		}
+	}
+}
+
+// TestRenderTableStaleProviderPlacement pins that the provider prefix and
+// the stale 旧 marker ride the account cell and appear only on the
+// account's single centered row, while error notes keep the full
+// provider/account attribution.
+func TestRenderTableStaleProviderPlacement(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	h := now.Add(45 * time.Minute)
+	got := RenderTableAt([]Snapshot{
+		{
+			Provider: "opencode-go",
+			Accounts: []string{"a1"},
+			Stale:    true,
+			Err:      "fetch_failed",
+			Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 3, ResetsAt: &h}},
+		},
+		{
+			Provider: "acme",
+			Accounts: []string{"b2"},
+			Stale:    true,
+			Err:      "timeout",
+			Windows: []Window{
+				{Name: "rolling", Status: "ok", Percent: 7, ResetsAt: &h},
+				{Name: "weekly", Status: "ok", Percent: 8, ResetsAt: &h},
+				{Name: "monthly", Status: "ok", Percent: 9, ResetsAt: &h},
+			},
+		},
+	}, now)
+	// Error notes keep the complete provider/account attribution.
+	for _, s := range []string{"opencode-go/a1 旧: fetch_failed", "acme/b2 旧: timeout"} {
+		if !strings.Contains(got, s) {
+			t.Fatalf("error attribution %q missing:\n%s", s, got)
+		}
+	}
+	// Each full account cell (provider prefix + stale marker) appears
+	// exactly twice in the whole report: once on its single window row
+	// and once on its error note — never on the group's other rows.
+	for _, acct := range []string{"opencode-go/a1 旧", "acme/b2 旧"} {
+		if n := strings.Count(got, acct); n != 2 {
+			t.Fatalf("%q occurs %d times, want 2 (one window row + one error note):\n%s", acct, n, got)
+		}
+	}
+	// a1's only window is rolling; b2's group has a weekly window, so the
+	// name sits on the 中期 row.
+	var a1Row, b2Row string
+	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
+		switch {
+		case strings.Contains(line, "opencode-go/a1 旧") && strings.Contains(line, "%"):
+			a1Row = line
+		case strings.Contains(line, "acme/b2 旧") && strings.Contains(line, "%"):
+			b2Row = line
+		}
+	}
+	if !strings.Contains(a1Row, "短期") {
+		t.Fatalf("a1 not on its single window row: %q", a1Row)
+	}
+	if !strings.Contains(b2Row, "中期") {
+		t.Fatalf("b2 not on the weekly row: %q", b2Row)
+	}
+	if !strings.Contains(got, "3%") || !strings.Contains(got, "7%") {
+		t.Fatalf("window rows missing:\n%s", got)
+	}
 }
 
 func TestRenderTableAtErrorAndStale(t *testing.T) {

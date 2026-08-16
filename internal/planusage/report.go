@@ -20,7 +20,9 @@ func RenderTable(snaps []Snapshot) string {
 }
 
 // RenderTableAt is RenderTable with an injectable clock (tests). Each
-// window is one row with the account repeated; load-balanced plans are
+// window is one row; every account name renders once per window group,
+// vertically centered on the weekly row when one exists, otherwise on
+// the group's middle row (see accountRowIndex). Load-balanced plans are
 // never merged. Snapshots without windows keep the account line and the
 // error line, if any. Error lines always carry the account attribution
 // ("  provider/account: fetch_failed") so failures from different
@@ -64,9 +66,14 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 			if s.Err != "" {
 				notes.WriteString(reportIndent + account + ": " + s.Err + "\n")
 			}
-			for _, w := range s.Windows {
+			accountRow := accountRowIndex(s.Windows)
+			for i, w := range s.Windows {
+				cell := ""
+				if i == accountRow {
+					cell = account
+				}
 				rows = append(rows, []string{
-					account,
+					cell,
 					windowLabel(w.Name),
 					statusLabel(w.Status),
 					fmt.Sprintf("%d%%", w.Percent),
@@ -116,6 +123,24 @@ func accountCell(s Snapshot, title string, multiProvider bool) string {
 		account += " 旧"
 	}
 	return account
+}
+
+// accountRowIndex returns the row within one account's window group that
+// carries the account name, so the name renders once and is vertically
+// centered in the group. The weekly window is the preferred home whenever
+// it exists — even when the group is not a plain three-window
+// rolling/weekly/monthly stack (missing or custom windows). Without a
+// weekly window the middle row of the actual window count wins: the
+// unique middle for odd counts, the lower middle (len/2, 0-based) for
+// even counts. The caller never passes an empty group (len == 0 is
+// handled before rows are built); 0 is returned defensively.
+func accountRowIndex(windows []Window) int {
+	for i, w := range windows {
+		if w.Name == "weekly" {
+			return i
+		}
+	}
+	return len(windows) / 2
 }
 
 func windowLabel(name string) string {
