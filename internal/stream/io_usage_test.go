@@ -1175,7 +1175,7 @@ func TestUsageEventCapture_SingleHugeWriteMemoryBounded(t *testing.T) {
 	}
 	c.Finish()
 	u := parseStreamUsage(c.headEvents(), c.recentEvents())
-	want := usagemeta.Usage{Prompt: 5, Completion: 3, Source: usagemeta.SourceOpenAI}
+	want := usagemeta.Usage{Prompt: 5, Completion: 3, Total: 8, Source: usagemeta.SourceOpenAI}
 	if u != want {
 		t.Errorf("usage after huge writes = %+v, want %+v (capture must recover after an oversize single Write)", u, want)
 	}

@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -205,5 +207,70 @@ func TestWindowJSONOmitsZeroResetsAtAndMarksEstimate(t *testing.T) {
 	}
 	if strings.Contains(s, `"limit_usd"`) && !strings.Contains(s, `"limit_usd_estimate"`) {
 		t.Fatalf("old limit_usd field: %s", s)
+	}
+}
+
+// TestGoFetcherNilClientRefusesCrossHostRedirect pins the CLI path
+// (Client() == nil): a custom auth_header must not follow a 3xx to another
+// host. Production accounts use the pool client; this is the fallback.
+func TestGoFetcherNilClientRefusesCrossHostRedirect(t *testing.T) {
+	var foreignHits int32
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&foreignHits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer foreign.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/usage", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Api-Key"); got != "raw-secret" {
+			t.Errorf("X-Api-Key = %q, want raw-secret on the first hop", got)
+		}
+		foreignHost := strings.Replace(foreign.URL, "127.0.0.1", "localhost", 1)
+		http.Redirect(w, r, foreignHost+"/steal", http.StatusFound)
+	})
+	local := httptest.NewServer(mux)
+	defer local.Close()
+
+	f := GoFetcher{Timeout: time.Second}
+	_, err := f.Fetch(context.Background(), fakeAcc{
+		name: "a", provider: "opencode-go", base: local.URL + "/v1",
+		key: "raw-secret", authHeader: "x-api-key",
+	})
+	if err == nil {
+		t.Fatal("cross-host redirect must fail (custom auth_header leak prevention)")
+	}
+	if n := atomic.LoadInt32(&foreignHits); n != 0 {
+		t.Errorf("foreign host hits = %d, want 0", n)
+	}
+	var uerr *url.Error
+	if !errors.As(err, &uerr) {
+		t.Fatalf("error = %v, want *url.Error", err)
+	}
+	if !strings.Contains(uerr.Error(), "cross-host redirect") {
+		t.Errorf("error = %q, want cross-host redirect", uerr.Error())
+	}
+}
+
+func TestGoFetcherNilClientFollowsSameHostRedirect(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/usage", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/v1/usage/current", http.StatusFound)
+	})
+	mux.HandleFunc("/v1/usage/current", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"usage":{"rolling":{"status":"ok","percent":3}}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f := GoFetcher{Timeout: time.Second}
+	snap, err := f.Fetch(context.Background(), fakeAcc{
+		name: "a", provider: "opencode-go", base: srv.URL + "/v1", key: "k",
+	})
+	if err != nil {
+		t.Fatalf("same-host redirect must be followed: %v", err)
+	}
+	if len(snap.Windows) != 1 || snap.Windows[0].Percent != 3 {
+		t.Fatalf("windows = %+v, want rolling percent 3", snap.Windows)
 	}
 }

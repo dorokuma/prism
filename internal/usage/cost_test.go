@@ -61,6 +61,37 @@ func TestCostZeroPriceStructIsPriced(t *testing.T) {
 	}
 }
 
+// TestCostZeroCacheReadFallsBackToInput: YAML cache_read omitted is 0.
+// That is "not configured", not "cache is free" — the cached portion is
+// priced at Input. An explicit positive CacheRead still wins (see
+// TestCostCachedTokensUseCacheReadPrice).
+func TestCostZeroCacheReadFallsBackToInput(t *testing.T) {
+	price := &Price{Input: 1.0, Output: 2.0, CacheRead: 0, CacheWrite: 0}
+	cost, status := ComputeCost(1_000_000, 0, 1_000_000, 0, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	if cost == nil || math.Abs(*cost-1.0) > 1e-12 {
+		t.Fatalf("cached cost = %v, want 1.0 (CacheRead 0 → Input)", cost)
+	}
+	// Anthropic: cached is billed on top of input, also at Input when CacheRead is 0.
+	cost, status = ComputeCost(1_000_000, 0, 1_000_000, 0, SourceAnthropic, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	if cost == nil || math.Abs(*cost-2.0) > 1e-12 {
+		t.Fatalf("anthropic cached cost = %v, want 2.0 (input + cache at Input)", cost)
+	}
+	// Non-cached remainder still uses Input only.
+	cost, status = ComputeCost(1_000_000, 0, 0, 0, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	if cost == nil || math.Abs(*cost-1.0) > 1e-12 {
+		t.Fatalf("uncached cost = %v, want 1.0", cost)
+	}
+}
+
 func TestCostCachedTokensUseCacheReadPrice(t *testing.T) {
 	// cached tokens must be priced at CacheRead, not Input
 	price := &Price{Input: 1.0, CacheRead: 0.1, CacheWrite: 0.2}

@@ -1198,7 +1198,15 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 			oldCfg.Usage.DBPath, newCfg.Usage.DBPath))
 	}
 	if oldCfg.Usage.Enabled != newCfg.Usage.Enabled {
-		warnings = append(warnings, "usage.enabled changed: restart required to take effect")
+		warnings = append(warnings, "usage.enabled changed: keeping the running usage.enabled (restart required to apply)")
+		// usage.enabled is NOT hot-applied: the recorder and pricer are
+		// built once at startup. Publishing the new flag would split the
+		// holder from the running writer (stream_options.include_usage
+		// follows holder.Load(), the recorder follows its startup cfg),
+		// so a SIGHUP flip would inject usage into upstream requests
+		// without recording, or keep recording after the operator
+		// turned it off. Keep the running value, like listen/accounts.
+		newCfg.Usage.Enabled = oldCfg.Usage.Enabled
 	}
 	if oldCfg.LogLevel != newCfg.LogLevel {
 		if LogLevelHook != nil {

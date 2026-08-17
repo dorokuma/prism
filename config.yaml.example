@@ -169,8 +169,9 @@ model_remap:
 #   NULL / cost_status=missing_price，词元照常入库。
 #   口径：OpenAI 口径的 prompt_tokens 包含缓存部分（cached 按 cache_read
 #   单价另计）；Anthropic 口径的 input_tokens 不含缓存（cache_read /
-#   cache_creation 平级另算，input 全额计价）。每行落库 usage_source
-#   （openai / anthropic）便于核对计价依据。
+#   cache_creation 平级另算，input 全额计价）。未配 cache_read（YAML 缺省
+#   为 0）按 input 单价计缓存，不当免费；要打折必须显式写正数 cache_read。
+#   每行落库 usage_source（openai / anthropic）便于核对计价依据。
 #
 #   查询接口：GET /admin/usage/summary
 #     - 鉴权（fail-closed）：配置了环境变量 PRISM_ADMIN_TOKEN 时，所有请求
@@ -231,10 +232,11 @@ accounts:
 
 # ---------------------------------------------------------------------------
 # 可选：default_provider —— 请求未带 X-Prism-Provider 头时的兜底 provider。
-# 不配（默认）= 拒绝无头请求：直接返回 HTTP 400
+# 不配（默认）= 聊天/补全拒绝无头请求：直接返回 HTTP 400
 #   {"error":{"message":"missing X-Prism-Provider header","type":"invalid_request_error"}}
+# GET /v1/models 在同样情况下返回空列表（不泄漏全部 provider 的目录）。
 # 不会回退到全池选择（回退会让任意账号被命中，导致账号跨 provider 串用）。
-# 配置后：无头请求按该 provider 走正常的 per-provider 轮转。
+# 配置后：无头聊天按该 provider 走正常的 per-provider 轮转；/v1/models 也返回该 provider 的目录。
 # 值必须是下方 providers（或 accounts 的 provider 字段）中已存在的 provider 名，
 # 否则启动报错退出。
 # ---------------------------------------------------------------------------

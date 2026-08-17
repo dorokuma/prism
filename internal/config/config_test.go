@@ -1027,6 +1027,79 @@ accounts:
 	}
 }
 
+// TestReloadConfig_UsageEnabledKeepsRunningValue: usage.enabled is not
+// hot-applied (recorder/pricer are built once). The holder must keep the
+// running flag so stream_options injection cannot diverge from the writer.
+// Other usage fields (default_key_id) still hot-reload.
+func TestReloadConfig_UsageEnabledKeepsRunningValue(t *testing.T) {
+	content1 := `
+listen: 127.0.0.1:8080
+usage:
+  enabled: false
+  default_key_id: old-key
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content1)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	cfg1, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg1.Usage.Enabled {
+		t.Fatal("initial usage.enabled must be false")
+	}
+	holder := NewConfigHolder(cfg1)
+
+	content2 := `
+listen: 127.0.0.1:8080
+usage:
+  enabled: true
+  default_key_id: new-key
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`
+	if err := os.WriteFile(f.Name(), []byte(content2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, f.Name())
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "usage.enabled") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning about usage.enabled, got: %v", warnings)
+	}
+	got := holder.Load()
+	if got.Usage.Enabled {
+		t.Error("holder usage.enabled = true, want false (running value kept)")
+	}
+	if got.Usage.DefaultKeyID != "new-key" {
+		t.Errorf("holder usage.default_key_id = %q, want new-key (still hot-reloadable)", got.Usage.DefaultKeyID)
+	}
+}
+
 func TestReloadConfig_TLSChangedKeepsRunningPaths(t *testing.T) {
 	content1 := `
 listen: 127.0.0.1:8080

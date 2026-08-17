@@ -40,8 +40,8 @@ const (
 //     The parsers record each as-is; the cost layer (usage.ComputeCost)
 //     applies the matching formula via Source.
 //
-// Total defaults to Prompt+Completion only when the upstream did not
-// provide one (Anthropic never does).
+// Total defaults to Prompt+Completion when the upstream did not provide
+// one (Anthropic never does; some OpenAI-compatible proxies omit it).
 type Usage struct {
 	Prompt     int // input / prompt tokens
 	Completion int // output / completion tokens
@@ -147,6 +147,13 @@ func ParseOpenAI(data []byte) Usage {
 	total := u.TotalTokens
 	if total < 0 {
 		total = 0
+	}
+	// Same fallback as ParseAnthropic: a missing or zero total_tokens is
+	// not a real zero-token response when prompt/completion are present
+	// (OpenAI-compatible proxies often omit the field). An explicit
+	// total_tokens > 0 is kept as-is.
+	if total == 0 {
+		total = prompt + completion
 	}
 	cached := u.PromptCacheHitTokens
 	if cached == 0 && u.PromptTokensDetails != nil {

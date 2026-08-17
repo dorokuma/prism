@@ -1,8 +1,6 @@
 package pool
 
 import (
-	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -11,6 +9,7 @@ import (
 	"time"
 
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/util"
 )
 
 // AccountStatus represents the health status of an upstream account.
@@ -214,30 +213,9 @@ func newHTTPClient() *http.Client {
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       90 * time.Second,
 		},
-		// Redirect policy: follow SAME-HOST redirects (e.g. http→https or a
-		// path move by the same upstream) but refuse CROSS-HOST redirects
-		// outright. The Go http.Client only strips the standard sensitive
-		// headers (Authorization/WWW-Authenticate/Cookie) on a cross-host
-		// hop; a custom auth_header (e.g. "x-api-key") and account-level
-		// custom headers would be forwarded to the redirect target VERBATIM,
-		// leaking the account credential to a foreign host (open-redirect
-		// credential leak). Refusing the hop is the only leak-proof answer:
-		// the request fails instead of sending the credential anywhere.
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return errors.New("stopped after 10 redirects")
-			}
-			// via[0] is the ORIGINAL request (Go passes the full chain): its
-			// host is the account's configured base URL host. Hosts are
-			// compared case-insensitively and port-less (Hostname), so
-			// "api.example.com:443" → "api.example.com" is the same host.
-			orig := via[0].URL.Hostname()
-			next := req.URL.Hostname()
-			if !strings.EqualFold(orig, next) {
-				return fmt.Errorf("refusing cross-host redirect to %q (account base host %q): account headers/credentials must never leave the configured host", next, orig)
-			}
-			return nil
-		},
+		// Shared same-host-only redirect policy (util.CheckSameHostRedirect):
+		// a custom auth_header is not stripped by Go on a cross-host hop.
+		CheckRedirect: util.CheckSameHostRedirect,
 	}
 }
 

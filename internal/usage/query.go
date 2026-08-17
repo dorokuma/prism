@@ -77,6 +77,12 @@ func (e *QueryError) Error() string { return "usage: " + e.Msg }
 const (
 	summaryDefaultLimit = 100
 	summaryMaxLimit     = 1000
+	// totalTokensSumExpr is the report "词元" aggregate. Prefer the stored
+	// total; a row whose total_tokens is 0 (legacy OpenAI parses that
+	// omitted the field) still contributes prompt+completion so the
+	// header cannot read 0 while 输入/输出词元 are non-zero. Shared by
+	// Summary and Overview so the two cannot drift.
+	totalTokensSumExpr = `SUM(CASE WHEN total_tokens > 0 THEN total_tokens ELSE prompt_tokens + completion_tokens END)`
 )
 
 // buildSummaryWhere renders the shared WHERE clause for q's filter fields
@@ -157,7 +163,7 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 		sb.WriteString(", ")
 	}
 	sb.WriteString(`COUNT(*) AS requests,
-		SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
+		SUM(prompt_tokens), SUM(completion_tokens), ` + totalTokensSumExpr + `,
 		SUM(cached_tokens), SUM(reasoning_tokens), SUM(cache_write_tokens),
 		SUM(cost_usd),
 		SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) AS cost_missing_requests
@@ -298,7 +304,7 @@ func (s *SQLiteStore) Overview(ctx context.Context, q SummaryQuery) (*Overview, 
 	}
 	where, args := buildSummaryWhere(q)
 	query := `SELECT COUNT(*),
-		SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
+		SUM(prompt_tokens), SUM(completion_tokens), ` + totalTokensSumExpr + `,
 		SUM(cached_tokens), SUM(reasoning_tokens), SUM(cache_write_tokens),
 		SUM(cost_usd),
 		SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END),

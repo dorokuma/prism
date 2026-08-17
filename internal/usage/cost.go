@@ -50,6 +50,10 @@ const (
 //	    cost = prompt/1e6*Input + cached/1e6*CacheRead
 //	         + cache_write/1e6*CacheWrite + completion/1e6*Output
 //
+//	A CacheRead of 0 (YAML cache_read omitted, or an all-zero Price) is
+//	treated as "not configured" and falls back to Input. Cache hits are
+//	never silently free; set an explicit positive cache_read to discount.
+//
 // reasoning_tokens are already included in completion_tokens and are never
 // priced separately. Returns:
 //
@@ -85,6 +89,13 @@ func ComputeCost(promptTokens, completionTokens, cachedTokens, cacheWriteTokens 
 		zero := 0.0
 		return &zero, CostStatusNoUsage
 	}
+	// cache_read omitted in YAML unmarshals to 0. That is "not configured",
+	// not "cache is free": fall back to Input so a missed field cannot
+	// silently undercharge. An explicit positive CacheRead still wins.
+	cacheRead := price.CacheRead
+	if cacheRead == 0 {
+		cacheRead = price.Input
+	}
 	var promptTerm float64
 	if source == SourceAnthropic {
 		// Anthropic input_tokens excludes cache tokens: the prompt is billed
@@ -92,7 +103,7 @@ func ComputeCost(promptTokens, completionTokens, cachedTokens, cacheWriteTokens 
 		// old shared formula (prompt - cached) undercounted Anthropic by
 		// repricing part of the input at the CacheRead rate.
 		promptTerm = float64(promptTokens)/1e6*price.Input +
-			float64(cachedTokens)/1e6*price.CacheRead
+			float64(cachedTokens)/1e6*cacheRead
 	} else {
 		// OpenAI prompt_tokens includes cached tokens: price the cached
 		// portion at CacheRead and the rest at Input. Cached is clamped into
@@ -108,7 +119,7 @@ func ComputeCost(promptTokens, completionTokens, cachedTokens, cacheWriteTokens 
 			cached = promptTokens
 		}
 		promptTerm = float64(promptTokens-cached)/1e6*price.Input +
-			float64(cached)/1e6*price.CacheRead
+			float64(cached)/1e6*cacheRead
 	}
 	cost := promptTerm +
 		float64(cacheWriteTokens)/1e6*price.CacheWrite +

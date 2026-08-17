@@ -255,6 +255,40 @@ func TestProxyModels_NoProviderHeader_Empty(t *testing.T) {
 	}
 }
 
+// TestProxyModels_NoProviderHeader_UsesDefaultProvider: a configured
+// default_provider is the same fallback chat already uses. Clients that
+// list models without X-Prism-Provider must see that provider's catalog.
+func TestProxyModels_NoProviderHeader_UsesDefaultProvider(t *testing.T) {
+	mc := newModelCacheWithMeta(t, "p",
+		[]cache.ModelEntry{{ID: "glm-5.2", Object: "model", Created: 1, OwnedBy: "p"}},
+		map[string]cache.ModelMeta{"glm-5.2": {ContextWindow: intPtr(1000000)}},
+	)
+	cfg := &config.Config{
+		DefaultProvider: "p",
+		Accounts:        []config.AccountConfig{{Name: "a", Provider: "p", BaseURL: "https://x.com/v1"}},
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	proxyModels(mc, w, r, cfg)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("data len = %d, want 1 (default_provider p)", len(resp.Data))
+	}
+	if resp.Data[0]["id"] != "glm-5.2" {
+		t.Errorf("id = %v, want glm-5.2", resp.Data[0]["id"])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Batch-2 audit: cache-miss fetch failures are classified (503/502), never
 // a 200 empty list

@@ -81,6 +81,19 @@ func TestParseOpenAI(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("absent_total_tokens_falls_back", func(t *testing.T) {
+		u := ParseOpenAI([]byte(`{"usage":{"prompt_tokens":100,"completion_tokens":50}}`))
+		if u.Prompt != 100 || u.Completion != 50 {
+			t.Fatalf("Prompt/Completion = %d/%d, want 100/50", u.Prompt, u.Completion)
+		}
+		if u.Total != 150 {
+			t.Errorf("Total = %d, want 150 (missing total_tokens → prompt+completion)", u.Total)
+		}
+		if u.Source != SourceOpenAI {
+			t.Errorf("Source = %q, want %q", u.Source, SourceOpenAI)
+		}
+	})
 }
 
 func TestParseAnthropic(t *testing.T) {

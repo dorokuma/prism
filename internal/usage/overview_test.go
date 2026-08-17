@@ -153,6 +153,40 @@ func TestOverviewMatchesSummaryTotals(t *testing.T) {
 	checkOverviewVsSummaryRow(t, o, sumSummaryRows(byModel))
 }
 
+// TestOverviewZeroTotalFallsBackToPromptPlusCompletion: a stored row with
+// total_tokens=0 (legacy OpenAI parse that omitted the field) still
+// contributes prompt+completion to the report "词元" figure. Summary and
+// Overview share the same expression.
+func TestOverviewZeroTotalFallsBackToPromptPlusCompletion(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: now, RequestID: "r1", Model: "a",
+			PromptTokens: 100, CompletionTokens: 50, TotalTokens: 0,
+			Source: SourceOpenAI},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	o, err := s.Overview(ctx, SummaryQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.PromptTokens != 100 || o.CompletionTokens != 50 {
+		t.Fatalf("prompt/completion = %d/%d, want 100/50", o.PromptTokens, o.CompletionTokens)
+	}
+	if o.TotalTokens != 150 {
+		t.Fatalf("total_tokens = %d, want 150 (zero total falls back to prompt+completion)", o.TotalTokens)
+	}
+	rows, err := s.Summary(ctx, SummaryQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].TotalTokens != 150 {
+		t.Fatalf("summary total_tokens = %+v, want 150", rows)
+	}
+}
+
 // TestOverviewIgnoresLimitAndGroupBy proves the reason Overview exists: with
 // more groups than the default Summary limit, the truncated per-group rows
 // sum to less than the true total, while Overview still returns the full

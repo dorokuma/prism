@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/dorokuma/prism/internal/util"
 )
 
 const (
@@ -23,6 +25,13 @@ const (
 	LimitWeeklyUSD  = 30
 	LimitMonthlyUSD = 60
 )
+
+// fetchHTTPClient is used when AccountView.Client() is nil (prism quota CLI).
+// It refuses cross-host redirects so a custom auth_header cannot leak.
+// Production poller accounts use the pool client, which shares this policy.
+var fetchHTTPClient = &http.Client{
+	CheckRedirect: util.CheckSameHostRedirect,
+}
 
 // Typed fetch failures. The poller maps these onto Snapshot.Err and does
 // not treat them as "keep last success + stale" the way a 5xx/timeout is.
@@ -132,7 +141,11 @@ func (f GoFetcher) Fetch(ctx context.Context, acc AccountView) (Snapshot, error)
 
 	client := acc.Client()
 	if client == nil {
-		client = http.DefaultClient
+		// CLI path (prism quota): AccountView.Client() is nil. Do not
+		// use http.DefaultClient — it follows cross-host redirects and
+		// would forward a custom auth_header (x-api-key) to the
+		// redirect target. Same policy as the production account client.
+		client = fetchHTTPClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {

@@ -35,8 +35,16 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 	}
 
 	provider := r.Header.Get("X-Prism-Provider")
+	if provider == "" && cfg != nil {
+		// Same fallback as chat/completions: a configured default_provider
+		// is the operator's "header optional" switch. Returning an empty
+		// list here while chat already routes would make clients that
+		// list models first (Codex / OpenCode / Cursor) show no models.
+		provider = cfg.DefaultProvider
+	}
 	if provider == "" {
-		// 不传 header → 返回空列表
+		// No header and no default_provider → empty list (do not leak
+		// every provider's catalog).
 		util.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []any{}})
 		slog.Debug("models returning empty (no provider header)", "req", requestID)
 		return
