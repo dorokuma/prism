@@ -777,6 +777,9 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 			if gz, ok := bodyReader.(*gzip.Reader); ok {
 				defer gz.Close()
 			}
+			var closeDump func()
+			bodyReader, closeDump = teeUpstreamRawDump(resp, requestID, bodyReader)
+			defer closeDump()
 			err = stream.TranslateChatStreamToResponses(w, bodyReader, opts.Model, opts.ReqTools, mcp.GetSearchToolCache(opts.TenantID), ctx)
 		}
 		translateElapsed := time.Since(translateStart).Milliseconds()
@@ -885,6 +888,9 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 		// decompressor.
 		rawBody, err := readUpstreamBodyLimited(resp, responseBodyCap(opts))
 		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
+		if err == nil {
+			util.DumpUpstreamRawBytes(upstreamRawDumpMeta(resp, requestID), rawBody)
+		}
 		if err != nil {
 			if errors.Is(err, ErrUpstreamResponseTooLarge) {
 				slog.Error("responses_json body too large", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "max_bytes", responseBodyCap(opts), "elapsed", time.Since(start), "error_type", "response_too_large")
@@ -996,6 +1002,9 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 			if gz, ok := bodyReader.(*gzip.Reader); ok {
 				defer gz.Close()
 			}
+			var closeDump func()
+			bodyReader, closeDump = teeUpstreamRawDump(resp, requestID, bodyReader)
+			defer closeDump()
 			n, err = stream.StreamResponseBody(lw, bodyReader, r, acc.Name())
 		}
 		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
@@ -1062,6 +1071,9 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 	// gzip body cannot leak its decompressor.
 	rawBody, err := readUpstreamBodyLimited(resp, responseBodyCap(opts))
 	bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
+	if err == nil {
+		util.DumpUpstreamRawBytes(upstreamRawDumpMeta(resp, requestID), rawBody)
+	}
 	if err != nil {
 		if errors.Is(err, ErrUpstreamResponseTooLarge) {
 			slog.Error("legacy_nonstream body too large", "request_id", requestID, "model", opts.Model, "account", acc.Name(), "max_bytes", responseBodyCap(opts), "elapsed", time.Since(start), "error_type", "response_too_large")
@@ -1118,3 +1130,35 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 	}
 	return true, nil, UpstreamErrorTemporary
 }
+
+func upstreamRawDumpMeta(resp *http.Response, requestID string) util.UpstreamRawDumpMeta {
+	meta := util.UpstreamRawDumpMeta{RequestID: requestID}
+	if resp == nil {
+		return meta
+	}
+	meta.Status = resp.StatusCode
+	if resp.Request != nil {
+		meta.Header = resp.Request.Header
+		if resp.Request.URL != nil {
+			meta.URL = resp.Request.URL.Redacted()
+		}
+	}
+	return meta
+}
+
+// teeUpstreamRawDump copies upstream body bytes to a dump file when the
+// PRISM_DUMP_UPSTREAM_SSE env switch is on. When the switch is off it
+// returns body unchanged and a no-op closer, so the copy path matches
+// the pre-dump code.
+func teeUpstreamRawDump(resp *http.Response, requestID string, body io.ReadCloser) (io.ReadCloser, func()) {
+	dump := util.StartUpstreamRawDump(upstreamRawDumpMeta(resp, requestID))
+	if dump == nil {
+		return body, func() {}
+	}
+	return io.NopCloser(io.TeeReader(body, dump)), func() {
+		if err := dump.Close(); err != nil {
+			slog.Warn("upstream raw dump close failed", "error", err)
+		}
+	}
+}
+
