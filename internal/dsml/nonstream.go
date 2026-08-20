@@ -13,8 +13,9 @@ func RewriteCompletion(body []byte) []byte {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return body
 	}
+	root, wrapKey := completionRoot(raw)
 	var choices []map[string]json.RawMessage
-	if err := json.Unmarshal(raw["choices"], &choices); err != nil || len(choices) == 0 {
+	if err := json.Unmarshal(root["choices"], &choices); err != nil || len(choices) == 0 {
 		return body
 	}
 	changed := false
@@ -53,12 +54,37 @@ func RewriteCompletion(body []byte) []byte {
 	if !changed {
 		return body
 	}
-	raw["choices"] = mustJSON(choices)
+	root["choices"] = mustJSON(choices)
+	if wrapKey != "" {
+		raw[wrapKey] = mustJSON(root)
+	} else {
+		raw = root
+	}
 	out, err := json.Marshal(raw)
 	if err != nil {
 		return body
 	}
 	return out
+}
+
+// completionRoot returns the object that holds choices. Clinepass non-stream
+// bodies are sometimes wrapped as {"data":{...completion...},"success":true}.
+func completionRoot(raw map[string]json.RawMessage) (map[string]json.RawMessage, string) {
+	if _, ok := raw["choices"]; ok {
+		return raw, ""
+	}
+	innerRaw, ok := raw["data"]
+	if !ok || len(innerRaw) == 0 {
+		return raw, ""
+	}
+	var inner map[string]json.RawMessage
+	if json.Unmarshal(innerRaw, &inner) != nil {
+		return raw, ""
+	}
+	if _, ok := inner["choices"]; !ok {
+		return raw, ""
+	}
+	return inner, "data"
 }
 
 func openaiToolCalls(calls []ToolCall) []map[string]any {

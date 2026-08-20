@@ -209,6 +209,48 @@ func TestRewriteCompletionAborted(t *testing.T) {
 	}
 }
 
+func TestRewriteCompletionWrappedDataEnvelope(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "dsml-sample-0708-L59-prefix.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := completionJSON(string(raw[:2000]), "length")
+	wrapped, err := json.Marshal(map[string]any{
+		"success": true,
+		"data":    json.RawMessage(inner),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := RewriteCompletion(wrapped)
+	var env struct {
+		Success bool            `json:"success"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	if !env.Success {
+		t.Fatal("wrapper success flag must be kept")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(env.Data, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	ch := parsed["choices"].([]any)[0].(map[string]any)
+	msg := ch["message"].(map[string]any)
+	content, _ := msg["content"].(string)
+	if HasMarker(content) || strings.Contains(content, "toolpending") {
+		t.Fatal("wrapped abort still has DSML")
+	}
+	if !strings.Contains(content, "[prism] removed ") {
+		t.Fatalf("content=%q", content)
+	}
+	if ch["finish_reason"] != "length" {
+		t.Fatalf("finish_reason=%v", ch["finish_reason"])
+	}
+}
+
 func TestRewriteCompletionRecover(t *testing.T) {
 	block := officialBlock("get_weather", "Shanghai", 3)
 	body := completionJSON(block, "stop")
