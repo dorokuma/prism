@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sort"
+	"strings"
 
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/reasoning"
@@ -47,7 +48,17 @@ func TransformRequestBodyForProvider(body []byte, cfg *config.Config, provider s
 
 	// Step 2: Reasoning effort / thinking mapping for all models
 	schema := cfg.EffortSchema(provider)
-	if reasoning.ApplyWithSchema(raw, model, schema) {
+	modelForReasoning := model
+	// clinepass serves vendor-prefixed ids (cline-pass/deepseek-v4-flash).
+	// ProfileFor matches the prefix on the whole string, so the slash form
+	// would miss the deepseek- table and strip thinking. Only clinepass is
+	// rewritten this way; every other provider keeps the original name.
+	if provider == "clinepass" {
+		if i := strings.LastIndex(model, "/"); i >= 0 && i+1 < len(model) {
+			modelForReasoning = model[i+1:]
+		}
+	}
+	if reasoning.ApplyWithSchema(raw, modelForReasoning, schema) {
 		changed = true
 	}
 

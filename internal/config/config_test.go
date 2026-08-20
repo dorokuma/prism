@@ -1434,6 +1434,49 @@ func TestEffortSchema_EmptyProvider(t *testing.T) {
 	}
 }
 
+func TestDSMLGuard_DefaultOffAndEnabled(t *testing.T) {
+	cfg := loadProviderSchemaCfg(t)
+	if cfg.DSMLGuard("opencode-go") {
+		t.Fatal("dsml_guard default must be off")
+	}
+	if cfg.DSMLGuard("missing") {
+		t.Fatal("unknown provider must be off")
+	}
+	content := `
+providers:
+  clinepass:
+    dsml_guard: true
+    accounts:
+      - name: clinepass-1
+        key: test-key-12345
+        base_url: https://api.example.com/v1
+  other:
+    accounts:
+      - name: other-1
+        key: test-key-12345
+        base_url: https://api.example.com/v1
+`
+	f, err := os.CreateTemp("", "cfg-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	got, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !got.DSMLGuard("clinepass") {
+		t.Fatal("clinepass dsml_guard true was not loaded")
+	}
+	if got.DSMLGuard("other") {
+		t.Fatal("other provider must stay off")
+	}
+}
+
 func loadProviderSchemaCfg(t *testing.T) *Config {
 	t.Helper()
 	content := `

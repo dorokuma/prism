@@ -733,6 +733,70 @@ func TestTransformRequestBody_MiniMaxM2_ForceOn(t *testing.T) {
 	}
 }
 
+func TestTransformRequestBody_ClinepassKeepsThinking(t *testing.T) {
+	cfg := &config.Config{}
+	body := []byte(`{"model":"cline-pass/deepseek-v4-flash","reasoning_effort":"high","thinking":{"level":"high"},"messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "clinepass")
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := raw["reasoning_effort"]; !ok {
+		t.Fatal("clinepass must keep reasoning_effort")
+	}
+	if _, ok := raw["thinking"]; !ok {
+		t.Fatal("clinepass must keep thinking")
+	}
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "high" {
+		t.Errorf("reasoning_effort=%q want high", got)
+	}
+}
+
+func TestTransformRequestBody_ClinepassXhighMapsToMax(t *testing.T) {
+	cfg := &config.Config{}
+	body := []byte(`{"model":"cline-pass/deepseek-v4-flash","reasoning_effort":"xhigh","thinking":{"level":"xhigh"}}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "clinepass")
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "max" {
+		t.Errorf("reasoning_effort=%q want max", got)
+	}
+}
+
+func TestTransformRequestBody_ClinepassDoesNotChangeOtherProvider(t *testing.T) {
+	cfg := &config.Config{}
+	body := []byte(`{"model":"cline-pass/deepseek-v4-flash","reasoning_effort":"high","thinking":{"level":"high"},"messages":[{"role":"user","content":"hi"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "opencode-go")
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Fatal("other provider must still strip reasoning_effort for slash-prefixed model")
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Fatal("other provider must still strip thinking for slash-prefixed model")
+	}
+}
+
+func TestTransformRequestBody_EmptyProviderStillStripsSlashDeepseek(t *testing.T) {
+	cfg := &config.Config{}
+	body := []byte(`{"model":"cline-pass/deepseek-v4-flash","reasoning_effort":"high","thinking":{"level":"high"}}`)
+	got := sanitize.TransformRequestBody(body, cfg)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Fatal("empty provider must still strip reasoning_effort")
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Fatal("empty provider must still strip thinking")
+	}
+}
+
 func TestTransformRequestBody_NoThinkingModel_Strip(t *testing.T) {
 	cfg := &config.Config{
 		ModelRemapEnabled: true,

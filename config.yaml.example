@@ -298,6 +298,11 @@ mcp_tools_json: "/var/lib/prism/mcp_tools.json"
 # 上游专用请求头（User-Agent、anthropic-beta、x-app 等）由 prism 在转发
 # 时按账号注入，pi 侧只需带 X-Prism-Provider 头即可。
 # ---------------------------------------------------------------------------
+# providers.<name>.dsml_guard: optional, default false. When true, the legacy
+# /v1/chat/completions path (stream and non-stream) strips aborted DSML leaks
+# in content and recovers complete DSML tool_calls. The Responses translation
+# path is not wired.
+# ---------------------------------------------------------------------------
 # providers:
 #   agentrouter-openai:
 #     accounts:

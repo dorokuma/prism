@@ -281,6 +281,11 @@ type Config struct {
 	// providerSchema maps a provider name to its effort schema ("ollama" or
 	// empty for opencode). Precomputed from account base_url hosts at load time.
 	providerSchema map[string]string
+
+	// providerDSMLGuard maps a provider name to the dsml_guard flag from the
+	// YAML providers.<name>.dsml_guard key. Missing or false means the
+	// legacy chat paths pass content through unchanged.
+	providerDSMLGuard map[string]bool
 }
 
 // LoadConfig reads a YAML config file, unmarshals it into Config, applies
@@ -394,13 +399,16 @@ func LoadConfig(path string) (*Config, error) {
 	// Support providers block
 	type providersConfig struct {
 		Providers map[string]struct {
-			Accounts []AccountConfig `yaml:"accounts"`
+			Accounts  []AccountConfig `yaml:"accounts"`
+			DSMLGuard bool            `yaml:"dsml_guard"`
 		} `yaml:"providers"`
 	}
 	var pc providersConfig
 	if err := yaml.Unmarshal(data, &pc); err == nil && len(pc.Providers) > 0 {
 		var allAccounts []AccountConfig
+		cfg.providerDSMLGuard = make(map[string]bool, len(pc.Providers))
 		for providerName, providerCfg := range pc.Providers {
+			cfg.providerDSMLGuard[providerName] = providerCfg.DSMLGuard
 			for _, acc := range providerCfg.Accounts {
 				acc.Provider = providerName
 				allAccounts = append(allAccounts, acc)
@@ -845,6 +853,15 @@ func (c *Config) EffortSchema(provider string) string {
 		return ""
 	}
 	return c.providerSchema[provider]
+}
+
+// DSMLGuard reports whether providers.<name>.dsml_guard is enabled. Default
+// (missing provider, missing key, or nil Config) is false.
+func (c *Config) DSMLGuard(provider string) bool {
+	if c == nil || provider == "" {
+		return false
+	}
+	return c.providerDSMLGuard[provider]
 }
 
 // RemapModel resolves a virtual model name to its upstream model via

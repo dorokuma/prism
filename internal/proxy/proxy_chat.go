@@ -40,6 +40,11 @@ type ChatForwardOpts struct {
 	// true for the anthropic /v1/messages surface whose body is NOT a chat
 	// completion body (remap/effort/strip would corrupt it).
 	SkipSanitize bool
+
+	// DSMLGuard enables aborted-DSML cleanup on the legacy chat streaming and
+	// non-streaming paths. Filled from cfg.DSMLGuard(provider). Responses
+	// translation is not wired.
+	DSMLGuard bool
 }
 
 // maxRequestBodyBytes caps the client request body read for the three POST
@@ -316,6 +321,7 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 	if !opts.SkipSanitize {
 		bodyBytes = sanitize.TransformRequestBodyForProvider(bodyBytes, cfg, provider)
 	}
+	opts.DSMLGuard = cfg != nil && cfg.DSMLGuard(provider)
 	// Usage-enabled OpenAI-compatible streaming: ensure the upstream reports
 	// usage in the stream (stream_options.include_usage=true) so the audit
 	// and usage store capture tokens. The client's other stream_options

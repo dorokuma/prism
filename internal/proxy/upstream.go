@@ -17,6 +17,7 @@ import (
 
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/convert"
+	"github.com/dorokuma/prism/internal/dsml"
 	"github.com/dorokuma/prism/internal/mcp"
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/pool"
@@ -1005,6 +1006,9 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 			var closeDump func()
 			bodyReader, closeDump = teeUpstreamRawDump(resp, requestID, bodyReader)
 			defer closeDump()
+			if opts.DSMLGuard {
+				bodyReader = dsml.NewGuardReader(bodyReader)
+			}
 			n, err = stream.StreamResponseBody(lw, bodyReader, r, acc.Name())
 		}
 		bodyReadElapsed := time.Since(bodyReadStart).Milliseconds()
@@ -1119,6 +1123,9 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 			a.ApplyUsage(u)
 		}
 	}
+	if opts.DSMLGuard {
+		rawBody = dsml.RewriteCompletion(rawBody)
+	}
 	copyUpstreamHeaders(w, resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	n, _ := w.Write(rawBody)
@@ -1161,4 +1168,3 @@ func teeUpstreamRawDump(resp *http.Response, requestID string, body io.ReadClose
 		}
 	}
 }
-
