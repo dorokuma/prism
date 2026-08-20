@@ -781,6 +781,9 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 			var closeDump func()
 			bodyReader, closeDump = teeUpstreamRawDump(resp, requestID, bodyReader)
 			defer closeDump()
+			if opts.DSMLGuard {
+				bodyReader = dsml.NewGuardReader(bodyReader)
+			}
 			err = stream.TranslateChatStreamToResponses(w, bodyReader, opts.Model, opts.ReqTools, mcp.GetSearchToolCache(opts.TenantID), ctx)
 		}
 		translateElapsed := time.Since(translateStart).Milliseconds()
@@ -924,6 +927,9 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 			return true, nil, UpstreamErrorTemporary
 		}
 		util.DumpDebugUpstreamResponse(rawBody, []string{acc.Key()})
+		if opts.DSMLGuard {
+			rawBody = dsml.RewriteCompletion(rawBody)
+		}
 		translateStart := time.Now()
 		out, err := convert.ChatCompletionToResponse(rawBody, opts.Model, opts.ReqTools)
 		translateElapsed := time.Since(translateStart).Milliseconds()

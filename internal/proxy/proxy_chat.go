@@ -41,9 +41,9 @@ type ChatForwardOpts struct {
 	// completion body (remap/effort/strip would corrupt it).
 	SkipSanitize bool
 
-	// DSMLGuard enables aborted-DSML cleanup on the legacy chat streaming and
-	// non-streaming paths. Filled from cfg.DSMLGuard(provider). Responses
-	// translation is not wired.
+	// DSMLGuard enables aborted-DSML cleanup on the legacy chat and
+	// Responses translation paths, streaming and non-streaming. Filled
+	// from cfg.DSMLGuard(provider).
 	DSMLGuard bool
 }
 
