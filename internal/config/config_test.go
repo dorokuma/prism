@@ -396,6 +396,29 @@ func TestLoadConfig_RejectsProviderlessAccount(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_RejectsMixedTopLevelAccountsAndProviders(t *testing.T) {
+	path := writeConfig(t, `
+accounts:
+  - name: top-1
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: top
+providers:
+  p:
+    accounts:
+      - name: block-1
+        key: test-key-12345
+        base_url: https://api.example.com
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("mixed top-level accounts and providers block must be rejected")
+	}
+	if !strings.Contains(err.Error(), "use one shape only") {
+		t.Errorf("error = %v, want one-shape message", err)
+	}
+}
+
 // TestLoadConfig_MaxConcurrentUpperBound pins item 11: a
 // max_concurrent_per_account value above math.MaxInt32 would truncate in
 // the pool's int32 concurrency accounting and must fail configuration
@@ -1431,6 +1454,52 @@ func TestEffortSchema_EmptyProvider(t *testing.T) {
 	cfg := loadProviderSchemaCfg(t)
 	if got := cfg.EffortSchema(""); got != "" {
 		t.Errorf("EffortSchema(\"\")=%q, want empty", got)
+	}
+}
+
+func TestStripModelPrefix_FromHostNotName(t *testing.T) {
+	content := `
+providers:
+  cline-alias:
+    accounts:
+      - name: alias-acc
+        key: test-key-12345
+        base_url: https://api.cline.bot/api/v1
+  clinepass:
+    accounts:
+      - name: misnamed-acc
+        key: test-key-12345
+        base_url: https://opencode.ai/zen/go/v1
+  opencode-go:
+    accounts:
+      - name: go-acc
+        key: test-key-12345
+        base_url: https://opencode.ai/zen/go/v1
+`
+	f, err := os.CreateTemp("", "cfg-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cfg, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.StripModelPrefix("cline-alias") {
+		t.Fatal("cline.bot host must peel model prefix regardless of provider name")
+	}
+	if cfg.StripModelPrefix("clinepass") {
+		t.Fatal("provider named clinepass on a non-cline host must not peel model prefix")
+	}
+	if cfg.StripModelPrefix("opencode-go") {
+		t.Fatal("opencode-go must not peel model prefix")
+	}
+	if cfg.StripModelPrefix("") {
+		t.Fatal("empty provider must not peel model prefix")
 	}
 }
 
@@ -2830,6 +2899,33 @@ func TestIsOllamaHost(t *testing.T) {
 	for _, tc := range tests {
 		if got := isOllamaHost(tc.baseURL); got != tc.want {
 			t.Errorf("isOllamaHost(%q) = %v, want %v", tc.baseURL, got, tc.want)
+		}
+	}
+}
+
+func TestIsClineHost(t *testing.T) {
+	tests := []struct {
+		baseURL string
+		want    bool
+	}{
+		{"https://api.cline.bot/api/v1", true},
+		{"https://cline.bot/v1", true},
+		{"https://cline.bot", true},
+		{"https://cline.bot:8443/v1", true},
+		{"https://sub.cline.bot/v1", true},
+		{"https://API.CLINE.BOT/api/v1", true},
+		{"http://api.cline.bot/api/v1", true},
+		{"https://evilcline.bot/v1", false},
+		{"https://cline.bot.evil.example/v1", false},
+		{"https://notcline.bot/v1", false},
+		{"https://opencode.ai/zen/v1", false},
+		{"https://ollama.com/v1", false},
+		{"not a url", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		if got := isClineHost(tc.baseURL); got != tc.want {
+			t.Errorf("isClineHost(%q) = %v, want %v", tc.baseURL, got, tc.want)
 		}
 	}
 }

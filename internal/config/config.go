@@ -282,6 +282,13 @@ type Config struct {
 	// empty for opencode). Precomputed from account base_url hosts at load time.
 	providerSchema map[string]string
 
+	// providerStripModelPrefix maps a provider name to whether vendor-prefixed
+	// model ids (vendor/model) should be peeled before reasoning-profile
+	// lookup. Precomputed from account base_url hosts at load time (cline.bot
+	// and its subdomains), the same way EffortSchema is derived — the
+	// provider name is not consulted.
+	providerStripModelPrefix map[string]bool
+
 	// providerDSMLGuard maps a provider name to the dsml_guard flag from the
 	// YAML providers.<name>.dsml_guard key. Missing or false means the
 	// legacy chat paths pass content through unchanged.
@@ -405,6 +412,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	var pc providersConfig
 	if err := yaml.Unmarshal(data, &pc); err == nil && len(pc.Providers) > 0 {
+		if len(cfg.Accounts) > 0 {
+			return nil, fmt.Errorf("config has both top-level accounts and a providers block; use one shape only — mixing them used to drop the top-level accounts list without error")
+		}
 		var allAccounts []AccountConfig
 		cfg.providerDSMLGuard = make(map[string]bool, len(pc.Providers))
 		for providerName, providerCfg := range pc.Providers {
@@ -665,6 +675,7 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	// Precompute the provider → effort schema map from account base_url hosts.
 	cfg.providerSchema = buildProviderSchema(cfg.Accounts)
+	cfg.providerStripModelPrefix = buildProviderStripModelPrefix(cfg.Accounts)
 	// Startup validation: warn if GLM/z-ai upstreams lack prompt_cache_retention in strip_fields
 	for tier, upstream := range cfg.ModelTiers {
 		upstreamLower := strings.ToLower(upstream)
@@ -810,17 +821,37 @@ func buildProviderSchema(accs []AccountConfig) map[string]string {
 }
 
 func isOllamaHost(baseURL string) bool {
+	return hostIsDomainOrSub(baseURL, "ollama.com")
+}
+
+func isClineHost(baseURL string) bool {
+	return hostIsDomainOrSub(baseURL, "cline.bot")
+}
+
+// hostIsDomainOrSub reports whether baseURL's hostname is exactly domain or a
+// subdomain of it (case-insensitive, port stripped). A raw suffix match on
+// the host would also accept lookalikes such as "evil" + domain.
+func hostIsDomainOrSub(baseURL, domain string) bool {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return false
 	}
-	// Hostname() strips the port; Parse already lowercases http(s) hosts,
-	// and the explicit ToLower makes the match robust for every other
-	// scheme/shape. Only the exact ollama.com domain and its subdomains
-	// qualify — a suffix match on the raw host would also accept
-	// "evilollama.com" and "ollama.com.evil.example".
 	host := strings.ToLower(u.Hostname())
-	return host == "ollama.com" || strings.HasSuffix(host, ".ollama.com")
+	return host == domain || strings.HasSuffix(host, "."+domain)
+}
+
+func buildProviderStripModelPrefix(accs []AccountConfig) map[string]bool {
+	m := map[string]bool{}
+	for _, a := range accs {
+		if a.Provider == "" {
+			continue
+		}
+		if _, ok := m[a.Provider]; ok {
+			continue
+		}
+		m[a.Provider] = isClineHost(a.BaseURL)
+	}
+	return m
 }
 
 // LookupModelMetadata resolves per-model metadata for (provider, model).
@@ -853,6 +884,17 @@ func (c *Config) EffortSchema(provider string) string {
 		return ""
 	}
 	return c.providerSchema[provider]
+}
+
+// StripModelPrefix reports whether vendor-prefixed model ids should be
+// peeled before reasoning-profile lookup for this provider. Derived from
+// the account base_url host (cline.bot and subdomains). An empty or
+// unconfigured provider, or a nil Config, is false.
+func (c *Config) StripModelPrefix(provider string) bool {
+	if c == nil || provider == "" {
+		return false
+	}
+	return c.providerStripModelPrefix[provider]
 }
 
 // DSMLGuard reports whether providers.<name>.dsml_guard is enabled. Default
@@ -1161,6 +1203,7 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 		// from the KEPT accounts so EffortSchema stays consistent with the
 		// running pool.
 		newCfg.providerSchema = buildProviderSchema(newCfg.Accounts)
+		newCfg.providerStripModelPrefix = buildProviderStripModelPrefix(newCfg.Accounts)
 		// default_provider must reference a provider that exists in the
 		// running accounts; if the new config's default_provider only exists
 		// in the (discarded) new accounts, keep the old default_provider and

@@ -49,11 +49,12 @@ func TransformRequestBodyForProvider(body []byte, cfg *config.Config, provider s
 	// Step 2: Reasoning effort / thinking mapping for all models
 	schema := cfg.EffortSchema(provider)
 	modelForReasoning := model
-	// clinepass serves vendor-prefixed ids (cline-pass/deepseek-v4-flash).
+	// Some upstreams serve vendor-prefixed ids (vendor/deepseek-v4-flash).
 	// ProfileFor matches the prefix on the whole string, so the slash form
-	// would miss the deepseek- table and strip thinking. Only clinepass is
-	// rewritten this way; every other provider keeps the original name.
-	if provider == "clinepass" {
+	// would miss the deepseek- table and strip thinking. Whether to peel
+	// the last '/' segment is derived from the account base_url host
+	// (see config.StripModelPrefix), not from the provider name.
+	if cfg.StripModelPrefix(provider) {
 		if i := strings.LastIndex(model, "/"); i >= 0 && i+1 < len(model) {
 			modelForReasoning = model[i+1:]
 		}

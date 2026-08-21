@@ -229,6 +229,13 @@ accounts:
   - name: account-2
     base_url: https://opencode.ai/zen/go/v1
     provider: opencode-go
+  # prism setup 出厂名单还有 opencode-zen、ollama-cloud、clinepass（只写 name + base_url）。
+  # clinepass 的 thinking 映射按账号 base_url 主机（cline.bot 及其子域）剥 vendor/model
+  # 前缀，不按 provider 名。dsml_guard / skip_pi_sync / probe_path 由运行配置按需打开，
+  # setup 不预填。
+  # - name: clinepass-1
+  #   base_url: https://api.cline.bot/api/v1
+  #   provider: clinepass
 
 # ---------------------------------------------------------------------------
 # 可选：default_provider —— 请求未带 X-Prism-Provider 头时的兜底 provider。
@@ -299,9 +306,10 @@ mcp_tools_json: "/var/lib/prism/mcp_tools.json"
 # 时按账号注入，pi 侧只需带 X-Prism-Provider 头即可。
 # ---------------------------------------------------------------------------
 # providers.<name>.dsml_guard: optional, default false. When true, the legacy
-# /v1/chat/completions path (stream and non-stream) strips aborted DSML leaks
-# in content and recovers complete DSML tool_calls. The Responses translation
-# path is not wired.
+# /v1/chat/completions path (stream and non-stream) AND the /v1/responses
+# translation path (stream and non-stream) strip aborted DSML leaks in
+# content and recover complete DSML tool_calls. The Anthropic /v1/messages
+# passthrough is not rewritten.
 # ---------------------------------------------------------------------------
 # providers:
 #   agentrouter-openai:

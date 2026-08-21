@@ -15,6 +15,8 @@ import (
 )
 
 // builtinProviders lists the providers that prism ships with.
+// Menu numbers, the "all" expansion, and the 自定义 index are derived
+// from this slice — do not hard-code the count in the prompt.
 var builtinProviders = []struct {
 	Name    string
 	Label   string
@@ -23,6 +25,22 @@ var builtinProviders = []struct {
 	{Name: "opencode-go", Label: "OpenCode Go", BaseURL: "https://opencode.ai/zen/go/v1"},
 	{Name: "opencode-zen", Label: "OpenCode Zen", BaseURL: "https://opencode.ai/zen/v1"},
 	{Name: "ollama-cloud", Label: "Ollama", BaseURL: "https://ollama.com/v1"},
+	{Name: "clinepass", Label: "Cline Pass", BaseURL: "https://api.cline.bot/api/v1"},
+}
+
+// customProviderIndex is the menu number for the free-form 自定义 entry
+// (one past the last builtin).
+func customProviderIndex() int {
+	return len(builtinProviders) + 1
+}
+
+// allBuiltinIndices is the "all" expansion: "1,2,...,N" for N builtins.
+func allBuiltinIndices() string {
+	parts := make([]string, len(builtinProviders))
+	for i := range builtinProviders {
+		parts[i] = strconv.Itoa(i + 1)
+	}
+	return strings.Join(parts, ",")
 }
 
 // builtinTools maps tool names to their config file path relative to $HOME.
@@ -156,15 +174,15 @@ func runSetup() error {
 	for i, p := range builtinProviders {
 		fmt.Printf("  %d. %-15s — %s\n", i+1, p.Label, p.BaseURL)
 	}
-	fmt.Println("  4. 自定义")
+	fmt.Printf("  %d. 自定义\n", customProviderIndex())
 	fmt.Println()
 	choice := prompt(reader, "选编号，逗号分隔（如 1,3），或 all：")
 	if choice == "all" {
-		choice = "1,2,3"
+		choice = allBuiltinIndices()
 	}
 	selected := parseIndices(choice)
 	if len(selected) == 0 && choice != "" {
-		// "4" alone or custom
+		// custom index alone
 	}
 
 	var providers []providerConfig
@@ -174,7 +192,7 @@ func runSetup() error {
 	registry := newAccountNameRegistry()
 
 	for _, idx := range selected {
-		if idx >= 1 && idx <= 3 {
+		if idx >= 1 && idx <= len(builtinProviders) {
 			bp := builtinProviders[idx-1]
 			fmt.Printf("\n=== %s ===\n", bp.Label)
 			accts, err := promptAccounts(reader, bp.Name, registry)
@@ -190,7 +208,7 @@ func runSetup() error {
 	}
 
 	// Check if custom was selected
-	if choice == "4" || containsIndex(selected, 4) {
+	if choice == strconv.Itoa(customProviderIndex()) || containsIndex(selected, customProviderIndex()) {
 		fmt.Println("\n=== 自定义 ===")
 		name := prompt(reader, "名称（用于 provider 标识）:")
 		baseURL := prompt(reader, "接口地址:")

@@ -734,7 +734,7 @@ func TestTransformRequestBody_MiniMaxM2_ForceOn(t *testing.T) {
 }
 
 func TestTransformRequestBody_ClinepassKeepsThinking(t *testing.T) {
-	cfg := &config.Config{}
+	cfg := loadProviderCfg(t)
 	body := []byte(`{"model":"cline-pass/deepseek-v4-flash","reasoning_effort":"high","thinking":{"level":"high"},"messages":[{"role":"user","content":"hi"}]}`)
 	got := sanitize.TransformRequestBodyForProvider(body, cfg, "clinepass")
 	var raw map[string]json.RawMessage
@@ -753,7 +753,7 @@ func TestTransformRequestBody_ClinepassKeepsThinking(t *testing.T) {
 }
 
 func TestTransformRequestBody_ClinepassXhighMapsToMax(t *testing.T) {
-	cfg := &config.Config{}
+	cfg := loadProviderCfg(t)
 	body := []byte(`{"model":"cline-pass/deepseek-v4-flash","reasoning_effort":"xhigh","thinking":{"level":"xhigh"}}`)
 	got := sanitize.TransformRequestBodyForProvider(body, cfg, "clinepass")
 	var raw map[string]json.RawMessage
@@ -766,7 +766,7 @@ func TestTransformRequestBody_ClinepassXhighMapsToMax(t *testing.T) {
 }
 
 func TestTransformRequestBody_ClinepassDoesNotChangeOtherProvider(t *testing.T) {
-	cfg := &config.Config{}
+	cfg := loadProviderCfg(t)
 	body := []byte(`{"model":"cline-pass/deepseek-v4-flash","reasoning_effort":"high","thinking":{"level":"high"},"messages":[{"role":"user","content":"hi"}]}`)
 	got := sanitize.TransformRequestBodyForProvider(body, cfg, "opencode-go")
 	var raw map[string]json.RawMessage
@@ -778,6 +778,38 @@ func TestTransformRequestBody_ClinepassDoesNotChangeOtherProvider(t *testing.T) 
 	}
 	if _, ok := raw["thinking"]; ok {
 		t.Fatal("other provider must still strip thinking for slash-prefixed model")
+	}
+}
+
+func TestTransformRequestBody_ClineHostPeelsPrefixRegardlessOfName(t *testing.T) {
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"cline-pass/deepseek-v4-flash","reasoning_effort":"high","thinking":{"level":"high"}}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "cline-alias")
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := raw["reasoning_effort"]; !ok {
+		t.Fatal("cline.bot host must keep reasoning_effort even when the provider is not named clinepass")
+	}
+	if got := unmarshalString(t, raw["reasoning_effort"]); got != "high" {
+		t.Errorf("reasoning_effort=%q want high", got)
+	}
+}
+
+func TestTransformRequestBody_ClinepassNameOnOtherHostDoesNotPeel(t *testing.T) {
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"cline-pass/deepseek-v4-flash","reasoning_effort":"high","thinking":{"level":"high"}}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "clinepass-misnamed")
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Fatal("provider named clinepass on a non-cline host must not peel the model prefix")
+	}
+	if _, ok := raw["thinking"]; ok {
+		t.Fatal("provider named clinepass on a non-cline host must not peel the model prefix")
 	}
 }
 
@@ -963,9 +995,9 @@ func TestTransformRequestBody_Qwen_Off_StripsBudget(t *testing.T) {
 
 // ── Provider-dimension effort schema tests ──────────────────────────────
 
-// testProvidersYAML configures two providers: an ollama-cloud host (→ ollama
-// schema) and an opencode-go host (→ opencode schema). EffortSchema is derived
-// from the account base_url hosts, so no extra YAML fields are needed.
+// testProvidersYAML configures providers whose effort schema and model-prefix
+// peeling are derived from account base_url hosts, so no extra YAML fields
+// (and no provider-name special cases) are needed.
 const testProvidersYAML = `
 providers:
   ollama-cloud:
@@ -978,6 +1010,21 @@ providers:
       - name: opencode-acc
         key: test-key-12345
         base_url: https://opencode.ai/zen
+  clinepass:
+    accounts:
+      - name: clinepass-acc
+        key: test-key-12345
+        base_url: https://api.cline.bot/api/v1
+  cline-alias:
+    accounts:
+      - name: cline-alias-acc
+        key: test-key-12345
+        base_url: https://api.cline.bot/api/v1
+  clinepass-misnamed:
+    accounts:
+      - name: clinepass-misnamed-acc
+        key: test-key-12345
+        base_url: https://opencode.ai/zen/go/v1
 `
 
 func loadProviderCfg(t testing.TB) *config.Config {

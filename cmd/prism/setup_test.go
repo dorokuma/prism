@@ -522,3 +522,37 @@ func TestSetup_AccountNameRegistryAllowsDistinctFoldNames(t *testing.T) {
 		}
 	}
 }
+
+func TestBuiltinProviders_ClinepassIsFourthAndMenuDerived(t *testing.T) {
+	if len(builtinProviders) != 4 {
+		t.Fatalf("len(builtinProviders) = %d, want 4", len(builtinProviders))
+	}
+	want := []string{"opencode-go", "opencode-zen", "ollama-cloud", "clinepass"}
+	for i, name := range want {
+		if builtinProviders[i].Name != name {
+			t.Errorf("builtinProviders[%d].Name = %q, want %q", i, builtinProviders[i].Name, name)
+		}
+	}
+	if got := builtinProviders[3].BaseURL; got != "https://api.cline.bot/api/v1" {
+		t.Errorf("clinepass BaseURL = %q, want https://api.cline.bot/api/v1", got)
+	}
+	if got := customProviderIndex(); got != 5 {
+		t.Errorf("customProviderIndex() = %d, want 5 (one past the last builtin)", got)
+	}
+	if got := allBuiltinIndices(); got != "1,2,3,4" {
+		t.Errorf("allBuiltinIndices() = %q, want 1,2,3,4", got)
+	}
+}
+
+func TestGenerateConfigYAML_DoesNotPrefillOptionalFlags(t *testing.T) {
+	got := generateConfigYAML("127.0.0.1:18790", []providerConfig{
+		{Name: "clinepass", BaseURL: "https://api.cline.bot/api/v1", Accounts: []accountConfig{{Name: "clinepass-1"}}},
+		{Name: "opencode-go", BaseURL: "https://opencode.ai/zen/go/v1", Accounts: []accountConfig{{Name: "opencode-go-1"}}},
+	}, nil)
+	if strings.Contains(got, "dsml_guard") || strings.Contains(got, "skip_pi_sync") || strings.Contains(got, "probe_path") {
+		t.Fatalf("setup YAML must not prefill dsml_guard/skip_pi_sync/probe_path:\n%s", got)
+	}
+	if !strings.Contains(got, "  clinepass:\n    accounts:\n      - name: clinepass-1\n        base_url: https://api.cline.bot/api/v1\n") {
+		t.Fatalf("generated YAML missing clinepass name+base_url block:\n%s", got)
+	}
+}
