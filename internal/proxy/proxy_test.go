@@ -47,6 +47,20 @@ func TestIsQuotaError(t *testing.T) {
 	if !IsQuotaError([]byte(`{"error":{"code":"insufficient_quota"}}`)) {
 		t.Error("IsQuotaError(insufficient_quota) = false, want true")
 	}
+	// new_api_error-family relays (e.g. agentrouter) report an empty balance
+	// as a bare 403 with this envelope; it must classify as permanent quota
+	// so the account is exhausted and the request fails over.
+	if !IsQuotaError([]byte(`{"error":{"code":"insufficient_user_quota","message":"pre-consume quota failed","type":"new_api_error"}}`)) {
+		t.Error("IsQuotaError(insufficient_user_quota) = false, want true")
+	}
+	if ClassifyUpstreamError(403, []byte(`{"error":{"code":"insufficient_user_quota","type":"new_api_error"}}`)) != UpstreamErrorPermanentQuota {
+		t.Error("ClassifyUpstreamError(403, insufficient_user_quota) != PermanentQuota")
+	}
+	// The relay's unrelated error codes must NOT exhaust the account: a bare
+	// 403 without a recognized envelope stays pass-through (temporary).
+	if ClassifyUpstreamError(403, []byte(`{"error":{"code":"some_other_error","type":"new_api_error"}}`)) != UpstreamErrorTemporary {
+		t.Error("ClassifyUpstreamError(403, unrecognized relay code) != Temporary")
+	}
 	// Broad body-substring matching was removed: plain-text quota messages
 	// are NOT structured permanent quota errors — a 429 carrying one is a
 	// temporary rate limit and must go to cooldown, not exhaustion.

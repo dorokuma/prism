@@ -100,8 +100,12 @@ func IsPermanentCredentialError(body []byte) bool {
 
 // IsQuotaError checks if the response body indicates a permanent quota
 // error via the structured OpenAI error envelope only: error.code
-// "insufficient_quota" or error.type "gousagelimiterror". Broad
-// substring matching was deliberately removed — a plain-text "quota
+// "insufficient_quota" / "insufficient_user_quota" or error.type
+// "gousagelimiterror". "insufficient_user_quota" is emitted by
+// new_api_error-family relays (e.g. agentrouter) that report an empty
+// balance as a bare 403; without it the 403 passes straight through to the
+// client and the account stays in rotation forever.
+// Broad substring matching was deliberately removed — a plain-text "quota
 // exceeded" message on a 429 is a temporary rate limit and must go to
 // cooldown, not exhaustion.
 func IsQuotaError(body []byte) bool {
@@ -119,7 +123,7 @@ func IsQuotaError(body []byte) bool {
 	}
 	if errResp.Error.Code != "" {
 		code := strings.ToLower(errResp.Error.Code)
-		if code == "insufficient_quota" {
+		if code == "insufficient_quota" || code == "insufficient_user_quota" {
 			return true
 		}
 	}
@@ -140,7 +144,8 @@ const (
 	// account_deactivated) — mark the account exhausted.
 	UpstreamErrorPermanentCredential
 	// UpstreamErrorPermanentQuota: recognized structured quota exhaustion
-	// (insufficient_quota / gousagelimiterror) — mark the account exhausted.
+	// (insufficient_quota / insufficient_user_quota / gousagelimiterror) —
+	// mark the account exhausted.
 	UpstreamErrorPermanentQuota
 )
 
