@@ -132,6 +132,15 @@ model_remap:
 #       output: 2.4
 #       cache_read: 0.12
 #       cache_write: 0.6
+#   claude-opus-5:
+#     # Anthropic official: input $5 / output $25 / 1M tokens;
+#     # cache hit 0.1x = $0.50; 5-minute cache write 1.25x = $6.25.
+#     # https://platform.claude.com/docs/en/about-claude/pricing
+#     cost:
+#       input: 5
+#       output: 25
+#       cache_read: 0.5
+#       cache_write: 6.25
 
 # ---------------------------------------------------------------------------
 # 可选：usage —— 每次请求的词元用量与费用落 SQLite，供

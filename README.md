@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.21.2  Date: 2026-08-22  Status: living document
+> Version: v0.21.3  Date: 2026-08-22  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -190,6 +190,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-22** — v0.21.3 — fix: usage detail table cache hit rate. Per-row 命中率 used `cached/prompt_tokens`, which explodes past 100% for Anthropic (input_tokens excludes cache_read and cache_creation; a claude-opus-5 row of 490 input / 24.17M cache rendered millions of percent). Summary now aggregates a source-aware denominator as `hit_rate_input_tokens` (OpenAI-form prompt; Anthropic prompt+cached+cache_write; mixed groups sum both), and the table uses that — same split as the overview 缓存命中(openai)/(anthropic) segments. Stored 输入词元/缓存 columns stay as-is; later price changes still do not rewrite history.
 
 - **2026-08-22** — v0.21.2 — fix: AgentRouter Anthropic `/v1/messages` reports remaining credit below one request as HTTP 403 `new_api_error` with message `pre-consume quota failed, user quota: ＄X, need quota: ＄Y` and **no** `error.code`. v0.21.1 only matched `error.code` `insufficient_user_quota`, so that envelope stayed `upstream_4xx` and the account stayed in rotation. The classifier now treats structured `error.message` containing `pre-consume quota failed` as permanent quota exhaustion (account kicked, request fails over); unrelated `new_api_error` codes and plain-text quota strings are still temporary.
 

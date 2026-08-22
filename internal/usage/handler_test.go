@@ -372,6 +372,26 @@ func TestHandlerTableFormatMixedSources(t *testing.T) {
 	if !strings.Contains(body, "缓存命中(openai) 900 (90.0%)   缓存命中(anthropic) 500 (99.8%)") {
 		t.Errorf("split cache segments missing or wrong:\n%s", body)
 	}
+	// Ungrouped table row: 1400 hits over openai prompt 1000 + anthropic
+	// assembled 501 = 1501 → 93.3%. cached/prompt (1400/1001 = 139.9%)
+	// is the bug this path used to show.
+	if !strings.Contains(body, "93.3%") {
+		t.Errorf("ungrouped table hit rate must be 1400/1501 = 93.3%%:\n%s", body)
+	}
+	if strings.Contains(body, "139.9%") || strings.Contains(body, "50000") {
+		t.Errorf("table hit rate still uses cached/prompt:\n%s", body)
+	}
+	rec = doRequest(h, http.MethodGet, "/admin/usage/summary?group_by=model&format=table", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("table by model: got %d, body %s", rec.Code, rec.Body.String())
+	}
+	byModel := rec.Body.String()
+	if !strings.Contains(byModel, "90.0%") || !strings.Contains(byModel, "99.8%") {
+		t.Errorf("per-model table must keep openai 90.0%% and anthropic 99.8%%:\n%s", byModel)
+	}
+	if strings.Contains(byModel, "50000") {
+		t.Errorf("anthropic model row still uses cached/prompt:\n%s", byModel)
+	}
 	// JSON default is untouched: the same dataset via the default format
 	// still serves the pre-existing row fields (ungrouped → one aggregate
 	// row).
@@ -390,6 +410,9 @@ func TestHandlerTableFormatMixedSources(t *testing.T) {
 	}
 	if body2.Rows[0].Requests != 2 || body2.Rows[0].PromptTokens != 1001 || body2.Rows[0].CachedTokens != 1400 {
 		t.Errorf("json aggregate broken by the split: %+v", body2.Rows[0])
+	}
+	if body2.Rows[0].HitRateInputTokens != 1501 {
+		t.Errorf("hit_rate_input_tokens = %d, want 1501 (1000 + 1+500+0)", body2.Rows[0].HitRateInputTokens)
 	}
 }
 

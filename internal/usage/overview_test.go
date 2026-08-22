@@ -47,6 +47,11 @@ func checkOverviewVsSummaryRow(t *testing.T, o *Overview, r SummaryRow) {
 	if o.CacheWriteTokens != r.CacheWriteTokens {
 		t.Errorf("cache_write_tokens: overview=%d summary=%d", o.CacheWriteTokens, r.CacheWriteTokens)
 	}
+	wantHit := o.OpenAIPromptTokens + o.AnthropicPromptTokens + o.AnthropicCachedTokens + o.AnthropicCacheWriteTokens
+	if r.HitRateInputTokens != wantHit {
+		t.Errorf("hit_rate_input_tokens: summary=%d want %d (openai prompt %d + anthropic assembled %d+%d+%d)",
+			r.HitRateInputTokens, wantHit, o.OpenAIPromptTokens, o.AnthropicPromptTokens, o.AnthropicCachedTokens, o.AnthropicCacheWriteTokens)
+	}
 	if (o.TotalCost == nil) != (r.CostUSD == nil) {
 		t.Errorf("cost nil-ness: overview=%v summary=%v", o.TotalCost, r.CostUSD)
 	} else if o.TotalCost != nil && !approxEqual(*o.TotalCost, *r.CostUSD) {
@@ -71,6 +76,7 @@ func sumSummaryRows(rows []SummaryRow) SummaryRow {
 		out.CachedTokens += r.CachedTokens
 		out.ReasoningTokens += r.ReasoningTokens
 		out.CacheWriteTokens += r.CacheWriteTokens
+		out.HitRateInputTokens += r.HitRateInputTokens
 		out.CostMissingRequests += r.CostMissingRequests
 		if r.CostUSD != nil {
 			hasCost = true
@@ -557,6 +563,27 @@ func TestOverviewSourceSplit(t *testing.T) {
 	}
 	if o.OpenAICachedTokens+o.AnthropicCachedTokens != o.CachedTokens {
 		t.Errorf("cached splits %d+%d != cached %d", o.OpenAICachedTokens, o.AnthropicCachedTokens, o.CachedTokens)
+	}
+
+	rows, err := s.Summary(ctx, SummaryQuery{GroupBy: []string{"model"}, Limit: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]SummaryRow{}
+	for _, r := range rows {
+		name, _ := r.Groups["model"].(string)
+		byName[name] = r
+	}
+	if gpt := byName["gpt"]; gpt.HitRateInputTokens != 1000 {
+		t.Errorf("gpt hit_rate_input_tokens = %d, want 1000 (openai prompt)", gpt.HitRateInputTokens)
+	}
+	// claude: two anthropic rows, assembled (1+500+0) + (100+50+40) = 691
+	if claude := byName["claude"]; claude.HitRateInputTokens != 691 {
+		t.Errorf("claude hit_rate_input_tokens = %d, want 691 (anthropic assembled)", claude.HitRateInputTokens)
+	}
+	// old: empty-string 200 + NULL 100, both OpenAI-form
+	if old := byName["old"]; old.HitRateInputTokens != 300 {
+		t.Errorf("old hit_rate_input_tokens = %d, want 300 (legacy openai prompt)", old.HitRateInputTokens)
 	}
 
 	// A model filter narrows the splits to the matching rows only: both

@@ -53,16 +53,34 @@ type SummaryQuery struct {
 // SummaryRow is one aggregated group (or the single overall row when no
 // group_by is requested).
 type SummaryRow struct {
-	Groups              map[string]any `json:"groups"`
-	Requests            int64          `json:"requests"`
-	PromptTokens        int64          `json:"prompt_tokens"`
-	CompletionTokens    int64          `json:"completion_tokens"`
-	TotalTokens         int64          `json:"total_tokens"`
-	CachedTokens        int64          `json:"cached_tokens"`
-	ReasoningTokens     int64          `json:"reasoning_tokens"`
-	CacheWriteTokens    int64          `json:"cache_write_tokens"`
-	CostUSD             *float64       `json:"cost_usd,omitempty"`
-	CostMissingRequests int64          `json:"cost_missing_requests"`
+	Groups           map[string]any `json:"groups"`
+	Requests         int64          `json:"requests"`
+	PromptTokens     int64          `json:"prompt_tokens"`
+	CompletionTokens int64          `json:"completion_tokens"`
+	TotalTokens      int64          `json:"total_tokens"`
+	CachedTokens     int64          `json:"cached_tokens"`
+	ReasoningTokens  int64          `json:"reasoning_tokens"`
+	CacheWriteTokens int64          `json:"cache_write_tokens"`
+	// HitRateInputTokens is the cache-hit denominator for this group
+	// (OpenAI-form prompt plus Anthropic assembled input). It is filled
+	// by Summary; in-memory fixtures that leave it zero fall back to
+	// PromptTokens. See cacheHitInput.
+	HitRateInputTokens  int64    `json:"hit_rate_input_tokens"`
+	CostUSD             *float64 `json:"cost_usd,omitempty"`
+	CostMissingRequests int64    `json:"cost_missing_requests"`
+}
+
+// cacheHitInput is the cache-hit denominator for this group. SQL fills
+// HitRateInputTokens using the same source split as Overview: OpenAI-form
+// prompt (cached already included) plus Anthropic assembled input
+// (prompt + cache_read + cache_creation). In-memory rows used by renderer
+// tests leave the field zero and fall back to PromptTokens, which is the
+// OpenAI-form formula those fixtures assume.
+func (r SummaryRow) cacheHitInput() int64 {
+	if r.HitRateInputTokens != 0 {
+		return r.HitRateInputTokens
+	}
+	return r.PromptTokens
 }
 
 // QueryError marks a client-side validation error (bad group_by name, bad
@@ -83,6 +101,16 @@ const (
 	// header cannot read 0 while 输入/输出词元 are non-zero. Shared by
 	// Summary and Overview so the two cannot drift.
 	totalTokensSumExpr = `SUM(CASE WHEN total_tokens > 0 THEN total_tokens ELSE prompt_tokens + completion_tokens END)`
+	// hitRateInputSumExpr is the cache-hit denominator. OpenAI-form
+	// prompt_tokens already includes cached tokens, so the denominator is
+	// prompt_tokens (legacy NULL / empty usage_source use the same
+	// OpenAI-form branch ComputeCost applies). Anthropic-form input_tokens
+	// excludes cache_read and cache_creation, so those counters are added
+	// back. Mixed groups sum both families. This matches the Overview
+	// split the renderer already uses for the summary segments, so a
+	// per-row hit rate cannot exceed 100% when the upstream reports
+	// cache_read outside input_tokens.
+	hitRateInputSumExpr = `SUM(CASE WHEN usage_source = 'anthropic' THEN prompt_tokens + cached_tokens + cache_write_tokens ELSE prompt_tokens END)`
 )
 
 // buildSummaryWhere renders the shared WHERE clause for q's filter fields
@@ -165,6 +193,7 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 	sb.WriteString(`COUNT(*) AS requests,
 		SUM(prompt_tokens), SUM(completion_tokens), ` + totalTokensSumExpr + `,
 		SUM(cached_tokens), SUM(reasoning_tokens), SUM(cache_write_tokens),
+		` + hitRateInputSumExpr + `,
 		SUM(cost_usd),
 		SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) AS cost_missing_requests
 	FROM usage_events`)
@@ -193,7 +222,7 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 	out := make([]SummaryRow, 0, 16)
 	for rows.Next() {
 		row := SummaryRow{Groups: make(map[string]any, len(groupNames))}
-		dest := make([]any, 0, len(groupNames)+9)
+		dest := make([]any, 0, len(groupNames)+10)
 		strVals := make([]*string, len(groupNames))
 		intVals := make([]*int64, len(groupNames))
 		for i, name := range groupNames {
@@ -206,9 +235,9 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 				dest = append(dest, strVals[i])
 			}
 		}
-		var requests, pt, ct, tt, cached, rt, cwt, missing sql.NullInt64
+		var requests, pt, ct, tt, cached, rt, cwt, hitIn, missing sql.NullInt64
 		var costSum sql.NullFloat64
-		dest = append(dest, &requests, &pt, &ct, &tt, &cached, &rt, &cwt, &costSum, &missing)
+		dest = append(dest, &requests, &pt, &ct, &tt, &cached, &rt, &cwt, &hitIn, &costSum, &missing)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
@@ -226,6 +255,7 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 		row.CachedTokens = cached.Int64
 		row.ReasoningTokens = rt.Int64
 		row.CacheWriteTokens = cwt.Int64
+		row.HitRateInputTokens = hitIn.Int64
 		if costSum.Valid {
 			v := costSum.Float64
 			row.CostUSD = &v

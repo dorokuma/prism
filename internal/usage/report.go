@@ -173,7 +173,7 @@ func usageTableData(rows []SummaryRow, groupBy []string) ([]render.Column, [][]s
 			formatRequests(r.Requests),
 			render.FormatTokens(r.PromptTokens),
 			render.FormatTokens(r.CachedTokens),
-			cacheHitRate(r.CachedTokens, r.PromptTokens),
+			cacheHitRate(r.CachedTokens, r.cacheHitInput()),
 			render.FormatTokens(r.CompletionTokens),
 			render.FormatCostCompact(r.CostUSD),
 		)
@@ -207,14 +207,18 @@ func renderUsageTable(cols []render.Column, cells [][]string, color bool) string
 	return t.Render()
 }
 
-// cacheHitRate renders the CachedTokens/PromptTokens hit ratio with one
-// decimal ("66.7%"). A zero prompt total must show a stable "0.0%" — the
-// guard avoids NaN/Inf from a division by zero.
-func cacheHitRate(cached, prompt int64) string {
-	if prompt == 0 {
+// cacheHitRate renders cached/input with one decimal ("66.7%"). input is
+// the source-aware denominator from SummaryRow.cacheHitInput — OpenAI-form
+// prompt_tokens (cached already included) or Anthropic assembled input
+// (input + cache_read + cache_creation) — so the ratio cannot exceed 100%
+// when the upstream reports cache_read outside input_tokens. A zero input
+// total must show a stable "0.0%" — the guard avoids NaN/Inf from a
+// division by zero (FormatPercent would render "-").
+func cacheHitRate(cached, input int64) string {
+	if input == 0 {
 		return "0.0%"
 	}
-	return render.FormatPercent(float64(cached), float64(prompt))
+	return render.FormatPercent(float64(cached), float64(input))
 }
 
 // formatGroupValue renders one group key value for the table. Time buckets

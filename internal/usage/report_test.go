@@ -233,8 +233,8 @@ func TestRenderUsageReportColor(t *testing.T) {
 // TestRenderUsageTableHitRateAndGroupTitles pins the per-view table
 // contract: the model view titles its first column 模型, every other
 // group_by view keeps the dynamic first-column name, the hit-rate column
-// shows CachedTokens/PromptTokens with one decimal, and a zero prompt total
-// renders a stable 0.0% — never NaN/Inf.
+// shows cached over the source-aware input with one decimal, and a zero
+// input total renders a stable 0.0% — never NaN/Inf.
 func TestRenderUsageTableHitRateAndGroupTitles(t *testing.T) {
 	rows := []SummaryRow{
 		{Groups: map[string]any{"model": "m1"}, Requests: 1, PromptTokens: 1000, CachedTokens: 968, CompletionTokens: 100, CostUSD: ptr64(0.1)},
@@ -287,6 +287,39 @@ func TestRenderUsageTableHitRateAndGroupTitles(t *testing.T) {
 	got = RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{Period: "x"})
 	if !strings.Contains(got, "0.0%") {
 		t.Errorf("zero-cached hit rate must render 0.0%%:\n%s", got)
+	}
+}
+
+// TestRenderUsageTableAnthropicHitRate pins the table hit-rate column to the
+// same source-aware denominator as the overview segments. Anthropic-form
+// cache_read sits outside input_tokens; cached/prompt would explode past
+// 100% (500/1 = 50000%). Mixed groups sum OpenAI prompt with Anthropic
+// assembled input.
+func TestRenderUsageTableAnthropicHitRate(t *testing.T) {
+	rows := []SummaryRow{
+		{Groups: map[string]any{"model": "claude-opus-5"}, Requests: 1,
+			PromptTokens: 1, CachedTokens: 500, CacheWriteTokens: 0,
+			HitRateInputTokens: 501, CompletionTokens: 50},
+	}
+	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{Period: "x"})
+	if !strings.Contains(got, "99.8%") {
+		t.Errorf("anthropic table hit rate must be 500/501 = 99.8%%:\n%s", got)
+	}
+	if strings.Contains(got, "50000") {
+		t.Errorf("anthropic table must not use cached/prompt:\n%s", got)
+	}
+
+	rows = []SummaryRow{
+		{Groups: map[string]any{"model": "mixed"}, Requests: 2,
+			PromptTokens: 1001, CachedTokens: 1400, CacheWriteTokens: 0,
+			HitRateInputTokens: 1501, CompletionTokens: 150},
+	}
+	got = RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{Period: "x"})
+	if !strings.Contains(got, "93.3%") {
+		t.Errorf("mixed-group table hit rate must be 1400/1501 = 93.3%%:\n%s", got)
+	}
+	if strings.Contains(got, "139.9%") {
+		t.Errorf("mixed-group table must not use cached/prompt:\n%s", got)
 	}
 }
 

@@ -759,6 +759,9 @@ func TestRunUsageSplitCacheSegments(t *testing.T) {
 	if strings.Contains(out, "缓存命中 980 (") || strings.Contains(out, "缓存命中 500 (") {
 		t.Errorf("old single-segment format still present:\n%s", out)
 	}
+	if strings.Contains(out, "50000") {
+		t.Errorf("claude table row still uses cached/prompt:\n%s", out)
+	}
 
 	// --json: the overview keeps every pre-existing field and adds the
 	// per-source split without renaming or retyping anything.
