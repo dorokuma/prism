@@ -507,6 +507,34 @@ func TestProbeExhausted_402Stops(t *testing.T) {
 	}
 }
 
+func TestProbeExhausted_403PreConsumeQuotaStops(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(403)
+		w.Write([]byte(`{"error":{"message":"pre-consume quota failed, user quota: ＄0.031792, need quota: ＄0.545150 (request id: x)","type":"new_api_error"},"type":"error"}`))
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "exhausted1", Key: "k1", BaseURL: upstream.URL},
+	})
+	accs := p.AllAccounts()
+	accs[0].MarkExhausted()
+
+	ProbeExhausted(p)
+
+	if callCount != 1 {
+		t.Errorf("pre-consume 403 should not retry, got %d calls", callCount)
+	}
+	if accs[0].IsHealthy() {
+		t.Error("account should stay exhausted")
+	}
+	if accs[0].LastExhaustClass() != ExhaustPermanentQuota {
+		t.Errorf("lastExhaustClass = %d, want quota", accs[0].LastExhaustClass())
+	}
+}
+
 func TestProbeExhausted_403QuotaBodyStops(t *testing.T) {
 	callCount := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

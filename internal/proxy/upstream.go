@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -70,64 +69,23 @@ func isHopByHop(key string) bool {
 	return hopByHopHeaders[http.CanonicalHeaderKey(key)]
 }
 
-// OpenAIErrorResponse represents an OpenAI API error response body.
-type OpenAIErrorResponse struct {
-	Error struct {
-		Message string      `json:"message"`
-		Type    string      `json:"type"`
-		Param   interface{} `json:"param"`
-		Code    string      `json:"code"`
-	} `json:"error"`
-}
-
 // IsPermanentCredentialError checks if the response body indicates a permanent
 // credential error (invalid_api_key, revoked, account_deactivated).
 func IsPermanentCredentialError(body []byte) bool {
-	if len(body) == 0 {
-		return false
-	}
-	var errResp OpenAIErrorResponse
-	err := json.Unmarshal(body, &errResp)
-
-	if err == nil && errResp.Error.Code != "" {
-		code := strings.ToLower(errResp.Error.Code)
-		if code == "invalid_api_key" || code == "revoked" || code == "account_deactivated" {
-			return true
-		}
-	}
-	return false
+	return pool.IsPermanentCredentialBody(body)
 }
 
 // IsQuotaError checks if the response body indicates a permanent quota
-// error via the structured OpenAI error envelope only: error.code
-// "insufficient_quota" / "insufficient_user_quota" or error.type
-// "gousagelimiterror". "insufficient_user_quota" is emitted by
-// new_api_error-family relays (e.g. agentrouter) that report an empty
-// balance as a bare 403; without it the 403 passes straight through to the
-// client and the account stays in rotation forever.
-// Broad substring matching was deliberately removed — a plain-text "quota
-// exceeded" message on a 429 is a temporary rate limit and must go to
-// cooldown, not exhaustion.
+// error via the structured error envelope only. Shared with the probe
+// loop (pool.IsQuotaErrorBody): error.code "insufficient_quota" /
+// "insufficient_user_quota", error.type "gousagelimiterror", or
+// error.message containing "pre-consume quota failed" (AgentRouter
+// new_api_error; Anthropic /v1/messages often omits error.code).
+// Broad substring matching on the raw body is deliberately not used — a
+// plain-text "quota exceeded" message on a 429 is a temporary rate limit
+// and must go to cooldown, not exhaustion.
 func IsQuotaError(body []byte) bool {
-	if len(body) == 0 {
-		return false
-	}
-	var errResp OpenAIErrorResponse
-	_ = json.Unmarshal(body, &errResp)
-
-	if errResp.Error.Type != "" {
-		typ := strings.ToLower(errResp.Error.Type)
-		if typ == "gousagelimiterror" {
-			return true
-		}
-	}
-	if errResp.Error.Code != "" {
-		code := strings.ToLower(errResp.Error.Code)
-		if code == "insufficient_quota" || code == "insufficient_user_quota" {
-			return true
-		}
-	}
-	return false
+	return pool.IsQuotaErrorBody(body)
 }
 
 // UpstreamErrorClass classifies an upstream HTTP error for account-state
@@ -144,8 +102,8 @@ const (
 	// account_deactivated) — mark the account exhausted.
 	UpstreamErrorPermanentCredential
 	// UpstreamErrorPermanentQuota: recognized structured quota exhaustion
-	// (insufficient_quota / insufficient_user_quota / gousagelimiterror) —
-	// mark the account exhausted.
+	// (insufficient_quota / insufficient_user_quota / gousagelimiterror /
+	// AgentRouter "pre-consume quota failed") — mark the account exhausted.
 	UpstreamErrorPermanentQuota
 )
 

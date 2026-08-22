@@ -56,10 +56,20 @@ func TestIsQuotaError(t *testing.T) {
 	if ClassifyUpstreamError(403, []byte(`{"error":{"code":"insufficient_user_quota","type":"new_api_error"}}`)) != UpstreamErrorPermanentQuota {
 		t.Error("ClassifyUpstreamError(403, insufficient_user_quota) != PermanentQuota")
 	}
+	antBody := []byte(`{"error":{"message":"pre-consume quota failed, user quota: ＄0.031792, need quota: ＄0.545150 (request id: 20260822200214517664032m5lgqVkUakoRB)","type":"new_api_error"},"type":"error"}`)
+	if !IsQuotaError(antBody) {
+		t.Error("IsQuotaError(anthropic pre-consume, no code) = false, want true")
+	}
+	if ClassifyUpstreamError(403, antBody) != UpstreamErrorPermanentQuota {
+		t.Error("ClassifyUpstreamError(403, anthropic pre-consume) != PermanentQuota")
+	}
 	// The relay's unrelated error codes must NOT exhaust the account: a bare
 	// 403 without a recognized envelope stays pass-through (temporary).
 	if ClassifyUpstreamError(403, []byte(`{"error":{"code":"some_other_error","type":"new_api_error"}}`)) != UpstreamErrorTemporary {
 		t.Error("ClassifyUpstreamError(403, unrecognized relay code) != Temporary")
+	}
+	if ClassifyUpstreamError(403, []byte(`{"error":{"message":"model not found","type":"new_api_error"}}`)) != UpstreamErrorTemporary {
+		t.Error("ClassifyUpstreamError(403, new_api_error without pre-consume) != Temporary")
 	}
 	// Broad body-substring matching was removed: plain-text quota messages
 	// are NOT structured permanent quota errors — a 429 carrying one is a
@@ -349,6 +359,61 @@ func TestUpstream5xxCooldown(t *testing.T) {
 	accs := p.AllAccounts()
 	if !accs[0].IsInCooldown() {
 		t.Error("account should be in cooldown after 5xx")
+	}
+}
+
+func TestAgentRouterPreConsumeQuotaFailsOver(t *testing.T) {
+	// Live AgentRouter Anthropic 403: remaining credit cannot cover one
+	// request, no error.code. The poor account must leave the pool and the
+	// request must retry on the funded account.
+	preConsume := []byte(`{"error":{"message":"pre-consume quota failed, user quota: ＄0.031792, need quota: ＄0.545150 (request id: 20260822200214517664032m5lgqVkUakoRB)","type":"new_api_error"},"type":"error"}`)
+	var aHits, bHits int32
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&aHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write(preConsume)
+	}))
+	defer upA.Close()
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&bHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upB.Close()
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{
+		{Name: "agentrouter-ant-2", Key: "ka", BaseURL: upA.URL, Provider: "agentrouter-anthropic"},
+		{Name: "agentrouter-ant-1", Key: "kb", BaseURL: upB.URL, Provider: "agentrouter-anthropic"},
+	}}
+	p := pool.NewPool(cfg.Accounts)
+	rec := httptest.NewRecorder()
+	body := []byte(`{"model":"claude-opus-5"}`)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Prism-Provider", "agentrouter-anthropic")
+
+	proxyChatWithBody(p, rec, r, body, time.Now(), ChatForwardOpts{Model: "claude-opus-5"}, cfg)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after quota failover; body=%s", rec.Code, rec.Body.String())
+	}
+	if atomic.LoadInt32(&aHits) != 1 {
+		t.Errorf("poor account hits = %d, want 1", aHits)
+	}
+	if atomic.LoadInt32(&bHits) != 1 {
+		t.Errorf("funded account hits = %d, want 1", bHits)
+	}
+	accs := p.AllAccounts()
+	if accs[0].Status() != pool.StatusExhausted {
+		t.Fatalf("poor account status = %v, want exhausted", accs[0].Status())
+	}
+	if accs[0].LastExhaustClass() != pool.ExhaustPermanentQuota {
+		t.Errorf("poor account class = %v, want ExhaustPermanentQuota", accs[0].LastExhaustClass())
+	}
+	if !accs[1].IsHealthy() {
+		t.Error("funded account must stay healthy")
 	}
 }
 

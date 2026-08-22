@@ -2,7 +2,6 @@ package pool
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -195,8 +194,8 @@ func probeExhaustedAccount(pool *Pool, acc *Account) {
 				return true
 			}
 
-			// Same rules as proxy.ClassifyUpstreamError (pool cannot
-			// import proxy: proxy already imports pool).
+			// Same rules as proxy.ClassifyUpstreamError (shared body
+			// matchers in errorbody.go; pool cannot import proxy).
 			class := classifyProbeError(statusCode, respBody)
 			if class == ExhaustPermanentCredential || class == ExhaustPermanentQuota {
 				acc.noteExhaustClass(class)
@@ -225,7 +224,8 @@ func probeExhaustedAccount(pool *Pool, acc *Account) {
 }
 
 // classifyProbeError mirrors proxy.ClassifyUpstreamError. The pool package
-// cannot import proxy (proxy already imports pool). Keep the two in sync:
+// cannot import proxy (proxy already imports pool). Body matching lives in
+// errorbody.go so the two paths cannot drift:
 // 401 → permanent credential, 402 → permanent quota, then structured
 // credential/quota bodies, else temporary. A bare 403 is temporary.
 func classifyProbeError(statusCode int, body []byte) ExhaustClass {
@@ -234,45 +234,11 @@ func classifyProbeError(statusCode int, body []byte) ExhaustClass {
 		return ExhaustPermanentCredential
 	case statusCode == 402:
 		return ExhaustPermanentQuota
-	case probePermanentCredentialBody(body):
+	case IsPermanentCredentialBody(body):
 		return ExhaustPermanentCredential
-	case probeQuotaBody(body):
+	case IsQuotaErrorBody(body):
 		return ExhaustPermanentQuota
 	default:
 		return ExhaustTemporary
 	}
-}
-
-type probeErrorEnvelope struct {
-	Error struct {
-		Type string `json:"type"`
-		Code string `json:"code"`
-	} `json:"error"`
-}
-
-func probePermanentCredentialBody(body []byte) bool {
-	if len(body) == 0 {
-		return false
-	}
-	var errResp probeErrorEnvelope
-	if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error.Code == "" {
-		return false
-	}
-	code := strings.ToLower(errResp.Error.Code)
-	return code == "invalid_api_key" || code == "revoked" || code == "account_deactivated"
-}
-
-func probeQuotaBody(body []byte) bool {
-	if len(body) == 0 {
-		return false
-	}
-	var errResp probeErrorEnvelope
-	_ = json.Unmarshal(body, &errResp)
-	if errResp.Error.Type != "" && strings.ToLower(errResp.Error.Type) == "gousagelimiterror" {
-		return true
-	}
-	if errResp.Error.Code != "" && strings.ToLower(errResp.Error.Code) == "insufficient_quota" {
-		return true
-	}
-	return false
 }

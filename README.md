@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.21.0  Date: 2026-08-21  Status: living document
+> Version: v0.21.2  Date: 2026-08-22  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -190,6 +190,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-22** — v0.21.2 — fix: AgentRouter Anthropic `/v1/messages` reports remaining credit below one request as HTTP 403 `new_api_error` with message `pre-consume quota failed, user quota: ＄X, need quota: ＄Y` and **no** `error.code`. v0.21.1 only matched `error.code` `insufficient_user_quota`, so that envelope stayed `upstream_4xx` and the account stayed in rotation. The classifier now treats structured `error.message` containing `pre-consume quota failed` as permanent quota exhaustion (account kicked, request fails over); unrelated `new_api_error` codes and plain-text quota strings are still temporary.
 
 - **2026-08-21** — v0.21.0 — feat: setup ships `clinepass` as a fourth builtin (menu numbers and 自定义 derived from the slice). Vendor-prefixed model ids are peeled for reasoning maps from the account `base_url` host (`cline.bot` and subdomains), not the provider name. `dsml_guard` / `skip_pi_sync` / `probe_path` stay runtime YAML. Chat and `/v1/responses` translation both apply `dsml_guard` (stream and non-stream); `/v1/messages` is unchanged. LoadConfig rejects mixing top-level `accounts:` with a `providers:` block (that mix used to drop the top-level list without error).
 
