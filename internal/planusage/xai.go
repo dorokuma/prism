@@ -121,9 +121,51 @@ func (f XAIFetcher) Fetch(ctx context.Context, acc AccountView) (Snapshot, error
 		return snap, ErrUnauthorized
 	case http.StatusForbidden:
 		return snap, ErrNoSubscription
+	case http.StatusPaymentRequired:
+		// The CLI billing proxy answers 402 when the included credits are
+		// exhausted. This is a valid, fully known quota state, not a fetch
+		// failure: keep the billing window visible at 100%.
+		if xaiQuotaExhausted(resp.StatusCode, body) {
+			snap.Windows = []Window{{Name: "weekly", Status: "rate-limited", Percent: 100}}
+			return snap, nil
+		}
+		return snap, fmt.Errorf("%w: %d", ErrUnexpectedStatus, resp.StatusCode)
+	case http.StatusTooManyRequests:
+		// Some proxy versions use 429 for an exhausted billing allowance.
+		// Only accept a body that explicitly identifies exhaustion; a generic
+		// rate limit remains a real upstream error.
+		if xaiQuotaExhausted(resp.StatusCode, body) {
+			snap.Windows = []Window{{Name: "weekly", Status: "rate-limited", Percent: 100}}
+			return snap, nil
+		}
+		return snap, fmt.Errorf("%w: %d", ErrUnexpectedStatus, resp.StatusCode)
 	default:
 		return snap, fmt.Errorf("%w: %d", ErrUnexpectedStatus, resp.StatusCode)
 	}
+}
+
+func xaiQuotaExhausted(status int, body []byte) bool {
+	if status == http.StatusPaymentRequired {
+		return true
+	}
+	text := strings.ToLower(string(body))
+	// Do not classify every 429 as exhaustion: transient request throttling
+	// must continue to surface as ErrUnexpectedStatus. These are the stable
+	// quota markers used by xAI/OpenAI-compatible billing envelopes.
+	for _, marker := range []string{
+		`"code":"insufficient_quota"`,
+		`"code":"quota_exceeded"`,
+		`"code":"credit_exhausted"`,
+		`"type":"insufficient_quota"`,
+		`"type":"quota_exceeded"`,
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return strings.Contains(text, "quota exhausted") ||
+		strings.Contains(text, "credits exhausted") ||
+		strings.Contains(text, "credit exhausted")
 }
 
 func parseXAICredits(body []byte) ([]Window, error) {

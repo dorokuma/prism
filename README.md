@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.21.4  Date: 2026-08-23  Status: living document
+> Version: v0.21.5  Date: 2026-08-23  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -190,6 +190,8 @@ systemctl kill -s HUP prism   # or restart
 MIT
 
 ## Changelog
+
+- **2026-08-23** — v0.21.5 — fix: Grok quota exhaustion. HTTP 402 and 429 responses with explicit quota-exhaustion markers now report the weekly window as 100% rate-limited without a query error; ordinary 429 responses and authentication/upstream failures still surface as errors.
 
 - **2026-08-23** — v0.21.4 — feat: SuperGrok OAuth, weekly quota, and Pi `/usage` defaulting to the SuperGrok week window. `prism auth xai` runs the public Grok-CLI device flow; CLI config loads `./config.yaml` then `/var/lib/prism/config.yaml`; the token file is chowned like `oauth_dir` so `User=prism` can hot-load it. Quota polls only `cli-chat-proxy.grok.com/v1/billing?format=credits` (OpenCode Go `/usage` windows are gone); the window label is week-limit; the limit-estimate column is grok-* tokens × 100 / week-pool percent and shows the previous week after reset. Grok Build `updates.jsonl` session usage merges into the same week ledger (`key_id=grok-build`). xAI models get official short-context USD/1M prices and thinking maps. `/admin/usage/summary` and `prism usage` omit-`from` default to SuperGrok `PeriodStart` (else the estimate file, else last 7 days); explicit `from=0` / `--since` still override.
 

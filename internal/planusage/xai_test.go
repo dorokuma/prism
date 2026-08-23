@@ -2,6 +2,7 @@ package planusage
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -84,6 +85,51 @@ func TestXAIFetcherUnauthorized(t *testing.T) {
 	}
 }
 
+func TestXAIFetcherQuotaExhaustedReturnsFullWindow(t *testing.T) {
+	cases := []struct {
+		name, body string
+		status     int
+	}{
+		{"payment required", `{"error":{"message":"credits exhausted"}}`, http.StatusPaymentRequired},
+		{"structured 429", `{"error":{"code":"insufficient_quota","message":"quota exceeded"}}`, http.StatusTooManyRequests},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			snap, err := (XAIFetcher{BillingURL: srv.URL, Timeout: time.Second}).Fetch(context.Background(), fakeAcc{
+				name: "a", provider: "xai", key: "tok", client: srv.Client(),
+			})
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if len(snap.Windows) != 1 || snap.Windows[0].Percent != 100 || snap.Windows[0].Status != "rate-limited" {
+				t.Fatalf("windows = %+v, want one rate-limited 100%% window", snap.Windows)
+			}
+		})
+	}
+}
+
+func TestXAIFetcherRealUpstreamErrorStillFails(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				io.WriteString(w, `{"error":{"message":"temporary failure"}}`)
+			}))
+			defer srv.Close()
+			_, err := (XAIFetcher{BillingURL: srv.URL, Timeout: time.Second}).Fetch(context.Background(), fakeAcc{
+				name: "a", provider: "xai", key: "tok", client: srv.Client(),
+			})
+			if err == nil || !errors.Is(err, ErrUnexpectedStatus) {
+				t.Fatalf("err = %v, want ErrUnexpectedStatus", err)
+			}
+		})
+	}
+}
 func TestXAIFetcherFullMarksRateLimited(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"config":{"creditUsagePercent":100,"billingPeriodEnd":"2026-08-29T00:00:00Z"}}`)
