@@ -97,9 +97,9 @@ func (a *usageRecorderAdapter) Price(audit *middleware.RequestAudit) (*float64, 
 	// upstream model has no known price, fall back to the client-requested
 	// model so deployments that price their virtual model names keep
 	// working (compatibility fallback).
-	price := priceFor(cfg, audit.Provider, audit.UpstreamModel)
+	price := priceFor(cfg, audit.Provider, audit.UpstreamModel, int64(audit.PromptTokens))
 	if price == nil {
-		price = priceFor(cfg, audit.Provider, audit.Model)
+		price = priceFor(cfg, audit.Provider, audit.Model, int64(audit.PromptTokens))
 	}
 	return usage.ComputeCost(
 		int64(audit.PromptTokens),
@@ -112,12 +112,10 @@ func (a *usageRecorderAdapter) Price(audit *middleware.RequestAudit) (*float64, 
 }
 
 // priceFor resolves the per-million-token USD price for (provider, model)
-// from the model_metadata config layers (default layer + per-provider
-// override, in LookupModelMetadata order). A nil result means the model has
-// no known price: the usage layer then persists cost as NULL with
-// cost_status "missing_price". No unit conversion is applied here — config
-// prices are already USD per 1M tokens and usage.ComputeCost divides by 1e6.
-func priceFor(cfg *config.Config, provider, model string) *usage.Price {
+// and selects the long-context tier when contextTokens reaches its threshold.
+// A nil result means the model has no known price. Legacy costs without a
+// long_context tier always return the original single-tier price.
+func priceFor(cfg *config.Config, provider, model string, contextTokens int64) *usage.Price {
 	if cfg == nil {
 		return nil
 	}
@@ -125,11 +123,26 @@ func priceFor(cfg *config.Config, provider, model string) *usage.Price {
 	if !ok || meta.Cost == nil {
 		return nil
 	}
+	cost := meta.Cost
+	// contextTokens is the audit prompt/input token count (unit: tokens), not
+	// completion tokens. A request enters the long tier when contextTokens >=
+	// the threshold. OpenAI prompt_tokens includes cached tokens, while
+	// Anthropic input_tokens excludes cached tokens (see internal/usage/cost.go:
+	// 38-50), so the trigger points are not exactly equivalent across upstreams.
+	if cost.LongContext != nil && cost.LongContextThreshold > 0 && contextTokens >= cost.LongContextThreshold {
+		cost = cost.LongContext
+	}
+	// A configured tier whose four rates are all zero is not an effective
+	// price. Return nil so ComputeCost records missing_price rather than
+	// silently treating an unpriced request as a genuine zero-dollar charge.
+	if cost.Input == 0 && cost.Output == 0 && cost.CacheRead == 0 && cost.CacheWrite == 0 {
+		return nil
+	}
 	return &usage.Price{
-		Input:      meta.Cost.Input,
-		Output:     meta.Cost.Output,
-		CacheRead:  meta.Cost.CacheRead,
-		CacheWrite: meta.Cost.CacheWrite,
+		Input:      cost.Input,
+		Output:     cost.Output,
+		CacheRead:  cost.CacheRead,
+		CacheWrite: cost.CacheWrite,
 	}
 }
 

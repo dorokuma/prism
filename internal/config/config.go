@@ -15,12 +15,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ModelCost defines per-model pricing rates.
+// ModelCost defines per-model pricing rates in USD per 1M tokens. When
+// LongContext is configured with a positive LongContextThreshold, requests
+// whose prompt/context length is at least the threshold use LongContext for
+// all token categories. A nil LongContext preserves the legacy single-rate
+// behavior.
 type ModelCost struct {
-	Input      float64 `yaml:"input"`
-	Output     float64 `yaml:"output"`
-	CacheRead  float64 `yaml:"cache_read"`
-	CacheWrite float64 `yaml:"cache_write"`
+	Input                float64    `yaml:"input"`
+	Output               float64    `yaml:"output"`
+	CacheRead            float64    `yaml:"cache_read"`
+	CacheWrite           float64    `yaml:"cache_write"`
+	LongContext          *ModelCost `yaml:"long_context,omitempty"`
+	LongContextThreshold int64      `yaml:"long_context_threshold,omitempty"`
 }
 
 // ModelMetadata defines optional per-model metadata that prism returns
@@ -437,6 +443,28 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		cfg.Accounts = allAccounts
 	}
+	// Validate the recursive YAML shape before any pricing lookup can silently
+	// discard nested tiers. LongContext is intentionally one level deep: a
+	// nested long_context has no defined pricing semantics.
+	validateModelCost := func(provider, model string, cost *ModelCost) error {
+		if cost != nil && cost.LongContext != nil && cost.LongContext.LongContext != nil {
+			return fmt.Errorf("model_metadata provider %q model %q: cost.long_context must not contain nested long_context", provider, model)
+		}
+		return nil
+	}
+	for model, metadata := range cfg.ModelMetadata {
+		if err := validateModelCost("<default>", model, metadata.Cost); err != nil {
+			return nil, err
+		}
+	}
+	for provider, metadataMap := range cfg.ModelMetadataPerProvider {
+		for model, metadata := range metadataMap {
+			if err := validateModelCost(provider, model, metadata.Cost); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// Provider names become model-cache file names (provider + ".json" under
 	// the cache dir). Reject names that would escape the cache directory
 	// (path separators, "." / "..", absolute paths) at load time — a

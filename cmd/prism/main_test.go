@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -609,17 +610,17 @@ func TestPriceFor_MapsConfigCost(t *testing.T) {
 			},
 		},
 	}
-	p := priceFor(cfg, "opencode-go", "deepseek-v4-pro")
+	p := priceFor(cfg, "opencode-go", "deepseek-v4-pro", 0)
 	if p == nil {
 		t.Fatal("price must resolve from the default model_metadata layer")
 	}
 	if p.Input != 0.6 || p.Output != 2.4 || p.CacheRead != 0.12 || p.CacheWrite != 0.6 {
 		t.Errorf("price mismatch: %+v", p)
 	}
-	if got := priceFor(cfg, "opencode-go", "unknown-model"); got != nil {
+	if got := priceFor(cfg, "opencode-go", "unknown-model", 0); got != nil {
 		t.Errorf("unknown model must yield nil price, got %+v", got)
 	}
-	if got := priceFor(nil, "p", "m"); got != nil {
+	if got := priceFor(nil, "p", "m", 0); got != nil {
 		t.Errorf("nil config must yield nil price, got %+v", got)
 	}
 }
@@ -635,17 +636,106 @@ func TestPriceFor_PerProviderOverride(t *testing.T) {
 			"p1": {"m": {Cost: &config.ModelCost{Input: 2, Output: 3, CacheRead: 4, CacheWrite: 5}}},
 		},
 	}
-	p := priceFor(cfg, "p1", "m")
+	p := priceFor(cfg, "p1", "m", 0)
 	if p == nil || p.Input != 2 || p.Output != 3 || p.CacheRead != 4 || p.CacheWrite != 5 {
 		t.Errorf("per-provider override must win, got %+v", p)
 	}
-	p2 := priceFor(cfg, "other-provider", "m")
+	p2 := priceFor(cfg, "other-provider", "m", 0)
 	if p2 == nil || p2.Input != 1 || p2.Output != 1 {
 		t.Errorf("default layer must apply for other providers, got %+v", p2)
 	}
 }
 
-// TestUsageAdapter_PersistsPricedEvent is the end-to-end acceptance test for
+// TestPriceFor_TieredContextPricing covers short, long, threshold, legacy,
+// and absent-threshold behavior. Selection is per request and the selected
+// tier is then passed to ComputeCost by the normal Price path.
+func TestPriceFor_TieredContextPricing(t *testing.T) {
+	short := &config.ModelCost{Input: 2, Output: 6, CacheRead: 0.3, CacheWrite: 0}
+	cfg := &config.Config{ModelMetadata: config.ModelMetadataMap{"m": {
+		Cost: &config.ModelCost{Input: 2, Output: 6, CacheRead: 0.3, CacheWrite: 0,
+			LongContextThreshold: 200000,
+			LongContext:          &config.ModelCost{Input: 4, Output: 12, CacheRead: 0.6, CacheWrite: 0}},
+	}}}
+	cases := []struct {
+		name   string
+		tokens int64
+		input  float64
+	}{
+		{"short_context_uses_short_tier", 199999, 2},
+		{"long_context_uses_long_tier", 200001, 4},
+		{"threshold_is_inclusive", 200000, 4},
+		{"zero_threshold_keeps_short_tier", 0, 2},
+		{"negative_threshold_keeps_short_tier", -1, 2},
+		{"nil_long_context_keeps_short_tier", 200001, 2},
+		// Cached tokens are part of OpenAI prompt_tokens; these boundary
+		// values therefore exercise both cache-below and cache-at-threshold.
+		{"cached_prompt_below_threshold_keeps_short_tier", 199999, 2},
+		{"cached_prompt_at_threshold_uses_long_tier", 200000, 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			caseCfg := cfg
+			if tc.name == "nil_long_context_keeps_short_tier" {
+				caseCfg = &config.Config{ModelMetadata: config.ModelMetadataMap{"m": {Cost: &config.ModelCost{Input: 2, Output: 6, LongContextThreshold: 200000}}}}
+			}
+			p := priceFor(caseCfg, "p", "m", tc.tokens)
+			if p == nil || p.Input != tc.input {
+				t.Fatalf("price = %+v, want input %v; prompt/input token threshold must be inclusive", p, tc.input)
+			}
+		})
+	}
+	// Non-positive thresholds are disabled by design, regardless of token count.
+	for _, threshold := range []int64{0, -1} {
+		noTierSwitch := &config.Config{ModelMetadata: config.ModelMetadataMap{"m": {Cost: &config.ModelCost{
+			Input: 2, LongContextThreshold: threshold, LongContext: &config.ModelCost{Input: 4}}}}}
+		if p := priceFor(noTierSwitch, "p", "m", 999999); p == nil || p.Input != 2 {
+			t.Fatalf("threshold %d must keep short tier, got %+v", threshold, p)
+		}
+	}
+	// prompt/input tokens only, so a completion-only overage remains short tier.
+	if p := priceFor(cfg, "p", "m", 1); p == nil || p.Input != 2 {
+		t.Fatalf("completion-only threshold overage must remain short tier, got %+v", p)
+	}
+	legacyCfg := &config.Config{ModelMetadata: config.ModelMetadataMap{"m": {Cost: short}}}
+	if p := priceFor(legacyCfg, "p", "m", 999999); p == nil || p.Input != 2 || p.Output != 6 {
+		t.Fatalf("legacy single-tier price = %+v, want unchanged short tier", p)
+	}
+	noThreshold := &config.Config{ModelMetadata: config.ModelMetadataMap{"m": {Cost: &config.ModelCost{
+		Input: 2, Output: 6, LongContext: &config.ModelCost{Input: 4, Output: 12}}}}}
+	if p := priceFor(noThreshold, "p", "m", 999999); p == nil || p.Input != 2 {
+		t.Fatalf("missing threshold must retain short tier, got %+v", p)
+	}
+	zeroLong := &config.Config{ModelMetadata: config.ModelMetadataMap{"m": {Cost: &config.ModelCost{
+		Input: 1, LongContextThreshold: 1, LongContext: &config.ModelCost{}}}}}
+	if p := priceFor(zeroLong, "p", "m", 1); p != nil {
+		t.Fatalf("all-zero long tier must be missing price (nil), got %+v", p)
+	}
+}
+
+func TestLoadConfig_RejectsNestedLongContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	const yamlConfig = `model_metadata:
+  demo:
+    cost:
+      input: 1
+      long_context_threshold: 100
+      long_context:
+        input: 2
+        long_context:
+          input: 3
+`
+	if err := os.WriteFile(path, []byte(yamlConfig), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := config.LoadConfig(path)
+	if err == nil {
+		t.Fatal("nested long_context must be rejected during config loading")
+	}
+	if !strings.Contains(err.Error(), "provider") || !strings.Contains(err.Error(), "demo") || !strings.Contains(err.Error(), "nested long_context") {
+		t.Fatalf("error must identify provider, model, and nested field, got %v", err)
+	}
+}
+
 // the single-pricing-point rule: an event emitted through middleware.EmitAudit
 // with the real adapter + pricer wired (pricer computes the cost synchronously
 // → request.complete log line → usage event carrying the SAME cost → Recorder
