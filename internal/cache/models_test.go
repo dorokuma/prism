@@ -874,6 +874,96 @@ func TestSyncPIModelsJSON_SkipPISync(t *testing.T) {
 	}
 }
 
+func TestSyncPIModelsJSON_SplitsOpenAIAndAnthropicByModelID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "models.json")
+	mixed := []ModelEntry{
+		{ID: "gpt-5.4", Object: "model"},
+		{ID: "claude-sonnet-4", Object: "model"},
+		{ID: "anyrouter/claude-opus-4", Object: "model"},
+		{ID: "gemini-3-pro", Object: "model"},
+	}
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "oai", Provider: "anyrouter-openai", BaseURL: "https://example.fcapp.run/v1"},
+			{Name: "ant", Provider: "anyrouter-anthropic", BaseURL: "https://example.fcapp.run/"},
+		},
+	}
+	mc := NewForTest(map[string]*providerCache{
+		"anyrouter-openai":    {Models: mixed},
+		"anyrouter-anthropic": {Models: mixed},
+	})
+	if err := mc.syncPIModelsJSON(path, "http://127.0.0.1:18790/v1", cfg); err != nil {
+		t.Fatalf("syncPIModelsJSON: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pc struct {
+		Providers map[string]struct {
+			BaseURL string           `json:"baseUrl"`
+			API     string           `json:"api"`
+			Models  []map[string]any `json:"models"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(data, &pc); err != nil {
+		t.Fatal(err)
+	}
+	oai := pc.Providers["anyrouter-openai"]
+	if oai.API != "openai-completions" {
+		t.Errorf("openai api = %q", oai.API)
+	}
+	if oai.BaseURL != "http://127.0.0.1:18790/v1" {
+		t.Errorf("openai baseUrl = %q", oai.BaseURL)
+	}
+	gotOAI := map[string]bool{}
+	for _, m := range oai.Models {
+		id, _ := m["id"].(string)
+		gotOAI[id] = true
+	}
+	if !gotOAI["gpt-5.4"] || !gotOAI["gemini-3-pro"] {
+		t.Errorf("openai models = %v, want gpt + gemini", gotOAI)
+	}
+	if gotOAI["claude-sonnet-4"] || gotOAI["anyrouter/claude-opus-4"] {
+		t.Errorf("openai must drop claude, got %v", gotOAI)
+	}
+
+	ant := pc.Providers["anyrouter-anthropic"]
+	if ant.API != "anthropic-messages" {
+		t.Errorf("anthropic api = %q", ant.API)
+	}
+	if ant.BaseURL != "http://127.0.0.1:18790/" {
+		t.Errorf("anthropic baseUrl = %q", ant.BaseURL)
+	}
+	gotAnt := map[string]bool{}
+	for _, m := range ant.Models {
+		id, _ := m["id"].(string)
+		gotAnt[id] = true
+	}
+	if !gotAnt["claude-sonnet-4"] || !gotAnt["anyrouter/claude-opus-4"] {
+		t.Errorf("anthropic models = %v, want claude ids", gotAnt)
+	}
+	if gotAnt["gpt-5.4"] || gotAnt["gemini-3-pro"] {
+		t.Errorf("anthropic must drop openai-family, got %v", gotAnt)
+	}
+}
+
+func TestAnthropicModelID(t *testing.T) {
+	yes := []string{"claude-sonnet-4", "Claude-Opus-4", "anthropic.claude-3", "gw/claude-haiku-4"}
+	no := []string{"gpt-5.4", "gemini-3-pro", "deepseek-v4-pro", "grok-4.6"}
+	for _, id := range yes {
+		if !anthropicModelID(id) {
+			t.Errorf("%q should be anthropic", id)
+		}
+	}
+	for _, id := range no {
+		if anthropicModelID(id) {
+			t.Errorf("%q should not be anthropic", id)
+		}
+	}
+}
+
 // TestFetchAllAsync_SkipPISync verifies the narrowed v0.10.1 semantics:
 // skip_pi_sync no longer suppresses upstream fetching — the provider IS
 // fetched and cached like any other — but syncPIModelsJSON still refuses to

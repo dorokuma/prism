@@ -1196,6 +1196,71 @@ func (mc *ModelCache) SyncTools(cfg *config.Config) {
 	}
 }
 
+// anthropicModelID reports whether id is an Anthropic/Claude model after
+// peeling a vendor prefix (e.g. "anyrouter/claude-sonnet-4").
+func anthropicModelID(id string) bool {
+	s := strings.ToLower(strings.TrimSpace(id))
+	if i := strings.LastIndex(s, "/"); i >= 0 {
+		s = s[i+1:]
+	}
+	return strings.HasPrefix(s, "claude") || strings.HasPrefix(s, "anthropic")
+}
+
+// piSyncKind is "anthropic", "openai", or "" (no family filter).
+func piSyncKind(provider string) string {
+	p := strings.ToLower(provider)
+	switch {
+	case strings.HasSuffix(p, "-anthropic"):
+		return "anthropic"
+	case strings.HasSuffix(p, "-openai"):
+		return "openai"
+	default:
+		return ""
+	}
+}
+
+func keepModelForPISync(provider, id string) bool {
+	switch piSyncKind(provider) {
+	case "anthropic":
+		return anthropicModelID(id)
+	case "openai":
+		return !anthropicModelID(id)
+	default:
+		return true
+	}
+}
+
+func filterModelsForPISync(provider string, models []ModelEntry) []ModelEntry {
+	if piSyncKind(provider) == "" {
+		return models
+	}
+	out := make([]ModelEntry, 0, len(models))
+	for _, m := range models {
+		if keepModelForPISync(provider, m.ID) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// piSyncAPIAndBase picks Pi's api + baseUrl. *-anthropic providers use
+// anthropic-messages on the prism origin (no /v1 suffix) so Pi posts
+// /v1/messages; everything else stays openai-completions on /v1.
+func piSyncAPIAndBase(provider, defaultBase string) (api, base string) {
+	if piSyncKind(provider) != "anthropic" {
+		return "openai-completions", defaultBase
+	}
+	base = strings.TrimSuffix(defaultBase, "/")
+	base = strings.TrimSuffix(base, "/v1")
+	if base == "" {
+		base = defaultBase
+	}
+	if !strings.HasSuffix(base, "/") {
+		base += "/"
+	}
+	return "anthropic-messages", base
+}
+
 // syncPIModelsJSON merges upstream model IDs into pi's models.json.
 //
 // For each Prism-managed provider:
@@ -1251,6 +1316,7 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 			slog.Warn("no cache for provider, skipping sync", "provider", provider)
 			continue
 		}
+		models = filterModelsForPISync(provider, models)
 
 		// Build set of upstream model IDs
 		upstreamIDs := make(map[string]bool, len(models))
@@ -1331,9 +1397,10 @@ func (mc *ModelCache) syncPIModelsJSON(path string, baseURL string, cfg *config.
 			// the placeholder when the entry has no apiKey yet.
 			apiKey = old.APIKey
 		}
+		api, piBase := piSyncAPIAndBase(provider, baseURL)
 		pc.Providers[provider] = piProvider{
-			BaseURL: baseURL,
-			API:     "openai-completions",
+			BaseURL: piBase,
+			API:     api,
 			APIKey:  apiKey,
 			Headers: map[string]string{"X-Prism-Provider": provider},
 			Models:  entries,
