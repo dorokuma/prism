@@ -16,6 +16,13 @@ import (
 	"github.com/dorokuma/prism/internal/usage"
 )
 
+func TestMain(m *testing.M) {
+	// Keep CLI tests off the production estimate file so a live SuperGrok
+	// period_start cannot empty March-dated fixtures or shift default From.
+	grokEstimatePath = filepath.Join(os.TempDir(), "prism-cli-usage-test-no-est.json")
+	os.Exit(m.Run())
+}
+
 // seedUsageDB creates a usage database with deterministic events around
 // base: "alpha" (priced, 2 requests), "beta" (missing price, 1 request) and
 // "gamma" (priced, 2 requests), one of which failed. Returns the path.
@@ -115,16 +122,20 @@ func TestParseTimeArg(t *testing.T) {
 
 func TestParseUsageArgsPresets(t *testing.T) {
 	now := time.Now()
-	// bare `prism usage` → today, grouped by model
-	_, q, _, _, err := parseUsageArgs(nil, now)
+	// bare `prism usage` → SuperGrok week (7d fallback with no estimate file)
+	o, q, _, _, err := parseUsageArgs(nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(q.GroupBy) != 1 || q.GroupBy[0] != "model" {
 		t.Errorf("default group_by = %v, want [model]", q.GroupBy)
 	}
-	if q.From != time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Unix() {
-		t.Errorf("default from must be today midnight, got %d", q.From)
+	wantFrom := now.Add(-7 * 24 * time.Hour).Unix()
+	if q.From != wantFrom {
+		t.Errorf("default from must be week start (7d fallback), got %d want %d", q.From, wantFrom)
+	}
+	if !o.weekDefault {
+		t.Error("bare usage must mark weekDefault")
 	}
 	if q.To != now.Unix() {
 		t.Errorf("default to must be now, got %d", q.To)
@@ -178,6 +189,37 @@ func TestParseUsageArgsPresets(t *testing.T) {
 	// flags may appear before the preset? No: preset must come first
 	if _, _, _, _, err := parseUsageArgs([]string{"--since", "7d", "models"}, now); err == nil {
 		t.Error("preset after flags must be rejected with a hint")
+	}
+}
+
+func TestParseUsageArgsWeekFromEstimate(t *testing.T) {
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	start := time.Date(2026, 8, 22, 8, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "est.json")
+	data := fmt.Sprintf(`{"period_start":%q,"live_tokens":1,"live_percent":1,"live_estimate":1,"display_estimate":1}`, start.UTC().Format(time.RFC3339Nano))
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := grokEstimatePath
+	grokEstimatePath = path
+	t.Cleanup(func() { grokEstimatePath = prev })
+
+	o, q, _, _, err := parseUsageArgs(nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.From != start.Unix() {
+		t.Errorf("from = %d, want estimate period_start %d", q.From, start.Unix())
+	}
+	if !o.weekDefault {
+		t.Error("want weekDefault")
+	}
+	_, q, _, _, err = parseUsageArgs([]string{"--since", "24h"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.From != now.Add(-24*time.Hour).Unix() {
+		t.Errorf("--since must override week default, got %d", q.From)
 	}
 }
 
@@ -393,8 +435,8 @@ func TestRunUsageJSON(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
 		t.Fatal(err)
 	}
-	if doc.Period != "今天" {
-		t.Errorf("period = %q, want 今天", doc.Period)
+	if doc.Period != "周限" {
+		t.Errorf("period = %q, want 周限", doc.Period)
 	}
 	// overview covers ALL 5 events (alpha 2 + beta 1 + gamma 2), including
 	// the failed one
@@ -434,7 +476,7 @@ func TestRunUsageTable(t *testing.T) {
 	out := buf.String()
 	// summary from Overview: all 5 requests, 750 total tokens, 4 priced
 	// events × $0.15 (price 1000/1000 on 150 tokens each)
-	if !strings.Contains(out, "今天  ·  5 请求  ·  750 词元  ·  $0.600") {
+	if !strings.Contains(out, "周限  ·  5 请求  ·  750 词元  ·  $0.600") {
 		t.Errorf("summary line missing/wrong:\n%s", out)
 	}
 	// the failed + missing-price hints

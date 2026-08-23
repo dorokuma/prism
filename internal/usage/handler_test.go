@@ -573,3 +573,50 @@ func TestHandlerAuth_TokenHotReload(t *testing.T) {
 		t.Fatalf("token unset: direct loopback got %d, want 200 (loopback shortcut restored)", rec.Code)
 	}
 }
+
+func TestHandlerDefaultFromWeek(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "")
+	s := openTestStore(t)
+	now := time.Now()
+	weekStart := now.Add(-3 * 24 * time.Hour)
+	old := now.Add(-10 * 24 * time.Hour)
+	ctx := context.Background()
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: old, RequestID: "old", Model: "old", PromptTokens: 10, CompletionTokens: 10, TotalTokens: 20},
+		{Ts: now, RequestID: "cur", Model: "cur", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewSummaryHandler(s)
+	h.DefaultFrom = func() int64 { return weekStart.Unix() }
+
+	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?group_by=model&format=table", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("table: got %d body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "周限") {
+		t.Errorf("default table must label 周限:\n%s", body)
+	}
+	if strings.Contains(body, "全部时间") {
+		t.Errorf("default table must not be 全部时间:\n%s", body)
+	}
+	if !strings.Contains(body, "  cur") {
+		t.Errorf("current-week row missing:\n%s", body)
+	}
+	if strings.Contains(body, "  old") {
+		t.Errorf("pre-week row must be excluded:\n%s", body)
+	}
+
+	rec = doRequest(h, http.MethodGet, "/admin/usage/summary?from=0&group_by=model&format=table", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("from=0: got %d", rec.Code)
+	}
+	all := rec.Body.String()
+	if !strings.Contains(all, "全部时间") {
+		t.Errorf("from=0 must stay 全部时间:\n%s", all)
+	}
+	if !strings.Contains(all, "  old") {
+		t.Errorf("from=0 must include old row:\n%s", all)
+	}
+}

@@ -18,6 +18,8 @@ import (
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/mcp"
 	"github.com/dorokuma/prism/internal/middleware"
+	"github.com/dorokuma/prism/internal/oauth"
+	"github.com/dorokuma/prism/internal/oauth/xai"
 	"github.com/dorokuma/prism/internal/planusage"
 	"github.com/dorokuma/prism/internal/pool"
 	"github.com/dorokuma/prism/internal/proxy"
@@ -390,6 +392,14 @@ func main() {
 		return
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == "auth" {
+		if err := runAuth(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "auth 失败: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// Fail fast on over-long admin/metrics tokens: a token longer than the
 	// constant-time comparison pad (256 bytes) can never authenticate (the
 	// comparison rejects it outright), so every request would fail at
@@ -412,6 +422,7 @@ func main() {
 	util.DebugMode.Store(cfg.Debug)
 	mcp.LoadMCPTools(cfg.MCPToolsJSON)
 	p := pool.NewPoolWithTotalCap(cfg.Accounts, config.ResolveAccountTotalCap(cfg))
+	attachOAuth(p, cfg)
 	wire, _ := config.ParseWireAPIMode(cfg.WireAPI)
 	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", util.DebugMode.Load(), "auth", len(cfg.APIKeys) > 0, "auth_keys", len(cfg.APIKeys), "tls", cfg.TLSCertFile != "")
 
@@ -474,8 +485,18 @@ func main() {
 	}
 	quotaPoller.SetAccounts(quotaViews)
 	quotaPoller.SetOptions(cfg.Quota.Enabled, cfg.Quota.RefreshInterval, cfg.Quota.RequestTimeout)
+	if ss, ok := usageStore.(*usage.SQLiteStore); ok && ss != nil {
+		quotaPoller.SetGrokEstimate(ss.SumGrokTokens, planusage.DefaultGrokEstimatePath)
+		quotaPoller.SetGrokBuildImport(func(ctx context.Context, from, to int64) error {
+			_, err := usage.ImportGrokBuild(ctx, ss, usage.DefaultGrokSessionsDir(), from, to, grokPriceFor(holder.Load()))
+			return err
+		})
+	}
 	quotaPoller.Start()
 	quotaHandler := planusage.NewHandler(quotaCache, quotaPoller.Enabled)
+	summaryHandler.DefaultFrom = func() int64 {
+		return planusage.WeekStartUnix(quotaCache.List(), planusage.DefaultGrokEstimatePath, time.Now())
+	}
 
 	metricCtx, metricCancel := context.WithCancel(context.Background())
 
@@ -604,5 +625,19 @@ func main() {
 			slog.Error("listen", "error", err)
 			os.Exit(1)
 		}
+	}
+}
+
+// attachOAuth wires file-backed xAI token sources onto oauth: xai accounts.
+func attachOAuth(p *pool.Pool, cfg *config.Config) {
+	client := &http.Client{Timeout: 20 * time.Second}
+	for _, acc := range p.AllAccounts() {
+		if acc.OAuth() != "xai" {
+			continue
+		}
+		name := acc.Name()
+		acc.SetTokenSource(oauth.NewXAISource(cfg.OAuthDir, name, func(ctx context.Context, refresh string) (xai.Tokens, error) {
+			return xai.Refresh(ctx, xai.Config{HTTP: client}, refresh)
+		}))
 	}
 }

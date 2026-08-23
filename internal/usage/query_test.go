@@ -300,3 +300,23 @@ func TestSummaryStreamSuccessGroups(t *testing.T) {
 		}
 	}
 }
+
+func TestSumGrokTokensOnlyGrokModels(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	ts := time.Unix(1_700_000_000, 0).UTC()
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: ts, Model: "grok-4.6", Provider: "xai", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Success: true, Status: 200},
+		{Ts: ts, Model: "grok-4.5", Provider: "xai", PromptTokens: 10, CompletionTokens: 5, TotalTokens: 0, Success: true, Status: 200},
+		{Ts: ts, Model: "deepseek-v4-flash", Provider: "opencode-go", PromptTokens: 999, CompletionTokens: 999, TotalTokens: 1998, Success: true, Status: 200},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.SumGrokTokens(ctx, ts.Unix(), ts.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 165 {
+		t.Fatalf("SumGrokTokens = %d, want 165 (150 + 15 fallback)", n)
+	}
+}

@@ -141,6 +141,22 @@ model_remap:
 #       output: 25
 #       cache_read: 0.5
 #       cache_write: 6.25
+#   grok-4.6:
+#     # xAI official short-context (<200k) USD / 1M tokens.
+#     # https://docs.x.ai/developers/pricing
+#     # Imagine SKUs are per-image / per-second — do not put those in cost.
+#     reasoning: true
+#     cost:
+#       input: 2
+#       output: 6
+#       cache_read: 0.5
+#       cache_write: 0
+#     thinking_level_map:
+#       "off": null
+#       low: low
+#       medium: medium
+#       high: high
+#       xhigh: xhigh
 
 # ---------------------------------------------------------------------------
 # 可选：usage —— 每次请求的词元用量与费用落 SQLite，供
@@ -204,7 +220,7 @@ model_remap:
 #   default_key_id: anonymous
 
 # ---------------------------------------------------------------------------
-# 可选：quota —— 上游套餐用量快照（当前：OpenCode Go 的短期 / 中期 / 长期窗口）。
+# 可选：quota —— 上游套餐用量快照（当前：SuperGrok 周限）。
 # 和上面的 usage 不是一层：usage 是本地词元账本，quota 是官方限额百分比。
 # 关掉 usage.enabled 不影响 quota。
 #
@@ -220,6 +236,10 @@ model_remap:
 #   enabled: true
 #   refresh_interval: 120s
 #   request_timeout: 5s
+
+# oauth_dir: SuperGrok / xAI device-code tokens (0600 JSON). Default
+# /var/lib/prism/oauth/<account>.json. Written by `prism auth xai`.
+# oauth_dir: /var/lib/prism/oauth
 
 accounts:
   # name 规则（LoadConfig 强制，setup 交互同规则）：非空、唯一、以 ASCII
@@ -245,6 +265,14 @@ accounts:
   # - name: clinepass-1
   #   base_url: https://api.cline.bot/api/v1
   #   provider: clinepass
+  #
+  # SuperGrok / xAI OAuth (no static key). Then run: prism auth xai
+  # Tokens refresh on the request path. Base URL is api.x.ai (Pi's built-in
+  # xAI provider), not cli-chat-proxy.
+  # - name: supergrok
+  #   provider: xai
+  #   oauth: xai
+  #   base_url: https://api.x.ai/v1
 
 # ---------------------------------------------------------------------------
 # 可选：default_provider —— 请求未带 X-Prism-Provider 头时的兜底 provider。

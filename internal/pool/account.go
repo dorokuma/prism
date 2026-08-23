@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -97,14 +98,43 @@ type Account struct {
 	// the counters inside are atomic.
 	keyMu         sync.Mutex
 	inFlightByKey map[string]*atomic.Int32
+
+	// tokens, when set, supplies a live OAuth access token for Key().
+	// Static-key accounts leave it nil.
+	tokens TokenSource
+}
+
+// TokenSource returns a live access token (refreshing if needed).
+type TokenSource interface {
+	Token(ctx context.Context) (string, error)
 }
 
 func (a *Account) Name() string               { return a.cfg.Name }
-func (a *Account) Key() string                { return a.cfg.Key }
 func (a *Account) Headers() map[string]string { return a.cfg.Headers }
 func (a *Account) AuthHeader() string         { return a.cfg.AuthHeader }
 func (a *Account) ProbePath() string          { return a.cfg.ProbePath }
 func (a *Account) SkipPISync() bool           { return a.cfg.SkipPISync }
+
+// OAuth is the built-in OAuth provider id from config (empty = static key).
+func (a *Account) OAuth() string { return strings.TrimSpace(a.cfg.OAuth) }
+
+// SetTokenSource attaches a live token supplier. Called once at pool
+// construction for oauth accounts.
+func (a *Account) SetTokenSource(s TokenSource) { a.tokens = s }
+
+// Key returns the upstream credential. OAuth accounts use the live
+// access token; static-key accounts use the configured key.
+func (a *Account) Key() string {
+	if a.tokens != nil {
+		tok, err := a.tokens.Token(context.Background())
+		if err != nil {
+			slog.Error("oauth token", "account", a.Name(), "error", err)
+			return ""
+		}
+		return tok
+	}
+	return a.cfg.Key
+}
 
 // Provider returns the provider name this account belongs to.
 // Empty string means the account belongs to no specific provider (backward compat).
@@ -489,12 +519,16 @@ func (a *Account) IsInCooldown() bool {
 // The credential always comes from acc.Key(); callers must never place keys
 // in account headers (see ApplyAccountHeaders).
 func ApplyAuthHeader(dst http.Header, acc *Account) {
-	authHeader := strings.TrimSpace(acc.AuthHeader())
-	if authHeader == "" || http.CanonicalHeaderKey(authHeader) == "Authorization" {
-		dst.Set("Authorization", "Bearer "+acc.Key())
+	key := acc.Key()
+	if key == "" {
 		return
 	}
-	dst.Set(authHeader, acc.Key())
+	authHeader := strings.TrimSpace(acc.AuthHeader())
+	if authHeader == "" || http.CanonicalHeaderKey(authHeader) == "Authorization" {
+		dst.Set("Authorization", "Bearer "+key)
+		return
+	}
+	dst.Set(authHeader, key)
 }
 
 // ApplyAccountHeaders applies account-level custom headers to dst using

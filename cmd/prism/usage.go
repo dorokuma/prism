@@ -12,9 +12,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/planusage"
 	"github.com/dorokuma/prism/internal/usage"
 )
 
@@ -37,20 +39,21 @@ var usagePresets = map[string]struct {
 
 // usageOptions carries the parsed flag values for `prism usage`.
 type usageOptions struct {
-	preset   string
-	since    string
-	until    string
-	by       string
-	model    string
-	key      string
-	account  string
-	provider string
-	failed   bool
-	limit    int
-	json     bool
-	watch    string
-	db       string
-	noColor  bool
+	preset      string
+	since       string
+	until       string
+	by          string
+	model       string
+	key         string
+	account     string
+	provider    string
+	failed      bool
+	limit       int
+	json        bool
+	watch       string
+	db          string
+	noColor     bool
+	weekDefault bool
 }
 
 // defaultUsageDBPath is used when neither --db nor any config yields a path.
@@ -74,6 +77,11 @@ var usageConfigDir = func() string {
 // can point it at a temp dir instead of depending on the real
 // /var/lib/prism.
 var usageConfigFallbackPath = "/var/lib/prism/config.yaml"
+
+// grokEstimatePath is the SuperGrok week-estimate file used as the
+// default `prism usage` window start. Tests redirect it away from
+// production so a live estimate file cannot leak into CLI tests.
+var grokEstimatePath = planusage.DefaultGrokEstimatePath
 
 // resolveUsageDBPath picks the usage database path for `prism usage`, in
 // priority order:
@@ -136,6 +144,17 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 		return fmt.Errorf("无法访问 usage 数据库 %s: %v", dbPath, err)
 	}
 
+	if !testing.Testing() {
+		if cfg, _, err := loadCLIConfig(""); err == nil {
+			wstore := usage.NewSQLiteStore(dbPath)
+			if err := wstore.Open(); err == nil {
+				from := now.Add(-14 * 24 * time.Hour).Unix()
+				_, _ = usage.ImportGrokBuild(context.Background(), wstore, usage.DefaultGrokSessionsDir(), from, now.Unix(), grokPriceFor(cfg))
+				_ = wstore.Close()
+			}
+		}
+	}
+
 	store := usage.NewReadOnlyStore(dbPath)
 	if err := store.Open(); err != nil {
 		return fmt.Errorf("无法以只读方式打开 usage 数据库 %s: %v", dbPath, err)
@@ -143,6 +162,9 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 	defer store.Close()
 
 	period := usage.DescribePeriod(q.From, q.To, now.Unix())
+	if o.weekDefault {
+		period = usage.PeriodWeek
+	}
 	render := func() error {
 		ov, err := store.Overview(context.Background(), q)
 		if err != nil {
@@ -198,7 +220,7 @@ func parseUsageArgs(args []string, now time.Time) (usageOptions, usage.SummaryQu
 
 	fs := flag.NewFlagSet("usage", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	fs.StringVar(&o.since, "since", "", "起始时间：24h/7d/30m 相对写法、08-01 月日、2026-08-01 完整日期（默认今天零点）")
+	fs.StringVar(&o.since, "since", "", "起始时间：24h/7d/30m 相对写法、08-01 月日、2026-08-01 完整日期（默认 SuperGrok 周限起点）")
 	fs.StringVar(&o.until, "until", "", "结束时间，格式同上（默认现在）")
 	fs.StringVar(&o.by, "by", "", "覆盖分组，逗号分隔：model/provider/account/key_id/stream/success/hour/day")
 	fs.StringVar(&o.model, "model", "", "只统计指定模型")
@@ -258,9 +280,11 @@ func parseUsageArgs(args []string, now time.Time) (usageOptions, usage.SummaryQu
 
 	// Time range. Days go through AddDate (calendar arithmetic), hours and
 	// minutes through Add, so month/year boundaries are handled by the time
-	// package instead of hand-rolled seconds math.
-	loc := now.Location()
-	from := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc) // 默认今天零点
+	// package instead of hand-rolled seconds math. Bare usage (no --since)
+	// defaults to the SuperGrok week start so Pi /usage and the CLI match
+	// the quota 周限 window.
+	from := time.Unix(planusage.WeekStartUnix(nil, grokEstimatePath, now), 0)
+	o.weekDefault = o.since == "" && o.until == ""
 	if o.since != "" {
 		var err error
 		from, err = parseTimeArg(o.since, now)
@@ -437,7 +461,7 @@ func printUsageHelp(fs *flag.FlagSet) {
 prism 服务未运行也能查询历史，服务运行中查询不干扰写入。
 
 preset（预设分组，不用记 group_by）:
-  prism usage            默认：今天，按模型分组
+  prism usage            默认：SuperGrok 周限，按模型分组
   prism usage models     按模型
   prism usage keys       按调用方 key_id
   prism usage accounts   按上游账号

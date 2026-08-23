@@ -490,6 +490,27 @@ func (s *SQLiteStore) DeleteBefore(ctx context.Context, tsUnix int64) (int64, er
 	return n, nil
 }
 
+// DeleteKeyIDRange removes events for one key_id inside [fromUnix, toUnix]
+// (inclusive). Used to refresh imported Grok Build rows for a week window.
+func (s *SQLiteStore) DeleteKeyIDRange(ctx context.Context, keyID string, fromUnix, toUnix int64) (int64, error) {
+	db := s.writePool()
+	if db == nil {
+		return 0, errors.New("usage: store not open")
+	}
+	res, err := db.ExecContext(ctx, `DELETE FROM usage_events WHERE key_id = ? AND ts_unix >= ? AND ts_unix <= ?`, keyID, fromUnix, toUnix)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tightenFileModes(s.path); err != nil {
+		reportTightenFailureAfterCommit(err, s.path, "delete")
+	}
+	return n, nil
+}
+
 func boolInt(b bool) int64 {
 	if b {
 		return 1

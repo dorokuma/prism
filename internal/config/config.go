@@ -93,8 +93,8 @@ type UsageConfig struct {
 	retentionDaysSet bool
 }
 
-// QuotaConfig is the yaml `quota` section: upstream plan-window snapshots
-// (OpenCode Go rolling/weekly/monthly). Independent of UsageConfig.
+// QuotaConfig is the yaml `quota` section: SuperGrok weekly pool snapshots.
+// Independent of UsageConfig.
 //
 // enabled defaults to true when the field is absent. refresh_interval
 // defaults to 120s (minimum 30s). request_timeout defaults to 5s.
@@ -176,6 +176,11 @@ type AccountConfig struct {
 	// overwritten by prism. It does NOT affect upstream model fetching —
 	// the model cache still fetches this provider like any other.
 	SkipPISync bool `yaml:"skip_pi_sync,omitempty"`
+	// OAuth names a built-in OAuth provider for this account. Currently
+	// only "xai" (Grok-CLI device-code against auth.x.ai). When set, the
+	// account has no static key: `prism auth xai` writes tokens under
+	// oauth_dir and the request path refreshes them. Empty = static key.
+	OAuth string `yaml:"oauth,omitempty"`
 }
 
 // APIKey defines a single client authentication credential for prism's
@@ -257,6 +262,9 @@ type Config struct {
 	// (they are resolved per request), but the aggregate bound needs a
 	// restart.
 	MaxConcurrentPerAccountTotal int `yaml:"max_concurrent_per_account_total,omitempty"`
+	// OAuthDir is the directory for per-account OAuth token files
+	// (access + refresh). Default /var/lib/prism/oauth. Files are 0600.
+	OAuthDir string `yaml:"oauth_dir,omitempty"`
 	// MaxUpstreamResponseBytes caps the size of a non-streaming upstream
 	// response body (both the legacy chat path and the responses translation
 	// path). Bodies larger than the cap are rejected with HTTP 502
@@ -384,6 +392,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Usage.DefaultKeyID == "" {
 		cfg.Usage.DefaultKeyID = "anonymous"
 	}
+	if cfg.OAuthDir == "" {
+		cfg.OAuthDir = "/var/lib/prism/oauth"
+	}
 	// Quota defaults. enabled defaults to true when the key is absent so a
 	// deployment with an opencode-go account starts reporting plan windows
 	// without extra YAML. Explicit enabled: false stays off.
@@ -508,6 +519,16 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.ModelTiers = map[string]string{}
 	}
 	for i := range cfg.Accounts {
+		oauth := strings.TrimSpace(cfg.Accounts[i].OAuth)
+		if oauth != "" {
+			if oauth != "xai" {
+				return nil, fmt.Errorf("account %s: unknown oauth %q (supported: xai)", cfg.Accounts[i].Name, oauth)
+			}
+			if cfg.Accounts[i].Key != "" {
+				return nil, fmt.Errorf("account %s: oauth accounts must not set key in config", cfg.Accounts[i].Name)
+			}
+			continue
+		}
 		if cfg.Accounts[i].Key == "" {
 			envVar := CredentialEnvName(cfg.Accounts[i].Name)
 			// Try systemd LoadCredential first, then env var
@@ -1228,6 +1249,9 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	if oldCfg.MaxConcurrentPerAccountTotal != newCfg.MaxConcurrentPerAccountTotal {
 		warnings = append(warnings, "max_concurrent_per_account_total changed: restart required to take effect")
 	}
+	if oldCfg.OAuthDir != newCfg.OAuthDir {
+		warnings = append(warnings, "oauth_dir changed: restart required to take effect")
+	}
 	if oldCfg.WireAPI != newCfg.WireAPI {
 		warnings = append(warnings, "wire_api changed: restart required to take effect")
 	}
@@ -1316,8 +1340,8 @@ func stringMapClone(m map[string]string) map[string]string {
 
 // accountsEqual compares two account slices by every field that cannot be
 // hot-reloaded (name, base_url, key, provider, headers, auth_header,
-// probe_path, skip_pi_sync). A change in any of them means the Pool (built
-// once at startup) is stale and a restart is required.
+// probe_path, skip_pi_sync, oauth). A change in any of them means the Pool
+// (built once at startup) is stale and a restart is required.
 func accountsEqual(a, b []AccountConfig) bool {
 	if len(a) != len(b) {
 		return false
@@ -1330,6 +1354,7 @@ func accountsEqual(a, b []AccountConfig) bool {
 			a[i].AuthHeader != b[i].AuthHeader ||
 			a[i].ProbePath != b[i].ProbePath ||
 			a[i].SkipPISync != b[i].SkipPISync ||
+			a[i].OAuth != b[i].OAuth ||
 			!stringMapsEqual(a[i].Headers, b[i].Headers) {
 			return false
 		}

@@ -36,10 +36,10 @@ func TestRenderTableTable(t *testing.T) {
 	want := "" +
 		"  账号 窗口 状态 占用  重置 限额估算\n" +
 		"       短期 ok    12% 2h13m        -\n" +
-		"  go-1 中期 ok     8%  3d4h        -\n" +
+		"  go-1 周限 ok     8%  3d4h        -\n" +
 		"       长期 ok    40%   12d        -\n" +
 		"       短期 限流 100% 2h13m        -\n" +
-		"  go-2 中期 ok    30%  3d4h        -\n" +
+		"  go-2 周限 ok    30%  3d4h        -\n" +
 		"       长期 ok    55%   12d        -\n"
 	if got != want {
 		t.Fatalf("layout\ngot:\n%s\nwant:\n%s", got, want)
@@ -130,7 +130,7 @@ func TestRenderTableAccountRowPlacement(t *testing.T) {
 			},
 			want: header +
 				"       短期 ok    12% 2h13m        -\n" +
-				"  a1   中期 ok     8%  3d4h        -\n" +
+				"  a1   周限 ok     8%  3d4h        -\n" +
 				"       长期 ok    40%   12d        -\n",
 		},
 		{
@@ -143,7 +143,7 @@ func TestRenderTableAccountRowPlacement(t *testing.T) {
 			want: header +
 				"       短期 ok    12% 2h13m        -\n" +
 				"       长期 ok    40%   12d        -\n" +
-				"  a1   中期 ok     8%  3d4h        -\n",
+				"  a1   周限 ok     8%  3d4h        -\n",
 		},
 		{
 			name: "two windows, no weekly: lower middle row",
@@ -200,7 +200,7 @@ func TestRenderTableAccountOncePerGroup(t *testing.T) {
 		if len(hits) != 1 {
 			t.Fatalf("%s appears in %d window rows, want exactly 1: %q\n%s", acct, len(hits), hits, got)
 		}
-		if !strings.Contains(hits[0], "中期") {
+		if !strings.Contains(hits[0], "周限") {
 			t.Fatalf("%s not on the weekly row: %q", acct, hits[0])
 		}
 	}
@@ -248,7 +248,7 @@ func TestRenderTableStaleProviderPlacement(t *testing.T) {
 		}
 	}
 	// a1's only window is rolling; b2's group has a weekly window, so the
-	// name sits on the 中期 row.
+	// name sits on the 周限 row.
 	var a1Row, b2Row string
 	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
 		switch {
@@ -261,7 +261,7 @@ func TestRenderTableStaleProviderPlacement(t *testing.T) {
 	if !strings.Contains(a1Row, "短期") {
 		t.Fatalf("a1 not on its single window row: %q", a1Row)
 	}
-	if !strings.Contains(b2Row, "中期") {
+	if !strings.Contains(b2Row, "周限") {
 		t.Fatalf("b2 not on the weekly row: %q", b2Row)
 	}
 	if !strings.Contains(got, "3%") || !strings.Contains(got, "7%") {
@@ -375,6 +375,20 @@ func TestFormatRemain(t *testing.T) {
 	}
 	if formatRemain(now, nil) != "-" {
 		t.Fatal("nil resets")
+	}
+}
+
+func TestRenderTableTokenEstimateColumn(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	got := RenderTableAt([]Snapshot{{
+		Provider: "xai",
+		Accounts: []string{"supergrok"},
+		Windows: []Window{
+			{Name: "weekly", Status: "ok", Percent: 57, LimitTokensEstimate: 1_540_000},
+		},
+	}}, now)
+	if !strings.Contains(got, "1.54M") {
+		t.Fatalf("token estimate missing:\n%s", got)
 	}
 }
 

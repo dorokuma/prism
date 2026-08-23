@@ -30,6 +30,10 @@ import (
 // runs takes effect immediately — no restart, no stale-token window.
 type SummaryHandler struct {
 	Store Store
+	// DefaultFrom, when the request omits `from`, sets SummaryQuery.From
+	// (unix seconds). Used to pin Pi /usage to the SuperGrok week.
+	// Nil or a non-positive result leaves From unbounded (全部时间).
+	DefaultFrom func() int64
 }
 
 // NewSummaryHandler creates a summary handler. The admin token is NOT read
@@ -63,6 +67,7 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeSummaryError(w, err)
 		return
 	}
+	weekDefault := h.applyDefaultRange(r, &q)
 	// format=table renders the same report as the prism usage CLI (shared
 	// render code); format=json (default) is the existing behavior.
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
@@ -70,7 +75,7 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "", "json":
 		// existing JSON behavior, unchanged
 	case "table":
-		h.serveTable(w, r, q)
+		h.serveTable(w, r, q, weekDefault)
 		return
 	default:
 		writeSummaryError(w, &QueryError{Msg: "invalid format"})
@@ -101,7 +106,7 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // produced by the same code. The compact single-line table is the only
 // layout — there are no layout/width params and no terminal-width
 // dependency.
-func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q SummaryQuery) {
+func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q SummaryQuery, weekDefault bool) {
 	ov, err := h.Store.Overview(r.Context(), q)
 	if err != nil {
 		slog.Error("usage: overview query failed", "error", err)
@@ -123,8 +128,12 @@ func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q Su
 		})
 		return
 	}
+	period := DescribePeriod(q.From, q.To, time.Now().Unix())
+	if weekDefault {
+		period = PeriodWeek
+	}
 	body := RenderUsageReport(ov, rows, q.GroupBy, ReportOptions{
-		Period: DescribePeriod(q.From, q.To, time.Now().Unix()),
+		Period: period,
 	})
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -186,6 +195,21 @@ func parseSummaryQuery(r *http.Request) (SummaryQuery, error) {
 		q.Limit = n
 	}
 	return q, nil
+}
+
+func (h *SummaryHandler) applyDefaultRange(r *http.Request, q *SummaryQuery) bool {
+	if _, ok := r.URL.Query()["from"]; ok {
+		return false
+	}
+	if h == nil || h.DefaultFrom == nil {
+		return false
+	}
+	v := h.DefaultFrom()
+	if v <= 0 {
+		return false
+	}
+	q.From = v
+	return true
 }
 
 func parseBoolParam(v string) (bool, error) {

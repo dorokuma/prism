@@ -11,8 +11,13 @@ import (
 	"path/filepath"
 	"time"
 
+	"strings"
+
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/oauth"
+	"github.com/dorokuma/prism/internal/oauth/xai"
 	"github.com/dorokuma/prism/internal/planusage"
+	"github.com/dorokuma/prism/internal/usage"
 )
 
 type cliAccount struct {
@@ -30,6 +35,62 @@ func runQuota(args []string) error {
 	return runQuotaWith(args, os.Stdout)
 }
 
+func grokPriceFor(cfg *config.Config) func(string) *usage.Price {
+	return func(model string) *usage.Price {
+		if cfg == nil {
+			return nil
+		}
+		m := strings.TrimSuffix(model, "-build")
+		meta, ok := cfg.LookupModelMetadata("xai", m)
+		if !ok || meta.Cost == nil {
+			meta, ok = cfg.LookupModelMetadata("", m)
+		}
+		if !ok || meta.Cost == nil {
+			return nil
+		}
+		c := meta.Cost
+		return &usage.Price{Input: c.Input, Output: c.Output, CacheRead: c.CacheRead, CacheWrite: c.CacheWrite}
+	}
+}
+
+func applyQuotaGrokEstimate(ctx context.Context, cfg *config.Config, snap planusage.Snapshot) planusage.Snapshot {
+	path := cfg.Usage.DBPath
+	if path == "" {
+		return snap
+	}
+	store := usage.NewSQLiteStore(path)
+	if err := store.Open(); err != nil {
+		return snap
+	}
+	defer store.Close()
+	from, to := planusage.GrokBuildImportWindow(snap, time.Now())
+	if _, err := usage.ImportGrokBuild(ctx, store, usage.DefaultGrokSessionsDir(), from, to, grokPriceFor(cfg)); err != nil {
+		// estimate still runs on whatever is already in the database
+	}
+	return planusage.ApplyGrokWeekEstimate(ctx, snap, store.SumGrokTokens, planusage.DefaultGrokEstimatePath, time.Now())
+}
+
+// quotaCredential is the upstream credential for prism quota. SuperGrok
+// oauth accounts have no static YAML key; the CLI reads the same token
+// file the service uses (`prism auth xai`).
+func quotaCredential(cfg *config.Config, a config.AccountConfig) string {
+	if strings.TrimSpace(a.OAuth) != "xai" {
+		return a.Key
+	}
+	if strings.TrimSpace(a.Key) != "" {
+		return a.Key
+	}
+	client := &http.Client{Timeout: 20 * time.Second}
+	src := oauth.NewXAISource(cfg.OAuthDir, a.Name, func(ctx context.Context, refresh string) (xai.Tokens, error) {
+		return xai.Refresh(ctx, xai.Config{HTTP: client}, refresh)
+	})
+	tok, err := src.Token(context.Background())
+	if err != nil {
+		return ""
+	}
+	return tok
+}
+
 func runQuotaWith(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("quota", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -39,9 +100,8 @@ func runQuotaWith(args []string, out io.Writer) error {
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), `用法: prism quota [flags]
 
-查询上游套餐用量（当前：OpenCode Go 的短期 / 中期 / 长期窗口）。
-不依赖 prism 服务进程，直接用 config 里的账号 key 请求上游。
-这不是 prism usage 的本地词元账本。
+查询 SuperGrok 周池占用（cli-chat-proxy /billing，OAuth token）。
+不依赖 prism 服务进程。这不是 prism usage 的本地词元账本。
 
 flags:
 `)
@@ -54,7 +114,7 @@ flags:
 		return err
 	}
 
-	cfg, err := loadQuotaConfig(*explicit)
+	cfg, _, err := loadCLIConfig(*explicit)
 	if err != nil {
 		return err
 	}
@@ -64,7 +124,7 @@ flags:
 
 	var accs []planusage.AccountView
 	for _, a := range cfg.Accounts {
-		accs = append(accs, cliAccount{name: a.Name, provider: a.Provider, base: a.BaseURL, key: a.Key, authHeader: a.AuthHeader})
+		accs = append(accs, cliAccount{name: a.Name, provider: a.Provider, base: a.BaseURL, key: quotaCredential(cfg, a), authHeader: a.AuthHeader})
 	}
 	if *provider != "" {
 		var filtered []planusage.AccountView
@@ -91,12 +151,14 @@ flags:
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		snap, ferr := g.Fetcher.Fetch(ctx, g.Accounts[0])
-		cancel()
 		snap.Accounts = names
 		if ferr != nil {
 			failed++
 			snap.Err = planusage.ErrorCode(ferr)
+		} else {
+			snap = applyQuotaGrokEstimate(ctx, cfg, snap)
 		}
+		cancel()
 		snaps = append(snaps, snap)
 	}
 
@@ -115,7 +177,11 @@ flags:
 	return nil
 }
 
-func loadQuotaConfig(explicit string) (*config.Config, error) {
+// loadCLIConfig loads prism YAML for CLI subcommands (auth, quota, …).
+// Explicit --config uses that path only. Otherwise it tries
+// <cwd>/config.yaml then usageConfigFallbackPath
+// (/var/lib/prism/config.yaml), matching systemd WorkingDirectory.
+func loadCLIConfig(explicit string) (*config.Config, string, error) {
 	var candidates []string
 	if explicit != "" {
 		candidates = []string{explicit}
@@ -129,12 +195,12 @@ func loadQuotaConfig(explicit string) (*config.Config, error) {
 	for _, p := range candidates {
 		cfg, err := config.LoadConfig(p)
 		if err == nil {
-			return cfg, nil
+			return cfg, p, nil
 		}
 		last = err
 	}
 	if last == nil {
 		last = fmt.Errorf("找不到 config.yaml")
 	}
-	return nil, fmt.Errorf("无法加载配置: %v", last)
+	return nil, "", fmt.Errorf("无法加载配置: %v", last)
 }

@@ -153,6 +153,26 @@ func buildSummaryWhere(q SummaryQuery) (string, []any) {
 	return sb.String(), args
 }
 
+// SumGrokTokens sums 词元 for model ids matching grok-% in [fromUnix, toUnix]
+// (unix seconds, inclusive). The per-row total is the same expression
+// Overview uses (stored total_tokens, else prompt+completion).
+func (s *SQLiteStore) SumGrokTokens(ctx context.Context, fromUnix, toUnix int64) (int64, error) {
+	db := s.readPool()
+	if db == nil {
+		return 0, errors.New("usage: store not open")
+	}
+	if fromUnix <= 0 {
+		return 0, nil
+	}
+	q := `SELECT COALESCE(SUM(CASE WHEN total_tokens > 0 THEN total_tokens ELSE prompt_tokens + completion_tokens END), 0)
+FROM usage_events WHERE ts_unix >= ? AND ts_unix <= ? AND LOWER(model) LIKE 'grok-%'`
+	var n int64
+	if err := db.QueryRowContext(ctx, q, fromUnix, toUnix).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // Summary runs the aggregated query on the read pool. All values are bound
 // as parameters; group_by and filter column names come exclusively from the
 // whitelist.

@@ -12,8 +12,13 @@ type Window struct {
 	Status           string     `json:"status"`
 	Percent          int        `json:"percent"`
 	ResetsAt         *time.Time `json:"resets_at,omitempty"`
+	PeriodStart      *time.Time `json:"period_start,omitempty"`
 	LimitUSDEstimate int        `json:"limit_usd_estimate,omitempty"`
 	USDStatus        string     `json:"usd_status,omitempty"`
+	// LimitTokensEstimate is the SuperGrok weekly pool size in tokens,
+	// inferred from grok-* usage rows and last period's week-pool
+	// percent. Zero means not yet available (no completed period).
+	LimitTokensEstimate int64 `json:"limit_tokens_estimate,omitempty"`
 }
 
 // Snapshot is one upstream plan fetch for a unique API key.

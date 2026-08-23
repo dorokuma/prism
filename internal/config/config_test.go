@@ -102,6 +102,88 @@ accounts:
 	}
 }
 
+func TestLoadConfigOAuthXAISkipsStaticKey(t *testing.T) {
+	content := `
+listen: 127.0.0.1:18790
+accounts:
+  - name: supergrok
+    base_url: https://api.x.ai/v1
+    provider: xai
+    oauth: xai
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cfg, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Accounts[0].OAuth != "xai" {
+		t.Errorf("oauth = %q", cfg.Accounts[0].OAuth)
+	}
+	if cfg.Accounts[0].Key != "" {
+		t.Errorf("key must stay empty for oauth accounts")
+	}
+	if cfg.OAuthDir != "/var/lib/prism/oauth" {
+		t.Errorf("oauth_dir = %q", cfg.OAuthDir)
+	}
+}
+
+func TestLoadConfigOAuthUnknownRejected(t *testing.T) {
+	content := `
+listen: 127.0.0.1:18790
+accounts:
+  - name: supergrok
+    base_url: https://api.x.ai/v1
+    provider: xai
+    oauth: other
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	_, err = LoadConfig(f.Name())
+	if err == nil || !strings.Contains(err.Error(), "unknown oauth") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLoadConfigOAuthWithYAMLKeyRejected(t *testing.T) {
+	content := `
+listen: 127.0.0.1:18790
+accounts:
+  - name: supergrok
+    base_url: https://api.x.ai/v1
+    provider: xai
+    oauth: xai
+    key: secret
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	_, err = LoadConfig(f.Name())
+	if err == nil || !strings.Contains(err.Error(), "must not set key") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestConfigRemapModel(t *testing.T) {
 	cfg := &Config{
 		ModelRemapEnabled: true,

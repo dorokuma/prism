@@ -235,11 +235,59 @@ var builtinProfiles = []namedProfile{
 		},
 	},
 	{
-		prefixes: []string{"grok-4.5"},
+		// Longest prefixes first is not required (matchPrefix picks the
+		// longest hit) but keep SKU-specific grok-4.20 names explicit so a
+		// future grok-4.20-* family prefix cannot swallow non-reasoning.
+		prefixes: []string{"grok-4.20-0309-reasoning"},
 		profile: Profile{
 			Form:       FormEnum,
 			EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high"},
 			EnumFields: []string{"reasoning_effort"},
+			OffValue:   "none",
+		},
+	},
+	{
+		prefixes: []string{"grok-4.20-multi-agent-0309"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh"},
+			EnumFields: []string{"reasoning_effort"},
+		},
+	},
+	{
+		prefixes: []string{"grok-4.6"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh"},
+			EnumFields: []string{"reasoning_effort"},
+			ForceOn:    true,
+		},
+	},
+	{
+		prefixes: []string{"grok-4.5"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high", "xhigh": "high"},
+			EnumFields: []string{"reasoning_effort"},
+			ForceOn:    true,
+		},
+	},
+	{
+		prefixes: []string{"grok-4.3"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"low": "low", "medium": "medium", "high": "high"},
+			EnumFields: []string{"reasoning_effort"},
+			OffValue:   "none",
+		},
+	},
+	{
+		prefixes: []string{"grok-build-0.1"},
+		profile: Profile{
+			Form:       FormEnum,
+			EffortMap:  map[string]string{"high": "high"},
+			EnumFields: []string{"reasoning_effort"},
+			ForceOn:    true,
 		},
 	},
 }

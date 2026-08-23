@@ -95,6 +95,12 @@ func TestProfileFor_Unknown(t *testing.T) {
 	if p.Form != FormEnum {
 		t.Errorf("grok-4.5: got Form=%s, want enum", p.Form)
 	}
+	if !p.ForceOn {
+		t.Error("grok-4.5 should have ForceOn=true (reasoning cannot be disabled)")
+	}
+	if p.EffortMap["xhigh"] != "high" {
+		t.Errorf("grok-4.5 xhigh=%q, want high (upstream treats xhigh as high)", p.EffortMap["xhigh"])
+	}
 
 	p = ProfileForModel("")
 	if p.Form != FormNone {
@@ -105,6 +111,64 @@ func TestProfileFor_Unknown(t *testing.T) {
 	if p.Form != FormNone {
 		t.Errorf("unknown: got Form=%s, want none", p.Form)
 	}
+}
+
+func TestProfileFor_GrokFamily(t *testing.T) {
+	t.Run("grok-4.6 xhigh and force-on", func(t *testing.T) {
+		p := ProfileForModel("grok-4.6")
+		if p.Form != FormEnum {
+			t.Fatalf("form=%s", p.Form)
+		}
+		if !p.ForceOn {
+			t.Error("ForceOn")
+		}
+		if p.EffortMap["xhigh"] != "xhigh" || p.EffortMap["high"] != "high" {
+			t.Errorf("EffortMap=%v", p.EffortMap)
+		}
+	})
+	t.Run("grok-4.3 can turn off with none", func(t *testing.T) {
+		p := ProfileForModel("grok-4.3")
+		if p.Form != FormEnum {
+			t.Fatalf("form=%s", p.Form)
+		}
+		if p.ForceOn {
+			t.Error("grok-4.3 must not ForceOn")
+		}
+		if p.OffValue != "none" {
+			t.Errorf("OffValue=%q", p.OffValue)
+		}
+	})
+	t.Run("grok-4.20 reasoning vs non-reasoning", func(t *testing.T) {
+		p := ProfileForModel("grok-4.20-0309-reasoning")
+		if p.Form != FormEnum || p.OffValue != "none" {
+			t.Errorf("reasoning form=%s off=%q", p.Form, p.OffValue)
+		}
+		p = ProfileForModel("grok-4.20-0309-non-reasoning")
+		if p.Form != FormNone {
+			t.Errorf("non-reasoning form=%s, want none", p.Form)
+		}
+	})
+	t.Run("grok-4.20 multi-agent xhigh", func(t *testing.T) {
+		p := ProfileForModel("grok-4.20-multi-agent-0309")
+		if p.Form != FormEnum {
+			t.Fatalf("form=%s", p.Form)
+		}
+		if p.EffortMap["xhigh"] != "xhigh" {
+			t.Errorf("EffortMap=%v", p.EffortMap)
+		}
+	})
+	t.Run("grok-build-0.1 force-on", func(t *testing.T) {
+		p := ProfileForModel("grok-build-0.1")
+		if p.Form != FormEnum || !p.ForceOn {
+			t.Errorf("form=%s forceOn=%v", p.Form, p.ForceOn)
+		}
+	})
+	t.Run("imagine has no effort profile", func(t *testing.T) {
+		p := ProfileForModel("grok-imagine-image-2.0")
+		if p.Form != FormNone {
+			t.Errorf("form=%s, want none", p.Form)
+		}
+	})
 }
 
 // ── Apply helpers ────────────────────────────────────────────────────

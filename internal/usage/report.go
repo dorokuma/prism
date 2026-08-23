@@ -8,6 +8,9 @@ import (
 	"github.com/dorokuma/prism/internal/render"
 )
 
+// PeriodWeek is the header label when usage defaults to the SuperGrok week.
+const PeriodWeek = "周限"
+
 // DescribePeriod renders a human-readable time-range description for the
 // summary header, e.g. "今天", "近 7 天", "08-01 至 08-10" or — when the
 // range crosses a year — "2025-12-01 至 2026-01-05". from/to/now are unix

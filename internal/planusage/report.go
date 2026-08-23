@@ -148,7 +148,7 @@ func windowLabel(name string) string {
 	case "rolling":
 		return "短期"
 	case "weekly":
-		return "中期"
+		return "周限"
 	case "monthly":
 		return "长期"
 	default:
@@ -172,11 +172,12 @@ func statusLabel(status string) string {
 	}
 }
 
-// formatEstimate renders the window quota limit: LimitUSDEstimate is the
-// upstream's documented dollar limit for the window, not the current
-// spend. It shows the field only when the upstream marks it estimated —
-// never a real spend figure.
+// formatEstimate prefers SuperGrok token-pool inference, then the old
+// OpenCode dollar window estimate.
 func formatEstimate(w Window) string {
+	if w.LimitTokensEstimate > 0 {
+		return render.FormatTokens(w.LimitTokensEstimate)
+	}
 	if w.LimitUSDEstimate > 0 && w.USDStatus == "estimated" {
 		return fmt.Sprintf("$%d.00", w.LimitUSDEstimate)
 	}
