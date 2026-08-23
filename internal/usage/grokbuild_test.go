@@ -68,6 +68,48 @@ func TestImportGrokBuildReplacesWeekRows(t *testing.T) {
 	}
 }
 
+func TestEventsFromSegmentTierSelectionUsesInputTokens(t *testing.T) {
+	short := &Price{Input: 1}
+	long := &Price{Input: 2}
+	var gotContext int64
+	seg := grokSegment{SessionID: "s", PromptID: "p", Usage: grokUsage{
+		InputTokens: 200000, OutputTokens: 1, TotalTokens: 200001,
+		CachedReadTokens: 50000, ModelUsage: map[string]grokUsage{"grok-4.6-build": {
+			InputTokens: 200000, OutputTokens: 1, TotalTokens: 200001, CachedReadTokens: 50000,
+		}},
+	}}
+	events := eventsFromSegment(seg, func(model string, contextTokens int64) *Price {
+		gotContext = contextTokens
+		if contextTokens >= 200000 {
+			return long
+		}
+		return short
+	})
+	if len(events) != 1 || gotContext != 200000 {
+		t.Fatalf("events=%d context=%d, want one event and InputTokens context", len(events), gotContext)
+	}
+	if events[0].Cost == nil || *events[0].Cost <= 0 {
+		t.Fatal("expected estimated cost")
+	}
+}
+
+func TestEventsFromSegmentCostTicksTakePriority(t *testing.T) {
+	called := false
+	seg := grokSegment{SessionID: "s", PromptID: "p", Usage: grokUsage{
+		InputTokens: 100, OutputTokens: 10, TotalTokens: 110, CostUsdTicks: 2500000000,
+	}}
+	events := eventsFromSegment(seg, func(model string, contextTokens int64) *Price {
+		called = true
+		return &Price{Input: 999}
+	})
+	if len(events) != 1 || called {
+		t.Fatalf("estimated pricing called=%v, want false", called)
+	}
+	if events[0].Cost == nil || *events[0].Cost != 2.5 {
+		t.Fatalf("cost=%v, want 2.5 from CostUsdTicks", events[0].Cost)
+	}
+}
+
 func TestStripBuildSuffix(t *testing.T) {
 	if stripBuildSuffix("grok-4.6-build") != "grok-4.6" {
 		t.Fatal(stripBuildSuffix("grok-4.6-build"))

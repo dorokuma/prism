@@ -4,8 +4,32 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/dorokuma/prism/internal/config"
 )
 
+func TestGrokPriceFor_AllZeroEffectiveTierIsMissing(t *testing.T) {
+	cfg := &config.Config{
+		ModelMetadata: config.ModelMetadataMap{
+			"grok": {Cost: &config.ModelCost{
+				Input:                1,
+				LongContextThreshold: 100,
+				LongContext:          &config.ModelCost{},
+			}},
+		},
+	}
+	priceFor := grokPriceFor(cfg)
+	short := priceFor("grok-build", 99)
+	if short == nil {
+		t.Fatal("short-context tier must return a price")
+	}
+	if short.Input != 1 {
+		t.Fatalf("short-context input price = %v, want 1", short.Input)
+	}
+	if got := priceFor("grok-build", 100); got != nil {
+		t.Fatalf("all-zero effective long_context tier must return nil, got %+v", got)
+	}
+}
 func TestRunQuotaHelp(t *testing.T) {
 	err := runQuotaWith([]string{"-h"}, &bytes.Buffer{})
 	if err != nil {

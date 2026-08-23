@@ -126,7 +126,7 @@ func collectGrokSegments(r io.Reader) []grokSegment {
 	return out
 }
 
-func eventsFromSegment(seg grokSegment, priceFor func(model string) *Price) []Event {
+func eventsFromSegment(seg grokSegment, priceFor func(model string, contextTokens int64) *Price) []Event {
 	models := seg.Usage.ModelUsage
 	if len(models) == 0 {
 		models = map[string]grokUsage{"grok-4.6": seg.Usage}
@@ -148,7 +148,7 @@ func eventsFromSegment(seg grokSegment, priceFor func(model string) *Price) []Ev
 			cost = &v
 			status = CostStatusOK
 		} else if priceFor != nil {
-			cost, status = ComputeCost(u.InputTokens, u.OutputTokens, u.CachedReadTokens, u.CacheCreationTokens, SourceOpenAI, priceFor(model))
+			cost, status = ComputeCost(u.InputTokens, u.OutputTokens, u.CachedReadTokens, u.CacheCreationTokens, SourceOpenAI, priceFor(model, u.InputTokens))
 		}
 		total := u.TotalTokens
 		if total == 0 {
@@ -185,7 +185,7 @@ func eventsFromSegment(seg grokSegment, priceFor func(model string) *Price) []Ev
 // session snapshots from the Grok Build CLI tree. Segments split when
 // numTurns drops (new conversation / rewind). Each segment contributes its
 // last usage snapshot so totals are not prefix-summed.
-func ImportGrokBuild(ctx context.Context, store *SQLiteStore, sessionsDir string, fromUnix, toUnix int64, priceFor func(model string) *Price) (int, error) {
+func ImportGrokBuild(ctx context.Context, store *SQLiteStore, sessionsDir string, fromUnix, toUnix int64, priceFor func(model string, contextTokens int64) *Price) (int, error) {
 	if store == nil || strings.TrimSpace(sessionsDir) == "" || fromUnix <= 0 {
 		return 0, nil
 	}

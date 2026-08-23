@@ -29,6 +29,21 @@ type ModelCost struct {
 	LongContextThreshold int64      `yaml:"long_context_threshold,omitempty"`
 }
 
+// EffectiveCost selects the pricing tier for a request based on its context
+// length. When LongContext is nil or LongContextThreshold is non-positive,
+// it returns the receiver, preserving legacy single-tier behavior. A request
+// at or above the positive threshold uses the long-context tier for all token
+// categories.
+func (c *ModelCost) EffectiveCost(contextTokens int64) *ModelCost {
+	if c == nil {
+		return nil
+	}
+	if c.LongContext != nil && c.LongContextThreshold > 0 && contextTokens >= c.LongContextThreshold {
+		return c.LongContext
+	}
+	return c
+}
+
 // ModelMetadata defines optional per-model metadata that prism returns
 // via /v1/models for agent/tool auto-discovery. All fields are optional;
 // agents use what they understand and ignore the rest.

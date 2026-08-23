@@ -123,15 +123,7 @@ func priceFor(cfg *config.Config, provider, model string, contextTokens int64) *
 	if !ok || meta.Cost == nil {
 		return nil
 	}
-	cost := meta.Cost
-	// contextTokens is the audit prompt/input token count (unit: tokens), not
-	// completion tokens. A request enters the long tier when contextTokens >=
-	// the threshold. OpenAI prompt_tokens includes cached tokens, while
-	// Anthropic input_tokens excludes cached tokens (see internal/usage/cost.go:
-	// 38-50), so the trigger points are not exactly equivalent across upstreams.
-	if cost.LongContext != nil && cost.LongContextThreshold > 0 && contextTokens >= cost.LongContextThreshold {
-		cost = cost.LongContext
-	}
+	cost := meta.Cost.EffectiveCost(contextTokens)
 	// A configured tier whose four rates are all zero is not an effective
 	// price. Return nil so ComputeCost records missing_price rather than
 	// silently treating an unpriced request as a genuine zero-dollar charge.

@@ -35,8 +35,8 @@ func runQuota(args []string) error {
 	return runQuotaWith(args, os.Stdout)
 }
 
-func grokPriceFor(cfg *config.Config) func(string) *usage.Price {
-	return func(model string) *usage.Price {
+func grokPriceFor(cfg *config.Config) func(string, int64) *usage.Price {
+	return func(model string, contextTokens int64) *usage.Price {
 		if cfg == nil {
 			return nil
 		}
@@ -48,7 +48,10 @@ func grokPriceFor(cfg *config.Config) func(string) *usage.Price {
 		if !ok || meta.Cost == nil {
 			return nil
 		}
-		c := meta.Cost
+		c := meta.Cost.EffectiveCost(contextTokens)
+		if c.Input == 0 && c.Output == 0 && c.CacheRead == 0 && c.CacheWrite == 0 {
+			return nil
+		}
 		return &usage.Price{Input: c.Input, Output: c.Output, CacheRead: c.CacheRead, CacheWrite: c.CacheWrite}
 	}
 }
