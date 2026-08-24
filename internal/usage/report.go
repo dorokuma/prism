@@ -9,7 +9,7 @@ import (
 )
 
 // PeriodWeek is the header label when usage defaults to the SuperGrok week.
-const PeriodWeek = "周限"
+const PeriodWeek = "本周"
 
 // DescribePeriod renders a human-readable time-range description for the
 // summary header, e.g. "今天", "近 7 天", "08-01 至 08-10" or — when the
@@ -88,12 +88,10 @@ type ReportOptions struct {
 func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts ReportOptions) string {
 	var b strings.Builder
 	b.WriteString(render.RenderSummary(render.Summary{
-		Period:    opts.Period,
-		Requests:  ov.Requests,
-		Tokens:    ov.TotalTokens,
-		Cost:      ov.TotalCost,
-		Failures:  ov.FailedRequests,
-		Streaming: ov.StreamingRequests,
+		Period:   opts.Period,
+		Requests: ov.Requests,
+		Tokens:   ov.TotalTokens,
+		Cost:     ov.TotalCost,
 		// Cache-hit segments are split by usage_source with per-family
 		// denominators: OpenAI-form rows (usage_source = 'openai', legacy
 		// NULL rows and empty-string rows — everything ComputeCost prices

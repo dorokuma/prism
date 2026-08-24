@@ -328,7 +328,7 @@ func TestHandlerTableFormat(t *testing.T) {
 	}
 	// widths: 模型 4 | 请求 4 | 输入词元 8 | 缓存 4 | 命中率 6 | 输出词元 8 | 花费 5 | 未计价 6
 	want := "  全部时间  ·  2 请求  ·  300 词元  ·  $0.150\n" +
-		"  流式 2 (100.0%)   缓存命中(openai) 0 (0.0%)\n" +
+		"  命中(OpenAI) 0 (0.0%)\n" +
 		"  ⚠ 有 1 个请求未算出金额（模型未配置单价），总费用可能偏低\n" +
 		"\n" +
 		"  模型" + strings.Repeat(" ", 1) + "请求 输入词元 缓存 命中率 输出词元  花费 未计价\n" +
@@ -369,7 +369,7 @@ func TestHandlerTableFormatMixedSources(t *testing.T) {
 	body := rec.Body.String()
 	// openai 900/1000 = 90.0%; anthropic 500/(1+500+0) = 99.8% — both
 	// independent, neither above 100%.
-	if !strings.Contains(body, "缓存命中(openai) 900 (90.0%)   缓存命中(anthropic) 500 (99.8%)") {
+	if !strings.Contains(body, "命中(OpenAI) 900 (90.0%)   命中(Anthropic) 500 (99.8%)") {
 		t.Errorf("split cache segments missing or wrong:\n%s", body)
 	}
 	// Ungrouped table row: 1400 hits over openai prompt 1000 + anthropic
@@ -595,8 +595,8 @@ func TestHandlerDefaultFromWeek(t *testing.T) {
 		t.Fatalf("table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "周限") {
-		t.Errorf("default table must label 周限:\n%s", body)
+	if !strings.Contains(body, "本周") {
+		t.Errorf("default table must label 本周:\n%s", body)
 	}
 	if strings.Contains(body, "全部时间") {
 		t.Errorf("default table must not be 全部时间:\n%s", body)

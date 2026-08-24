@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.21.6  Date: 2026-08-23  Status: living document
+> Version: v0.22.1  Date: 2026-08-24  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -191,6 +191,7 @@ MIT
 
 ## Changelog
 
+- **2026-08-24** — v0.22.1 — fix: usage summary layout. The `prism usage` and `/admin/usage/summary?format=table` summary block drops the failure and streaming segments (the second line now shows only the cache-hit segments), renames `缓存命中` to `命中`, upper-cases the source labels to `OpenAI`/`Anthropic`, and renames the SuperGrok week default header from `周限` to `本周` (shared table header and JSON `period` field via the `PeriodWeek` constant); `render.Summary` no longer carries failure/streaming counts. Tests updated.
 - **2026-08-23** — v0.21.6 — fix: align Grok Build zero-rate guards with `priceFor` long-context tier selection, so unpriced tiers remain missing prices instead of recording zero-cost usage; tests cover short/long lookup and explicit cost precedence.
 - **2026-08-23** — v0.21.5 — fix: Grok quota exhaustion. HTTP 402 and 429 responses with explicit quota-exhaustion markers now report the weekly window as 100% rate-limited without a query error; ordinary 429 responses and authentication/upstream failures still surface as errors.
 

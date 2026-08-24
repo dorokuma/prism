@@ -133,10 +133,10 @@ func TestRenderUsageReportStructure(t *testing.T) {
 	if !strings.Contains(got, "  今天  ·  1,783 请求  ·  2.23M 词元  ·  $0.836\n") {
 		t.Errorf("summary line missing or wrong:\n%s", got)
 	}
-	// Failure + streaming counts from Overview; the cache-hit segment is the
-	// OpenAI-family one (only openai requests in this dataset).
-	if !strings.Contains(got, "失败 12 (0.7%)   流式 1,690 (94.8%)   缓存命中(openai) 1.1M (55.0%)") {
-		t.Errorf("failure/streaming/cache line missing or wrong:\n%s", got)
+	// The cache-hit segment is the OpenAI-family one (only openai requests
+	// in this dataset).
+	if !strings.Contains(got, "命中(OpenAI) 1.1M (55.0%)") {
+		t.Errorf("cache line missing or wrong:\n%s", got)
 	}
 	// The anthropic family had zero requests: its segment must be omitted.
 	if strings.Contains(got, "anthropic") {
@@ -191,7 +191,7 @@ func TestRenderUsageReportAlignment(t *testing.T) {
 	}
 	// widths: 模型 15 (deepseek-v4-pro) | 请求 4 | 输入词元 8 | 缓存 4 | 命中率 6 | 输出词元 8 | 花费 5 | 未计价 6
 	want := "  今天  ·  1,783 请求  ·  2.23M 词元  ·  $0.836\n" +
-		"  失败 12 (0.7%)   流式 1,690 (94.8%)   缓存命中(openai) 1.1M (55.0%)\n" +
+		"  命中(OpenAI) 1.1M (55.0%)\n" +
 		"  ⚠ 有 3 个请求未算出金额（模型未配置单价），总费用可能偏低\n" +
 		"\n" +
 		"  模型" + strings.Repeat(" ", 12) + "请求 输入词元 缓存 命中率 输出词元  花费 未计价\n" +
@@ -370,7 +370,7 @@ func TestRenderUsageReportSplitCacheSegments(t *testing.T) {
 		AnthropicRequests: 1, AnthropicPromptTokens: 1, AnthropicCachedTokens: 500, AnthropicCacheWriteTokens: 0,
 	}
 	got := RenderUsageReport(ov, nil, []string{"model"}, ReportOptions{Period: "x"})
-	if !strings.Contains(got, "缓存命中(openai) 900 (90.0%)   缓存命中(anthropic) 500 (99.8%)") {
+	if !strings.Contains(got, "命中(OpenAI) 900 (90.0%)   命中(Anthropic) 500 (99.8%)") {
 		t.Errorf("mixed segments must render side by side with independent ratios:\n%s", got)
 	}
 	if strings.Contains(got, "缓存命中 900 (") || strings.Contains(got, "缓存命中 500 (") {
@@ -380,10 +380,10 @@ func TestRenderUsageReportSplitCacheSegments(t *testing.T) {
 	// Pure openai: only the openai segment (anthropic has zero requests).
 	ov = &Overview{Requests: 1, OpenAIRequests: 1, OpenAIPromptTokens: 1000, OpenAICachedTokens: 900}
 	got = RenderUsageReport(ov, nil, []string{"model"}, ReportOptions{Period: "x"})
-	if !strings.Contains(got, "缓存命中(openai) 900 (90.0%)") {
+	if !strings.Contains(got, "命中(OpenAI) 900 (90.0%)") {
 		t.Errorf("pure openai: openai segment missing:\n%s", got)
 	}
-	if strings.Contains(got, "anthropic") {
+	if strings.Contains(got, "Anthropic") {
 		t.Errorf("pure openai: anthropic segment must be omitted:\n%s", got)
 	}
 
@@ -391,10 +391,10 @@ func TestRenderUsageReportSplitCacheSegments(t *testing.T) {
 	// assembled total input including cache_creation: 500/(100+500+400)=50%.
 	ov = &Overview{Requests: 1, AnthropicRequests: 1, AnthropicPromptTokens: 100, AnthropicCachedTokens: 500, AnthropicCacheWriteTokens: 400}
 	got = RenderUsageReport(ov, nil, []string{"model"}, ReportOptions{Period: "x"})
-	if !strings.Contains(got, "缓存命中(anthropic) 500 (50.0%)") {
+	if !strings.Contains(got, "命中(Anthropic) 500 (50.0%)") {
 		t.Errorf("pure anthropic: segment missing or denominator wrong:\n%s", got)
 	}
-	if strings.Contains(got, "openai") {
+	if strings.Contains(got, "OpenAI") {
 		t.Errorf("pure anthropic: openai segment must be omitted:\n%s", got)
 	}
 

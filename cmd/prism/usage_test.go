@@ -435,8 +435,8 @@ func TestRunUsageJSON(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
 		t.Fatal(err)
 	}
-	if doc.Period != "周限" {
-		t.Errorf("period = %q, want 周限", doc.Period)
+	if doc.Period != "本周" {
+		t.Errorf("period = %q, want 本周", doc.Period)
 	}
 	// overview covers ALL 5 events (alpha 2 + beta 1 + gamma 2), including
 	// the failed one
@@ -476,13 +476,10 @@ func TestRunUsageTable(t *testing.T) {
 	out := buf.String()
 	// summary from Overview: all 5 requests, 750 total tokens, 4 priced
 	// events × $0.15 (price 1000/1000 on 150 tokens each)
-	if !strings.Contains(out, "周限  ·  5 请求  ·  750 词元  ·  $0.600") {
+	if !strings.Contains(out, "本周  ·  5 请求  ·  750 词元  ·  $0.600") {
 		t.Errorf("summary line missing/wrong:\n%s", out)
 	}
-	// the failed + missing-price hints
-	if !strings.Contains(out, "失败 1 (20.0%)") {
-		t.Errorf("failure line missing:\n%s", out)
-	}
+	// the missing-price hint
 	if !strings.Contains(out, "⚠ 有 1 个请求未算出金额") {
 		t.Errorf("missing-price warning missing:\n%s", out)
 	}
@@ -794,7 +791,7 @@ func TestRunUsageSplitCacheSegments(t *testing.T) {
 	out := buf.String()
 	// openai bucket = openai row + NULL legacy row: (900+80)/(1000+100) =
 	// 980/1100 = 89.1%; anthropic bucket: 500/(1+500+0) = 99.8%.
-	if !strings.Contains(out, "缓存命中(openai) 980 (89.1%)   缓存命中(anthropic) 500 (99.8%)") {
+	if !strings.Contains(out, "命中(OpenAI) 980 (89.1%)   命中(Anthropic) 500 (99.8%)") {
 		t.Errorf("split cache segments missing or wrong:\n%s", out)
 	}
 	// The old single-segment format must be gone.

@@ -27,10 +27,6 @@ type Summary struct {
 	// Cost is the total cost in USD. nil means no unit price is configured
 	// for the models, which renders as "-" and is distinct from $0.000.
 	Cost *float64
-	// Failures is the number of failed requests.
-	Failures int64
-	// Streaming is the number of streaming requests.
-	Streaming int64
 	// OpenAI holds the cache-hit segment for OpenAI-form rows (including
 	// legacy rows with no recorded source); nil when that family has no
 	// requests in range. Caching only applies to the input side, so the
@@ -45,12 +41,12 @@ type Summary struct {
 // RenderSummary renders s as two indented lines:
 //
 //	{Period}  ·  {requests} 请求  ·  {tokens} 词元  ·  {cost}
-//	失败 {n} ({pct})   流式 {n} ({pct})   缓存命中(openai) {tokens} ({pct})   缓存命中(anthropic) {tokens} ({pct})
+//	命中(OpenAI) {tokens} ({pct})   命中(Anthropic) {tokens} ({pct})
 //
-// The failure segment is omitted when Failures is zero. The failure and
-// streaming percentages use Requests as denominator; each cache-hit segment
-// uses its own Input denominator. A segment whose source family had no
-// requests (nil) is omitted entirely. Percentages keep one decimal; a zero
+// The failure and streaming segments are not rendered. Each cache-hit
+// segment uses its own Input denominator. A segment whose source family had
+// no requests (nil) is omitted entirely — when neither family has requests
+// only the first line is emitted. Percentages keep one decimal; a zero
 // denominator renders as "-". The result ends with a newline.
 func RenderSummary(s Summary) string {
 	var b strings.Builder
@@ -64,20 +60,18 @@ func RenderSummary(s Summary) string {
 	b.WriteString(FormatCost(s.Cost))
 	b.WriteByte('\n')
 
-	parts := make([]string, 0, 4)
-	if s.Failures != 0 {
-		parts = append(parts, "失败 "+FormatInt(s.Failures)+" ("+FormatPercent(float64(s.Failures), float64(s.Requests))+")")
-	}
-	parts = append(parts, "流式 "+FormatInt(s.Streaming)+" ("+FormatPercent(float64(s.Streaming), float64(s.Requests))+")")
+	parts := make([]string, 0, 2)
 	if s.OpenAI != nil {
-		parts = append(parts, "缓存命中(openai) "+FormatTokens(s.OpenAI.Hits)+" ("+FormatPercent(float64(s.OpenAI.Hits), float64(s.OpenAI.Input))+")")
+		parts = append(parts, "命中(OpenAI) "+FormatTokens(s.OpenAI.Hits)+" ("+FormatPercent(float64(s.OpenAI.Hits), float64(s.OpenAI.Input))+")")
 	}
 	if s.Anthropic != nil {
-		parts = append(parts, "缓存命中(anthropic) "+FormatTokens(s.Anthropic.Hits)+" ("+FormatPercent(float64(s.Anthropic.Hits), float64(s.Anthropic.Input))+")")
+		parts = append(parts, "命中(Anthropic) "+FormatTokens(s.Anthropic.Hits)+" ("+FormatPercent(float64(s.Anthropic.Hits), float64(s.Anthropic.Input))+")")
 	}
 
-	b.WriteString("  ")
-	b.WriteString(strings.Join(parts, "   "))
-	b.WriteByte('\n')
+	if len(parts) > 0 {
+		b.WriteString("  ")
+		b.WriteString(strings.Join(parts, "   "))
+		b.WriteByte('\n')
+	}
 	return b.String()
 }
