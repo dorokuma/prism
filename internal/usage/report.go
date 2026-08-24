@@ -94,10 +94,10 @@ func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts R
 		Cost:     ov.TotalCost,
 		// Cache-hit segments are split by usage_source with per-family
 		// denominators: OpenAI-form rows (usage_source = 'openai', legacy
-		// NULL rows and empty-string rows — everything ComputeCost prices
-		// with the OpenAI formula) count cached/prompt — cached is a subset
-		// of prompt there. Anthropic-form rows count cache_read against the
-		// assembled total input (input + cache_read + cache_creation),
+		// NULL/empty rows) count cached/prompt — cached is a subset of
+		// prompt there. Anthropic-form rows (usage_source = 'anthropic' or
+		// 'pi') count cache_read against the assembled total input (input +
+		// cache_read + cache_creation),
 		// because Anthropic input_tokens excludes the cache counters; that
 		// keeps the ratio ≤ 100% and matches the upstream billing basis. A
 		// source family with zero requests gets no segment at all.

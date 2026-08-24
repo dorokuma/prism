@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.22.2  Date: 2026-08-24  Status: living document
+> Version: v0.22.3  Date: 2026-08-24  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -191,6 +191,7 @@ MIT
 
 ## Changelog
 
+- **2026-08-24** — v0.22.3 — fix: pi-session hit-rate denominators now include Anthropic cache-read and cache-creation input, preventing hit rates above 100%; Pi rows are included in the Anthropic overview bucket.
 - **2026-08-24** — v0.22.2 — feat: usage statistics now ingest Pi session data and merge all three sources within the same time window.
 - **2026-08-24** — v0.22.1 — fix: usage summary layout. The `prism usage` and `/admin/usage/summary?format=table` summary block drops the failure and streaming segments (the second line now shows only the cache-hit segments), renames `缓存命中` to `命中`, upper-cases the source labels to `OpenAI`/`Anthropic`, and renames the SuperGrok week default header from `周限` to `本周` (shared table header and JSON `period` field via the `PeriodWeek` constant); `render.Summary` no longer carries failure/streaming counts. Tests updated.
 - **2026-08-23** — v0.22.0 — feat: Pi model family sync and long-context model pricing. Pi `models.json` sync filters entries by provider family (`-anthropic` / `-openai` suffix): Anthropic providers keep only Claude/Anthropic ids and rewrite to `anthropic-messages` on the prism origin with the `/v1` suffix stripped (Pi posts `/v1/messages`); OpenAI-family providers exclude Anthropic ids. `model_metadata[].cost` gains an optional `long_context` tier with `long_context_threshold`: requests whose prompt/input tokens are `>= threshold` price all token categories at the long-context rate (completion tokens do not trigger it); a nested `long_context` is rejected at load with an explicit error.

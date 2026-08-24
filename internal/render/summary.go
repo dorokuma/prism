@@ -32,9 +32,9 @@ type Summary struct {
 	// requests in range. Caching only applies to the input side, so the
 	// ratio uses the family's input tokens as denominator.
 	OpenAI *CacheStats
-	// Anthropic holds the cache-hit segment for Anthropic-form rows; nil
-	// when that family has no requests in range. Input must already be the
-	// assembled total input (input_tokens + cache_read + cache_creation).
+	// Anthropic holds the cache-hit segment for Anthropic-form and pi-session
+	// rows; nil when that family has no requests in range. Input must already
+	// be the assembled total input (input_tokens + cache_read + cache_creation).
 	Anthropic *CacheStats
 }
 

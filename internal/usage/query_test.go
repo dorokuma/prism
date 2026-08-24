@@ -11,6 +11,42 @@ import (
 // TestSummaryRejectsInvalidGroupBy is the acceptance test for the whitelist:
 // user input must never be interpolated into SQL. Anything that is not an
 // exact whitelist name is rejected with a QueryError before any SQL runs.
+func TestSummaryPiUsesAnthropicCacheDenominator(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.InsertBatch(ctx, []Event{{
+		Ts: time.Now(), RequestID: "pi-hit", Model: "claude", Source: PiSessionSource,
+		PromptTokens: 100, CachedTokens: 500, CacheWriteTokens: 50,
+		TotalTokens: 650,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.Summary(ctx, SummaryQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("summary rows = %d, want 1", len(rows))
+	}
+	if rows[0].HitRateInputTokens != 650 {
+		t.Fatalf("pi hit-rate denominator = %d, want 650 (100 + 500 + 50)", rows[0].HitRateInputTokens)
+	}
+	if got := cacheHitRate(rows[0].CachedTokens, rows[0].cacheHitInput()); got != "76.9%" {
+		t.Fatalf("pi hit rate = %s, want 76.9%% (500/650)", got)
+	}
+
+	o, err := s.Overview(ctx, SummaryQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.OpenAIRequests != 0 || o.AnthropicRequests != 1 ||
+		o.AnthropicPromptTokens != 100 || o.AnthropicCachedTokens != 500 ||
+		o.AnthropicCacheWriteTokens != 50 {
+		t.Fatalf("pi source split = %+v, want Anthropic bucket", o)
+	}
+}
+
 func TestSummaryRejectsInvalidGroupBy(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

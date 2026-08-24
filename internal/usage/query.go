@@ -109,8 +109,9 @@ const (
 	// back. Mixed groups sum both families. This matches the Overview
 	// split the renderer already uses for the summary segments, so a
 	// per-row hit rate cannot exceed 100% when the upstream reports
-	// cache_read outside input_tokens.
-	hitRateInputSumExpr = `SUM(CASE WHEN usage_source = 'anthropic' THEN prompt_tokens + cached_tokens + cache_write_tokens ELSE prompt_tokens END)`
+	// cache_read outside input_tokens. The pi source uses this same
+	// Anthropic-form denominator.
+	hitRateInputSumExpr = `SUM(CASE WHEN usage_source IN ('anthropic', 'pi') THEN prompt_tokens + cached_tokens + cache_write_tokens ELSE prompt_tokens END)`
 )
 
 // buildSummaryWhere renders the shared WHERE clause for q's filter fields
@@ -363,10 +364,10 @@ func (s *SQLiteStore) Overview(ctx context.Context, q SummaryQuery) (*Overview, 
 		SUM(CASE WHEN usage_source = 'openai' OR usage_source = '' OR usage_source IS NULL THEN 1 ELSE 0 END),
 		SUM(CASE WHEN usage_source = 'openai' OR usage_source = '' OR usage_source IS NULL THEN prompt_tokens ELSE 0 END),
 		SUM(CASE WHEN usage_source = 'openai' OR usage_source = '' OR usage_source IS NULL THEN cached_tokens ELSE 0 END),
-		SUM(CASE WHEN usage_source = 'anthropic' THEN 1 ELSE 0 END),
-		SUM(CASE WHEN usage_source = 'anthropic' THEN prompt_tokens ELSE 0 END),
-		SUM(CASE WHEN usage_source = 'anthropic' THEN cached_tokens ELSE 0 END),
-		SUM(CASE WHEN usage_source = 'anthropic' THEN cache_write_tokens ELSE 0 END)
+		SUM(CASE WHEN usage_source = 'anthropic' OR usage_source = 'pi' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN usage_source = 'anthropic' OR usage_source = 'pi' THEN prompt_tokens ELSE 0 END),
+		SUM(CASE WHEN usage_source = 'anthropic' OR usage_source = 'pi' THEN cached_tokens ELSE 0 END),
+		SUM(CASE WHEN usage_source = 'anthropic' OR usage_source = 'pi' THEN cache_write_tokens ELSE 0 END)
 	FROM usage_events` + where
 
 	var o Overview
