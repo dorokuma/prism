@@ -148,8 +148,9 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 		if cfg, _, err := loadCLIConfig(""); err == nil {
 			wstore := usage.NewSQLiteStore(dbPath)
 			if err := wstore.Open(); err == nil {
-				from := now.Add(-14 * 24 * time.Hour).Unix()
-				_, _ = usage.ImportGrokBuild(context.Background(), wstore, usage.DefaultGrokSessionsDir(), from, now.Unix(), grokPriceFor(cfg))
+				from, to := q.From, q.To
+				_, _ = usage.ImportGrokBuild(context.Background(), wstore, usage.DefaultGrokSessionsDir(), from, to, grokPriceFor(cfg))
+				_, _ = usage.ImportPiSessions(context.Background(), wstore, usage.DefaultPiSessionsDir(), from, to)
 				_ = wstore.Close()
 			}
 		}
