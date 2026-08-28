@@ -23,12 +23,81 @@ func assertBodyUnchanged(t *testing.T, got, body []byte) {
 // ── Message role normalization tests ──────────────────────────────────
 
 // TestTransformRequestBody_DevRoleToSystem verifies that a message with
-// role:"developer" is rewritten to role:"system" for ollama-schema providers
-// while every other field (including non-developer roles) is preserved verbatim.
+// role:"developer" is rewritten to role:"system" for all providers/schemas
+// (including ollama, opencode, and default empty provider) while every other
+// field is preserved verbatim.
 func TestTransformRequestBody_DevRoleToSystem(t *testing.T) {
 	cfg := loadProviderCfg(t)
-	body := []byte(`{"model":"glm-5.2","messages":[{"role":"developer","content":"You are a helpful assistant."},{"role":"user","content":"hi"}]}`)
-	got := sanitize.TransformRequestBodyForProvider(body, cfg, "ollama-cloud")
+	providers := []string{"ollama-cloud", "opencode-go", ""}
+
+	for _, provider := range providers {
+		t.Run("provider="+provider, func(t *testing.T) {
+			body := []byte(`{"model":"glm-5.2","messages":[{"role":"developer","content":"You are a helpful assistant."},{"role":"user","content":"hi"}]}`)
+			got := sanitize.TransformRequestBodyForProvider(body, cfg, provider)
+
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(got, &raw); err != nil {
+				t.Fatalf("unmarshal result: %v", err)
+			}
+
+			var messages []map[string]any
+			if err := json.Unmarshal(raw["messages"], &messages); err != nil {
+				t.Fatalf("unmarshal messages: %v", err)
+			}
+
+			if len(messages) != 2 {
+				t.Fatalf("expected 2 messages, got %d", len(messages))
+			}
+			if role, _ := messages[0]["role"].(string); role != "system" {
+				t.Errorf("messages[0].role = %q, want system", role)
+			}
+			if role, _ := messages[1]["role"].(string); role != "user" {
+				t.Errorf("messages[1].role = %q, want user", role)
+			}
+			if content, _ := messages[0]["content"].(string); content != "You are a helpful assistant." {
+				t.Errorf("messages[0].content = %q, want preserved content", content)
+			}
+		})
+	}
+}
+
+// TestTransformRequestBody_DevRole_MixedRolesAndNonDevPreserved verifies that
+// in a multi-message conversation with mixed roles, only developer roles are
+// rewritten to system, while all other roles (system, user, assistant, tool)
+// are preserved verbatim.
+func TestTransformRequestBody_DevRole_MixedRolesAndNonDevPreserved(t *testing.T) {
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"system","content":"base system"},{"role":"developer","content":"dev instructions"},{"role":"user","content":"hello"},{"role":"assistant","content":"response"},{"role":"tool","content":"tool result"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "opencode-go")
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	var messages []map[string]any
+	if err := json.Unmarshal(raw["messages"], &messages); err != nil {
+		t.Fatalf("unmarshal messages: %v", err)
+	}
+
+	if len(messages) != 5 {
+		t.Fatalf("expected 5 messages, got %d", len(messages))
+	}
+	expectedRoles := []string{"system", "system", "user", "assistant", "tool"}
+	for i, exp := range expectedRoles {
+		if role, _ := messages[i]["role"].(string); role != exp {
+			t.Errorf("messages[%d].role = %q, want %q", i, role, exp)
+		}
+	}
+}
+
+// TestTransformRequestBody_DevRole_MultimodalContentPreserved verifies that
+// multimodal array content (containing text and image objects) is preserved
+// intact without being flattened or corrupted when developer role is rewritten.
+func TestTransformRequestBody_DevRole_MultimodalContentPreserved(t *testing.T) {
+	cfg := loadProviderCfg(t)
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"developer","content":[{"type":"text","text":"analyze this image"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]},{"role":"user","content":"what is it?"}]}`)
+	got := sanitize.TransformRequestBodyForProvider(body, cfg, "")
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(got, &raw); err != nil {
@@ -46,32 +115,22 @@ func TestTransformRequestBody_DevRoleToSystem(t *testing.T) {
 	if role, _ := messages[0]["role"].(string); role != "system" {
 		t.Errorf("messages[0].role = %q, want system", role)
 	}
-	if role, _ := messages[1]["role"].(string); role != "user" {
-		t.Errorf("messages[1].role = %q, want user", role)
-	}
-	if content, _ := messages[0]["content"].(string); content != "You are a helpful assistant." {
-		t.Errorf("messages[0].content = %q, want preserved content", content)
-	}
-}
 
-// TestTransformRequestBody_DevRoleNotChangedOnOpencode verifies that
-// role:"developer" is NOT rewritten for opencode-schema providers (they may
-// support the developer role natively).
-func TestTransformRequestBody_DevRoleNotChangedOnOpencode(t *testing.T) {
-	cfg := loadProviderCfg(t)
-	body := []byte(`{"model":"glm-5.2","messages":[{"role":"developer","content":"sys"},{"role":"user","content":"hi"}]}`)
-	got := sanitize.TransformRequestBodyForProvider(body, cfg, "opencode-go")
-
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(got, &raw); err != nil {
-		t.Fatalf("unmarshal result: %v", err)
+	// Verify multimodal array content is intact
+	contentArr, ok := messages[0]["content"].([]any)
+	if !ok {
+		t.Fatalf("messages[0].content type = %T, want []any", messages[0]["content"])
 	}
-	var messages []map[string]any
-	if err := json.Unmarshal(raw["messages"], &messages); err != nil {
-		t.Fatalf("unmarshal messages: %v", err)
+	if len(contentArr) != 2 {
+		t.Fatalf("content array len = %d, want 2", len(contentArr))
 	}
-	if role, _ := messages[0]["role"].(string); role != "developer" {
-		t.Errorf("messages[0].role = %q, want developer (unchanged on opencode)", role)
+	part0, _ := contentArr[0].(map[string]any)
+	if part0["type"] != "text" || part0["text"] != "analyze this image" {
+		t.Errorf("content[0] = %+v, want text part", part0)
+	}
+	part1, _ := contentArr[1].(map[string]any)
+	if part1["type"] != "image_url" {
+		t.Errorf("content[1].type = %v, want image_url", part1["type"])
 	}
 }
 

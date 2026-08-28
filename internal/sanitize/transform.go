@@ -63,28 +63,27 @@ func TransformRequestBodyForProvider(body []byte, cfg *config.Config, provider s
 		changed = true
 	}
 
-	// Step 2.5: Message role normalization (developer → system) — ollama only.
+	// Step 2.5: Message role normalization (developer → system) for all upstreams.
 	//
-	// Ollama silently drops the non-standard "developer" role, which would
-	// cause the SYSTEM.md / AGENTS.md context to be lost. Other upstreams
-	// (e.g. opencode-go) either support developer natively or pi already
-	// sends role:system, so we gate this step to the ollama schema only.
-	// The /v1/responses path already normalizes via
-	// NormalizeMessagesForChatAPI, but that helper also flattens multimodal
-	// content into plain text and merges consecutive system turns. For the
-	// chat/completions path we must preserve images and every other field
-	// exactly as sent, so we perform only the minimal developer→system role
-	// rewrite here (no flatten, no merge).
-	if schema == reasoning.SchemaOllama {
-		if msgsRaw, ok := raw["messages"]; ok && len(msgsRaw) > 0 {
-			var messages []map[string]any
-			if err := json.Unmarshal(msgsRaw, &messages); err == nil && len(messages) > 0 {
-				if normalizeMessageRoles(messages) {
-					rawBytes, _ := json.Marshal(messages)
-					raw["messages"] = json.RawMessage(rawBytes)
-					changed = true
-					slog.Debug("normalized message roles (developer → system)")
-				}
+	// Multiple upstreams (e.g. Ollama, certain OpenAI-compatible proxies) do not
+	// recognize or silently drop / reject the non-standard "developer" role. Pi sends
+	// role:developer messages carrying crucial project context (e.g. SYSTEM.md / AGENTS.md),
+	// so dropping or rejecting them causes system context to be lost or requests to fail.
+	// Therefore, normalizeMessageRoles is executed unconditionally for all providers.
+	//
+	// Note that the /v1/responses path already has NormalizeMessagesForChatAPI
+	// handling normalization and remains unaffected. Unlike NormalizeMessagesForChatAPI,
+	// which flattens multimodal content and merges consecutive system turns, this
+	// chat/completions path performs only minimal developer→system rewriting so images
+	// and other fields are forwarded verbatim (no flatten, no merge).
+	if msgsRaw, ok := raw["messages"]; ok && len(msgsRaw) > 0 {
+		var messages []map[string]any
+		if err := json.Unmarshal(msgsRaw, &messages); err == nil && len(messages) > 0 {
+			if normalizeMessageRoles(messages) {
+				rawBytes, _ := json.Marshal(messages)
+				raw["messages"] = json.RawMessage(rawBytes)
+				changed = true
+				slog.Debug("normalized message roles (developer → system)")
 			}
 		}
 	}

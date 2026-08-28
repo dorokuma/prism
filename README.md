@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.22.4  Date: 2026-08-28  Status: living document
+> Version: v0.22.5  Date: 2026-08-28  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -191,6 +191,7 @@ MIT
 
 ## Changelog
 
+- **2026-08-28** — v0.22.5 — fix: TransformRequestBodyForProvider message role normalization (`role:developer` → `role:system`) now applies globally to all upstreams instead of being gated to ollama-only, preventing SYSTEM.md/AGENTS.md context loss or errors on upstreams that do not accept the developer role.
 - **2026-08-28** — v0.22.4 — feat: credential prefix LB_KEY_ renamed to PRISM_KEY_ across configuration, CLI setup, systemd credentials, and documentation.
 - **2026-08-24** — v0.22.3 — fix: pi-session hit-rate denominators now include Anthropic cache-read and cache-creation input, preventing hit rates above 100%; Pi rows are included in the Anthropic overview bucket.
 - **2026-08-24** — v0.22.2 — feat: usage statistics now ingest Pi session data and merge all three sources within the same time window.
