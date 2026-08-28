@@ -6,12 +6,12 @@
 #             edit /var/lib/prism/config.yaml
 #   Binary:   install -m 755 ./prism /usr/local/bin/prism
 #   Keys:     systemd LoadCredential (see scripts/prism.service.example)
-#             OR env LB_KEY_<NAME>  (hyphens in account name → underscores)
+#             OR env PRISM_KEY_<NAME>  (hyphens in account name → underscores)
 #   Do NOT commit real keys. Source tree must not hold production config.yaml.
 #
 # Local dev:
 #   cp config.yaml.example config.yaml
-#   export LB_KEY_ACCOUNT_1=...
+#   export PRISM_KEY_ACCOUNT_1=...
 #   ./prism
 
 debug: false
@@ -256,10 +256,10 @@ model_remap:
 accounts:
   # name 规则（LoadConfig 强制，setup 交互同规则）：非空、唯一、以 ASCII
   # 字母/数字开头，仅允许 A-Z a-z 0-9 _ -，最长 64 字节（名称用于
-  # LB_KEY_* 凭据/环境变量名、expvar 键、日志与 usage 标签；点、路径分隔符、
-  # 空格等均被拒绝）。两个名称折叠到同一个 LB_KEY_*（如 a-b 与 a_b）会
+  # PRISM_KEY_* 凭据/环境变量名、expvar 键、日志与 usage 标签；点、路径分隔符、
+  # 空格等均被拒绝）。两个名称折叠到同一个 PRISM_KEY_*（如 a-b 与 a_b）会
   # 在加载时报错。
-  # name "account-1" → credential/env LB_KEY_ACCOUNT_1
+  # name "account-1" → credential/env PRISM_KEY_ACCOUNT_1
   # provider 必填（v0.17.0 起）：provider 为空的账号永远选不到（业务请求按
   # provider 路由），加载会直接报错。裸顶层 accounts 必须声明 provider，
   # 或改用下方 providers 块。
@@ -315,7 +315,7 @@ accounts:
 #
 # max_concurrent_per_account_total: 账号级总并发上限（对每个账号生效）。
 # 缺省/0 时取向后兼容默认值 = max_concurrent_per_account 中互不相同的
-# 正值之和（等价于旧版按 max 值分组的账号总并发上限，配置不变则总并发
+# 正值之和（等价于旧版按 max值分组的账号总并发上限，配置不变则总并发
 # 不变）；显式配置后 N 个模型档位不会让账号总并发线性叠加。
 # 负值或大于 2^31-1 报错；改动需重启生效（ReloadConfig 会警告）。
 # ---------------------------------------------------------------------------
@@ -334,9 +334,9 @@ mcp_tools_json: "/var/lib/prism/mcp_tools.json"
 # agentrouter 账号池示例（可选接入；默认全部注释，不影响现有账号）
 #
 # 4 个账号 = 2 把 key × 两协议（openai / anthropic）。key 一律省略，走凭证：
-#   LB_KEY_AGENTROUTER_OAI_1 / LB_KEY_AGENTROUTER_OAI_2 /
-#   LB_KEY_AGENTROUTER_ANT_1 / LB_KEY_AGENTROUTER_ANT_2
-# （账号名连字符转下划线后大写，规则同 account-1 → LB_KEY_ACCOUNT_1）
+#   PRISM_KEY_AGENTROUTER_OAI_1 / PRISM_KEY_AGENTROUTER_OAI_2 /
+#   PRISM_KEY_AGENTROUTER_ANT_1 / PRISM_KEY_AGENTROUTER_ANT_2
+# （账号名连字符转下划线后大写，规则同 account-1 → PRISM_KEY_ACCOUNT_1）
 #
 # probe_path: disabled —— 探活端点（GET /v1/models）未实测，disabled 表示
 # 不发探活请求，也不改变账号状态：exhausted 账号保持 exhausted，直到运营者

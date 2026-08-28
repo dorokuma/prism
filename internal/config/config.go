@@ -507,15 +507,15 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	// Account NAMEs are the audit/usage account label, the expvar key
-	// (pool_account_<name>_*), and the seed of the LB_KEY_* credential /
+	// (pool_account_<name>_*), and the seed of the PRISM_KEY_* credential /
 	// env / credstore file name. Validate them at load:
 	//   - non-empty, unique, ASCII alnum start, charset [A-Za-z0-9_-], at
 	//     most MaxAccountNameLen bytes (the name also seeds systemd
 	//     LoadCredential names and shell env names, so the charset excludes
 	//     dots — the expvar hierarchy separator — path separators and ".."
 	//     — the name seeds file names — spaces and unicode);
-	//   - no two names may FOLD to the same LB_KEY_* credential name
-	//     ("a-b" and "a_b" both fold to LB_KEY_A_B via
+	//   - no two names may FOLD to the same PRISM_KEY_* credential name
+	//     ("a-b" and "a_b" both fold to PRISM_KEY_A_B via
 	//     CredentialEnvName): getCredential would silently resolve both
 	//     accounts to the same secret, and the generated systemd unit
 	//     would emit duplicate LoadCredential lines.
@@ -526,12 +526,12 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("account %q: %w", acc.Name, err)
 		}
 		if seenAccountNames[acc.Name] {
-			return nil, fmt.Errorf("accounts: duplicate name %q; every account needs a unique name (it is the audit account label, the expvar key and the LB_KEY_* credential name)", acc.Name)
+			return nil, fmt.Errorf("accounts: duplicate name %q; every account needs a unique name (it is the audit account label, the expvar key and the PRISM_KEY_* credential name)", acc.Name)
 		}
 		seenAccountNames[acc.Name] = true
 		envName := CredentialEnvName(acc.Name)
 		if prev, ok := foldedCredNames[envName]; ok {
-			return nil, fmt.Errorf("accounts %q and %q collide on credential name %s (hyphens fold to underscores); rename one account so the LB_KEY_* names differ", prev, acc.Name, envName)
+			return nil, fmt.Errorf("accounts %q and %q collide on credential name %s (hyphens fold to underscores); rename one account so the PRISM_KEY_* names differ", prev, acc.Name, envName)
 		}
 		foldedCredNames[envName] = acc.Name
 	}
@@ -761,25 +761,25 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // MaxAccountNameLen is the maximum accepted upstream account-name length
-// (bytes). Account names seed the LB_KEY_* credential/env/credstore names
+// (bytes). Account names seed the PRISM_KEY_* credential/env/credstore names
 // and the expvar keys, so a sane bound keeps the derived names bounded and
 // readable.
 const MaxAccountNameLen = 64
 
 // CredentialEnvName derives the credential/env/credstore name of an
-// account from its account name: "LB_KEY_" + the name uppercased with
+// account from its account name: "PRISM_KEY_" + the name uppercased with
 // hyphens folded to underscores ("a-b" and "a_b" both fold to
-// "LB_KEY_A_B"). It is the SINGLE implementation of the conversion,
+// "PRISM_KEY_A_B"). It is the SINGLE implementation of the conversion,
 // shared by LoadConfig (the fold-collision check and the credential/env
 // lookup), `prism setup` (the interactive cross-provider conflict check
 // and the generated credstore/systemd names) and cmd/prism's wiring.
 func CredentialEnvName(accountName string) string {
-	return "LB_KEY_" + strings.ToUpper(strings.ReplaceAll(accountName, "-", "_"))
+	return "PRISM_KEY_" + strings.ToUpper(strings.ReplaceAll(accountName, "-", "_"))
 }
 
 // ValidateAccountName validates an upstream account name: the audit/usage
 // account label, the expvar key prefix (pool_account_<name>_*), and the
-// seed of the LB_KEY_* credential / env / credstore file name. Rules:
+// seed of the PRISM_KEY_* credential / env / credstore file name. Rules:
 //   - non-empty;
 //   - at most MaxAccountNameLen bytes;
 //   - starts with an ASCII letter or digit;
@@ -792,10 +792,10 @@ func CredentialEnvName(accountName string) string {
 // so a generated config can never be rejected by LoadConfig.
 func ValidateAccountName(name string) error {
 	if name == "" {
-		return fmt.Errorf("name is empty; every account needs a non-empty name (it is the audit account label and the LB_KEY_* credential name)")
+		return fmt.Errorf("name is empty; every account needs a non-empty name (it is the audit account label and the PRISM_KEY_* credential name)")
 	}
 	if len(name) > MaxAccountNameLen {
-		return fmt.Errorf("name longer than %d bytes is not supported (it seeds the LB_KEY_* credential name and the expvar keys)", MaxAccountNameLen)
+		return fmt.Errorf("name longer than %d bytes is not supported (it seeds the PRISM_KEY_* credential name and the expvar keys)", MaxAccountNameLen)
 	}
 	if c := name[0]; !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
 		return fmt.Errorf("name %q must start with an ASCII letter or digit", name)

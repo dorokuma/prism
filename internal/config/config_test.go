@@ -51,8 +51,8 @@ accounts:
 }
 
 func TestLoadConfigKeyFromEnv(t *testing.T) {
-	os.Setenv("LB_KEY_TEST_ACC", "env-key-value")
-	defer os.Unsetenv("LB_KEY_TEST_ACC")
+	os.Setenv("PRISM_KEY_TEST_ACC", "env-key-value")
+	defer os.Unsetenv("PRISM_KEY_TEST_ACC")
 
 	content := `
 accounts:
@@ -1751,8 +1751,8 @@ providers:
 	f.Close()
 
 	// Keys must be present (env fallback would fail otherwise).
-	t.Setenv("LB_KEY_AGENTROUTER_ANT_1", "test-key-ant-1")
-	t.Setenv("LB_KEY_AGENTROUTER_OAI_1", "test-key-oai-1")
+	t.Setenv("PRISM_KEY_AGENTROUTER_ANT_1", "test-key-ant-1")
+	t.Setenv("PRISM_KEY_AGENTROUTER_OAI_1", "test-key-oai-1")
 
 	cfg, err := LoadConfig(f.Name())
 	if err != nil {
@@ -3103,7 +3103,7 @@ func TestValidateAccountName(t *testing.T) {
 
 // TestLoadConfig_AccountNameValidation pins the load-time account-name
 // gates: invalid names, duplicate names and names that fold to the same
-// LB_KEY_* credential name are all rejected.
+// PRISM_KEY_* credential name are all rejected.
 func TestLoadConfig_AccountNameValidation(t *testing.T) {
 	base := `
 accounts:
@@ -3141,7 +3141,7 @@ accounts:
 		}
 	})
 	t.Run("credential folding collision rejected", func(t *testing.T) {
-		// "a-b" and "a_b" both fold to LB_KEY_A_B: getCredential would
+		// "a-b" and "a_b" both fold to PRISM_KEY_A_B: getCredential would
 		// silently resolve both accounts to the same secret.
 		_, err := loadConfigFrom(t, `
 accounts:
@@ -3155,9 +3155,9 @@ accounts:
     provider: test
 `)
 		if err == nil {
-			t.Fatal("account names folding to the same LB_KEY_* credential name must be rejected")
+			t.Fatal("account names folding to the same PRISM_KEY_* credential name must be rejected")
 		}
-		if !strings.Contains(err.Error(), "LB_KEY_A_B") {
+		if !strings.Contains(err.Error(), "PRISM_KEY_A_B") {
 			t.Errorf("error = %q, want it to name the colliding credential", err)
 		}
 	})

@@ -187,7 +187,7 @@ func runSetup() error {
 
 	var providers []providerConfig
 
-	// 账号名全局注册表：跨 provider 拒绝重名与 LB_KEY_* 折叠冲突（与
+	// 账号名全局注册表：跨 provider 拒绝重名与 PRISM_KEY_* 折叠冲突（与
 	// LoadConfig 同一规则），保证生成的配置一定能被加载。
 	registry := newAccountNameRegistry()
 
@@ -381,7 +381,7 @@ func containsIndex(arr []int, target int) bool {
 
 // accountNameRegistry tracks the account names already entered across ALL
 // providers during one setup run. It mirrors the two account-name gates of
-// LoadConfig — exact duplicates and folded LB_KEY_* credential collisions
+// LoadConfig — exact duplicates and folded PRISM_KEY_* credential collisions
 // ("a-b" vs "a_b") are rejected GLOBALLY, not per provider — so the
 // generated config is guaranteed to load: LoadConfig rejects a duplicate
 // name or a folded credential collision anywhere in the flattened account
@@ -404,11 +404,11 @@ func newAccountNameRegistry() *accountNameRegistry {
 // so the setup-side conflict rule can never drift from the load-side rule.
 func (r *accountNameRegistry) check(name string) error {
 	if r.names[name] {
-		return fmt.Errorf("账号名 %q 重复：账号名必须在所有 provider 间唯一（它是审计账号标签、expvar 键和 LB_KEY_* 凭据名）", name)
+		return fmt.Errorf("账号名 %q 重复：账号名必须在所有 provider 间唯一（它是审计账号标签、expvar 键和 PRISM_KEY_* 凭据名）", name)
 	}
 	envName := config.CredentialEnvName(name)
 	if prev, ok := r.foldedCreds[envName]; ok {
-		return fmt.Errorf("账号名 %q 与 %q 冲突：凭据名 %s 相同（连字符折叠为下划线）；请改名使 LB_KEY_* 名称不同", prev, name, envName)
+		return fmt.Errorf("账号名 %q 与 %q 冲突：凭据名 %s 相同（连字符折叠为下划线）；请改名使 PRISM_KEY_* 名称不同", prev, name, envName)
 	}
 	r.names[name] = true
 	r.foldedCreds[envName] = name
@@ -433,7 +433,7 @@ func promptAccounts(reader *bufio.Reader, providerName string, registry *account
 		// 跨 provider 的全局唯一性与凭据名折叠冲突（与 LoadConfig 同一规则，
 		// 凭据名转换复用 config.CredentialEnvName）：
 		// “opencode-go” 的默认名与自定义 provider 同名时，或某 provider 的
-		// “a-b” 与另一 provider 的 “a_b” 折叠到同一 LB_KEY_* 时，生成的配置
+		// “a-b” 与另一 provider 的 “a_b” 折叠到同一 PRISM_KEY_* 时，生成的配置
 		// 会被 LoadConfig 拒绝——在这里就拦住。
 		if err := registry.check(name); err != nil {
 			return nil, err

@@ -471,7 +471,7 @@ func TestSetup_PromptAccountsRejectsCrossProviderDuplicate(t *testing.T) {
 
 // TestSetup_PromptAccountsRejectsFoldedCredentialCollision pins the
 // cross-provider CredentialEnvName fold gate: "a-b" in one provider and
-// "a_b" in another both fold to LB_KEY_A_B — LoadConfig rejects that
+// "a_b" in another both fold to PRISM_KEY_A_B — LoadConfig rejects that
 // collision anywhere in the flattened account list, so setup must reject
 // it at the second prompt too (same conversion function, same rule).
 func TestSetup_PromptAccountsRejectsFoldedCredentialCollision(t *testing.T) {
@@ -488,32 +488,32 @@ func TestSetup_PromptAccountsRejectsFoldedCredentialCollision(t *testing.T) {
 		t.Fatal("exact duplicate a-b in a second provider must be rejected")
 	}
 
-	// Second provider, FOLDED collision a_b → LB_KEY_A_B: must be rejected
+	// Second provider, FOLDED collision a_b → PRISM_KEY_A_B: must be rejected
 	// with the credential-name message.
 	readerB := bufio.NewReader(strings.NewReader("1\na_b\nsk-b\n"))
 	_, err := promptAccounts(readerB, "provB", reg)
 	if err == nil {
-		t.Fatal("a_b in a second provider must be rejected (folds to LB_KEY_A_B like a-b)")
+		t.Fatal("a_b in a second provider must be rejected (folds to PRISM_KEY_A_B like a-b)")
 	}
-	if !strings.Contains(err.Error(), "LB_KEY_A_B") {
-		t.Errorf("error = %q, want it to name the folded credential LB_KEY_A_B", err)
+	if !strings.Contains(err.Error(), "PRISM_KEY_A_B") {
+		t.Errorf("error = %q, want it to name the folded credential PRISM_KEY_A_B", err)
 	}
 }
 
 // TestSetup_AccountNameRegistryAllowsDistinctFoldNames guards the
 // converse: names that fold to DIFFERENT credential names stay accepted
-// across providers (a-b vs a-c → LB_KEY_A_B vs LB_KEY_A_C).
+// across providers (a-b vs a-c → PRISM_KEY_A_B vs PRISM_KEY_A_C).
 func TestSetup_AccountNameRegistryAllowsDistinctFoldNames(t *testing.T) {
 	reg := newAccountNameRegistry()
 	for _, tc := range []struct{ name, provider string }{
 		{"a-b", "p1"},
 		{"a-c", "p2"},
-		{"a_b", "p3"}, // folds to LB_KEY_A_B — collides with a-b!
+		{"a_b", "p3"}, // folds to PRISM_KEY_A_B — collides with a-b!
 	} {
 		err := reg.check(tc.name)
 		if tc.name == "a_b" {
 			if err == nil {
-				t.Error("a_b after a-b must be rejected (both fold to LB_KEY_A_B)")
+				t.Error("a_b after a-b must be rejected (both fold to PRISM_KEY_A_B)")
 			}
 			continue
 		}
