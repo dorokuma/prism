@@ -427,7 +427,7 @@ func main() {
 	util.DebugMode.Store(cfg.Debug)
 	mcp.LoadMCPTools(cfg.MCPToolsJSON)
 	p := pool.NewPoolWithTotalCap(cfg.Accounts, config.ResolveAccountTotalCap(cfg))
-	attachOAuth(p, cfg)
+	oauthCancel := attachOAuth(p, cfg)
 	wire, _ := config.ParseWireAPIMode(cfg.WireAPI)
 	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", util.DebugMode.Load(), "auth", len(cfg.APIKeys) > 0, "auth_keys", len(cfg.APIKeys), "tls", cfg.TLSCertFile != "")
 
@@ -604,6 +604,7 @@ func main() {
 			}
 			slog.Info("shutting down", "signal", sig.String())
 			close(stop)
+			oauthCancel()
 			mc.Stop()
 			quotaPoller.Stop()
 			metricCancel()
@@ -634,15 +635,32 @@ func main() {
 }
 
 // attachOAuth wires file-backed xAI token sources onto oauth: xai accounts.
-func attachOAuth(p *pool.Pool, cfg *config.Config) {
+func attachOAuth(p *pool.Pool, cfg *config.Config) context.CancelFunc {
 	client := &http.Client{Timeout: 20 * time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
 	for _, acc := range p.AllAccounts() {
 		if acc.OAuth() != "xai" {
 			continue
 		}
 		name := acc.Name()
-		acc.SetTokenSource(oauth.NewXAISource(cfg.OAuthDir, name, func(ctx context.Context, refresh string) (xai.Tokens, error) {
+		src := oauth.NewXAISource(cfg.OAuthDir, name, func(ctx context.Context, refresh string) (xai.Tokens, error) {
 			return xai.Refresh(ctx, xai.Config{HTTP: client}, refresh)
-		}))
+		})
+		acc.SetTokenSource(src)
+		go func(acc *pool.Account, src *oauth.Source) {
+			ticker := time.NewTicker(2 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if _, err := src.ForceRefresh(ctx); err != nil {
+						slog.Warn("xAI OAuth keepalive refresh failed", "account", acc.Name(), "error", err)
+					}
+				}
+			}
+		}(acc, src)
 	}
+	return cancel
 }

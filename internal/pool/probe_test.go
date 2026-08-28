@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -734,5 +735,80 @@ func TestProbeExhausted_ConcurrencyCap(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("ProbeExhausted did not finish after releasing blockers")
+	}
+}
+
+// stubOAuthTokens mimics the surface of oauth.Source that the probe
+// terminal-skip check uses (structural assertion in
+// Account.OAuthTerminalInvalid).
+type stubOAuthTokens struct {
+	tok      string
+	err      error
+	terminal bool
+}
+
+func (s stubOAuthTokens) Token(context.Context) (string, error) { return s.tok, s.err }
+func (s stubOAuthTokens) OAuthTerminalInvalid() bool            { return s.terminal }
+
+// Audit item 6d: an exhausted xai account in the TERMINAL OAuth state
+// (dead refresh token, re-login required) must be skipped by the probe
+// loop — probing would call acc.Key() → Token() and either hammer the
+// invalid refresh token or log a terminal error every probe cycle. A
+// NON-terminal exhausted OAuth account must still be probed normally.
+func TestProbeExhausted_SkipsTerminalOAuthAccount(t *testing.T) {
+	termURL := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("terminal OAuth account must not be probed (no HTTP request, no refresh attempt)")
+		w.WriteHeader(500)
+	}))
+	defer termURL.Close()
+	liveURL := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer liveURL.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "xai-terminal", OAuth: "xai", BaseURL: termURL.URL},
+		{Name: "xai-live", OAuth: "xai", BaseURL: liveURL.URL},
+	})
+	accs := p.AllAccounts()
+	accs[0].SetTokenSource(stubOAuthTokens{tok: "dead", terminal: true})
+	accs[1].SetTokenSource(stubOAuthTokens{tok: "live"})
+	accs[0].MarkExhaustedWithClass(ExhaustPermanentCredential)
+	accs[1].MarkExhaustedWithClass(ExhaustPermanentCredential)
+
+	ProbeExhausted(p)
+
+	// The terminal account stays exhausted, untouched.
+	if accs[0].IsHealthy() {
+		t.Error("terminal account must not be revived by a probe")
+	}
+	if accs[0].LastExhaustClass() != ExhaustPermanentCredential {
+		t.Errorf("terminal account exhaust class = %v, want unchanged", accs[0].LastExhaustClass())
+	}
+	// The non-terminal OAuth account is still probed (200 → healthy).
+	if !accs[1].IsHealthy() {
+		t.Error("non-terminal exhausted OAuth account should be probed and revived")
+	}
+}
+
+// A static-key exhausted account (no OAuth) is unaffected by the
+// terminal-skip guard and keeps being probed.
+func TestProbeExhausted_StaticAccountStillProbed(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "static1", Key: "k1", BaseURL: upstream.URL},
+	})
+	acc := p.AllAccounts()[0]
+	acc.MarkExhausted()
+
+	ProbeExhausted(p)
+
+	if !acc.IsHealthy() {
+		t.Error("static-key exhausted account should be probed and revived")
 	}
 }

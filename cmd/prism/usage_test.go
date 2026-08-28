@@ -643,25 +643,32 @@ func TestRunUsageConcurrentWithLiveRecorder(t *testing.T) {
 		}
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
 	queries := 0
-	for time.Now().Before(deadline) {
-		var buf bytes.Buffer
-		err := runUsageWith([]string{"--db", path, "--json", "--since", "7d"}, &buf, time.Now())
-		if err != nil {
-			t.Fatalf("prism usage during live writes failed: %v", err)
+	// The 30-query floor is a load/smoke threshold, not a correctness
+	// assertion (correctness is the per-query error check below plus the
+	// final persist count). Under -race or on loaded CI a single 2s window
+	// can fall short purely due to machine speed, so grant one extra window
+	// before failing instead of flaking.
+	for window := 0; window < 2 && queries < 30; window++ {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			var buf bytes.Buffer
+			err := runUsageWith([]string{"--db", path, "--json", "--since", "7d"}, &buf, time.Now())
+			if err != nil {
+				t.Fatalf("prism usage during live writes failed: %v", err)
+			}
+			var doc struct {
+				Overview *usage.Overview `json:"overview"`
+			}
+			if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+				t.Fatalf("json output: %v\n%s", err, buf.String())
+			}
+			if doc.Overview == nil {
+				t.Fatal("missing overview in JSON")
+			}
+			queries++
+			time.Sleep(2 * time.Millisecond)
 		}
-		var doc struct {
-			Overview *usage.Overview `json:"overview"`
-		}
-		if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
-			t.Fatalf("json output: %v\n%s", err, buf.String())
-		}
-		if doc.Overview == nil {
-			t.Fatal("missing overview in JSON")
-		}
-		queries++
-		time.Sleep(2 * time.Millisecond)
 	}
 	close(stop)
 	<-writerDone

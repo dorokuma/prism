@@ -435,6 +435,12 @@ type doUpstreamResult struct {
 	cancel   context.CancelFunc
 	retry    bool
 	fatalErr error
+	// key is the exact credential sent upstream with this request ("" on
+	// the retry/fatal paths). The 401 reactive refresh compares it against
+	// the on-disk token to detect whether a concurrent caller already
+	// rotated the token (thundering-herd protection: N concurrent 401s
+	// must burn exactly one refresh-token rotation).
+	key string
 }
 
 // doUpstreamRequest builds and sends the upstream HTTP request.
@@ -474,7 +480,12 @@ func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opt
 	//      explicitly set their own Content-Type)
 	copyClientHeaders(req.Header, r.Header)
 	pool.ApplyAccountHeaders(req.Header, acc)
-	pool.ApplyAuthHeader(req.Header, acc)
+	// Resolve the credential exactly once and send the SAME value that is
+	// recorded on the result (doUpstreamResult.key) for the 401 reactive
+	// refresh's token comparison — a second Key() call could straddle a
+	// refresh and record a token that was never sent.
+	key := acc.Key()
+	pool.ApplyAuthHeaderWithValue(req.Header, acc, key)
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -512,7 +523,7 @@ func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opt
 		return doUpstreamResult{retry: false, fatalErr: err}
 	}
 
-	return doUpstreamResult{resp: resp, ctx: ctx, cancel: cancel}
+	return doUpstreamResult{resp: resp, ctx: ctx, cancel: cancel, key: key}
 }
 
 // responseCommitWriter is the writer contract for handleUpstreamResponse's

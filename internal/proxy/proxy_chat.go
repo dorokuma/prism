@@ -436,22 +436,41 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 			defer p.Release(slot)
 			res := doUpstreamRequest(acc, r, bodyBytes, opts, requestID)
 			if res.resp != nil {
-				done, fatalErr, upClass := handleUpstreamResponse(acc, sc, r, res.resp, bodyBytes, start, opts, requestID, res.ctx, res.cancel)
-				if done {
-					terminalDone = true
-					terminalFatalErr = fatalErr
+				// OAuth access tokens can be revoked independently of local
+				// expiry: on 401 rotate once and replay the buffered request.
+				// The rejected response is deliberately left UNTOUCHED until
+				// the refresh succeeds (no pre-closed body, no pre-cancelled
+				// ctx): a failed refresh must fall through to the normal 401
+				// handling with the original response fully intact.
+				//
+				// res.key is the token the 401 request actually used:
+				// OAuthRefreshIfStale reuses a rotation a concurrent 401
+				// handler (or the keepalive) already performed instead of
+				// burning another single-use refresh-token rotation
+				// (thundering herd: N concurrent 401s → one rotation).
+				if res.resp.StatusCode == http.StatusUnauthorized && acc.OAuth() == "xai" {
+					if _, refreshErr := acc.OAuthRefreshIfStale(r.Context(), res.key); refreshErr == nil {
+						_ = res.resp.Body.Close()
+						res.cancel()
+						res = doUpstreamRequest(acc, r, bodyBytes, opts, requestID)
+					} else {
+						slog.Warn("oauth reactive refresh failed, falling back to 401 handling", "req", requestID, "account", acc.Name(), "error", refreshErr.Error(), "error_type", "oauth_refresh_failed")
+					}
+				}
+				if res.resp != nil {
+					done, fatalErr, upClass := handleUpstreamResponse(acc, sc, r, res.resp, bodyBytes, start, opts, requestID, res.ctx, res.cancel)
+					if done {
+						terminalDone = true
+						terminalFatalErr = fatalErr
+						return
+					}
+					if upClass == UpstreamErrorPermanentCredential {
+						sawCredential = true
+					} else if upClass == UpstreamErrorPermanentQuota {
+						sawQuota = true
+					}
 					return
 				}
-				// Retryable upstream failure: accumulate the permanent
-				// rejection classes (credential and quota tracked
-				// independently — the last account's class must not hide an
-				// earlier account's different failure).
-				if upClass == UpstreamErrorPermanentCredential {
-					sawCredential = true
-				} else if upClass == UpstreamErrorPermanentQuota {
-					sawQuota = true
-				}
-				return
 			}
 			if res.retry {
 				return

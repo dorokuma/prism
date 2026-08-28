@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -47,6 +49,8 @@ type Source struct {
 	cred   File
 	mtime  time.Time
 	loaded bool
+
+	terminalInvalid bool
 }
 
 // NewXAISource builds a file-backed source for one xai oauth account.
@@ -67,6 +71,203 @@ func (s *Source) path() string {
 	return filepath.Join(s.dir, s.account+".json")
 }
 
+func (s *Source) lockPath() string    { return s.path() + ".lock" }
+func (s *Source) invalidPath() string { return s.path() + ".invalid" }
+
+// bootstrapOAuthDir creates the oauth directory when missing and aligns its
+// owner with its parent (mirrors the directory handling in writeFile, moved
+// here so the LOCK file created below already belongs to the directory's
+// final owner — the login CLI usually runs as root while the service runs
+// as the prism user).
+func bootstrapOAuthDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if parent := filepath.Dir(dir); parent != "" && parent != dir {
+		if err := chownLike(dir, parent); err != nil && !os.IsPermission(err) {
+			return fmt.Errorf("chown oauth dir to parent owner: %w", err)
+		}
+	}
+	return nil
+}
+
+// lockFile takes an exclusive flock on path, creating the file when
+// missing. O_CREATE is load-bearing: deployments that predate the lock
+// file have a token file but no .lock, so the first refresh must
+// bootstrap the lock instead of failing. The lock's owner is aligned with
+// the directory (same treatment as the token file).
+func lockFile(path string) (*os.File, error) {
+	dir := filepath.Dir(path)
+	if err := bootstrapOAuthDir(dir); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := chownLike(path, dir); err != nil && !os.IsPermission(err) {
+		_ = f.Close()
+		return nil, fmt.Errorf("chown oauth lock to directory owner: %w", err)
+	}
+	return f, nil
+}
+
+func unlockFile(f *os.File) {
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
+}
+
+func (s *Source) withFileLock(fn func() error) error {
+	f, err := lockFile(s.lockPath())
+	if err != nil {
+		return err
+	}
+	defer unlockFile(f)
+	return fn()
+}
+
+func (s *Source) reloadFromDiskLocked() error {
+	cred, err := readFile(s.path())
+	if err != nil {
+		return err
+	}
+	// The in-memory pair may be NEWER than the disk one: a refresh
+	// consumed the refresh token and then the persist failed, leaving
+	// the disk with the dead-on-arrival pair. Re-reading it unconditionally
+	// (the old behavior) would resurrect the consumed refresh token — the
+	// next refresh would be a guaranteed invalid_grant and would trip the
+	// terminal latch even though a valid pair is live in memory. Adopt the
+	// disk state only when it is at least as fresh: for constant-TTL
+	// providers like xAI a later rotation always extends ExpiresAt, so the
+	// comparison is unambiguous (memory already empty → always adopt).
+	if s.cred.RefreshToken == "" || cred.ExpiresAt.After(s.cred.ExpiresAt) {
+		s.cred = cred
+	}
+	if fi, e := os.Stat(s.path()); e == nil {
+		s.mtime = fi.ModTime()
+	}
+	s.loaded = true
+	s.syncTerminalInvalidFromDisk()
+	return nil
+}
+
+// syncTerminalInvalidFromDisk keeps the in-memory terminal latch in
+// lockstep with the on-disk .invalid marker in BOTH directions: a refresh
+// failure sets the latch and writes the marker; a re-login (Save removes
+// the marker and writes a fresh token) must clear the latch WITHOUT a
+// process restart. A one-way latch (only ever set) strands the account in
+// the terminal state after login until the service is restarted.
+func (s *Source) syncTerminalInvalidFromDisk() {
+	_, err := os.Stat(s.invalidPath())
+	s.terminalInvalid = (err == nil)
+}
+
+func isTerminalRefreshError(err error) bool {
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "invalid_grant") || strings.Contains(text, "invalid or unknown refresh token")
+}
+
+func (s *Source) refreshLocked(ctx context.Context, force bool) (string, error) {
+	if s.terminalInvalid {
+		return "", fmt.Errorf("oauth: terminal token invalid (run: prism auth xai --account %s)", s.account)
+	}
+	if !force && s.now().Before(s.cred.ExpiresAt) {
+		return s.cred.AccessToken, nil
+	}
+	tok, err := s.refresh(ctx, s.cred.RefreshToken)
+	if err != nil {
+		if isTerminalRefreshError(err) {
+			s.terminalInvalid = true
+			_ = os.WriteFile(s.invalidPath(), []byte("invalid\n"), 0o600)
+		}
+		return "", err
+	}
+	next := File{Provider: s.provider, AccessToken: tok.Access, RefreshToken: tok.Refresh, ExpiresAt: tok.ExpiresAt}
+	// The refresh token was just CONSUMED by the rotation: when the
+	// persist fails, adopt the new pair in memory anyway and keep working
+	// (the next successful refresh re-persists it). Returning the error
+	// here would strand the process on the OLD refresh token, which is
+	// dead on arrival — the next refresh would be a guaranteed
+	// invalid_grant and would trip the terminal latch even though the
+	// account is perfectly recoverable from memory.
+	if err := writeFileFn(s.path(), next); err != nil {
+		slog.Warn("oauth token persist failed, keeping new token in memory", "account", s.account, "error", err)
+	}
+	s.cred = next
+	s.loaded = true
+	s.terminalInvalid = false
+	if fi, e := os.Stat(s.path()); e == nil {
+		s.mtime = fi.ModTime()
+	}
+	_ = os.Remove(s.invalidPath())
+	return next.AccessToken, nil
+}
+
+// writeFileFn is the token-file write used by refreshLocked. It is a
+// variable (not a direct call) so tests can simulate a failed persist
+// (full disk, EROFS, ...) and assert the in-memory token survives;
+// production always uses writeFile.
+var writeFileFn = writeFile
+
+// ForceRefresh rotates the token regardless of its expiry time.
+func (s *Source) ForceRefresh(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var result string
+	err := s.withFileLock(func() error {
+		if err := s.reloadFromDiskLocked(); err != nil {
+			return err
+		}
+		var err error
+		result, err = s.refreshLocked(ctx, true)
+		return err
+	})
+	return result, err
+}
+
+// OAuthTerminalInvalid reports a terminal refresh failure until login.
+func (s *Source) OAuthTerminalInvalid() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminalInvalid
+}
+
+// RefreshIfStale is the 401-reactive refresh. It rotates only when the
+// on-disk access token is still the one the upstream just rejected
+// (staleToken). When a concurrent 401 handler (or the periodic keepalive)
+// already rotated, the disk holds a different token and it is reused
+// as-is — the single-use refresh token is never rotated twice for the
+// same rejection (N concurrent 401s must burn exactly one rotation).
+func (s *Source) RefreshIfStale(ctx context.Context, staleToken string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var result string
+	err := s.withFileLock(func() error {
+		if err := s.reloadFromDiskLocked(); err != nil {
+			return err
+		}
+		if s.terminalInvalid {
+			return fmt.Errorf("oauth: terminal token invalid (run: prism auth xai --account %s)", s.account)
+		}
+		if s.cred.AccessToken == "" || s.cred.RefreshToken == "" {
+			return fmt.Errorf("%w (run: prism auth xai --account %s)", ErrNotLoggedIn, s.account)
+		}
+		if s.cred.AccessToken != staleToken {
+			// A concurrent caller already rotated: reuse its result.
+			result = s.cred.AccessToken
+			return nil
+		}
+		var refreshErr error
+		result, refreshErr = s.refreshLocked(ctx, true)
+		return refreshErr
+	})
+	return result, err
+}
+
 // Token returns a non-expired access token, refreshing and rewriting the
 // file when needed. A login completed by `prism auth xai` is picked up via
 // the file mtime without a process restart.
@@ -75,6 +276,9 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 	defer s.mu.Unlock()
 	if err := s.reloadLocked(); err != nil {
 		return "", err
+	}
+	if s.terminalInvalid {
+		return "", fmt.Errorf("oauth: terminal token invalid (run: prism auth xai --account %s)", s.account)
 	}
 	if s.cred.AccessToken == "" || s.cred.RefreshToken == "" {
 		return "", fmt.Errorf("%w (run: prism auth xai --account %s)", ErrNotLoggedIn, s.account)
@@ -85,25 +289,19 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 	if s.refresh == nil {
 		return "", fmt.Errorf("oauth: token expired and no refresher is configured")
 	}
-	tok, err := s.refresh(ctx, s.cred.RefreshToken)
-	if err != nil {
-		return "", err
-	}
-	next := File{
-		Provider:     s.provider,
-		AccessToken:  tok.Access,
-		RefreshToken: tok.Refresh,
-		ExpiresAt:    tok.ExpiresAt,
-	}
-	if err := writeFile(s.path(), next); err != nil {
-		return "", err
-	}
-	s.cred = next
-	if fi, err := os.Stat(s.path()); err == nil {
-		s.mtime = fi.ModTime()
-	}
-	s.loaded = true
-	return s.cred.AccessToken, nil
+	var result string
+	err := s.withFileLock(func() error {
+		if err := s.reloadFromDiskLocked(); err != nil {
+			return err
+		}
+		if s.cred.AccessToken == "" || s.cred.RefreshToken == "" {
+			return fmt.Errorf("%w (run: prism auth xai --account %s)", ErrNotLoggedIn, s.account)
+		}
+		var refreshErr error
+		result, refreshErr = s.refreshLocked(ctx, false)
+		return refreshErr
+	})
+	return result, err
 }
 
 func (s *Source) reloadLocked() error {
@@ -114,11 +312,13 @@ func (s *Source) reloadLocked() error {
 			s.cred = File{}
 			s.loaded = true
 			s.mtime = time.Time{}
+			s.syncTerminalInvalidFromDisk()
 			return nil
 		}
 		return err
 	}
 	if s.loaded && fi.ModTime().Equal(s.mtime) {
+		s.syncTerminalInvalidFromDisk()
 		return nil
 	}
 	cred, err := readFile(path)
@@ -128,10 +328,16 @@ func (s *Source) reloadLocked() error {
 	s.cred = cred
 	s.mtime = fi.ModTime()
 	s.loaded = true
+	s.syncTerminalInvalidFromDisk()
 	return nil
 }
 
 // Save writes tokens for account under dir. Used by `prism auth xai`.
+// The token write and the .invalid removal run under the SAME flock as the
+// server's refreshes: a refresh in flight when the login completes must
+// finish first, otherwise it would either overwrite the fresh login with
+// its stale session's rotation or re-write .invalid on top of the new
+// state — silently voiding the login.
 func Save(dir, account, provider string, tok xai.Tokens) error {
 	if err := config.ValidateAccountName(account); err != nil {
 		return fmt.Errorf("oauth account: %w", err)
@@ -142,12 +348,23 @@ func Save(dir, account, provider string, tok xai.Tokens) error {
 	if provider == "" {
 		provider = "xai"
 	}
-	return writeFile(filepath.Join(dir, account+".json"), File{
+	lock, err := lockFile(filepath.Join(dir, account+".json.lock"))
+	if err != nil {
+		return err
+	}
+	defer unlockFile(lock)
+	if err := writeFile(filepath.Join(dir, account+".json"), File{
 		Provider:     provider,
 		AccessToken:  tok.Access,
 		RefreshToken: tok.Refresh,
 		ExpiresAt:    tok.ExpiresAt,
-	})
+	}); err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(dir, account+".json.invalid")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func readFile(path string) (File, error) {
@@ -205,8 +422,11 @@ func writeFile(path string, f File) error {
 		return err
 	}
 	if err := chownLike(path, dir); err != nil {
-		_ = os.Remove(path)
-		ok = true
+		// The rename above already replaced the token file with the NEW
+		// token: removing it here (the old behavior) would destroy a live
+		// credential. Keep the file and surface the error — the refresh
+		// path adopts the token in memory regardless, and Save reports the
+		// login failure.
 		return fmt.Errorf("chown oauth token to directory owner: %w", err)
 	}
 	ok = true

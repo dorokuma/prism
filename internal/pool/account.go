@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -109,6 +110,19 @@ type TokenSource interface {
 	Token(ctx context.Context) (string, error)
 }
 
+// ReactiveRefreshTokenSource supports 401-reactive OAuth refreshes that
+// reuse a rotation already performed by a concurrent caller.
+type ReactiveRefreshTokenSource interface {
+	TokenSource
+	RefreshIfStale(context.Context, string) (string, error)
+}
+
+// TerminalTokenSource reports terminal OAuth invalidation.
+type TerminalTokenSource interface {
+	TokenSource
+	OAuthTerminalInvalid() bool
+}
+
 func (a *Account) Name() string               { return a.cfg.Name }
 func (a *Account) Headers() map[string]string { return a.cfg.Headers }
 func (a *Account) AuthHeader() string         { return a.cfg.AuthHeader }
@@ -134,6 +148,25 @@ func (a *Account) Key() string {
 		return tok
 	}
 	return a.cfg.Key
+}
+
+func (a *Account) OAuthTerminalInvalid() bool {
+	s, ok := a.tokens.(interface{ OAuthTerminalInvalid() bool })
+	return ok && s.OAuthTerminalInvalid()
+}
+
+// OAuthRefreshIfStale performs the 401-reactive refresh: it rotates only
+// when staleToken (the access token the upstream just rejected) is still
+// the current on-disk token; a concurrent rotation is reused instead of
+// burning another single-use refresh-token rotation.
+func (a *Account) OAuthRefreshIfStale(ctx context.Context, staleToken string) (string, error) {
+	s, ok := a.tokens.(interface {
+		RefreshIfStale(context.Context, string) (string, error)
+	})
+	if !ok {
+		return "", errors.New("oauth: reactive refresh unsupported")
+	}
+	return s.RefreshIfStale(ctx, staleToken)
 }
 
 // Provider returns the provider name this account belongs to.
@@ -519,7 +552,16 @@ func (a *Account) IsInCooldown() bool {
 // The credential always comes from acc.Key(); callers must never place keys
 // in account headers (see ApplyAccountHeaders).
 func ApplyAuthHeader(dst http.Header, acc *Account) {
-	key := acc.Key()
+	ApplyAuthHeaderWithValue(dst, acc, acc.Key())
+}
+
+// ApplyAuthHeaderWithValue is ApplyAuthHeader with the credential resolved
+// by the caller. Callers that must RECORD the exact credential they sent
+// (doUpstreamRequest: the 401 reactive refresh compares the sent token
+// against the on-disk token to detect a concurrent rotation) resolve it
+// ONCE and pass it in — a second Key() call could straddle a refresh and
+// record a token that was never sent.
+func ApplyAuthHeaderWithValue(dst http.Header, acc *Account, key string) {
 	if key == "" {
 		return
 	}

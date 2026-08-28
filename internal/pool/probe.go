@@ -124,6 +124,10 @@ func ProbeExhausted(pool *Pool) {
 	sem := make(chan struct{}, ProbeConcurrency)
 	var wg sync.WaitGroup
 	for _, acc := range exhausted {
+		if acc.OAuth() == "xai" && acc.OAuthTerminalInvalid() {
+			slog.Warn("probe skipped for terminal OAuth failure", "account", acc.Name(), "retry_after", "login")
+			continue
+		}
 		if acc.recentlyProbed(recentProbeSkipWindow) {
 			continue
 		}
