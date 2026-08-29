@@ -39,20 +39,47 @@ func GrokBuildImportWindow(snap Snapshot, now time.Time) (from, to int64) {
 
 const weekFallback = 7 * 24 * time.Hour
 
+// rollWeekStart advances a weekly period start by whole window spans until
+// it is the latest start that is not after now. The default usage range then
+// resets at the weekly boundary on schedule — even when the live snapshot or
+// the estimate file is stale (upstream fetch failures, read-only estimate
+// path) — instead of freezing on the last known period forever. The anchor
+// (wall-clock moment of the last confirmed reset) is preserved, so a 7-day
+// roll lands on the same time-of-day as the upstream window. span <= 0 falls
+// back to 7 days.
+func rollWeekStart(start time.Time, span time.Duration, now time.Time) time.Time {
+	if span <= 0 {
+		span = weekFallback
+	}
+	for end := start.Add(span); !end.After(now); end = start.Add(span) {
+		start = end
+	}
+	return start
+}
+
 // WeekStartUnix is the SuperGrok week-window start used as the default
 // usage range. Live weekly snapshots win, then the estimate file, then
-// now minus 7 days so a cold start still bounds the query.
+// now minus 7 days so a cold start still bounds the query. Whichever source
+// provides the anchor, it is rolled forward to the latest weekly boundary
+// not after now, so the range resets in step with the grok quota period even
+// when the source is stale.
 func WeekStartUnix(snaps []Snapshot, estimatePath string, now time.Time) int64 {
 	for _, snap := range snaps {
 		for _, w := range snap.Windows {
 			if w.Name != "weekly" || w.PeriodStart == nil || w.PeriodStart.IsZero() {
 				continue
 			}
-			return w.PeriodStart.Unix()
+			span := weekFallback
+			if w.ResetsAt != nil && !w.ResetsAt.IsZero() {
+				if d := w.ResetsAt.Sub(*w.PeriodStart); d > 0 {
+					span = d
+				}
+			}
+			return rollWeekStart(*w.PeriodStart, span, now).Unix()
 		}
 	}
 	if t, ok := StoredPeriodStart(estimatePath); ok {
-		return t.Unix()
+		return rollWeekStart(t, weekFallback, now).Unix()
 	}
 	return now.Add(-weekFallback).Unix()
 }
