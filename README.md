@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.22.6  Date: 2026-08-28  Status: living document
+> Version: v0.22.7  Date: 2026-08-30  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -191,6 +191,7 @@ MIT
 
 ## Changelog
 
+- **2026-08-30** — v0.22.7 — feat: sort usage summary by cache hit rate (hitRateSumExpr descending with request count as tie breaker)
 - **2026-08-28** — v0.22.6 — fix: xAI OAuth token persistence — background keepalive refresh (2h), cross-process flock with disk re-read (CLI/service single-use token race), reactive 401 force-refresh retry, terminal invalid_grant circuit breaker with restart-free re-login recovery; 9 new race-tested cases
 - **2026-08-28** — v0.22.5 — fix: TransformRequestBodyForProvider message role normalization (`role:developer` → `role:system`) now applies globally to all upstreams instead of being gated to ollama-only, preventing SYSTEM.md/AGENTS.md context loss or errors on upstreams that do not accept the developer role.
 - **2026-08-28** — v0.22.4 — feat: credential prefix LB_KEY_ renamed to PRISM_KEY_ across configuration, CLI setup, systemd credentials, and documentation.

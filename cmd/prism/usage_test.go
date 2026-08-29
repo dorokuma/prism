@@ -878,3 +878,55 @@ func TestRunUsageDefaultCompactNonTTY(t *testing.T) {
 		t.Errorf("piped output must not be colored:\n%q", out)
 	}
 }
+
+func TestRunUsageSortsByHitRateDescending(t *testing.T) {
+	base := time.Date(2026, 3, 10, 15, 4, 5, 0, time.Local)
+	path := filepath.Join(t.TempDir(), "usage.db")
+	s := usage.NewSQLiteStore(path)
+	if err := s.Open(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	events := []usage.Event{
+		// model-low: 2 requests, 1000 prompt, 100 cached -> 10.0%
+		{Ts: base.Add(-time.Hour), RequestID: "l1", Model: "model-low", PromptTokens: 500, CachedTokens: 50, TotalTokens: 500, Source: usage.SourceOpenAI},
+		{Ts: base.Add(-2 * time.Hour), RequestID: "l2", Model: "model-low", PromptTokens: 500, CachedTokens: 50, TotalTokens: 500, Source: usage.SourceOpenAI},
+
+		// model-high: 1 request, 1000 prompt, 900 cached -> 90.0%
+		{Ts: base.Add(-3 * time.Hour), RequestID: "h1", Model: "model-high", PromptTokens: 1000, CachedTokens: 900, TotalTokens: 1000, Source: usage.SourceOpenAI},
+
+		// model-zero: 5 requests, 1000 prompt, 0 cached -> 0.0%
+		{Ts: base.Add(-4 * time.Hour), RequestID: "z1", Model: "model-zero", PromptTokens: 1000, CachedTokens: 0, TotalTokens: 1000, Source: usage.SourceOpenAI},
+	}
+	if err := s.InsertBatch(ctx, events); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	var buf bytes.Buffer
+	if err := runUsageWith([]string{"--db", path, "--since", "24h", "--json"}, &buf, base); err != nil {
+		t.Fatal(err)
+	}
+
+	var doc struct {
+		Rows []usage.SummaryRow `json:"rows"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(doc.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(doc.Rows))
+	}
+	wantOrder := []string{"model-high", "model-low", "model-zero"}
+	for i, want := range wantOrder {
+		got := doc.Rows[i].Groups["model"]
+		if got != want {
+			t.Errorf("row %d: got model %v, want %v", i, got, want)
+		}
+	}
+}

@@ -112,6 +112,8 @@ const (
 	// cache_read outside input_tokens. The pi source uses this same
 	// Anthropic-form denominator.
 	hitRateInputSumExpr = `SUM(CASE WHEN usage_source IN ('anthropic', 'pi') THEN prompt_tokens + cached_tokens + cache_write_tokens ELSE prompt_tokens END)`
+	// hitRateSumExpr calculates the cache hit rate ratio for ordering.
+	hitRateSumExpr = `(CASE WHEN ` + hitRateInputSumExpr + ` > 0 THEN (CAST(SUM(cached_tokens) AS REAL) / ` + hitRateInputSumExpr + `) ELSE 0.0 END)`
 )
 
 // buildSummaryWhere renders the shared WHERE clause for q's filter fields
@@ -225,11 +227,11 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 		sb.WriteString(" GROUP BY " + strings.Join(groupExprs, ", "))
 	}
 	// Deterministic ordering: time buckets ascending, everything else by
-	// request count descending.
+	// hit rate descending (with request count descending as tie breaker).
 	if len(groupNames) > 0 && (groupNames[0] == "hour" || groupNames[0] == "day") {
 		sb.WriteString(" ORDER BY " + groupExprs[0] + " ASC")
 	} else {
-		sb.WriteString(" ORDER BY requests DESC")
+		sb.WriteString(" ORDER BY " + hitRateSumExpr + " DESC, requests DESC")
 	}
 	sb.WriteString(" LIMIT ?")
 	args = append(args, limit)

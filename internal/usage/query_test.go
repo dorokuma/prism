@@ -356,3 +356,67 @@ func TestSumGrokTokensOnlyGrokModels(t *testing.T) {
 		t.Fatalf("SumGrokTokens = %d, want 165 (150 + 15 fallback)", n)
 	}
 }
+
+func TestSummaryOrderByHitRateDescending(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	events := []Event{
+		// model-zero: 2 requests, 1000 prompt, 0 cached -> 0.0%
+		{Ts: now, RequestID: "z1", Model: "model-zero", PromptTokens: 500, CachedTokens: 0, TotalTokens: 500, Source: SourceOpenAI},
+		{Ts: now, RequestID: "z2", Model: "model-zero", PromptTokens: 500, CachedTokens: 0, TotalTokens: 500, Source: SourceOpenAI},
+
+		// model-high: 2 requests, 1000 prompt, 900 cached -> 90.0%
+		{Ts: now, RequestID: "h1", Model: "model-high", PromptTokens: 500, CachedTokens: 450, TotalTokens: 500, Source: SourceOpenAI},
+		{Ts: now, RequestID: "h2", Model: "model-high", PromptTokens: 500, CachedTokens: 450, TotalTokens: 500, Source: SourceOpenAI},
+
+		// model-mid: 5 requests, 1000 prompt, 500 cached -> 50.0%
+		{Ts: now, RequestID: "m1", Model: "model-mid", PromptTokens: 200, CachedTokens: 100, TotalTokens: 200, Source: SourceOpenAI},
+		{Ts: now, RequestID: "m2", Model: "model-mid", PromptTokens: 200, CachedTokens: 100, TotalTokens: 200, Source: SourceOpenAI},
+		{Ts: now, RequestID: "m3", Model: "model-mid", PromptTokens: 200, CachedTokens: 100, TotalTokens: 200, Source: SourceOpenAI},
+		{Ts: now, RequestID: "m4", Model: "model-mid", PromptTokens: 200, CachedTokens: 100, TotalTokens: 200, Source: SourceOpenAI},
+		{Ts: now, RequestID: "m5", Model: "model-mid", PromptTokens: 200, CachedTokens: 100, TotalTokens: 200, Source: SourceOpenAI},
+
+		// model-anthropic-high: 1 request, anthropic format: prompt 100, cached 900 -> 900/(100+900) = 90.0%
+		{Ts: now, RequestID: "ah1", Model: "model-anthropic-high", PromptTokens: 100, CachedTokens: 900, CacheWriteTokens: 0, TotalTokens: 1000, Source: SourceAnthropic},
+
+		// model-zero-single: 1 request, 1000 prompt, 0 cached -> 0.0% (ties model-zero on 0.0%, but has fewer requests)
+		{Ts: now, RequestID: "zs1", Model: "model-zero-single", PromptTokens: 1000, CachedTokens: 0, TotalTokens: 1000, Source: SourceOpenAI},
+	}
+
+	if err := s.InsertBatch(ctx, events); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.Summary(ctx, SummaryQuery{GroupBy: []string{"model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(rows) != 5 {
+		t.Fatalf("expected 5 rows, got %d", len(rows))
+	}
+
+	// Expected order:
+	// 1. model-high (90.0%, 2 reqs)
+	// 2. model-anthropic-high (90.0%, 1 req)
+	// 3. model-mid (50.0%, 5 reqs)
+	// 4. model-zero (0.0%, 2 reqs)
+	// 5. model-zero-single (0.0%, 1 req)
+	expectedModels := []string{
+		"model-high",
+		"model-anthropic-high",
+		"model-mid",
+		"model-zero",
+		"model-zero-single",
+	}
+
+	for i, wantModel := range expectedModels {
+		gotModel := rows[i].Groups["model"]
+		if gotModel != wantModel {
+			t.Errorf("row %d: got model %v, want %v (hit rate: %s, requests: %d)",
+				i, gotModel, wantModel, cacheHitRate(rows[i].CachedTokens, rows[i].cacheHitInput()), rows[i].Requests)
+		}
+	}
+}
