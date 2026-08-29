@@ -95,6 +95,35 @@ func TestWeekStartUnixRollsPastReset(t *testing.T) {
 	}
 }
 
+// TestRollWeekStartFallbackAndFuture pins the two defensive branches of
+// rollWeekStart directly: a non-positive span falls back to 7 days, and an
+// anchor that lies in the future (clock skew / upstream oddity) is returned
+// unchanged instead of being rolled backwards or panicking.
+func TestRollWeekStartFallbackAndFuture(t *testing.T) {
+	anchor := time.Date(2026, 8, 22, 8, 48, 26, 0, time.UTC)
+	now := time.Date(2026, 8, 29, 22, 57, 0, 0, time.UTC)
+
+	if got := rollWeekStart(anchor, 0, now); got.Unix() != anchor.Add(7*24*time.Hour).Unix() {
+		t.Fatalf("zero span falls back to 7d: got %s want %s", got, anchor.Add(7*24*time.Hour))
+	}
+	if got := rollWeekStart(anchor, -time.Hour, now); got.Unix() != anchor.Add(7*24*time.Hour).Unix() {
+		t.Fatalf("negative span falls back to 7d: got %s want %s", got, anchor.Add(7*24*time.Hour))
+	}
+
+	future := now.Add(48 * time.Hour)
+	if got := rollWeekStart(future, weekFallback, now); !got.Equal(future) {
+		t.Fatalf("future anchor must not roll: got %s want %s", got, future)
+	}
+
+	// A multi-week roll must also terminate for a far-past anchor (no
+	// runaway loop): 3 years of weekly spans is a bounded iteration count.
+	farPast := anchor.AddDate(-3, 0, 0)
+	got := rollWeekStart(farPast, weekFallback, now)
+	if got.After(now) || now.Sub(got) >= 7*24*time.Hour {
+		t.Fatalf("far-past anchor rolls into current week: got %s (now %s)", got, now)
+	}
+}
+
 func TestApplyGrokWeekEstimateFirstPeriodUsesLive(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "est.json")
 	start := time.Date(2026, 8, 22, 8, 0, 0, 0, time.UTC)
