@@ -815,9 +815,6 @@ func TestUsageAdapter_PersistsPricedEvent(t *testing.T) {
 	if math.Abs(*row.CostUSD-want) > 1e-9 {
 		t.Errorf("cost = %v, want %v", *row.CostUSD, want)
 	}
-	if row.CostMissingRequests != 0 {
-		t.Errorf("cost_missing_requests = %d, want 0", row.CostMissingRequests)
-	}
 	if row.CostUSD == nil || math.Abs(*row.CostUSD) < 1e-12 {
 		t.Fatalf("acceptance: DB cost_usd must be non-zero, got %v", row.CostUSD)
 	}
@@ -896,8 +893,8 @@ func TestUsageAdapter_MissingPriceLogAndDBNil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Summary: %v", err)
 	}
-	if len(rows) != 1 || rows[0].CostMissingRequests != 1 {
-		t.Fatalf("rows = %+v, want 1 row counted as missing-price", rows)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want 1 row", rows)
 	}
 	if rows[0].CostUSD != nil {
 		t.Errorf("cost_usd = %v, want NULL for a model without price", rows[0].CostUSD)

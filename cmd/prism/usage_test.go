@@ -443,8 +443,8 @@ func TestRunUsageJSON(t *testing.T) {
 	if doc.Overview.Requests != 5 {
 		t.Errorf("overview.requests = %d, want 5", doc.Overview.Requests)
 	}
-	if doc.Overview.FailedRequests != 1 || doc.Overview.CostMissingRequests != 1 {
-		t.Errorf("overview failed/missing = %d/%d, want 1/1", doc.Overview.FailedRequests, doc.Overview.CostMissingRequests)
+	if doc.Overview.FailedRequests != 1 {
+		t.Errorf("overview failed = %d, want 1", doc.Overview.FailedRequests)
 	}
 	// rows grouped by model: alpha, beta, gamma
 	if len(doc.Rows) != 3 {
@@ -479,9 +479,9 @@ func TestRunUsageTable(t *testing.T) {
 	if !strings.Contains(out, "本周  ·  5 请求  ·  750 词元  ·  $0.600") {
 		t.Errorf("summary line missing/wrong:\n%s", out)
 	}
-	// the missing-price hint
-	if !strings.Contains(out, "⚠ 有 1 个请求未算出金额") {
-		t.Errorf("missing-price warning missing:\n%s", out)
+	// missing-price hint must not appear
+	if strings.Contains(out, "未算出金额") {
+		t.Errorf("missing-price warning must not appear:\n%s", out)
 	}
 	// compact table: one header line carrying both token labels, with the
 	// short 请求/缓存 headers (never the long 请求数/缓存命中)
@@ -489,10 +489,13 @@ func TestRunUsageTable(t *testing.T) {
 	if h == "" {
 		t.Fatalf("default output must be the compact single-line table:\n%s", out)
 	}
-	for _, want := range []string{"模型", "请求", "输入词元", "缓存", "命中率", "输出词元", "花费", "未计价"} {
+	for _, want := range []string{"模型", "请求", "输入词元", "缓存", "命中率", "输出词元", "花费"} {
 		if !strings.Contains(h, want) {
 			t.Errorf("table header missing %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(h, "未计价") {
+		t.Errorf("未计价 column must not appear:\n%s", out)
 	}
 	if strings.Contains(out, "请求数") {
 		t.Errorf("the long 请求数 header must be gone:\n%s", out)

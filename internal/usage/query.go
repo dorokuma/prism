@@ -65,9 +65,8 @@ type SummaryRow struct {
 	// (OpenAI-form prompt plus Anthropic assembled input). It is filled
 	// by Summary; in-memory fixtures that leave it zero fall back to
 	// PromptTokens. See cacheHitInput.
-	HitRateInputTokens  int64    `json:"hit_rate_input_tokens"`
-	CostUSD             *float64 `json:"cost_usd,omitempty"`
-	CostMissingRequests int64    `json:"cost_missing_requests"`
+	HitRateInputTokens int64    `json:"hit_rate_input_tokens"`
+	CostUSD            *float64 `json:"cost_usd,omitempty"`
 }
 
 // cacheHitInput is the cache-hit denominator for this group. SQL fills
@@ -217,8 +216,7 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 		SUM(prompt_tokens), SUM(completion_tokens), ` + totalTokensSumExpr + `,
 		SUM(cached_tokens), SUM(reasoning_tokens), SUM(cache_write_tokens),
 		` + hitRateInputSumExpr + `,
-		SUM(cost_usd),
-		SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) AS cost_missing_requests
+		SUM(cost_usd)
 	FROM usage_events`)
 
 	where, args := buildSummaryWhere(q)
@@ -245,7 +243,7 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 	out := make([]SummaryRow, 0, 16)
 	for rows.Next() {
 		row := SummaryRow{Groups: make(map[string]any, len(groupNames))}
-		dest := make([]any, 0, len(groupNames)+10)
+		dest := make([]any, 0, len(groupNames)+9)
 		strVals := make([]*string, len(groupNames))
 		intVals := make([]*int64, len(groupNames))
 		for i, name := range groupNames {
@@ -258,9 +256,9 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 				dest = append(dest, strVals[i])
 			}
 		}
-		var requests, pt, ct, tt, cached, rt, cwt, hitIn, missing sql.NullInt64
+		var requests, pt, ct, tt, cached, rt, cwt, hitIn sql.NullInt64
 		var costSum sql.NullFloat64
-		dest = append(dest, &requests, &pt, &ct, &tt, &cached, &rt, &cwt, &hitIn, &costSum, &missing)
+		dest = append(dest, &requests, &pt, &ct, &tt, &cached, &rt, &cwt, &hitIn, &costSum)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
@@ -283,7 +281,6 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 			v := costSum.Float64
 			row.CostUSD = &v
 		}
-		row.CostMissingRequests = missing.Int64
 		out = append(out, row)
 	}
 	if err := rows.Err(); err != nil {
@@ -297,8 +294,7 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 // streaming counts). Cost semantics: TotalCost is nil when no row in range
 // had a price (SUM over an all-NULL set is NULL — "cannot be computed", not
 // "zero dollars"); when only some rows were priced, TotalCost is the sum of
-// the priced ones and CostMissingRequests reports how many rows could not be
-// priced so callers can flag the number as partial.
+// the priced ones.
 //
 // The OpenAI*/Anthropic* fields split the cache-relevant counters by
 // usage_source so the renderer can compute two independent cache-hit ratios
@@ -315,17 +311,16 @@ func (s *SQLiteStore) Summary(ctx context.Context, q SummaryQuery) ([]SummaryRow
 // CachedTokens, and the two request splits sum to Requests exactly (every
 // row falls into exactly one bucket).
 type Overview struct {
-	Requests            int64    `json:"requests"`
-	PromptTokens        int64    `json:"prompt_tokens"`
-	CompletionTokens    int64    `json:"completion_tokens"`
-	TotalTokens         int64    `json:"total_tokens"`
-	CachedTokens        int64    `json:"cached_tokens"`
-	ReasoningTokens     int64    `json:"reasoning_tokens"`
-	CacheWriteTokens    int64    `json:"cache_write_tokens"`
-	TotalCost           *float64 `json:"total_cost,omitempty"`
-	CostMissingRequests int64    `json:"cost_missing_requests"`
-	FailedRequests      int64    `json:"failed_requests"`
-	StreamingRequests   int64    `json:"streaming_requests"`
+	Requests          int64    `json:"requests"`
+	PromptTokens      int64    `json:"prompt_tokens"`
+	CompletionTokens  int64    `json:"completion_tokens"`
+	TotalTokens       int64    `json:"total_tokens"`
+	CachedTokens      int64    `json:"cached_tokens"`
+	ReasoningTokens   int64    `json:"reasoning_tokens"`
+	CacheWriteTokens  int64    `json:"cache_write_tokens"`
+	TotalCost         *float64 `json:"total_cost,omitempty"`
+	FailedRequests    int64    `json:"failed_requests"`
+	StreamingRequests int64    `json:"streaming_requests"`
 	// OpenAI-form bucket: everything not priced with the Anthropic formula
 	// (usage_source = 'openai', legacy NULL rows, and empty-string rows
 	// from events without a parsed usage payload) — the same partition
@@ -360,7 +355,6 @@ func (s *SQLiteStore) Overview(ctx context.Context, q SummaryQuery) (*Overview, 
 		SUM(prompt_tokens), SUM(completion_tokens), ` + totalTokensSumExpr + `,
 		SUM(cached_tokens), SUM(reasoning_tokens), SUM(cache_write_tokens),
 		SUM(cost_usd),
-		SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END),
 		SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END),
 		SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END),
 		SUM(CASE WHEN usage_source = 'openai' OR usage_source = '' OR usage_source IS NULL THEN 1 ELSE 0 END),
@@ -374,11 +368,11 @@ func (s *SQLiteStore) Overview(ctx context.Context, q SummaryQuery) (*Overview, 
 
 	var o Overview
 	var requests int64
-	var pt, ct, tt, cached, rt, cwt, missing, failed, streamed sql.NullInt64
+	var pt, ct, tt, cached, rt, cwt, failed, streamed sql.NullInt64
 	var oaiReq, oaiPt, oaiCached, antReq, antPt, antCached, antCwt sql.NullInt64
 	var costSum sql.NullFloat64
 	if err := db.QueryRowContext(ctx, query, args...).Scan(
-		&requests, &pt, &ct, &tt, &cached, &rt, &cwt, &costSum, &missing, &failed, &streamed,
+		&requests, &pt, &ct, &tt, &cached, &rt, &cwt, &costSum, &failed, &streamed,
 		&oaiReq, &oaiPt, &oaiCached, &antReq, &antPt, &antCached, &antCwt,
 	); err != nil {
 		return nil, err
@@ -394,7 +388,6 @@ func (s *SQLiteStore) Overview(ctx context.Context, q SummaryQuery) (*Overview, 
 		v := costSum.Float64
 		o.TotalCost = &v
 	}
-	o.CostMissingRequests = missing.Int64
 	o.FailedRequests = failed.Int64
 	o.StreamingRequests = streamed.Int64
 	o.OpenAIRequests = oaiReq.Int64

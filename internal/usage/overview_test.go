@@ -57,9 +57,6 @@ func checkOverviewVsSummaryRow(t *testing.T, o *Overview, r SummaryRow) {
 	} else if o.TotalCost != nil && !approxEqual(*o.TotalCost, *r.CostUSD) {
 		t.Errorf("cost: overview=%v summary=%v", *o.TotalCost, *r.CostUSD)
 	}
-	if o.CostMissingRequests != r.CostMissingRequests {
-		t.Errorf("cost_missing_requests: overview=%d summary=%d", o.CostMissingRequests, r.CostMissingRequests)
-	}
 }
 
 // sumSummaryRows folds grouped Summary rows back into a single row. Used to
@@ -77,7 +74,6 @@ func sumSummaryRows(rows []SummaryRow) SummaryRow {
 		out.ReasoningTokens += r.ReasoningTokens
 		out.CacheWriteTokens += r.CacheWriteTokens
 		out.HitRateInputTokens += r.HitRateInputTokens
-		out.CostMissingRequests += r.CostMissingRequests
 		if r.CostUSD != nil {
 			hasCost = true
 			costSum += *r.CostUSD
@@ -125,9 +121,6 @@ func TestOverviewMatchesSummaryTotals(t *testing.T) {
 	}
 	if o.TotalCost == nil || !approxEqual(*o.TotalCost, 0.0004) {
 		t.Fatalf("overview cost = %v, want 0.0004", o.TotalCost)
-	}
-	if o.CostMissingRequests != 1 {
-		t.Fatalf("overview cost_missing = %d, want 1", o.CostMissingRequests)
 	}
 	if o.FailedRequests != 1 || o.StreamingRequests != 2 {
 		t.Fatalf("overview failed=%d streamed=%d, want 1/2", o.FailedRequests, o.StreamingRequests)
@@ -238,8 +231,8 @@ func TestOverviewIgnoresLimitAndGroupBy(t *testing.T) {
 	if o.FailedRequests != 100 {
 		t.Fatalf("failed = %d, want 100 (every third request)", o.FailedRequests)
 	}
-	if o.CostMissingRequests != 0 || o.TotalCost == nil || !approxEqual(*o.TotalCost, 300*2e-6) {
-		t.Fatalf("cost = %v missing=%d, want ~6e-4 / 0", o.TotalCost, o.CostMissingRequests)
+	if o.TotalCost == nil || !approxEqual(*o.TotalCost, 300*2e-6) {
+		t.Fatalf("cost = %v, want ~6e-4", o.TotalCost)
 	}
 
 	// full (un-truncated) grouped Summary sums to exactly the Overview
@@ -284,7 +277,7 @@ func TestOverviewNoData(t *testing.T) {
 		}
 		if o.Requests != 0 || o.PromptTokens != 0 || o.CompletionTokens != 0 ||
 			o.TotalTokens != 0 || o.CachedTokens != 0 || o.ReasoningTokens != 0 ||
-			o.CacheWriteTokens != 0 || o.CostMissingRequests != 0 ||
+			o.CacheWriteTokens != 0 ||
 			o.FailedRequests != 0 || o.StreamingRequests != 0 {
 			t.Errorf("%s: nonzero fields: %+v", name, o)
 		}
@@ -300,8 +293,8 @@ func TestOverviewNoData(t *testing.T) {
 }
 
 // TestOverviewAllCostsMissing: when every row in range has a NULL cost_usd,
-// TotalCost must be nil (\"cannot be computed\"), never 0 (\"spent
-// nothing\"). SQL SUM over an all-NULL set is NULL; it must map to nil, not
+// TotalCost must be nil ("cannot be computed"), never 0 ("spent
+// nothing"). SQL SUM over an all-NULL set is NULL; it must map to nil, not
 // be COALESCEd to zero.
 func TestOverviewAllCostsMissing(t *testing.T) {
 	s := openTestStore(t)
@@ -323,14 +316,10 @@ func TestOverviewAllCostsMissing(t *testing.T) {
 	if o.TotalCost != nil {
 		t.Fatalf("TotalCost = %v, want nil when every cost_usd is NULL", *o.TotalCost)
 	}
-	if o.CostMissingRequests != 2 {
-		t.Fatalf("cost_missing = %d, want 2", o.CostMissingRequests)
-	}
 }
 
 // TestOverviewPartialCostMissing: with a mix of priced and unpriced rows,
-// TotalCost must be the sum of the priced rows only, and CostMissingRequests
-// must report the unpriced count so callers can flag the total as partial.
+// TotalCost must be the sum of the priced rows only.
 func TestOverviewPartialCostMissing(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -349,8 +338,8 @@ func TestOverviewPartialCostMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.Requests != 4 || o.CostMissingRequests != 1 {
-		t.Fatalf("requests=%d missing=%d, want 4/1", o.Requests, o.CostMissingRequests)
+	if o.Requests != 4 {
+		t.Fatalf("requests=%d, want 4", o.Requests)
 	}
 	if o.TotalCost == nil {
 		t.Fatalf("TotalCost is nil, want sum of priced rows")
@@ -608,7 +597,7 @@ func TestOverviewJSONFields(t *testing.T) {
 	ov := &Overview{
 		Requests: 3, PromptTokens: 1101, CompletionTokens: 210, TotalTokens: 1311,
 		CachedTokens: 1480, ReasoningTokens: 0, CacheWriteTokens: 40,
-		TotalCost: ptr64(0.5), CostMissingRequests: 0,
+		TotalCost: ptr64(0.5),
 		FailedRequests: 1, StreamingRequests: 2,
 		OpenAIRequests: 2, OpenAIPromptTokens: 1100, OpenAICachedTokens: 980,
 		AnthropicRequests: 1, AnthropicPromptTokens: 1, AnthropicCachedTokens: 500, AnthropicCacheWriteTokens: 40,
@@ -625,7 +614,7 @@ func TestOverviewJSONFields(t *testing.T) {
 	for _, k := range []string{
 		"requests", "prompt_tokens", "completion_tokens", "total_tokens",
 		"cached_tokens", "reasoning_tokens", "cache_write_tokens",
-		"total_cost", "cost_missing_requests", "failed_requests", "streaming_requests",
+		"total_cost", "failed_requests", "streaming_requests",
 		"openai_requests", "openai_prompt_tokens", "openai_cached_tokens",
 		"anthropic_requests", "anthropic_prompt_tokens", "anthropic_cached_tokens",
 		"anthropic_cache_write_tokens",

@@ -258,9 +258,6 @@ func TestInsertBatchAndSummaryRoundtrip(t *testing.T) {
 	if r.CostUSD == nil || *r.CostUSD != 0.0004 {
 		t.Fatalf("cost_usd = %v, want 0.0004", r.CostUSD)
 	}
-	if r.CostMissingRequests != 1 {
-		t.Fatalf("cost_missing_requests = %d, want 1", r.CostMissingRequests)
-	}
 
 	byModel, err := s.Summary(ctx, SummaryQuery{GroupBy: []string{"model"}})
 	if err != nil {
@@ -272,15 +269,15 @@ func TestInsertBatchAndSummaryRoundtrip(t *testing.T) {
 	for _, row := range byModel {
 		switch row.Groups["model"] {
 		case "model-a":
-			if row.Requests != 1 || row.CostMissingRequests != 0 || row.CostUSD == nil || *row.CostUSD != 0.0002 {
+			if row.Requests != 1 || row.CostUSD == nil || *row.CostUSD != 0.0002 {
 				t.Errorf("model-a row: %+v", row)
 			}
 		case "model-a-2":
-			if row.Requests != 1 || row.CostMissingRequests != 1 || row.CostUSD != nil {
+			if row.Requests != 1 || row.CostUSD != nil {
 				t.Errorf("model-a-2 row (missing price): %+v", row)
 			}
 		case "model-b":
-			if row.Requests != 1 || row.CostMissingRequests != 0 || row.CostUSD == nil || *row.CostUSD != 0.0002 {
+			if row.Requests != 1 || row.CostUSD == nil || *row.CostUSD != 0.0002 {
 				t.Errorf("model-b row: %+v", row)
 			}
 		default:

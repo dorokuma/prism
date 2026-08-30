@@ -269,8 +269,8 @@ func TestCostMissingInSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rows[0].Requests != 3 || rows[0].CostMissingRequests != 1 {
-		t.Fatalf("ungrouped: requests=%d missing=%d, want 3/1", rows[0].Requests, rows[0].CostMissingRequests)
+	if rows[0].Requests != 3 {
+		t.Fatalf("ungrouped: requests=%d, want 3", rows[0].Requests)
 	}
 
 	byModel, err := s.Summary(ctx, SummaryQuery{GroupBy: []string{"model"}})
@@ -289,11 +289,11 @@ func TestCostMissingInSummary(t *testing.T) {
 	if aRow == nil || bRow == nil {
 		t.Fatalf("missing rows: %+v", byModel)
 	}
-	if aRow.Requests != 2 || aRow.CostMissingRequests != 1 {
-		t.Fatalf("model a: requests=%d missing=%d, want 2/1", aRow.Requests, aRow.CostMissingRequests)
+	if aRow.Requests != 2 {
+		t.Fatalf("model a: requests=%d, want 2", aRow.Requests)
 	}
-	if bRow.Requests != 1 || bRow.CostMissingRequests != 0 {
-		t.Fatalf("model b: requests=%d missing=%d, want 1/0", bRow.Requests, bRow.CostMissingRequests)
+	if bRow.Requests != 1 {
+		t.Fatalf("model b: requests=%d, want 1", bRow.Requests)
 	}
 	if aRow.CostUSD == nil {
 		t.Fatalf("model a cost should be the sum of priced events only")

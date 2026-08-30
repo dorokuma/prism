@@ -269,8 +269,8 @@ func TestHandlerSummaryJSON(t *testing.T) {
 	if a.CostUSD == nil || *a.CostUSD != 2*10.0/1e6 {
 		t.Fatalf("model a cost: %v", a.CostUSD)
 	}
-	if b.CostUSD != nil || b.CostMissingRequests != 1 {
-		t.Fatalf("model b (missing price): cost=%v missing=%d", b.CostUSD, b.CostMissingRequests)
+	if b.CostUSD != nil {
+		t.Fatalf("model b (missing price): cost=%v", b.CostUSD)
 	}
 	if a.Requests != 1 || a.PromptTokens != 10 {
 		t.Fatalf("model a aggregates: %+v", a)
@@ -309,12 +309,9 @@ func seedTableEvents(t *testing.T) *SummaryHandler {
 	return NewSummaryHandler(s)
 }
 
-// TestHandlerTableFormat is the acceptance test for format=table: the
-// response is text/plain with the compact single-line table, the summary
-// header comes from Overview (total 300 tokens across both models), the
-// missing-price request is warned about, the nil cost renders as a dash,
-// and the JSON default behavior is untouched (the existing JSON tests
-// still pass).
+// TestHandlerTableFormat pins the HTTP format=table representation: the
+// nil cost renders as a dash, and the JSON default behavior is untouched
+// (the existing JSON tests still pass).
 func TestHandlerTableFormat(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	h := seedTableEvents(t)
@@ -326,14 +323,13 @@ func TestHandlerTableFormat(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
 		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
-	// widths: 模型 4 | 请求 4 | 输入词元 8 | 缓存 4 | 命中率 6 | 输出词元 8 | 花费 5 | 未计价 6
+	// widths: 模型 4 | 请求 4 | 输入词元 8 | 缓存 4 | 命中率 6 | 输出词元 8 | 花费 5
 	want := "  全部时间  ·  2 请求  ·  300 词元  ·  $0.150\n" +
 		"  命中(OpenAI) 0 (0.0%)\n" +
-		"  ⚠ 有 1 个请求未算出金额（模型未配置单价），总费用可能偏低\n" +
 		"\n" +
-		"  模型" + strings.Repeat(" ", 1) + "请求 输入词元 缓存 命中率 输出词元  花费 未计价\n" +
-		"  a" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 6) + "100" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%" + strings.Repeat(" ", 7) + "50 $0.15" + strings.Repeat(" ", 6) + "0\n" +
-		"  b" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 6) + "100" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%" + strings.Repeat(" ", 7) + "50" + strings.Repeat(" ", 5) + "-" + strings.Repeat(" ", 6) + "1\n"
+		"  模型" + strings.Repeat(" ", 1) + "请求 输入词元 缓存 命中率 输出词元  花费\n" +
+		"  a" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 6) + "100" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%" + strings.Repeat(" ", 7) + "50 $0.15\n" +
+		"  b" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 6) + "100" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%" + strings.Repeat(" ", 7) + "50     -\n"
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("table body mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}

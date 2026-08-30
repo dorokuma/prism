@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.23.0  Date: 2026-08-30  Status: living document
+> Version: v0.23.1  Date: 2026-08-30  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -192,6 +192,7 @@ MIT
 
 ## Changelog
 
+- **2026-08-30** — v0.23.1 — fix(usage): remove unpriced warning and unpriced column to prevent misleading cost totals.
 - **2026-08-30** — v0.23.0 — feat: provider- and account-level `public_service` mode for zero-balance/public-service upstreams (HTTP 402 and structured PermanentQuota bypass pool exhaustion and QuotaReviveAfter lockouts; 401 and true 429 behaviors unchanged).
 - **2026-08-30** — v0.22.7 — feat: sort usage summary by cache hit rate (hitRateSumExpr descending with request count as tie breaker)
 - **2026-08-28** — v0.22.6 — fix: xAI OAuth token persistence — background keepalive refresh (2h), cross-process flock with disk re-read (CLI/service single-use token race), reactive 401 force-refresh retry, terminal invalid_grant circuit breaker with restart-free re-login recovery; 9 new race-tested cases

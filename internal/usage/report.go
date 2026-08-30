@@ -78,13 +78,12 @@ type ReportOptions struct {
 
 // RenderUsageReport renders the summary block (taken from Overview — never
 // from summing the grouped rows, because a truncated LIMIT would make the
-// totals look small), an optional missing-cost warning line, a blank line
-// and the grouped detail table. The detail section is the compact
-// single-line table by default — one row per group, short headers, a
-// one-space column gap and compact numbers — and never depends on the
-// terminal width or switches to another layout. It is the single
-// implementation behind both the prism usage CLI and the HTTP format=table
-// output, so the two outputs can never drift apart.
+// totals look small), a blank line and the grouped detail table. The detail
+// section is the compact single-line table by default — one row per group,
+// short headers, a one-space column gap and compact numbers — and never
+// depends on the terminal width or switches to another layout. It is the
+// single implementation behind both the prism usage CLI and the HTTP
+// format=table output, so the two outputs can never drift apart.
 func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts ReportOptions) string {
 	var b strings.Builder
 	b.WriteString(render.RenderSummary(render.Summary{
@@ -105,10 +104,6 @@ func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts R
 		Anthropic: segment(ov.AnthropicRequests, ov.AnthropicCachedTokens,
 			ov.AnthropicPromptTokens+ov.AnthropicCachedTokens+ov.AnthropicCacheWriteTokens),
 	}))
-	if ov.CostMissingRequests > 0 {
-		fmt.Fprintf(&b, "  ⚠ 有 %s 个请求未算出金额（模型未配置单价），总费用可能偏低\n",
-			render.FormatInt(ov.CostMissingRequests))
-	}
 	b.WriteByte('\n')
 	cols, cells := usageTableData(rows, groupBy)
 	b.WriteString(renderUsageTable(cols, cells, opts.Color))
@@ -130,22 +125,14 @@ func segment(requests, hits, input int64) *render.CacheStats {
 // usageTableData builds the detail section's column definitions and cell
 // rows from the summary rows: one column per group_by key (the model group
 // uses the "模型" title, other group keys keep their short name), then
-// 请求 / 输入词元 / 缓存 / 命中率 / 输出词元 / 花费, plus an 未计价 column
-// when at least one group contains rows without a price. The Total column
-// is deliberately not rendered. Request/token cells use the compact k/M
+// 请求 / 输入词元 / 缓存 / 命中率 / 输出词元 / 花费. The Total column is
+// deliberately not rendered. Request/token cells use the compact k/M
 // notation (display precision only — the stored aggregates are unchanged),
 // the cost cell uses the compact cost format. Group values are never
 // truncated: the group column is sized to its widest cell, so model names
 // and other group values render in full.
 func usageTableData(rows []SummaryRow, groupBy []string) ([]render.Column, [][]string) {
-	hasMissing := false
-	for _, r := range rows {
-		if r.CostMissingRequests > 0 {
-			hasMissing = true
-			break
-		}
-	}
-	cols := make([]render.Column, 0, len(groupBy)+7)
+	cols := make([]render.Column, 0, len(groupBy)+6)
 	for _, g := range groupBy {
 		title := g
 		if g == "model" {
@@ -161,9 +148,6 @@ func usageTableData(rows []SummaryRow, groupBy []string) ([]render.Column, [][]s
 		render.Column{Title: "输出词元", Align: render.AlignRight},
 		render.Column{Title: "花费", Align: render.AlignRight},
 	)
-	if hasMissing {
-		cols = append(cols, render.Column{Title: "未计价", Align: render.AlignRight})
-	}
 	cells := make([][]string, 0, len(rows))
 	for _, r := range rows {
 		row := make([]string, 0, len(cols))
@@ -178,9 +162,6 @@ func usageTableData(rows []SummaryRow, groupBy []string) ([]render.Column, [][]s
 			render.FormatTokens(r.CompletionTokens),
 			render.FormatCostCompact(r.CostUSD),
 		)
-		if hasMissing {
-			row = append(row, render.FormatInt(r.CostMissingRequests))
-		}
 		cells = append(cells, row)
 	}
 	return cols, cells
