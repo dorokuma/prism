@@ -11,6 +11,22 @@ import (
 // ── ProfileFor tests ─────────────────────────────────────────────────
 
 func TestProfileFor_Order(t *testing.T) {
+	t.Run("glm-5.3-flash has enum profile and force-on", func(t *testing.T) {
+		p := ProfileForModel("glm-5.3-flash")
+		if p.Form != FormEnum {
+			t.Fatalf("glm-5.3-flash: got Form=%s, want enum", p.Form)
+		}
+		if !p.ForceOn {
+			t.Error("glm-5.3-flash should have ForceOn=true")
+		}
+		if p.EffortMap["low"] != "low" || p.EffortMap["high"] != "high" || p.EffortMap["xhigh"] != "max" {
+			t.Errorf("glm-5.3-flash EffortMap=%v", p.EffortMap)
+		}
+		if p.ToggleField != "thinking.type" {
+			t.Errorf("glm-5.3-flash ToggleField=%q, want thinking.type", p.ToggleField)
+		}
+	})
+
 	t.Run("glm-5.2 not swallowed by glm-5", func(t *testing.T) {
 		p := ProfileForModel("glm-5.2-v2")
 		if p.Form != FormEnum {
@@ -49,6 +65,16 @@ func TestProfileFor_Order(t *testing.T) {
 		}
 		if p.ForceOn {
 			t.Error("minimax-m3 should have ForceOn=false")
+		}
+	})
+
+	t.Run("minimaxai/minimax-m3 matches minimax-m3 profile", func(t *testing.T) {
+		p := ProfileForModel("minimaxai/minimax-m3")
+		if p.Form != FormToggle {
+			t.Fatalf("minimaxai/minimax-m3: got Form=%s, want toggle", p.Form)
+		}
+		if p.ToggleField != "thinking" || p.ToggleOn != "adaptive" || p.ToggleOff != "disabled" {
+			t.Errorf("minimaxai/minimax-m3 profile fields mismatch: %+v", p)
 		}
 	})
 
@@ -249,7 +275,74 @@ func TestApply_DeepSeekNoFields(t *testing.T) {
 	}
 }
 
-// ── Apply: FormEnum ─────────────────────────────────────────────────
+func TestApply_GLM53Flash_EffortMap(t *testing.T) {
+	// xhigh -> max + thinking.type=enabled
+	raw := rawFromJSON(t, `{"reasoning_effort":"xhigh"}`)
+	changed := Apply(raw, "glm-5.3-flash")
+	if !changed {
+		t.Fatal("expected change")
+	}
+	if got := strField(t, raw, "reasoning_effort"); got != "max" {
+		t.Errorf("reasoning_effort=%q, want max", got)
+	}
+	var thinking map[string]any
+	_ = json.Unmarshal(raw["thinking"], &thinking)
+	if typ, _ := thinking["type"].(string); typ != "enabled" {
+		t.Errorf("thinking.type=%q, want enabled", typ)
+	}
+
+	// low -> low
+	raw2 := rawFromJSON(t, `{"reasoning_effort":"low"}`)
+	if !Apply(raw2, "glm-5.3-flash") {
+		t.Fatal("expected change")
+	}
+	if got := strField(t, raw2, "reasoning_effort"); got != "low" {
+		t.Errorf("reasoning_effort=%q, want low", got)
+	}
+
+	// medium -> low (clamp down)
+	raw3 := rawFromJSON(t, `{"reasoning_effort":"medium"}`)
+	if !Apply(raw3, "glm-5.3-flash") {
+		t.Fatal("expected change")
+	}
+	if got := strField(t, raw3, "reasoning_effort"); got != "low" {
+		t.Errorf("reasoning_effort=%q, want low", got)
+	}
+}
+
+func TestApply_MiniMaxAIM3_Toggle(t *testing.T) {
+	raw := rawFromJSON(t, `{"reasoning_effort":"high"}`)
+	changed := Apply(raw, "minimaxai/minimax-m3")
+	if !changed {
+		t.Fatal("expected change")
+	}
+	if _, ok := raw["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be stripped")
+	}
+	var thinking string
+	if err := json.Unmarshal(raw["thinking"], &thinking); err != nil {
+		t.Fatalf("thinking is not a string: %v", err)
+	}
+	if thinking != "adaptive" {
+		t.Errorf("thinking=%q, want adaptive", thinking)
+	}
+
+	// off -> disabled
+	raw2 := rawFromJSON(t, `{"reasoning_effort":"off"}`)
+	if !Apply(raw2, "minimaxai/minimax-m3") {
+		t.Fatal("expected change")
+	}
+	if _, ok := raw2["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be stripped")
+	}
+	var thinking2 string
+	if err := json.Unmarshal(raw2["thinking"], &thinking2); err != nil {
+		t.Fatalf("thinking is not a string: %v", err)
+	}
+	if thinking2 != "disabled" {
+		t.Errorf("thinking=%q, want disabled", thinking2)
+	}
+}
 
 func TestApply_GLM52_EffortMap(t *testing.T) {
 	raw := rawFromJSON(t, `{"reasoning_effort":"xhigh"}`)

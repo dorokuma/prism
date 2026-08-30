@@ -83,6 +83,17 @@ var builtinProfiles = []namedProfile{
 		},
 	},
 	{
+		prefixes: []string{"glm-5.3-flash", "glm-5.3"},
+		profile: Profile{
+			Form:        FormEnum,
+			EffortMap:   map[string]string{"low": "low", "medium": "low", "high": "high", "xhigh": "max"},
+			EnumFields:  []string{"reasoning_effort"},
+			ToggleField: "thinking.type",
+			ToggleOn:    "enabled",
+			ForceOn:     true,
+		},
+	},
+	{
 		prefixes: []string{"glm-5.2"},
 		profile: Profile{
 			Form:        FormEnum,
@@ -193,7 +204,7 @@ var builtinProfiles = []namedProfile{
 		},
 	},
 	{
-		prefixes: []string{"minimax-m3"},
+		prefixes: []string{"minimaxai/minimax-m3", "minimax-m3"},
 		profile: Profile{
 			Form:              FormToggle,
 			ToggleField:       "thinking",
