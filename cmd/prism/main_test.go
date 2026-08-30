@@ -1289,6 +1289,85 @@ func TestStartInitialAccountProbes402SetsPermanentQuotaClass(t *testing.T) {
 	}
 }
 
+func TestStartInitialAccountProbes402PublicServiceStaysHealthy(t *testing.T) {
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"error":{"code":"insufficient_quota"}}`))
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}))
+	defer srv.Close()
+
+	p := pool.NewPool([]config.AccountConfig{{
+		Name:          "acc-ps-402",
+		Key:           "test-key",
+		BaseURL:       srv.URL,
+		PublicService: true,
+	}})
+	startInitialAccountProbes(p)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup probe did not reach upstream")
+	}
+
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		acc := p.AllAccounts()[0]
+		if !acc.IsHealthy() {
+			t.Fatalf("account status = %v, want healthy after 402 startup probe on public_service account", acc.Status())
+		}
+		if acc.IsInCooldown() {
+			t.Fatalf("public_service 402 should not enter cooldown, got in cooldown")
+		}
+		select {
+		case <-deadline:
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestStartInitialAccountProbes429PublicServiceCooldown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"insufficient_quota"}}`))
+	}))
+	defer srv.Close()
+
+	p := pool.NewPool([]config.AccountConfig{{
+		Name:          "acc-ps-429",
+		Key:           "test-key",
+		BaseURL:       srv.URL,
+		PublicService: true,
+	}})
+	startInitialAccountProbes(p)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		acc := p.AllAccounts()[0]
+		if acc.IsInCooldown() {
+			if !acc.IsHealthy() {
+				t.Fatalf("account status = %v, want healthy after 429 startup probe on public_service account", acc.Status())
+			}
+			return
+		}
+		if acc.Status() == pool.StatusExhausted {
+			t.Fatalf("public_service account got exhausted on 429: %v", acc.LastExhaustClass())
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("account did not enter cooldown after 429 startup probe; status=%v, inCooldown=%v", acc.Status(), acc.IsInCooldown())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func TestStartInitialAccountProbesDoesNotWait(t *testing.T) {
 	started := make(chan struct{}, 16)
 	release := make(chan struct{})

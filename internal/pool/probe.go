@@ -177,8 +177,14 @@ func probeExhaustedAccount(pool *Pool, acc *Account) {
 				// recovered. PermanentQuota revives only after
 				// config.QuotaReviveAfter since exhaustedAt.
 				// Permanent credential (and unspecified MarkExhausted)
-				// may revive on 200 immediately.
+				// may revive on 200 immediately. Public service
+				// accounts ignore QuotaReviveAfter and revive immediately.
 				if acc.LastExhaustClass() == ExhaustPermanentQuota {
+					if acc.PublicService() {
+						pool.MarkHealthy(acc)
+						slog.Info("probe recovered public_service account", "account", acc.Name(), "status", 200)
+						return true
+					}
 					if !acc.quotaReviveReady(config.QuotaReviveAfter) {
 						slog.Info("probe 200 ignored for quota-exhausted account until revive window",
 							"account", acc.Name(), "status", 200, "window", config.QuotaReviveAfter)
@@ -201,6 +207,9 @@ func probeExhaustedAccount(pool *Pool, acc *Account) {
 			// Same rules as proxy.ClassifyUpstreamError (shared body
 			// matchers in errorbody.go; pool cannot import proxy).
 			class := classifyProbeError(statusCode, respBody)
+			if acc.PublicService() && class == ExhaustPermanentQuota {
+				class = ExhaustTemporary
+			}
 			if class == ExhaustPermanentCredential || class == ExhaustPermanentQuota {
 				acc.noteExhaustClass(class)
 				slog.Warn("probe permanent error, stopping this round", "account", acc.Name(), "status", statusCode, "attempt", attempt, "max_attempts", maxProbeAttempts, "class", int(class), "body", string(util.RedactBodyBytesWithKeys(respBody, []string{acc.Key()})))

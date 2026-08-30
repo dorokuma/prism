@@ -197,6 +197,10 @@ type AccountConfig struct {
 	// overwritten by prism. It does NOT affect upstream model fetching —
 	// the model cache still fetches this provider like any other.
 	SkipPISync bool `yaml:"skip_pi_sync,omitempty"`
+	// PublicService marks an account as a zero-balance/public-service upstream.
+	// HTTP 402 and structured PermanentQuota errors will not MarkExhausted or
+	// apply QuotaReviveAfter.
+	PublicService bool `yaml:"public_service,omitempty"`
 	// OAuth names a built-in OAuth provider for this account. Currently
 	// only "xai" (Grok-CLI device-code against auth.x.ai). When set, the
 	// account has no static key: `prism auth xai` writes tokens under
@@ -438,8 +442,9 @@ func LoadConfig(path string) (*Config, error) {
 	// Support providers block
 	type providersConfig struct {
 		Providers map[string]struct {
-			Accounts  []AccountConfig `yaml:"accounts"`
-			DSMLGuard bool            `yaml:"dsml_guard"`
+			Accounts      []AccountConfig `yaml:"accounts"`
+			DSMLGuard     bool            `yaml:"dsml_guard"`
+			PublicService bool            `yaml:"public_service"`
 		} `yaml:"providers"`
 	}
 	var pc providersConfig
@@ -453,6 +458,9 @@ func LoadConfig(path string) (*Config, error) {
 			cfg.providerDSMLGuard[providerName] = providerCfg.DSMLGuard
 			for _, acc := range providerCfg.Accounts {
 				acc.Provider = providerName
+				if providerCfg.PublicService {
+					acc.PublicService = true
+				}
 				allAccounts = append(allAccounts, acc)
 			}
 		}
@@ -970,6 +978,20 @@ func (c *Config) DSMLGuard(provider string) bool {
 	return c.providerDSMLGuard[provider]
 }
 
+// PublicService reports whether any account under the given provider has
+// PublicService enabled. Default (missing provider, missing key, or nil Config) is false.
+func (c *Config) PublicService(provider string) bool {
+	if c == nil || provider == "" {
+		return false
+	}
+	for _, acc := range c.Accounts {
+		if acc.Provider == provider && acc.PublicService {
+			return true
+		}
+	}
+	return false
+}
+
 // RemapModel resolves a virtual model name to its upstream model via
 // model_remap → model_tiers. Models NOT in model_remap (real upstream names)
 // pass through unchanged. Models IN model_remap whose tier has no upstream
@@ -1383,7 +1405,7 @@ func stringMapClone(m map[string]string) map[string]string {
 
 // accountsEqual compares two account slices by every field that cannot be
 // hot-reloaded (name, base_url, key, provider, headers, auth_header,
-// probe_path, skip_pi_sync, oauth). A change in any of them means the Pool
+// probe_path, skip_pi_sync, oauth, public_service). A change in any of them means the Pool
 // (built once at startup) is stale and a restart is required.
 func accountsEqual(a, b []AccountConfig) bool {
 	if len(a) != len(b) {
@@ -1398,6 +1420,7 @@ func accountsEqual(a, b []AccountConfig) bool {
 			a[i].ProbePath != b[i].ProbePath ||
 			a[i].SkipPISync != b[i].SkipPISync ||
 			a[i].OAuth != b[i].OAuth ||
+			a[i].PublicService != b[i].PublicService ||
 			!stringMapsEqual(a[i].Headers, b[i].Headers) {
 			return false
 		}

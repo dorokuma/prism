@@ -128,6 +128,12 @@ func (a *Account) Headers() map[string]string { return a.cfg.Headers }
 func (a *Account) AuthHeader() string         { return a.cfg.AuthHeader }
 func (a *Account) ProbePath() string          { return a.cfg.ProbePath }
 func (a *Account) SkipPISync() bool           { return a.cfg.SkipPISync }
+func (a *Account) PublicService() bool {
+	if a == nil {
+		return false
+	}
+	return a.cfg.PublicService
+}
 
 // OAuth is the built-in OAuth provider id from config (empty = static key).
 func (a *Account) OAuth() string { return strings.TrimSpace(a.cfg.OAuth) }

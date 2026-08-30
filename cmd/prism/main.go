@@ -354,6 +354,14 @@ func startInitialAccountProbes(p *pool.Pool) {
 				slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", statusCode, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
 				a.MarkExhaustedWithClass(pool.ExhaustPermanentCredential)
 			case proxy.UpstreamErrorPermanentQuota:
+				if a.PublicService() {
+					slog.Info("startup check public_service quota error ignored", "account", a.Name(), "status", statusCode)
+					if statusCode == 429 {
+						slog.Warn("startup check temporary quota error, cooling down", "account", a.Name(), "status", 429, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
+						a.SetCooldown(2 * time.Minute)
+					}
+					return
+				}
 				slog.Error("startup check permanent error, marking exhausted", "account", a.Name(), "status", statusCode, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{a.Key()})))
 				a.MarkExhaustedWithClass(pool.ExhaustPermanentQuota)
 			default:

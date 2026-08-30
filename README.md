@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.22.7  Date: 2026-08-30  Status: living document
+> Version: v0.23.0  Date: 2026-08-30  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -146,6 +146,7 @@ upstream model name. The resolution logic is:
 | `key` | Optional inline key (avoid in production) |
 | `base_url` | Upstream API base |
 | `provider` | REQUIRED since v0.17.0: every account must declare a provider (via `account.provider` or a `providers:` block). A provider-less account can never be selected by business requests (they route by provider) and loading now fails with an explicit error — **compat note**: configs with bare top-level `accounts:` entries must add `provider:` or move them under a `providers:` block |
+| `public_service` | Optional bool (default false). When true (or set on the provider block), HTTP 402 and structured PermanentQuota errors from upstream do not mark the account exhausted or lock it out with QuotaReviveAfter |
 
 ## Endpoints
 
@@ -191,6 +192,7 @@ MIT
 
 ## Changelog
 
+- **2026-08-30** — v0.23.0 — feat: provider- and account-level `public_service` mode for zero-balance/public-service upstreams (HTTP 402 and structured PermanentQuota bypass pool exhaustion and QuotaReviveAfter lockouts; 401 and true 429 behaviors unchanged).
 - **2026-08-30** — v0.22.7 — feat: sort usage summary by cache hit rate (hitRateSumExpr descending with request count as tie breaker)
 - **2026-08-28** — v0.22.6 — fix: xAI OAuth token persistence — background keepalive refresh (2h), cross-process flock with disk re-read (CLI/service single-use token race), reactive 401 force-refresh retry, terminal invalid_grant circuit breaker with restart-free re-login recovery; 9 new race-tested cases
 - **2026-08-28** — v0.22.5 — fix: TransformRequestBodyForProvider message role normalization (`role:developer` → `role:system`) now applies globally to all upstreams instead of being gated to ollama-only, preventing SYSTEM.md/AGENTS.md context loss or errors on upstreams that do not accept the developer role.

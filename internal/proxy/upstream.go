@@ -246,7 +246,16 @@ func handleUpstreamError(acc *pool.Account, resp *http.Response, requestID strin
 
 	baseAttrs := []any{"req", requestID, "model", model, "account", acc.Name(), "status", resp.StatusCode}
 
-	switch ClassifyUpstreamError(resp.StatusCode, bodyBytes) {
+	class := ClassifyUpstreamError(resp.StatusCode, bodyBytes)
+	if acc.PublicService() && class == UpstreamErrorPermanentQuota {
+		slog.Info("public_service quota/balance error ignored for pool health", append(baseAttrs, "error_type", "public_service_quota_ignored")...)
+		if resp.StatusCode != 429 {
+			return UpstreamErrorTemporary
+		}
+		class = UpstreamErrorTemporary
+	}
+
+	switch class {
 	case UpstreamErrorPermanentCredential:
 		acc.MarkExhaustedWithClass(pool.ExhaustPermanentCredential)
 		slog.Error("upstream permanent credential error, marking exhausted", append(baseAttrs, "body", string(util.RedactBodyBytesWithKeys(bodyBytes, []string{acc.Key()})), "error_type", "auth_failed")...)
@@ -659,9 +668,14 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 			acc.MarkExhaustedWithClass(pool.ExhaustPermanentCredential)
 			slog.Error("upstream 4xx permanent credential error, marking exhausted", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", string(util.RedactBodyBytesWithKeys(errBody, []string{acc.Key()})), "error_type", "auth_failed")
 		case UpstreamErrorPermanentQuota:
-			class = UpstreamErrorPermanentQuota
-			acc.MarkExhaustedWithClass(pool.ExhaustPermanentQuota)
-			slog.Error("upstream 4xx permanent quota error, marking exhausted", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", string(util.RedactBodyBytesWithKeys(errBody, []string{acc.Key()})), "error_type", "upstream_ratelimited")
+			if acc.PublicService() {
+				slog.Info("public_service quota/balance error ignored for pool health", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "error_type", "public_service_quota_ignored")
+				class = UpstreamErrorTemporary
+			} else {
+				class = UpstreamErrorPermanentQuota
+				acc.MarkExhaustedWithClass(pool.ExhaustPermanentQuota)
+				slog.Error("upstream 4xx permanent quota error, marking exhausted", "req", requestID, "model", opts.Model, "account", acc.Name(), "status", resp.StatusCode, "body", string(util.RedactBodyBytesWithKeys(errBody, []string{acc.Key()})), "error_type", "upstream_ratelimited")
+			}
 		}
 		if resp.StatusCode == http.StatusForbidden &&
 			(class == UpstreamErrorPermanentCredential || class == UpstreamErrorPermanentQuota) {

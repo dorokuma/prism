@@ -1628,6 +1628,102 @@ providers:
 	}
 }
 
+func TestPublicService_DefaultOffAndEnabled(t *testing.T) {
+	cfg := loadProviderSchemaCfg(t)
+	if cfg.PublicService("opencode-go") {
+		t.Fatal("public_service default must be off")
+	}
+	if cfg.PublicService("missing") {
+		t.Fatal("unknown provider must be off")
+	}
+	content := `
+providers:
+  pangmao:
+    public_service: true
+    accounts:
+      - name: pangmao-1
+        key: test-key-12345
+        base_url: https://api.example.com/v1
+  other:
+    accounts:
+      - name: other-1
+        key: test-key-12345
+        base_url: https://api.example.com/v1
+`
+	f, err := os.CreateTemp("", "cfg-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	got, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !got.PublicService("pangmao") {
+		t.Fatal("pangmao PublicService true was not loaded")
+	}
+	if got.PublicService("other") {
+		t.Fatal("other provider PublicService must stay off")
+	}
+	for _, acc := range got.Accounts {
+		if acc.Name == "pangmao-1" && !acc.PublicService {
+			t.Fatal("pangmao-1 account PublicService must be true")
+		}
+		if acc.Name == "other-1" && acc.PublicService {
+			t.Fatal("other-1 account PublicService must be false")
+		}
+	}
+
+	// Test top-level accounts
+	contentTop := `
+accounts:
+  - name: top-ps
+    provider: ps-prov
+    key: test-key-12345
+    base_url: https://api.example.com/v1
+    public_service: true
+  - name: top-normal
+    provider: normal-prov
+    key: test-key-12345
+    base_url: https://api.example.com/v1
+`
+	fTop, err := os.CreateTemp("", "cfg-top-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(fTop.Name())
+	if _, err := fTop.Write([]byte(contentTop)); err != nil {
+		t.Fatal(err)
+	}
+	fTop.Close()
+	gotTop, err := LoadConfig(fTop.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig top: %v", err)
+	}
+	if !gotTop.PublicService("ps-prov") {
+		t.Fatal("ps-prov PublicService must be true")
+	}
+	if gotTop.PublicService("normal-prov") {
+		t.Fatal("normal-prov PublicService must be false")
+	}
+}
+
+func TestAccountsEqual_PublicService(t *testing.T) {
+	a := []AccountConfig{{Name: "a", BaseURL: "http://a", Key: "k", Provider: "p", PublicService: false}}
+	b := []AccountConfig{{Name: "a", BaseURL: "http://a", Key: "k", Provider: "p", PublicService: true}}
+	if accountsEqual(a, b) {
+		t.Fatal("accountsEqual must return false when PublicService differs")
+	}
+	c := []AccountConfig{{Name: "a", BaseURL: "http://a", Key: "k", Provider: "p", PublicService: false}}
+	if !accountsEqual(a, c) {
+		t.Fatal("accountsEqual must return true when PublicService matches")
+	}
+}
+
 func loadProviderSchemaCfg(t *testing.T) *Config {
 	t.Helper()
 	content := `
@@ -3218,3 +3314,4 @@ accounts:
 		t.Fatal("explicit quota.enabled: false must stay false")
 	}
 }
+

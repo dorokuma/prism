@@ -359,9 +359,15 @@ mcp_tools_json: "/var/lib/prism/mcp_tools.json"
 # translation path (stream and non-stream) strip aborted DSML leaks in
 # content and recover complete DSML tool_calls. The Anthropic /v1/messages
 # passthrough is not rewritten.
+#
+# providers.<name>.public_service: optional, default false. When true (or set on
+# an individual account), HTTP 402 and structured PermanentQuota errors from
+# the upstream will not mark the account exhausted or lock it out with
+# QuotaReviveAfter.
 # ---------------------------------------------------------------------------
 # providers:
 #   agentrouter-openai:
+#     # public_service: true
 #     accounts:
 #       - name: agentrouter-oai-1
 #         base_url: https://your-gateway.example.com/v1

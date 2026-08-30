@@ -636,6 +636,49 @@ func TestProbeExhausted_200RevivesQuotaWhenWindowZero(t *testing.T) {
 	}
 }
 
+func TestProbeExhausted_200RevivesPublicServiceImmediately(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "ps1", Key: "k1", BaseURL: upstream.URL, PublicService: true},
+	})
+	accs := p.AllAccounts()
+	accs[0].MarkExhaustedWithClass(ExhaustPermanentQuota)
+
+	ProbeExhausted(p)
+
+	if !accs[0].IsHealthy() {
+		t.Error("public_service account must revive immediately on 200 within revive window")
+	}
+}
+
+func TestProbeExhausted_402DoesNotLockPublicServiceAsQuota(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(402)
+		w.Write([]byte(`{"error":{"code":"insufficient_quota","message":"quota"}}`))
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "ps1", Key: "k1", BaseURL: upstream.URL, PublicService: true},
+	})
+	accs := p.AllAccounts()
+	accs[0].MarkExhausted()
+
+	ProbeExhausted(p)
+
+	if accs[0].IsHealthy() {
+		t.Error("402 probe must not mark account healthy")
+	}
+	if accs[0].LastExhaustClass() == ExhaustPermanentQuota {
+		t.Error("402 probe must not set LastExhaustClass to ExhaustPermanentQuota on public_service account")
+	}
+}
+
 func TestProbeExhausted_200RevivesCredential(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
