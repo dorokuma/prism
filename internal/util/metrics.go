@@ -8,12 +8,13 @@ import (
 
 // Metrics collected by the proxy.
 var (
-	MetricsRequestsTotal     = expvar.NewInt("requests_total")
-	MetricsErrorsTotal       = expvar.NewInt("errors_total")
-	MetricsRateLimitedTotal  = expvar.NewInt("rate_limited_total")
-	MetricsUpstreamRetries   = expvar.NewInt("upstream_retries")
-	MetricsAccountsHealthy   expvar.Int
-	MetricsAccountsExhausted expvar.Int
+	MetricsRequestsTotal            = expvar.NewInt("requests_total")
+	MetricsErrorsTotal              = expvar.NewInt("errors_total")
+	MetricsRateLimitedTotal         = expvar.NewInt("rate_limited_total")
+	MetricsUpstreamRetries          = expvar.NewInt("upstream_retries")
+	MetricsAccountsHealthy          expvar.Int
+	MetricsAccountsExhausted        expvar.Int
+	MetricsModelCacheRefreshesTotal = expvar.NewInt("model_cache_refreshes_total")
 
 	metricsRequestDurationMu sync.Mutex
 	metricsRequestDuration   time.Duration

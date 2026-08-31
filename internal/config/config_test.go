@@ -3315,3 +3315,164 @@ accounts:
 	}
 }
 
+func TestLoadConfig_ModelCacheRefreshDefaultsAndExplicit(t *testing.T) {
+	t.Run("defaults when absent", func(t *testing.T) {
+		cfg, err := loadConfigFrom(t, `
+accounts:
+  - name: acc-1
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: p
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ModelCacheRefreshInterval != 3*time.Hour {
+			t.Fatalf("ModelCacheRefreshInterval default = %v, want 3h", cfg.ModelCacheRefreshInterval)
+		}
+		if cfg.ModelCacheRefreshStrategy != "full" {
+			t.Fatalf("ModelCacheRefreshStrategy default = %q, want full", cfg.ModelCacheRefreshStrategy)
+		}
+	})
+
+	t.Run("explicit 0 disables periodic refresh", func(t *testing.T) {
+		cfg, err := loadConfigFrom(t, `
+model_cache_refresh_interval: 0s
+accounts:
+  - name: acc-1
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: p
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ModelCacheRefreshInterval != 0 {
+			t.Fatalf("explicit 0 must stay 0, got %v", cfg.ModelCacheRefreshInterval)
+		}
+	})
+
+	t.Run("explicit positive interval and strategy stale", func(t *testing.T) {
+		cfg, err := loadConfigFrom(t, `
+model_cache_refresh_interval: 4h
+model_cache_refresh_strategy: stale
+accounts:
+  - name: acc-1
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: p
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ModelCacheRefreshInterval != 4*time.Hour {
+			t.Fatalf("ModelCacheRefreshInterval = %v, want 4h", cfg.ModelCacheRefreshInterval)
+		}
+		if cfg.ModelCacheRefreshStrategy != "stale" {
+			t.Fatalf("ModelCacheRefreshStrategy = %q, want stale", cfg.ModelCacheRefreshStrategy)
+		}
+	})
+
+	t.Run("negative interval rejected", func(t *testing.T) {
+		_, err := loadConfigFrom(t, `
+model_cache_refresh_interval: -1m
+accounts:
+  - name: acc-1
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: p
+`)
+		if err == nil {
+			t.Fatal("negative interval must be rejected")
+		}
+	})
+
+	t.Run("interval too small warns and falls back to 3h", func(t *testing.T) {
+		var buf bytes.Buffer
+		oldDefault := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(oldDefault)
+
+		cfg, err := loadConfigFrom(t, `
+model_cache_refresh_interval: 10s
+accounts:
+  - name: acc-1
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: p
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ModelCacheRefreshInterval != 3*time.Hour {
+			t.Fatalf("too small interval = %v, want fallback to 3h", cfg.ModelCacheRefreshInterval)
+		}
+		if !strings.Contains(buf.String(), "model_cache_refresh_interval too small") {
+			t.Fatalf("expected warning log, got: %s", buf.String())
+		}
+	})
+
+	t.Run("unknown strategy rejected", func(t *testing.T) {
+		_, err := loadConfigFrom(t, `
+model_cache_refresh_strategy: invalid
+accounts:
+  - name: acc-1
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: p
+`)
+		if err == nil || !strings.Contains(err.Error(), "unknown model_cache_refresh_strategy") {
+			t.Fatalf("expected unknown strategy error, got %v", err)
+		}
+	})
+}
+
+func TestReloadConfig_ModelCacheRefreshWarnings(t *testing.T) {
+	path := writeConfig(t, `
+model_cache_refresh_interval: 3h
+model_cache_refresh_strategy: full
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`)
+	cfg1, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	holder := NewConfigHolder(cfg1)
+
+	if err := os.WriteFile(path, []byte(`
+model_cache_refresh_interval: 6h
+model_cache_refresh_strategy: stale
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, path)
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	foundInterval := false
+	foundStrategy := false
+	for _, w := range warnings {
+		if strings.Contains(w, "model_cache_refresh_interval") {
+			foundInterval = true
+		}
+		if strings.Contains(w, "model_cache_refresh_strategy") {
+			foundStrategy = true
+		}
+	}
+	if !foundInterval {
+		t.Errorf("expected model_cache_refresh_interval restart warning, got: %v", warnings)
+	}
+	if foundStrategy {
+		t.Errorf("model_cache_refresh_strategy is hot-reloadable and should not warn restart, got: %v", warnings)
+	}
+}

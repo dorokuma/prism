@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.23.1  Date: 2026-08-30  Status: living document
+> Version: v0.24.0  Date: 2026-08-31  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -100,6 +100,8 @@ denied), setup fails with an explicit error.
 |-------|------|---------|-------------|
 | `listen` | string | `127.0.0.1:18790` | Listen address |
 | `probe_interval` | duration | `10m` | Exhausted-account probe interval |
+| `model_cache_refresh_interval` | duration | `3h` | Model cache periodic refresh interval. `0` disables periodic refresh. Negative values rejected; `< 1m` warns and falls back to `3h`. Requires restart (ReloadConfig warns) |
+| `model_cache_refresh_strategy` | string | `full` | Model cache periodic refresh strategy: `full` (refreshes all providers every round) or `stale` (refreshes only providers with expired/missing cache). Hot-reloadable (SIGHUP) |
 | `wire_api` | string | `both` | `legacy` / `responses` / `both` |
 | `accounts` | array | required | Upstream accounts |
 | `model_tiers` | map | — | Tier → upstream model |
@@ -155,11 +157,13 @@ upstream model name. The resolution logic is:
 | `/v1/chat/completions` | POST | Chat proxy (non-POST → 405 `method_not_allowed`) |
 | `/v1/responses` | POST | Responses path (non-POST → 405 `method_not_allowed`) |
 | `/v1/models` | GET | Model list. No `X-Prism-Provider` header uses `default_provider` when set (same fallback as chat); if that is also unset → empty 200 list. Cache hit → cached models. Cache miss → fetch from upstream; fetch failure is never a 200 empty list: no healthy account → 503 `no_healthy`, account saturated → 503 `model_fetch_saturated`, other upstream/parse/size errors → 502 `model_fetch_failed`. Request body cap 10 MiB (413 `request_too_large` / 400 `invalid_request`) on the POST surfaces |
+| `/prism/v1/models/refresh` | POST, GET | Administrative model cache refresh (POST) and read-only status query (GET). Accepts optional query param `?provider=<name>` to refresh or query a single provider. POST returns HTTP 202 `accepted` with JSON status of scheduled providers; GET returns HTTP 200 `ok` with current provider snapshot without triggering a refresh. Protected by admin auth (`PRISM_ADMIN_TOKEN` / loopback) before global `api_keys` gate, with dedicated rate limiter for POST (1 req / 10s, burst 2). CLI: `prism models refresh` / `prism models status` |
 | `/health` | GET | Liveness: `ok` whenever the process is serving. Bypasses the api_keys gate and the rate limiter |
 | `/ready` | GET | Readiness: `ok` only when at least one account is healthy AND out of cooldown, otherwise 503 `not ready`. Bypasses the api_keys gate and the rate limiter (like `/health`); used by `deploy.sh` / load balancers. **Fail-closed**: when EVERY account is exhausted or in cooldown (bad key rotation, upstream outage) the deploy health check fails and `deploy.sh` rolls back — by design, so a version that breaks account state never ships. If the pre-restart `/ready` probe already fails (old process down or pool already not ready), `deploy.sh` switches this round to the same host's `/health` so an already-unready pool is not treated as a new-binary failure and rolled back with a second restart. Deployments that want liveness-only gating set `HEALTH_URL=http://127.0.0.1:18790/health` explicitly; do not paper over an all-accounts-down state by extending `HEALTH_TIMEOUT` to minutes |
 | `/metrics` | GET | expvar metrics. Auth (fail-closed): when `METRICS_TOKEN` is configured every request — loopback included — must present it as a Bearer token; only when it is unset is a direct loopback request (no `X-Forwarded-For`/`X-Real-IP`/`Forwarded`) allowed without a token, while loopback with forwarding headers (same-machine reverse proxy) and all remote requests are denied |
 | `/admin/usage/summary` | GET | Aggregated token usage/cost summary (when `usage.enabled`). Auth (fail-closed): when `PRISM_ADMIN_TOKEN` is configured every request — loopback included — must present it as a Bearer token (the token is re-read from the environment on every request, so rotation takes effect without a restart); only when it is unset is a direct loopback request (no `X-Forwarded-For`/`X-Real-IP`/`Forwarded`) allowed; mounted before the global api_keys gate (like `/metrics`). Query params: `from`/`to` (unix seconds; omitted `from` defaults to the SuperGrok week start, omitted `to` is now; explicit `from=0` keeps all-time), `group_by` (`model`,`provider`,`account`,`key_id`,`stream`,`success`,`hour`,`day`), filters `model`/`provider`/`account`/`key_id`/`stream`/`success`, `limit` (default 100, max 1000). `format=table` renders the same text report as the CLI — user-visible labels use "tokens" (input tokens / output tokens) — and always uses the single-line compact table suited to the Pi panel: one row per model/group, short headers (model / reqs / in tokens / cache / hit% / out tokens / cost, plus unpriced when unpriced rows exist), a one-space column gap with the same two-space left indent as the summary and warning lines, requests and token totals in compact k/M notation, while unpriced counts remain exact, compact cost, and model/group names shown in full — never truncated (numbers are never truncated either); it never depends on the terminal width and has no other layout. `format=json` is unaffected. Returns 503 `store_unavailable` when usage is disabled or the store failed |
 | `/admin/quota` | GET | SuperGrok weekly pool snapshot (`creditUsagePercent` + reset). Independent of `usage.enabled`. Same `PRISM_ADMIN_TOKEN` auth as `/admin/usage/summary`. `format=table` for the CLI-style text report. Returns 503 `quota_unavailable` when `quota.enabled` is false. CLI: `prism quota` |
+
 
 ### Codex
 
@@ -186,13 +190,45 @@ python3 scripts/generate_mcp_tools.py /var/lib/prism/mcp_tools.json
 systemctl kill -s HUP prism   # or restart
 ```
 
+### Model Cache CLI
+
+Manage and query upstream model caches directly or via HTTP:
+
+```bash
+# Query cache status via HTTP GET (read-only, does not trigger refresh)
+prism models status
+
+# Refresh all providers via HTTP API (default)
+prism models refresh
+
+# Refresh specific provider
+prism models refresh --provider opencode-go
+
+# Refresh in direct mode (writes to /var/lib/prism/model_cache directly, does NOT notify running prism instances; use ONLY when service is not running)
+prism models refresh --direct --config /var/lib/prism/config.yaml
+
+# Output machine-readable JSON
+prism models refresh --json
+```
+
+#### Rollback Preset
+
+To restore the legacy behavior (refresh on-demand or after 24h expiration):
+
+```yaml
+model_cache_refresh_strategy: stale
+model_cache_refresh_interval: 24h
+```
+
 ## License
 
 MIT
 
 ## Changelog
 
+- **2026-08-31** — v0.24.0 — feat: 3h periodic full model cache refresh, administrative manual refresh HTTP API (`POST /prism/v1/models/refresh`), thin CLI (`prism models refresh`), and dual-review residue cleanup. Added configurable `model_cache_refresh_interval` (default 3h, 0 to disable) and `model_cache_refresh_strategy` (default "full", optional "stale"). Includes +/-10% periodic jitter, 0-2s provider stagger, failure exponential backoff (30s*2^(n-1) capped at 1h), deduped unique provider rounds, singleflight leader sharing, pending queue upgrades, dedicated 10s/req token-bucket rate limiting with admin auth, and `--direct` local CLI execution.
 - **2026-08-30** — v0.23.1 — fix(usage): remove unpriced warning and unpriced column to prevent misleading cost totals.
+
 - **2026-08-30** — v0.23.0 — feat: provider- and account-level `public_service` mode for zero-balance/public-service upstreams (HTTP 402 and structured PermanentQuota bypass pool exhaustion and QuotaReviveAfter lockouts; 401 and true 429 behaviors unchanged).
 - **2026-08-30** — v0.22.7 — feat: sort usage summary by cache hit rate (hitRateSumExpr descending with request count as tie breaker)
 - **2026-08-28** — v0.22.6 — fix: xAI OAuth token persistence — background keepalive refresh (2h), cross-process flock with disk re-read (CLI/service single-use token race), reactive 401 force-refresh retry, terminal invalid_grant circuit breaker with restart-free re-login recovery; 9 new race-tested cases

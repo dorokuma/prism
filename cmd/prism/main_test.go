@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/planusage"
@@ -165,7 +166,7 @@ func TestHTTPHandler_UsageDisabledProxyStillServes(t *testing.T) {
 	cfg := testConfig(t, nil)
 	holder := config.NewConfigHolder(cfg)
 	fp := &fakeProxy{status: http.StatusOK}
-	h := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	rr := httptest.NewRecorder()
@@ -196,7 +197,7 @@ func TestHTTPHandler_UsageStoreFailureProxyStillServes(t *testing.T) {
 
 	holder := config.NewConfigHolder(cfg)
 	fp := &fakeProxy{status: http.StatusOK}
-	h := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(store), nil)
+	h := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(store), nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/responses", nil)
 	rr := httptest.NewRecorder()
@@ -229,7 +230,7 @@ func TestHTTPHandler_SummaryRouteBeforeAuthGate(t *testing.T) {
 	})
 	holder := config.NewConfigHolder(cfg)
 	fp := &fakeProxy{status: http.StatusOK}
-	h := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	// Localhost + no API key → own auth allows (localhost), store nil → 503.
 	req := httptest.NewRequest("GET", "/admin/usage/summary", nil)
@@ -262,7 +263,7 @@ func TestHTTPHandler_QuotaRouteAuth(t *testing.T) {
 	})
 	holder := config.NewConfigHolder(cfg)
 	fp := &fakeProxy{status: http.StatusOK}
-	h := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	req := httptest.NewRequest("GET", "/admin/quota", nil)
 	req.RemoteAddr = "10.1.2.3:9"
@@ -295,7 +296,8 @@ func TestHTTPHandler_QuotaRouteAuth(t *testing.T) {
 
 	cache := planusage.NewCache()
 	cache.Store("k", planusage.Snapshot{Provider: "opencode-go"})
-	live := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(nil), planusage.NewHandler(cache, func() bool { return true }))
+	live := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(nil), planusage.NewHandler(cache, func() bool { return true }), nil)
+
 	req4 := httptest.NewRequest("GET", "/admin/quota", nil)
 	req4.RemoteAddr = "10.1.2.3:9"
 	req4.Header.Set("Authorization", "Bearer sekret")
@@ -303,6 +305,76 @@ func TestHTTPHandler_QuotaRouteAuth(t *testing.T) {
 	live.ServeHTTP(rr4, req4)
 	if rr4.Code != http.StatusOK {
 		t.Errorf("quota live handler: status = %d, want 200 body=%s", rr4.Code, rr4.Body.String())
+	}
+}
+
+// TestHTTPHandler_ModelsRefreshRouteAuth verifies that /prism/v1/models/refresh
+// is mounted before the global api_keys gate, uses PRISM_ADMIN_TOKEN or loopback auth,
+// and never falls through to the proxy handler.
+func TestHTTPHandler_ModelsRefreshRouteAuth(t *testing.T) {
+	cfg := testConfig(t, func(c *config.Config) {
+		c.APIKeys = []config.APIKey{{Name: "client-key", Token: "sk-client-secret"}}
+		c.Accounts = []config.AccountConfig{
+			{Name: "a1", Provider: "p1", BaseURL: "http://127.0.0.1:18790", Key: "k1"},
+		}
+	})
+	holder := config.NewConfigHolder(cfg)
+	fp := &fakeProxy{status: http.StatusOK}
+
+	// 1. nil refreshHandler returns 503 and never hits proxy
+	hNil := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(nil), nil, nil)
+	reqNil := httptest.NewRequest(http.MethodGet, "/prism/v1/models/refresh", nil)
+	reqNil.RemoteAddr = "127.0.0.1:12345"
+	rrNil := httptest.NewRecorder()
+	hNil.ServeHTTP(rrNil, reqNil)
+	if rrNil.Code != http.StatusServiceUnavailable {
+		t.Fatalf("nil refresh handler: status = %d, want 503", rrNil.Code)
+	}
+	if fp.called != 0 {
+		t.Fatal("nil refresh handler must not fall through to proxy")
+	}
+
+	mc := &cache.ModelCache{}
+	mc.UpdateConfig(cfg)
+	rh := cache.NewRefreshHandler(mc, holder)
+	h := newHTTPHandler(holder, fp, nil, nil, usage.NewSummaryHandler(nil), nil, rh)
+
+	// 2. Loopback without client api_key or admin token -> 200 OK (GET status)
+	req := httptest.NewRequest(http.MethodGet, "/prism/v1/models/refresh", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("loopback GET without token: status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+	if fp.called != 0 {
+		t.Fatal("loopback GET must not fall through to proxy")
+	}
+
+	// 3. Remote request without admin token -> 401 (not passing api_keys gate)
+	reqRemote := httptest.NewRequest(http.MethodGet, "/prism/v1/models/refresh", nil)
+	reqRemote.RemoteAddr = "192.168.1.50:12345"
+	rrRemote := httptest.NewRecorder()
+	h.ServeHTTP(rrRemote, reqRemote)
+	if rrRemote.Code != http.StatusUnauthorized {
+		t.Fatalf("remote GET without admin token: status = %d, want 401", rrRemote.Code)
+	}
+	if fp.called != 0 {
+		t.Fatal("remote GET without admin token must not fall through to proxy")
+	}
+
+	// 4. Remote request with admin token -> 200 OK without needing client api_keys
+	t.Setenv("PRISM_ADMIN_TOKEN", "admin-secret")
+	reqAdmin := httptest.NewRequest(http.MethodGet, "/prism/v1/models/refresh", nil)
+	reqAdmin.RemoteAddr = "192.168.1.50:12345"
+	reqAdmin.Header.Set("Authorization", "Bearer admin-secret")
+	rrAdmin := httptest.NewRecorder()
+	h.ServeHTTP(rrAdmin, reqAdmin)
+	if rrAdmin.Code != http.StatusOK {
+		t.Fatalf("remote GET with admin token: status = %d, want 200 (body: %s)", rrAdmin.Code, rrAdmin.Body.String())
+	}
+	if fp.called != 0 {
+		t.Fatal("remote GET with admin token must not fall through to proxy")
 	}
 }
 
@@ -387,7 +459,7 @@ func TestHTTPHandler_MissingProvider400_KeyIDFilled(t *testing.T) {
 	})
 	rec := wireUsageRecorder(t, cfg)
 	holder := config.NewConfigHolder(cfg)
-	h := newHTTPHandler(holder, &auditProxyHandler{p: pool.NewPool(cfg.Accounts), holder: holder}, nil, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(holder, &auditProxyHandler{p: pool.NewPool(cfg.Accounts), holder: holder}, nil, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
 	rr := httptest.NewRecorder()
@@ -424,7 +496,7 @@ func TestHTTPHandler_DefaultKeyIDConfigApplied(t *testing.T) {
 	})
 	rec := wireUsageRecorder(t, cfg)
 	holder := config.NewConfigHolder(cfg)
-	h := newHTTPHandler(holder, &auditProxyHandler{p: pool.NewPool(cfg.Accounts), holder: holder}, nil, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(holder, &auditProxyHandler{p: pool.NewPool(cfg.Accounts), holder: holder}, nil, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -465,7 +537,7 @@ func TestHTTPHandler_AuthenticatedKeyNameWins(t *testing.T) {
 	})
 	rec := wireUsageRecorder(t, cfg)
 	holder := config.NewConfigHolder(cfg)
-	h := newHTTPHandler(holder, &auditProxyHandler{p: pool.NewPool(cfg.Accounts), holder: holder}, nil, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(holder, &auditProxyHandler{p: pool.NewPool(cfg.Accounts), holder: holder}, nil, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -932,7 +1004,7 @@ func TestUsageAdapter_MissingPriceLogAndDBNil(t *testing.T) {
 func TestHTTPHandler_MetricsRequiresTokenBehindForwardHeaders(t *testing.T) {
 	t.Setenv("METRICS_TOKEN", "metrics-sekret")
 	cfg := testConfig(t, nil)
-	h := newHTTPHandler(config.NewConfigHolder(cfg), &fakeProxy{status: http.StatusOK}, nil, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(config.NewConfigHolder(cfg), &fakeProxy{status: http.StatusOK}, nil, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	// Fail-closed: direct loopback without forwarding headers and WITHOUT a
 	// token is 401 once METRICS_TOKEN is configured.
@@ -985,7 +1057,7 @@ func TestHTTPHandler_MetricsRequiresTokenBehindForwardHeaders(t *testing.T) {
 func TestHTTPHandler_MetricsLoopbackNoTokenNoHeader401(t *testing.T) {
 	t.Setenv("METRICS_TOKEN", "metrics-sekret")
 	cfg := testConfig(t, nil)
-	h := newHTTPHandler(config.NewConfigHolder(cfg), &fakeProxy{status: http.StatusOK}, nil, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(config.NewConfigHolder(cfg), &fakeProxy{status: http.StatusOK}, nil, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	req := httptest.NewRequest("GET", "/metrics", nil)
 	req.RemoteAddr = "127.0.0.1:12345" // loopback, no X-Forwarded-For / X-Real-IP
@@ -1011,7 +1083,7 @@ func TestHTTPHandler_MetricsLoopbackNoTokenNoHeader401(t *testing.T) {
 func TestHTTPHandler_MetricsRemoteNoTokenDenied(t *testing.T) {
 	t.Setenv("METRICS_TOKEN", "")
 	cfg := testConfig(t, nil)
-	h := newHTTPHandler(config.NewConfigHolder(cfg), &fakeProxy{status: http.StatusOK}, nil, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(config.NewConfigHolder(cfg), &fakeProxy{status: http.StatusOK}, nil, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	req := httptest.NewRequest("GET", "/metrics", nil) // RemoteAddr is non-loopback by default
 	rr := httptest.NewRecorder()
@@ -1147,7 +1219,7 @@ func TestHTTPHandler_HealthBypassesRateLimit(t *testing.T) {
 	})
 	// rate 0 / burst 0: every non-exempt request is limited.
 	rl := ratelimit.NewRateLimiter(0, 0)
-	h := newHTTPHandler(holder, next, rl, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(holder, next, rl, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -1183,7 +1255,7 @@ func TestHTTPHandler_ReadyBypassesRateLimitAndAuth(t *testing.T) {
 	// rate 0 / burst 0: every non-exempt request would be limited; with
 	// api_keys configured every non-exempt request would need auth.
 	rl := ratelimit.NewRateLimiter(0, 0)
-	h := newHTTPHandler(holder, proxy.NewProxyHandler(p, config.WireAPIBoth, holder, nil), rl, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(holder, proxy.NewProxyHandler(p, config.WireAPIBoth, holder, nil), rl, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
@@ -1217,7 +1289,7 @@ func TestHTTPHandler_ResponsesDeepSchema400InvalidRequest(t *testing.T) {
 	})
 	holder := config.NewConfigHolder(cfg)
 	p := pool.NewPool(cfg.Accounts)
-	h := newHTTPHandler(holder, proxy.NewProxyHandler(p, config.WireAPIBoth, holder, nil), nil, nil, usage.NewSummaryHandler(nil), nil)
+	h := newHTTPHandler(holder, proxy.NewProxyHandler(p, config.WireAPIBoth, holder, nil), nil, nil, usage.NewSummaryHandler(nil), nil, nil)
 
 	deep := map[string]any{"type": "object"}
 	cur := deep

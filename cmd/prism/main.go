@@ -214,7 +214,7 @@ func validateEnvTokenLengths() error {
 // /admin/usage/summary admin endpoint, the global api_keys auth gate and the
 // proxy dispatch. Extracted from main so tests can exercise the wiring
 // invariant that usage degradation never breaks /v1 forwarding.
-func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *ratelimit.RateLimiter, trustedProxies []*net.IPNet, summaryHandler http.Handler, quotaHandler http.Handler) http.Handler {
+func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *ratelimit.RateLimiter, trustedProxies []*net.IPNet, summaryHandler http.Handler, quotaHandler http.Handler, refreshHandler http.Handler) http.Handler {
 	// Bucket key is resolved per request from the live holder so api_keys
 	// hot-reloads take effect. Authenticated keys (len(api_keys)>0 and a
 	// matching Bearer) share a per-key-name bucket; auth failure and
@@ -274,6 +274,17 @@ func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *
 			quotaHandler.ServeHTTP(w, r)
 			return
 		}
+		if r.URL.Path == "/prism/v1/models/refresh" {
+			if refreshHandler == nil {
+				util.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
+					"error": map[string]any{"message": "refresh unavailable", "code": "refresh_unavailable"},
+				})
+				return
+			}
+			refreshHandler.ServeHTTP(w, r)
+			return
+		}
+
 		curCfg := holder.Load()
 		if r.URL.Path != "/health" && r.URL.Path != "/ready" {
 			keyName, ok := middleware.Authenticate(r, curCfg.APIKeys)
@@ -413,6 +424,14 @@ func main() {
 		return
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == "models" {
+		if err := runModels(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "models 失败: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// Fail fast on over-long admin/metrics tokens: a token longer than the
 	// constant-time comparison pad (256 bytes) can never authenticate (the
 	// comparison rejects it outright), so every request would fail at
@@ -453,8 +472,8 @@ func main() {
 		mc.SyncTools(holder.Load())
 	})
 
-	// 启动 24h 后台刷新（刷新后也同步 tools）
-	mc.StartRefreshLoop(24*time.Hour, func() {
+	// 启动后台刷新（按配置策略 full/stale，默认3h，0关闭；刷新后也同步 tools）
+	mc.StartRefreshLoop(cfg.ModelCacheRefreshInterval, func() {
 		// 重新读 config，因为可能被 SIGHUP 热重载过
 		curCfg := holder.Load()
 		mc.SyncTools(curCfg)
@@ -489,6 +508,7 @@ func main() {
 		middleware.SetUsagePricer(adapter.Price)
 	}
 	summaryHandler := usage.NewSummaryHandler(usageStore)
+	refreshHandler := cache.NewRefreshHandler(mc, holder)
 
 	quotaCache := planusage.NewCache()
 	quotaPoller := planusage.NewPoller(planusage.DefaultFetchers(), quotaCache, cfg.Quota.RefreshInterval, cfg.Quota.RequestTimeout)
@@ -562,12 +582,13 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           newHTTPHandler(holder, proxyHandler, rl, trustedProxies, summaryHandler, quotaHandler),
+		Handler:           newHTTPHandler(holder, proxyHandler, rl, trustedProxies, summaryHandler, quotaHandler, refreshHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		// WriteTimeout=0: allow long-lived streaming responses to clients.
 	}
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {

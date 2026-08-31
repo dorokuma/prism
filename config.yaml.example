@@ -88,6 +88,24 @@ probe_interval: 10m
 # wire_api: legacy | responses | both
 wire_api: both
 
+# ---------------------------------------------------------------------------
+# 可选：model_cache_refresh_interval —— 上游模型列表定时全量刷新间隔。
+# 默认 3h；0 表示关闭定时刷新（仍保留启动拉取与手动刷新）。
+# 负数启动报错拒绝；>0 且 <1m 告警并回退为 3h。
+# 改动需要重启生效（SIGHUP 热重载会打印 warning）。
+#
+# 可选：model_cache_refresh_strategy —— 定时刷新策略。
+# 默认 "full"（每轮刷新全量拉取所有 provider）；可选 "stale"（仅当缓存过期或不存在时拉取）。
+# 热更生效（SIGHUP 热重载立即生效，无须重启）。
+#
+# 回滚预设（回退到旧版行为：仅按需/24h过期刷新）：
+# model_cache_refresh_strategy: stale
+# model_cache_refresh_interval: 24h
+# ---------------------------------------------------------------------------
+# model_cache_refresh_interval: 3h
+# model_cache_refresh_strategy: full
+
+
 # 可选：非流式上游响应体大小上限（字节）。默认 32 MiB（33554432）。
 # 超过上限的上游响应（chat 透传与 responses 翻译两条路径）以
 # HTTP 502 + code=response_too_large 拒绝，避免整包缓冲进内存。

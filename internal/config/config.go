@@ -326,6 +326,35 @@ type Config struct {
 	// YAML providers.<name>.dsml_guard key. Missing or false means the
 	// legacy chat paths pass content through unchanged.
 	providerDSMLGuard map[string]bool
+
+	// ModelCacheRefreshInterval is the periodic interval for model cache background
+	// refresh. Default 3h. 0 disables periodic refresh.
+	ModelCacheRefreshInterval time.Duration `yaml:"model_cache_refresh_interval"`
+
+	// ModelCacheRefreshStrategy is the refresh strategy ("full" or "stale"). Default "full".
+	ModelCacheRefreshStrategy string `yaml:"model_cache_refresh_strategy"`
+
+	// modelCacheRefreshIntervalSet records whether model_cache_refresh_interval was explicitly present.
+	modelCacheRefreshIntervalSet bool
+}
+
+// UnmarshalYAML decodes Config and remembers whether
+// model_cache_refresh_interval was explicitly present, so LoadConfig
+// can distinguish "user configured 0" (disabled) from "absent" (default 3h).
+func (c *Config) UnmarshalYAML(value *yaml.Node) error {
+	type plain Config
+	if err := value.Decode((*plain)(c)); err != nil {
+		return err
+	}
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "model_cache_refresh_interval" {
+				c.modelCacheRefreshIntervalSet = true
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // LoadConfig reads a YAML config file, unmarshals it into Config, applies
@@ -352,7 +381,27 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.WireAPI == "" {
 		cfg.WireAPI = "both"
 	}
+	if !cfg.modelCacheRefreshIntervalSet && cfg.ModelCacheRefreshInterval == 0 {
+		cfg.ModelCacheRefreshInterval = DefaultModelCacheRefreshInterval
+	}
+	if cfg.ModelCacheRefreshInterval < 0 {
+		return nil, fmt.Errorf("model_cache_refresh_interval must be >= 0, got %v", cfg.ModelCacheRefreshInterval)
+	}
+	if cfg.ModelCacheRefreshInterval > 0 && cfg.ModelCacheRefreshInterval < ModelCacheMinInterval {
+		slog.Warn("model_cache_refresh_interval too small, falling back to 3h", "model_cache_refresh_interval", cfg.ModelCacheRefreshInterval)
+		cfg.ModelCacheRefreshInterval = DefaultModelCacheRefreshInterval
+	}
+	if cfg.ModelCacheRefreshStrategy == "" {
+		cfg.ModelCacheRefreshStrategy = DefaultModelCacheRefreshStrategy
+	}
+	strat := strings.ToLower(cfg.ModelCacheRefreshStrategy)
+	if strat != ModelCacheRefreshStrategyFull && strat != ModelCacheRefreshStrategyStale {
+		return nil, fmt.Errorf("unknown model_cache_refresh_strategy %q (supported: full, stale)", cfg.ModelCacheRefreshStrategy)
+	}
+	cfg.ModelCacheRefreshStrategy = strat
+
 	if cfg.MaxUpstreamResponseBytes < 0 {
+
 		return nil, fmt.Errorf("max_upstream_response_bytes must be >= 0, got %d", cfg.MaxUpstreamResponseBytes)
 	}
 	if cfg.MaxUpstreamResponseBytes == 0 {
@@ -1016,14 +1065,21 @@ func (c *Config) RemapModel(model string) string {
 	return model
 }
 
-// hasProvider reports whether any account belongs to the given provider name.
-func (c *Config) hasProvider(name string) bool {
+// HasProvider reports whether any account belongs to the given provider name.
+func (c *Config) HasProvider(name string) bool {
+	if c == nil {
+		return false
+	}
 	for _, acc := range c.Accounts {
 		if acc.Provider == name {
 			return true
 		}
 	}
 	return false
+}
+
+func (c *Config) hasProvider(name string) bool {
+	return c.HasProvider(name)
 }
 
 // ProviderNames returns all distinct provider names from account configs.
@@ -1304,6 +1360,9 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	}
 	if oldCfg.ProbeInterval != newCfg.ProbeInterval {
 		warnings = append(warnings, "probe_interval changed: restart required to take effect")
+	}
+	if oldCfg.ModelCacheRefreshInterval != newCfg.ModelCacheRefreshInterval {
+		warnings = append(warnings, "model_cache_refresh_interval changed: restart required to take effect")
 	}
 	// The account AGGREGATE concurrency cap is a pool-construction property
 	// (NewPoolWithTotalCap at startup): the per-model max values hot-reload

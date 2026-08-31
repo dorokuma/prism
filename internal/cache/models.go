@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +22,14 @@ import (
 	"github.com/dorokuma/prism/internal/pool"
 	"github.com/dorokuma/prism/internal/util"
 )
+
+const defaultStaggerMax = 2 * time.Second
+
+type providerBackoff struct {
+	failCount int
+	nextRetry time.Time
+	lastErr   string
+}
 
 // ErrNoHealthyAccount is returned by Fetch when the provider has no healthy
 // account to fetch from. internal/proxy maps it to HTTP 503 with code
@@ -65,14 +74,20 @@ type ModelCache struct {
 	// round can start, so Wait can never race a future Add.
 	refreshMu       sync.Mutex
 	refreshing      bool
+	runningKind     roundKind
+	runningTarget   string
 	pending         bool
 	pendingKind     roundKind
+	pendingTarget   string
 	pendingOnDone   func()
 	stopped         bool
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
 	refreshWG       sync.WaitGroup
 	stopOnce        sync.Once
+	backoffs        map[string]providerBackoff
+	staggerMax      time.Duration
+	backoffInitial  time.Duration
 
 	// doneMu serializes onDone callbacks: at most one callback runs at a
 	// time, and a later round's callback never starts before an earlier
@@ -185,11 +200,12 @@ func New(dir string, p *pool.Pool, cfg *config.Config) (*ModelCache, error) {
 		return nil, fmt.Errorf("chmod cache dir: %w", err)
 	}
 	return &ModelCache{
-		dir:    dir,
-		caches: make(map[string]*providerCache),
-		pool:   p,
-		cfg:    cfg,
-		stop:   make(chan struct{}),
+		dir:        dir,
+		caches:     make(map[string]*providerCache),
+		pool:       p,
+		cfg:        cfg,
+		stop:       make(chan struct{}),
+		staggerMax: defaultStaggerMax,
 	}, nil
 }
 
@@ -312,27 +328,90 @@ func (mc *ModelCache) snapshotConfig() *config.Config {
 	return mc.cfg
 }
 
+// calculateBackoffLocked calculates exponential backoff duration. Must be called with refreshMu held or when safe.
+func (mc *ModelCache) calculateBackoffLocked(failCount int) time.Duration {
+	if failCount <= 0 {
+		return 0
+	}
+	initial := mc.backoffInitial
+	if initial <= 0 {
+		initial = config.ModelCacheBackoffInitial
+	}
+	shift := failCount - 1
+	if shift > 7 { // 30s * 128 = 3840s > 3600s (1h)
+		return config.ModelCacheBackoffMax
+	}
+	d := initial * time.Duration(1<<shift)
+	if d > config.ModelCacheBackoffMax {
+		return config.ModelCacheBackoffMax
+	}
+	return d
+}
+
+func (mc *ModelCache) calculateBackoff(failCount int) time.Duration {
+	mc.refreshMu.Lock()
+	defer mc.refreshMu.Unlock()
+	return mc.calculateBackoffLocked(failCount)
+}
+
+// SetBackoffInitialForTest overrides the initial backoff duration for testing.
+func (mc *ModelCache) SetBackoffInitialForTest(d time.Duration) {
+	mc.refreshMu.Lock()
+	defer mc.refreshMu.Unlock()
+	mc.backoffInitial = d
+}
+
+// jitterTimer returns base +/- 10% random jitter.
+func jitterTimer(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	delta := float64(base) * 0.1
+	jitter := (rand.Float64()*2 - 1) * delta
+	res := base + time.Duration(jitter)
+	if res <= 0 {
+		return base
+	}
+	return res
+}
+
 // roundKind selects which providers a background refresh round fetches.
 type roundKind int
 
 const (
-	// roundManual refreshes every provider, ignoring cache state (the
-	// SIGHUP path, RefreshAllAsync).
+	// roundManual refreshes every provider (or single target), ignoring cache state
+	// (the SIGHUP path, RefreshAllAsync, RefreshOneAsync, HTTP POST /models/refresh).
 	roundManual roundKind = iota
 	// roundStale refreshes only providers whose cache is missing or older
-	// than 24h (the StartRefreshLoop ticker, RefreshStale).
+	// than stale window (the StartRefreshLoop ticker when strategy is stale, RefreshStale).
 	roundStale
 	// roundFill refreshes only providers with no cached models, plus
 	// ollama providers whose cache predates the Meta format (the startup
-	// FetchAllAsync path).
+	// FetchAllAsync path or newly added providers).
 	roundFill
+	// roundPeriodicFull refreshes all unique providers periodically (strategy full).
+	roundPeriodicFull
 )
 
 // shouldFetch reports whether provider's cache (pc, may be nil) must be
 // refreshed by a round of the given kind.
 func (mc *ModelCache) shouldFetch(provider string, pc *providerCache, kind roundKind, cfg *config.Config) bool {
+	// Manual rounds bypass backoff unconditionally
+	if kind == roundManual {
+		return true
+	}
+
+	// For automated/periodic rounds (fill, stale, periodic full), respect backoff
+	mc.refreshMu.Lock()
+	if b, ok := mc.backoffs[provider]; ok && time.Now().Before(b.nextRetry) {
+		mc.refreshMu.Unlock()
+		slog.Debug("model cache provider in backoff, skipping", "provider", provider, "next_retry", b.nextRetry.Format(time.RFC3339))
+		return false
+	}
+	mc.refreshMu.Unlock()
+
 	switch kind {
-	case roundManual:
+	case roundPeriodicFull:
 		return true
 	case roundFill:
 		if pc == nil {
@@ -346,9 +425,26 @@ func (mc *ModelCache) shouldFetch(provider string, pc *providerCache, kind round
 		if pc == nil {
 			return true
 		}
-		return !pc.UpdatedAt.After(time.Now().Add(-24 * time.Hour))
+		staleWindow := 24 * time.Hour
+		if cfg != nil && cfg.ModelCacheRefreshInterval > 0 {
+			staleWindow = cfg.ModelCacheRefreshInterval
+		}
+		return !pc.UpdatedAt.After(time.Now().Add(-staleWindow))
 	}
 	return false
+}
+
+func mergeOnDone(oldDone, newDone func()) func() {
+	if oldDone == nil {
+		return newDone
+	}
+	if newDone == nil {
+		return oldDone
+	}
+	return func() {
+		oldDone()
+		newDone()
+	}
 }
 
 // FetchAllAsync fetches model lists from upstream for any providers missing
@@ -370,36 +466,22 @@ func (mc *ModelCache) FetchAllAsync(onDone func()) {
 		return
 	}
 	if mc.refreshing {
-		// The fill work is subsumed by the running round, but the caller's
-		// onDone must not be dropped: hand over to exactly one more fill
-		// round when the running round finishes (or drop it if that round
-		// is cancelled/stopped, as with every pending request).
-		//
-		// Priority rule: a pending MANUAL round (SIGHUP) refreshes every
-		// provider and fully subsumes the fill work, so it must never be
-		// downgraded to fill here — downgrading would silently drop
-		// providers from the next round. Keep the manual kind; only the
-		// onDone follows the latest caller.
-		//
-		// In every other case the queued round must be a FILL. Note that
-		// pendingKind alone cannot decide: when NO request is pending yet,
-		// pendingKind still reads roundManual (the default that
-		// startRoundLocked/RefreshStale leave behind even though nothing
-		// is queued). Treating that default as manual would escalate a
-		// startup fill into a full manual refresh, re-fetching every
-		// provider instead of only the missing caches. The pending flag —
-		// not pendingKind — is what distinguishes "manual pending" from
-		// "nothing pending"; an already-pending fill stays a fill
-		// (latest caller wins, as before).
 		if !mc.pending || mc.pendingKind != roundManual {
 			mc.pendingKind = roundFill
+			mc.pendingTarget = ""
+			mc.pendingOnDone = onDone
+		} else {
+			// Already have a manual pending round: upgrade any single-provider
+			// manual target to a full manual round so no provider is missed,
+			// and merge the completion callbacks so the manual onDone is not lost.
+			mc.pendingTarget = ""
+			mc.pendingOnDone = mergeOnDone(mc.pendingOnDone, onDone)
 		}
 		mc.pending = true
-		mc.pendingOnDone = onDone
 		slog.Debug("model cache fill already in progress, queueing pending fill")
 		return
 	}
-	mc.startRoundLocked(roundFill, onDone)
+	mc.startRoundLocked(roundFill, "", onDone)
 }
 
 // Fetch calls the upstream /v1/models endpoint for a provider, caches
@@ -836,8 +918,11 @@ func (mc *ModelCache) RefreshStale() {
 		return
 	}
 	mc.refreshing = true
+	mc.runningKind = roundStale
+	mc.runningTarget = ""
 	mc.pending = false
 	mc.pendingKind = roundManual
+	mc.pendingTarget = ""
 	mc.pendingOnDone = nil
 	ctx := mc.ensureLifecycleLocked()
 	// Add under refreshMu: Stop takes refreshMu before Wait, so the counter
@@ -847,7 +932,7 @@ func (mc *ModelCache) RefreshStale() {
 	// Run the round synchronously. refreshing stays true for the whole
 	// pass, so a concurrent RefreshAllAsync/FetchAllAsync queues pending
 	// and is handed over to exactly one more round when this one finishes.
-	mc.runRefresh(ctx, roundStale, nil)
+	mc.runRefresh(ctx, roundStale, "", nil)
 }
 
 // RefreshAll fetches model lists for all providers, ignoring cache state.
@@ -866,8 +951,11 @@ func (mc *ModelCache) RefreshAll() {
 		return
 	}
 	mc.refreshing = true
+	mc.runningKind = roundManual
+	mc.runningTarget = ""
 	mc.pending = false
 	mc.pendingKind = roundManual
+	mc.pendingTarget = ""
 	mc.pendingOnDone = nil
 	ctx := mc.ensureLifecycleLocked()
 	// Add under refreshMu: Stop takes refreshMu before Wait, so the counter
@@ -877,7 +965,7 @@ func (mc *ModelCache) RefreshAll() {
 	// Run the round synchronously. refreshing stays true for the whole
 	// pass, so a concurrent RefreshAllAsync/FetchAllAsync queues pending
 	// and is handed over to exactly one more round when this one finishes.
-	mc.runRefresh(ctx, roundManual, nil)
+	mc.runRefresh(ctx, roundManual, "", nil)
 }
 
 // RefreshAllAsync triggers a controlled background refresh of every provider
@@ -911,11 +999,54 @@ func (mc *ModelCache) RefreshAllAsync(onDone func()) {
 		// full refresh, whatever the in-flight round was.
 		mc.pending = true
 		mc.pendingKind = roundManual
+		mc.pendingTarget = ""
 		mc.pendingOnDone = onDone
 		slog.Debug("model cache refresh already in progress, queueing pending refresh")
 		return
 	}
-	mc.startRoundLocked(roundManual, onDone)
+	mc.startRoundLocked(roundManual, "", onDone)
+}
+
+// RefreshOneAsync triggers a controlled background refresh for a single provider.
+func (mc *ModelCache) RefreshOneAsync(provider string, onDone func()) {
+	mc.refreshMu.Lock()
+	defer mc.refreshMu.Unlock()
+	if mc.stopped {
+		slog.Debug("model cache refresh refused: cache is stopped")
+		return
+	}
+	if mc.refreshing {
+		if !mc.pending {
+			mc.pending = true
+			mc.pendingKind = roundManual
+			mc.pendingTarget = provider
+			mc.pendingOnDone = onDone
+		} else if mc.pendingKind == roundFill {
+			// Pending fill is already queued: upgrade to full manual so all
+			// missing and existing providers are fetched, and merge callbacks
+			// so the fill onDone is not lost.
+			mc.pending = true
+			mc.pendingKind = roundManual
+			mc.pendingTarget = ""
+			mc.pendingOnDone = mergeOnDone(mc.pendingOnDone, onDone)
+		} else if mc.pendingKind == roundManual {
+			if mc.pendingTarget != "" && mc.pendingTarget != provider {
+				// Two different single providers queued -> upgrade to full manual
+				// and merge callbacks so neither is lost.
+				mc.pendingTarget = ""
+				mc.pendingOnDone = mergeOnDone(mc.pendingOnDone, onDone)
+			} else {
+				mc.pendingOnDone = onDone
+			}
+		} else {
+			mc.pending = true
+			mc.pendingKind = roundManual
+			mc.pendingTarget = provider
+			mc.pendingOnDone = onDone
+		}
+		return
+	}
+	mc.startRoundLocked(roundManual, provider, onDone)
 }
 
 // ensureLifecycleLocked returns the shared background lifecycle context,
@@ -931,17 +1062,20 @@ func (mc *ModelCache) ensureLifecycleLocked() context.Context {
 
 // startRoundLocked begins a new refresh round of the given kind. Must be
 // called with refreshMu held and refreshing == false.
-func (mc *ModelCache) startRoundLocked(kind roundKind, onDone func()) {
+func (mc *ModelCache) startRoundLocked(kind roundKind, target string, onDone func()) {
 	mc.refreshing = true
+	mc.runningKind = kind
+	mc.runningTarget = target
 	mc.pending = false
 	mc.pendingKind = roundManual
+	mc.pendingTarget = ""
 	mc.pendingOnDone = nil
 	ctx := mc.ensureLifecycleLocked()
 	// Add under refreshMu: Stop takes refreshMu before Wait, so the counter
 	// is guaranteed to be >= 1 by the time Stop waits — Stop can never
 	// return before this goroutine has started (and exited).
 	mc.refreshWG.Add(1)
-	go mc.runRefresh(ctx, kind, onDone)
+	go mc.runRefresh(ctx, kind, target, onDone)
 }
 
 // runRefresh executes one refresh round of the given kind. When the round
@@ -952,17 +1086,37 @@ func (mc *ModelCache) startRoundLocked(kind roundKind, onDone func()) {
 // Wait cannot return while any round is live; a round cancelled or stopped
 // never hands over (pending work is dropped during shutdown) and never runs
 // onDone.
-func (mc *ModelCache) runRefresh(ctx context.Context, kind roundKind, onDone func()) {
+func (mc *ModelCache) runRefresh(ctx context.Context, kind roundKind, target string, onDone func()) {
 	defer mc.refreshWG.Done()
 
 	cancelled := false
 	cfg := mc.snapshotConfig()
-	for _, acc := range cfg.Accounts {
-		provider := acc.Provider
+	var providers []string
+	if target != "" {
+		providers = []string{target}
+	} else if cfg != nil {
+		providers = cfg.ProviderNames()
+	}
+
+	mc.refreshMu.Lock()
+	staggerMax := mc.staggerMax
+	mc.refreshMu.Unlock()
+
+	for idx, provider := range providers {
 		if provider == "" {
 			continue
 		}
-		if ctx.Err() != nil {
+		if idx > 0 && staggerMax > 0 && len(providers) > 1 {
+			stagger := time.Duration(rand.Float64() * float64(staggerMax))
+			timer := time.NewTimer(stagger)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				cancelled = true
+			case <-timer.C:
+			}
+		}
+		if ctx.Err() != nil || cancelled {
 			cancelled = true
 			break
 		}
@@ -977,7 +1131,23 @@ func (mc *ModelCache) runRefresh(ctx context.Context, kind roundKind, onDone fun
 				cancelled = true
 				break
 			}
-			slog.Warn("model cache refresh failed", "provider", provider, "error", err)
+			mc.refreshMu.Lock()
+			if mc.backoffs == nil {
+				mc.backoffs = make(map[string]providerBackoff)
+			}
+			b := mc.backoffs[provider]
+			b.failCount++
+			d := mc.calculateBackoffLocked(b.failCount)
+			b.nextRetry = time.Now().Add(d)
+			b.lastErr = err.Error()
+			mc.backoffs[provider] = b
+			mc.refreshMu.Unlock()
+
+			slog.Warn("model cache refresh failed", "provider", provider, "fail_count", b.failCount, "backoff", d, "error", err)
+		} else {
+			mc.refreshMu.Lock()
+			delete(mc.backoffs, provider)
+			mc.refreshMu.Unlock()
 		}
 	}
 
@@ -991,21 +1161,27 @@ func (mc *ModelCache) runRefresh(ctx context.Context, kind roundKind, onDone fun
 		// cache must NOT hand over: Stop drains every round before returning.
 		nextDone := mc.pendingOnDone
 		nextKind := mc.pendingKind
+		nextTarget := mc.pendingTarget
 		mc.pending = false
 		mc.pendingKind = roundManual
+		mc.pendingTarget = ""
 		mc.pendingOnDone = nil
+		mc.runningKind = nextKind
+		mc.runningTarget = nextTarget
 		// The counter is still >= 1 from this round, so the positive-delta
 		// Add below is safe even while Stop's Wait runs concurrently.
 		mc.refreshWG.Add(1)
 		mc.refreshMu.Unlock()
-		go mc.runRefresh(ctx, nextKind, nextDone)
+		go mc.runRefresh(ctx, nextKind, nextTarget, nextDone)
 		return
 	}
 	mc.refreshing = false
+	mc.runningTarget = ""
 	// No handover happened: any queued pending request was dropped (a round
 	// cancelled or stopped must not start more work), so clear the stale flag.
 	mc.pending = false
 	mc.pendingKind = roundManual
+	mc.pendingTarget = ""
 	mc.pendingOnDone = nil
 	// Launch the callback under refreshMu, atomically with the stopped check
 	// above: once Stop has set stopped, no new callback starts. The callback
@@ -1046,18 +1222,20 @@ func (mc *ModelCache) runOnDone(fn func()) {
 	fn()
 }
 
-// StartRefreshLoop runs a background goroutine that checks for stale caches
-// every checkInterval and refreshes them through the shared refresh
-// scheduler (a stale round can never overlap a manual RefreshAllAsync round,
-// and Stop cancels and waits for it like every other round). Call Stop() to
-// shut down. onRefresh runs after each stale round that actually completes
-// (never after Stop). The loop goroutine is tracked in loopWG: Stop returns
-// only after the loop has exited.
+// StartRefreshLoop runs a background goroutine that checks and refreshes model cache
+// every checkInterval (with +/- 10% jitter) through the shared refresh
+// scheduler. If checkInterval <= 0, the refresh loop is disabled.
+// Call Stop() to shut down. onRefresh runs after each round that actually completes.
 func (mc *ModelCache) StartRefreshLoop(checkInterval time.Duration, onRefresh func()) {
 	mc.refreshMu.Lock()
 	if mc.stopped {
 		mc.refreshMu.Unlock()
 		slog.Debug("model cache refresh loop refused: cache is stopped")
+		return
+	}
+	if checkInterval <= 0 {
+		mc.refreshMu.Unlock()
+		slog.Info("model cache refresh loop disabled (interval <= 0)")
 		return
 	}
 	// Add under refreshMu, ordered before Stop's own refreshMu acquisition
@@ -1068,18 +1246,34 @@ func (mc *ModelCache) StartRefreshLoop(checkInterval time.Duration, onRefresh fu
 	mc.refreshMu.Unlock()
 	go func() {
 		defer mc.loopWG.Done()
-		ticker := time.NewTicker(checkInterval)
-		defer ticker.Stop()
 		for {
+			jittered := jitterTimer(checkInterval)
+			timer := time.NewTimer(jittered)
 			select {
 			case <-mc.stop:
+				timer.Stop()
 				slog.Info("model cache refresh loop stopped")
 				return
-			case <-ticker.C:
-				mc.requestStaleRefresh(onRefresh)
+			case <-timer.C:
+				mc.requestPeriodicRefresh(onRefresh)
 			}
 		}
 	}()
+}
+
+// requestPeriodicRefresh queues a periodic refresh round according to the configured strategy (full or stale).
+func (mc *ModelCache) requestPeriodicRefresh(onRefresh func()) {
+	mc.refreshMu.Lock()
+	defer mc.refreshMu.Unlock()
+	if mc.stopped || mc.refreshing {
+		return
+	}
+	cfg := mc.snapshotConfig()
+	kind := roundPeriodicFull
+	if cfg != nil && cfg.ModelCacheRefreshStrategy == config.ModelCacheRefreshStrategyStale {
+		kind = roundStale
+	}
+	mc.startRoundLocked(kind, "", onRefresh)
 }
 
 // requestStaleRefresh queues a stale-only refresh round. If a round is
@@ -1092,28 +1286,17 @@ func (mc *ModelCache) requestStaleRefresh(onRefresh func()) {
 	if mc.stopped || mc.refreshing {
 		return
 	}
-	mc.startRoundLocked(roundStale, onRefresh)
+	mc.startRoundLocked(roundStale, "", onRefresh)
 }
 
 // Stop shuts down the refresh loop, cancels the shared lifecycle context
 // (aborting any in-flight refresh round — manual RefreshAllAsync, startup
-// FetchAllAsync fill, or the stale ticker — at its next cancellation check)
+// FetchAllAsync fill, or the periodic ticker — at its next cancellation check)
 // and waits for ALL refresh rounds AND every launched onDone callback to
 // exit, so nothing leaks and no callback (no models.json write) can run
 // after Stop returns. Once Stop has begun, no new refresh round can start:
-// RefreshAllAsync, FetchAllAsync, RefreshStale and the stale ticker all
+// RefreshAllAsync, FetchAllAsync, RefreshStale and the periodic ticker all
 // refuse once stopped is set. It is idempotent: a second call is a no-op.
-//
-// The Wait cannot return before a round that is about to start: every Add
-// happens under refreshMu (startRoundLocked, RefreshStale and the runRefresh
-// handover), and this Wait is ordered after this method's own refreshMu
-// acquisition, so a counter of zero implies no round is live or scheduled —
-// and stopped=true blocks any future Add. The same ordering holds for
-// callbacks: their doneWG.Add happens inside runRefresh under refreshMu
-// before refreshWG.Done, so by the time refreshWG.Wait returns every
-// launched callback is already counted and doneWG.Wait below waits for all
-// of them. Contract: onDone must NOT call Stop synchronously (production
-// callbacks are pure SyncTools); a violating callback would deadlock here.
 func (mc *ModelCache) Stop() {
 	mc.stopOnce.Do(func() { close(mc.stop) })
 	mc.refreshMu.Lock()
@@ -1133,11 +1316,102 @@ func (mc *ModelCache) Stop() {
 	mc.doneWG.Wait()
 }
 
-// UpdateConfig replaces the stored config reference. Call after SIGHUP reloads config.
-func (mc *ModelCache) UpdateConfig(cfg *config.Config) {
+// UpdateConfig replaces the stored config reference. If new providers are detected,
+// it triggers a background fill round to fetch their models.
+func (mc *ModelCache) UpdateConfig(newCfg *config.Config) {
 	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	mc.cfg = cfg
+	oldCfg := mc.cfg
+	mc.cfg = newCfg
+
+	var hasNewProviders bool
+	if oldCfg != nil && newCfg != nil {
+		oldSet := make(map[string]bool)
+		for _, p := range oldCfg.ProviderNames() {
+			oldSet[p] = true
+		}
+		for _, p := range newCfg.ProviderNames() {
+			if !oldSet[p] {
+				hasNewProviders = true
+				break
+			}
+		}
+	}
+	mc.mu.Unlock()
+
+	if hasNewProviders {
+		slog.Info("new providers detected in config update, triggering cache fill")
+		mc.FetchAllAsync(func() {
+			mc.SyncTools(newCfg)
+		})
+	}
+}
+
+// AcceptRefresh handles an external/admin refresh trigger (e.g. POST /prism/v1/models/refresh).
+// If provider is non-empty, it refreshes only that provider; otherwise it refreshes all providers.
+// Returns a snapshot of providers status immediately.
+func (mc *ModelCache) AcceptRefresh(provider string, onDone func()) (map[string]ProviderSnapshot, error) {
+	cfg := mc.snapshotConfig()
+	if provider != "" {
+		if cfg != nil && !cfg.HasProvider(provider) {
+			return nil, fmt.Errorf("provider %q not found", provider)
+		}
+		mc.RefreshOneAsync(provider, onDone)
+	} else {
+		mc.RefreshAllAsync(onDone)
+	}
+	return mc.Snapshot(), nil
+}
+
+// ProviderSnapshot captures the current cache and backoff state of a provider.
+type ProviderSnapshot struct {
+	ModelsCount int        `json:"models_count"`
+	UpdatedAt   *time.Time `json:"updated_at,omitempty"`
+	InBackoff   bool       `json:"in_backoff,omitempty"`
+	Error       string     `json:"error,omitempty"`
+}
+
+// Snapshot returns the current status of all configured providers.
+func (mc *ModelCache) Snapshot() map[string]ProviderSnapshot {
+	mc.mu.RLock()
+	cfg := mc.cfg
+	res := make(map[string]ProviderSnapshot)
+	var provs []string
+	if cfg != nil {
+		provs = cfg.ProviderNames()
+	}
+	for _, p := range provs {
+		snap := ProviderSnapshot{}
+		if pc, ok := mc.caches[p]; ok && pc != nil {
+			snap.ModelsCount = len(pc.Models)
+			if !pc.UpdatedAt.IsZero() {
+				t := pc.UpdatedAt
+				snap.UpdatedAt = &t
+			}
+		}
+		res[p] = snap
+	}
+	mc.mu.RUnlock()
+
+	mc.refreshMu.Lock()
+	for p, b := range mc.backoffs {
+		if snap, ok := res[p]; ok {
+			if time.Now().Before(b.nextRetry) {
+				snap.InBackoff = true
+			}
+			snap.Error = b.lastErr
+			res[p] = snap
+		}
+	}
+	mc.refreshMu.Unlock()
+
+	return res
+}
+
+// SetStaggerForTest sets the stagger duration between providers (used in tests to disable stagger).
+func (mc *ModelCache) SetStaggerForTest(d time.Duration) {
+	mc.refreshMu.Lock()
+	defer mc.refreshMu.Unlock()
+	mc.staggerMax = d
 }
 
 // selectAccounts returns every healthy, non-cooldown account for the given

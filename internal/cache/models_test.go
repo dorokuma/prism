@@ -2770,6 +2770,113 @@ func TestFetchAllAsync_PendingFirstTimeWhileBusyIsFill(t *testing.T) {
 	}
 }
 
+// TestFetchAllAsync_UpgradePendingManualToFullAndMergeOnDone tests that when
+// FetchAllAsync is called while a manual single-target round is pending, it
+// upgrades the pending target to full manual (target="") so no providers are
+// missed, and merges both completion callbacks without dropping either.
+func TestFetchAllAsync_UpgradePendingManualToFullAndMergeOnDone(t *testing.T) {
+	var p1Hits, p2Hits int32
+	entered1 := make(chan struct{})
+	release1 := make(chan struct{})
+	done := make(chan struct{})
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&p1Hits, 1)
+		if atomic.LoadInt32(&p1Hits) == 1 {
+			select {
+			case <-entered1:
+			default:
+				close(entered1)
+			}
+			select {
+			case <-release1:
+			case <-done:
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srv1.Close()
+	defer close(done)
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&p2Hits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m2","object":"model","created":1,"owned_by":"y"}]}`))
+	}))
+	defer srv2.Close()
+
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "p1", BaseURL: srv1.URL, Key: "k"},
+			{Name: "a2", Provider: "p2", BaseURL: srv2.URL, Key: "k"},
+		},
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool:   pool.NewPool(cfg.Accounts),
+		stop:   make(chan struct{}),
+	}
+	defer mc.Stop()
+
+	// Round 1: manual refresh, blocks on p1
+	mc.RefreshAllAsync(nil)
+	select {
+	case <-entered1:
+	case <-time.After(5 * time.Second):
+		t.Fatal("round 1 never reached p1")
+	}
+
+	// Queue pending manual for single provider "p1"
+	manualDone := make(chan struct{})
+	mc.RefreshOneAsync("p1", func() { close(manualDone) })
+
+	mc.refreshMu.Lock()
+	if !mc.pending || mc.pendingKind != roundManual || mc.pendingTarget != "p1" {
+		mc.refreshMu.Unlock()
+		t.Fatalf("expected pending manual round targeting p1, got pending=%v kind=%v target=%q", mc.pending, mc.pendingKind, mc.pendingTarget)
+	}
+	mc.refreshMu.Unlock()
+
+	// Now startup fill arrives: must upgrade pending target from "p1" to "" (full)
+	// and preserve/merge onDone
+	fillDone := make(chan struct{})
+	mc.FetchAllAsync(func() { close(fillDone) })
+
+	mc.refreshMu.Lock()
+	if !mc.pending || mc.pendingKind != roundManual || mc.pendingTarget != "" {
+		mc.refreshMu.Unlock()
+		t.Fatalf("expected pending manual upgraded to full (target=\"\"), got pending=%v kind=%v target=%q", mc.pending, mc.pendingKind, mc.pendingTarget)
+	}
+	mc.refreshMu.Unlock()
+
+	close(release1)
+
+	select {
+	case <-manualDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("manual onDone never ran")
+	}
+
+	select {
+	case <-fillDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fill onDone never ran")
+	}
+
+	// Round 1 fetched p1 and p2 (1 each).
+	// Pending round was upgraded to manual full, so it fetched p1 and p2 again (2 hits each total).
+	if got := atomic.LoadInt32(&p1Hits); got != 2 {
+		t.Errorf("p1 hits = %d, want 2", got)
+	}
+	if got := atomic.LoadInt32(&p2Hits); got != 2 {
+		t.Errorf("p2 hits = %d, want 2 (upgraded full manual must fetch both)", got)
+	}
+}
+
 // TestRefreshAllAsync_OnDoneSerializedAcrossRounds: a later round's onDone
 // must not start until the earlier round's onDone has finished. Round 1's
 // callback blocks; round 2 is requested, runs and finishes — its callback
@@ -3025,6 +3132,8 @@ func TestRefreshLoop_StopWaitsForLoopExit(t *testing.T) {
 		}),
 		stop: make(chan struct{}),
 	}
+	mc.SetBackoffInitialForTest(time.Millisecond)
+	mc.SetStaggerForTest(0)
 
 	mc.StartRefreshLoop(5*time.Millisecond, nil)
 	deadline := time.Now().Add(5 * time.Second)
@@ -4332,4 +4441,286 @@ func TestFetch_ShowTimeoutStillPersistsModels(t *testing.T) {
 		t.Errorf("cache dir after show timeout = %v, want [ollama-cloud.json]", entries)
 	}
 	close(releaseShow) // let /api/show handlers return so the test server can shut down
+}
+
+func TestRefreshOneAsync_PendingFillUpgradesToFullWhenOneManualArrives(t *testing.T) {
+	var p1Hits, p2Hits int32
+	entered1 := make(chan struct{})
+	release1 := make(chan struct{})
+
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := atomic.AddInt32(&p1Hits, 1)
+		if h == 1 {
+			close(entered1)
+			<-release1
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srv1.Close()
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&p2Hits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m2","object":"model","created":1,"owned_by":"y"}]}`))
+	}))
+	defer srv2.Close()
+
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "p1", BaseURL: srv1.URL, Key: "k"},
+			{Name: "a2", Provider: "p2", BaseURL: srv2.URL, Key: "k"},
+		},
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool:   pool.NewPool(cfg.Accounts),
+		stop:   make(chan struct{}),
+	}
+	defer mc.Stop()
+
+	// Round 1: manual refresh, blocks on p1
+	mc.RefreshAllAsync(nil)
+	select {
+	case <-entered1:
+	case <-time.After(5 * time.Second):
+		t.Fatal("round 1 never reached p1")
+	}
+
+	// Queue pending fill
+	fillDone := make(chan struct{})
+	mc.FetchAllAsync(func() { close(fillDone) })
+
+	mc.refreshMu.Lock()
+	if !mc.pending || mc.pendingKind != roundFill || mc.pendingTarget != "" {
+		mc.refreshMu.Unlock()
+		t.Fatalf("expected pending fill round, got pending=%v kind=%v target=%q", mc.pending, mc.pendingKind, mc.pendingTarget)
+	}
+	mc.refreshMu.Unlock()
+
+	// Now single-provider manual arrives (RefreshOneAsync for p1):
+	// Must NOT downgrade pending to single-provider manual targeting only p1;
+	// it must upgrade to full manual (target="") and merge onDone callbacks!
+	manualDone := make(chan struct{})
+	mc.RefreshOneAsync("p1", func() { close(manualDone) })
+
+	mc.refreshMu.Lock()
+	if !mc.pending || mc.pendingKind != roundManual || mc.pendingTarget != "" {
+		mc.refreshMu.Unlock()
+		t.Fatalf("expected pending fill upgraded to full manual (target=\"\"), got pending=%v kind=%v target=%q", mc.pending, mc.pendingKind, mc.pendingTarget)
+	}
+	mc.refreshMu.Unlock()
+
+	close(release1)
+
+	select {
+	case <-manualDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("manual onDone never ran")
+	}
+
+	select {
+	case <-fillDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fill onDone never ran")
+	}
+
+	// Round 1 fetched p1 and p2 (1 each).
+	// Pending round was upgraded to full manual, so it fetched p1 and p2 again (2 hits each total).
+	if got := atomic.LoadInt32(&p1Hits); got != 2 {
+		t.Errorf("p1 hits = %d, want 2", got)
+	}
+	if got := atomic.LoadInt32(&p2Hits); got != 2 {
+		t.Errorf("p2 hits = %d, want 2 (upgraded full manual must fetch both p1 and p2)", got)
+	}
+}
+
+func TestRefreshOneAsync_TwoDifferentSingleProvidersUpgradeToFullAndMergeOnDone(t *testing.T) {
+	var p1Hits, p2Hits int32
+	entered1 := make(chan struct{})
+	release1 := make(chan struct{})
+
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := atomic.AddInt32(&p1Hits, 1)
+		if h == 1 {
+			close(entered1)
+			<-release1
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srv1.Close()
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&p2Hits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m2","object":"model","created":1,"owned_by":"y"}]}`))
+	}))
+	defer srv2.Close()
+
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "p1", BaseURL: srv1.URL, Key: "k"},
+			{Name: "a2", Provider: "p2", BaseURL: srv2.URL, Key: "k"},
+		},
+		MaxConcurrentPerAccount: map[string]int{"*": 1},
+	}
+	mc := &ModelCache{
+		dir:    t.TempDir(),
+		caches: map[string]*providerCache{},
+		cfg:    cfg,
+		pool:   pool.NewPool(cfg.Accounts),
+		stop:   make(chan struct{}),
+	}
+	defer mc.Stop()
+
+	// Round 1: blocks on p1
+	mc.RefreshAllAsync(nil)
+	select {
+	case <-entered1:
+	case <-time.After(5 * time.Second):
+		t.Fatal("round 1 never reached p1")
+	}
+
+	done1 := make(chan struct{})
+	mc.RefreshOneAsync("p1", func() { close(done1) })
+
+	done2 := make(chan struct{})
+	mc.RefreshOneAsync("p2", func() { close(done2) })
+
+	mc.refreshMu.Lock()
+	if !mc.pending || mc.pendingKind != roundManual || mc.pendingTarget != "" {
+		mc.refreshMu.Unlock()
+		t.Fatalf("expected pending upgraded to full manual (target=\"\"), got pending=%v kind=%v target=%q", mc.pending, mc.pendingKind, mc.pendingTarget)
+	}
+	mc.refreshMu.Unlock()
+
+	close(release1)
+
+	select {
+	case <-done1:
+	case <-time.After(10 * time.Second):
+		t.Fatal("done1 never ran")
+	}
+
+	select {
+	case <-done2:
+	case <-time.After(10 * time.Second):
+		t.Fatal("done2 never ran")
+	}
+
+	if got := atomic.LoadInt32(&p1Hits); got != 2 {
+		t.Errorf("p1 hits = %d, want 2", got)
+	}
+	if got := atomic.LoadInt32(&p2Hits); got != 2 {
+		t.Errorf("p2 hits = %d, want 2", got)
+	}
+}
+
+func TestModelCache_New_StaggerDefaultAndCancellable(t *testing.T) {
+	cfg := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "p1", BaseURL: "http://127.0.0.1:1", Key: "k"},
+			{Name: "a2", Provider: "p2", BaseURL: "http://127.0.0.1:1", Key: "k"},
+			{Name: "a3", Provider: "p3", BaseURL: "http://127.0.0.1:1", Key: "k"},
+		},
+	}
+	mc, err := New(t.TempDir(), pool.NewPool(cfg.Accounts), cfg)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	if mc.staggerMax != defaultStaggerMax {
+		t.Fatalf("staggerMax in New() = %v, want default %v", mc.staggerMax, defaultStaggerMax)
+	}
+
+	// Set a long stagger duration and verify Stop aborts immediately without hanging
+	mc.SetStaggerForTest(10 * time.Second)
+
+	start := time.Now()
+	mc.RefreshAllAsync(nil)
+
+	// Wait briefly so round starts and enters stagger between providers
+	time.Sleep(50 * time.Millisecond)
+
+	stopDone := make(chan struct{})
+	go func() {
+		mc.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mc.Stop() hung or waited for full stagger duration")
+	}
+
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("mc.Stop() took %v, expected prompt exit (< 3s)", elapsed)
+	}
+}
+
+func TestModelCache_Snapshot_ConcurrentStress(t *testing.T) {
+	cfg1 := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "p1", BaseURL: "http://127.0.0.1:1", Key: "k"},
+		},
+	}
+	cfg2 := &config.Config{
+		Accounts: []config.AccountConfig{
+			{Name: "a1", Provider: "p1", BaseURL: "http://127.0.0.1:1", Key: "k"},
+			{Name: "a2", Provider: "p2", BaseURL: "http://127.0.0.1:1", Key: "k"},
+		},
+	}
+	mc, err := New(t.TempDir(), pool.NewPool(cfg1.Accounts), cfg1)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer mc.Stop()
+
+	stopStress := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Readers running Snapshot
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopStress:
+					return
+				default:
+					_ = mc.Snapshot()
+				}
+			}
+		}()
+	}
+
+	// Writers alternating UpdateConfig and requestPeriodicRefresh
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				select {
+				case <-stopStress:
+					return
+				default:
+					if j%2 == 0 {
+						mc.UpdateConfig(cfg2)
+					} else {
+						mc.UpdateConfig(cfg1)
+					}
+					mc.requestPeriodicRefresh(nil)
+				}
+			}
+		}(i)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	close(stopStress)
+	wg.Wait()
 }

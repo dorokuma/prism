@@ -20,9 +20,35 @@ var (
 	// A variable (not a const) so tests can set it to 0 or a short
 	// duration; the default 6h is unchanged.
 	QuotaReviveAfter = 6 * time.Hour
+
+	// DefaultModelCacheRefreshInterval is the default periodic interval for
+	// model cache background refresh (3 hours).
+	DefaultModelCacheRefreshInterval = 3 * time.Hour
+
+	// ModelCacheMinInterval is the minimum accepted non-zero refresh interval (1 minute).
+	// Values below this trigger a warning and fall back to the default (3h).
+	ModelCacheMinInterval = 1 * time.Minute
+
+	// ModelCacheBackoffInitial is the initial exponential backoff duration for failed background refreshes (30s).
+	ModelCacheBackoffInitial = 30 * time.Second
+
+	// ModelCacheBackoffMax is the cap on exponential backoff for failed background refreshes (1h).
+	ModelCacheBackoffMax = 1 * time.Hour
 )
 
 const (
+	// DefaultModelCacheRefreshStrategy is the default refresh strategy ("full").
+	DefaultModelCacheRefreshStrategy = "full"
+
+	// ModelCacheRefreshStrategyFull refreshes every unique provider on each tick.
+	ModelCacheRefreshStrategyFull = "full"
+
+	// ModelCacheRefreshStrategyStale refreshes only missing or stale providers on each tick.
+	ModelCacheRefreshStrategyStale = "stale"
+)
+
+const (
+
 	// DeepseekV4ProConcurrency is the concurrency limit for DeepSeek v4 (official × 90% safety margin).
 	// Kept for compatibility (exported constant); the built-in DEFAULT per-account
 	// concurrency is now the conservative DefaultAccountConcurrency — model-name
