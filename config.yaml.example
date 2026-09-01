@@ -314,7 +314,7 @@ accounts:
 # 值必须是下方 providers（或 accounts 的 provider 字段）中已存在的 provider 名，
 # 否则启动报错退出。
 # ---------------------------------------------------------------------------
-# default_provider: "agentrouter-anthropic"
+# default_provider: "agentrouter"
 
 # ---------------------------------------------------------------------------
 # 可选：max_concurrent_per_account —— 按模型名精确匹配的单账号最大并发。
@@ -351,9 +351,8 @@ mcp_tools_json: "/var/lib/prism/mcp_tools.json"
 # ---------------------------------------------------------------------------
 # agentrouter 账号池示例（可选接入；默认全部注释，不影响现有账号）
 #
-# 4 个账号 = 2 把 key × 两协议（openai / anthropic）。key 一律省略，走凭证：
-#   PRISM_KEY_AGENTROUTER_OAI_1 / PRISM_KEY_AGENTROUTER_OAI_2 /
-#   PRISM_KEY_AGENTROUTER_ANT_1 / PRISM_KEY_AGENTROUTER_ANT_2
+# key 一律省略，走凭证：
+#   PRISM_KEY_AGENTROUTER_OAI_1 / PRISM_KEY_AGENTROUTER_OAI_2
 # （账号名连字符转下划线后大写，规则同 account-1 → PRISM_KEY_ACCOUNT_1）
 #
 # probe_path: disabled —— 探活端点（GET /v1/models）未实测，disabled 表示
@@ -384,7 +383,7 @@ mcp_tools_json: "/var/lib/prism/mcp_tools.json"
 # QuotaReviveAfter.
 # ---------------------------------------------------------------------------
 # providers:
-#   agentrouter-openai:
+#   agentrouter:
 #     # public_service: true
 #     accounts:
 #       - name: agentrouter-oai-1
@@ -403,24 +402,4 @@ mcp_tools_json: "/var/lib/prism/mcp_tools.json"
 #         headers:
 #           Originator: codex_cli_rs
 #           User-Agent: codex-cli/1.0.0
-#           x-app: cli
-#   agentrouter-anthropic:
-#     accounts:
-#       - name: agentrouter-ant-1
-#         base_url: https://your-gateway.example.com/
-#         skip_pi_sync: true
-#         probe_path: disabled
-#         headers:
-#           User-Agent: "claude-cli/1.0.0 (external, cli)"
-#           anthropic-beta: "claude-code-20250219,interleaved-thinking-20250219"
-#           anthropic-dangerous-direct-browser-access: "true"
-#           x-app: cli
-#       - name: agentrouter-ant-2
-#         base_url: https://your-gateway.example.com/
-#         skip_pi_sync: true
-#         probe_path: disabled
-#         headers:
-#           User-Agent: "claude-cli/1.0.0 (external, cli)"
-#           anthropic-beta: "claude-code-20250219,interleaved-thinking-20250219"
-#           anthropic-dangerous-direct-browser-access: "true"
 #           x-app: cli

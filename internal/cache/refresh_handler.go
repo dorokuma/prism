@@ -114,7 +114,7 @@ func (h *RefreshHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 		util.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": map[string]any{
-				"message": "model cache not initialized",
+				"message": "模型缓存未初始化",
 				"code":    "cache_unavailable",
 			},
 		})
@@ -177,7 +177,7 @@ func (h *RefreshHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 		util.WriteJSON(w, http.StatusTooManyRequests, map[string]any{
 			"error": map[string]any{
-				"message": "rate limit exceeded: max 1 refresh per 10s (burst 2)",
+				"message": "限流：10 秒内最多刷新一次",
 				"code":    "rate_limited",
 			},
 		})

@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dorokuma/prism/internal/cache"
 )
@@ -330,5 +332,62 @@ accounts:
 	}
 	if !strings.Contains(err.Error(), "prov_fail") {
 		t.Fatalf("expected JSON error to mention failed provider prov_fail, got: %v", err)
+	}
+}
+
+func TestPrintSnapshotTable(t *testing.T) {
+	tm := time.Date(2026, 9, 1, 8, 51, 23, 0, time.Local)
+	snaps := map[string]cache.ProviderSnapshot{
+		"agentrouter": {ModelsCount: 15, UpdatedAt: &tm},
+		"x-api":       {ModelsCount: 3, UpdatedAt: nil},
+	}
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+
+	printSnapshotTable(snaps)
+	w.Close()
+	os.Stdout = oldStdout
+
+	var buf strings.Builder
+	_, _ = io.Copy(&buf, r)
+	out := buf.String()
+
+	if !strings.Contains(out, "供应商") || !strings.Contains(out, "模型") || !strings.Contains(out, "更新时间") {
+		t.Errorf("missing expected Chinese headers, got:\n%s", out)
+	}
+	if strings.Contains(out, "BACKOFF") || strings.Contains(out, "PROVIDER") {
+		t.Errorf("old headers should not appear, got:\n%s", out)
+	}
+	if !strings.Contains(out, "09-01 08:51") {
+		t.Errorf("expected short time format '09-01 08:51', got:\n%s", out)
+	}
+	if strings.Contains(out, "2026-09-01") {
+		t.Errorf("year should not appear in short time format, got:\n%s", out)
+	}
+}
+
+func TestPrintSnapshotTable_Empty(t *testing.T) {
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+
+	printSnapshotTable(nil)
+	w.Close()
+	os.Stdout = oldStdout
+
+	var buf strings.Builder
+	_, _ = io.Copy(&buf, r)
+	out := buf.String()
+
+	if strings.TrimSpace(out) != "无供应商" {
+		t.Errorf("expected '无供应商', got %q", out)
 	}
 }

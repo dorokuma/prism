@@ -11,12 +11,15 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/pool"
+	"github.com/dorokuma/prism/internal/render"
 )
 
 var defaultModelCacheDir = "/var/lib/prism/model_cache"
@@ -170,12 +173,12 @@ func runModelsDirect(subcommand, configPath, provider string, jsonOutput bool) e
 					"status":    "error",
 					"provider":  provider,
 					"providers": snapshot,
-					"error":     fmt.Sprintf("refresh failed for %d provider(s): %s", len(failed), strings.Join(failed, ", ")),
+					"error":     fmt.Sprintf("刷新失败 %d 个: %s", len(failed), strings.Join(failed, ", ")),
 				})
 			} else {
 				printSnapshotTable(snapshot)
 			}
-			return fmt.Errorf("refresh failed for %d provider(s): %s", len(failed), strings.Join(failed, ", "))
+			return fmt.Errorf("刷新失败 %d 个: %s", len(failed), strings.Join(failed, ", "))
 		}
 	}
 
@@ -189,7 +192,7 @@ func runModelsDirect(subcommand, configPath, provider string, jsonOutput bool) e
 		})
 	}
 
-	fmt.Printf("Model cache refreshed successfully (direct mode)\n")
+	fmt.Println("刷新成功。")
 	printSnapshotTable(snapshot)
 	return nil
 }
@@ -238,19 +241,19 @@ func runModelsHTTP(subcommand, serverURL, configPath, adminToken, provider strin
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("unauthorized (HTTP 401): provide valid PRISM_ADMIN_TOKEN via --token or environment")
+		return fmt.Errorf("未授权 (401)：需有效 PRISM_ADMIN_TOKEN")
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return fmt.Errorf("rate limit exceeded (HTTP 429): max 1 refresh per 10s")
+		return fmt.Errorf("限流 (429)：10 秒内最多刷新一次")
 	}
 	if resp.StatusCode == http.StatusBadRequest {
-		return fmt.Errorf("bad request (HTTP 400): %s", string(bodyBytes))
+		return fmt.Errorf("请求无效 (400): %s", string(bodyBytes))
 	}
 	if method == http.MethodGet && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status query failed (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf("状态查询失败 (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
 	}
 	if method == http.MethodPost && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("refresh failed (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf("刷新失败 (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	if jsonOutput {
@@ -261,15 +264,15 @@ func runModelsHTTP(subcommand, serverURL, configPath, adminToken, provider strin
 	var refreshResp cache.RefreshResponse
 	if err := json.Unmarshal(bodyBytes, &refreshResp); err == nil {
 		if method == http.MethodPost {
-			fmt.Printf("Model cache refresh accepted (HTTP %d)\n", resp.StatusCode)
+			fmt.Println("刷新成功。")
 		}
 		if refreshResp.Provider != "" {
-			fmt.Printf("Target provider: %s\n", refreshResp.Provider)
+			fmt.Printf("目标供应商: %s\n", refreshResp.Provider)
 		}
 		printSnapshotTable(refreshResp.Providers)
 	} else {
 		if method == http.MethodPost {
-			fmt.Printf("Model cache refresh accepted: %s\n", string(bodyBytes))
+			fmt.Printf("刷新成功: %s\n", string(bodyBytes))
 		} else {
 			fmt.Println(string(bodyBytes))
 		}
@@ -310,20 +313,39 @@ func resolveBaseURLFromConfig(configPath string) string {
 
 func printSnapshotTable(snapshots map[string]cache.ProviderSnapshot) {
 	if len(snapshots) == 0 {
-		fmt.Println("No providers configured.")
+		fmt.Println("无供应商")
 		return
 	}
-	fmt.Printf("%-25s %-12s %-10s %s\n", "PROVIDER", "MODELS", "BACKOFF", "UPDATED AT")
-	fmt.Println(strings.Repeat("-", 75))
-	for name, s := range snapshots {
+
+	names := make([]string, 0, len(snapshots))
+	for name := range snapshots {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	rows := make([][]string, 0, len(names))
+	for _, name := range names {
+		s := snapshots[name]
 		updated := "-"
 		if s.UpdatedAt != nil {
-			updated = s.UpdatedAt.Format("2006-01-02 15:04:05")
+			updated = s.UpdatedAt.Format("01-02 15:04")
 		}
-		backoff := "no"
-		if s.InBackoff {
-			backoff = "yes"
-		}
-		fmt.Printf("%-25s %-12d %-10s %s\n", name, s.ModelsCount, backoff, updated)
+		rows = append(rows, []string{
+			name,
+			strconv.Itoa(s.ModelsCount),
+			updated,
+		})
 	}
+
+	tbl := &render.Table{
+		Columns: []render.Column{
+			{Title: "供应商", Align: render.AlignLeft},
+			{Title: "模型", Align: render.AlignRight},
+			{Title: "更新时间", Align: render.AlignRight},
+		},
+		Rows:   rows,
+		Indent: "  ",
+		Gap:    " ",
+	}
+	fmt.Print(tbl.Render())
 }

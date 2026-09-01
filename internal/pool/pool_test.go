@@ -423,8 +423,8 @@ func TestSelectByProviderCrossProviderIsolation(t *testing.T) {
 func TestSelectByProviderHighTrafficIsolation(t *testing.T) {
 	cfgs := []config.AccountConfig{
 		{Name: "plan-3", Key: "key-plan", BaseURL: "http://localhost:8001", Provider: "plan"},
-		{Name: "oai-1", Key: "key-oai1", BaseURL: "http://localhost:8002", Provider: "agentrouter-openai"},
-		{Name: "oai-2", Key: "key-oai2", BaseURL: "http://localhost:8003", Provider: "agentrouter-openai"},
+		{Name: "oai-1", Key: "key-oai1", BaseURL: "http://localhost:8002", Provider: "agentrouter"},
+		{Name: "oai-2", Key: "key-oai2", BaseURL: "http://localhost:8003", Provider: "agentrouter"},
 	}
 	p := NewPool(cfgs)
 	ctx := context.Background()
@@ -444,7 +444,7 @@ func TestSelectByProviderHighTrafficIsolation(t *testing.T) {
 	// The low-traffic provider must still rotate strictly 2:2.
 	var got []string
 	for i := 0; i < 4; i++ {
-		acc, slot, err := p.SelectByProvider(ctx, "m", 1, "agentrouter-openai")
+		acc, slot, err := p.SelectByProvider(ctx, "m", 1, "agentrouter")
 		if err != nil {
 			t.Fatalf("agent select %d: %v", i, err)
 		}

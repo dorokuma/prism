@@ -1826,7 +1826,7 @@ providers:
           User-Agent: "claude-cli/1.0.0 (external, cli)"
           anthropic-beta: "claude-code-20250219,interleaved-thinking-20250219"
           x-app: cli
-  agentrouter-openai:
+  agentrouter:
     accounts:
       - name: agentrouter-oai-1
         base_url: https://gw.example.com/v1
@@ -1896,8 +1896,8 @@ providers:
 		t.Errorf("ant x-app = %q", ant.Headers["x-app"])
 	}
 
-	if oai.Provider != "agentrouter-openai" {
-		t.Errorf("oai provider = %q, want agentrouter-openai", oai.Provider)
+	if oai.Provider != "agentrouter" {
+		t.Errorf("oai provider = %q, want agentrouter", oai.Provider)
 	}
 	if !oai.SkipPISync {
 		t.Error("oai skip_pi_sync = false, want true")

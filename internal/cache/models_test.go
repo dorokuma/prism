@@ -681,7 +681,7 @@ func TestFetch_AppliesAccountHeaders(t *testing.T) {
 		pool: pool.NewPool([]config.AccountConfig{
 			{
 				Name:     "a1",
-				Provider: "agentrouter-openai",
+				Provider: "agentrouter",
 				BaseURL:  srv.URL + "/v1",
 				Key:      "test-key-12345",
 				Headers:  map[string]string{"Originator": "codex_cli_rs", "x-app": "cli"},
@@ -690,10 +690,10 @@ func TestFetch_AppliesAccountHeaders(t *testing.T) {
 		stop: make(chan struct{}),
 	}
 
-	if err := mc.Fetch("agentrouter-openai"); err != nil {
+	if err := mc.Fetch("agentrouter"); err != nil {
 		t.Fatalf("Fetch with account headers: %v", err)
 	}
-	models := mc.GetModels("agentrouter-openai")
+	models := mc.GetModels("agentrouter")
 	if len(models) != 1 || models[0].ID != "claude-opus-4-8" {
 		t.Fatalf("expected fetched model list, got %v", models)
 	}
@@ -729,7 +729,7 @@ func TestFetch_AuthHeaderCustom(t *testing.T) {
 		pool: pool.NewPool([]config.AccountConfig{
 			{
 				Name:       "a1",
-				Provider:   "agentrouter-openai",
+				Provider:   "agentrouter",
 				BaseURL:    srv.URL + "/v1",
 				Key:        "raw-key-98765",
 				AuthHeader: "x-api-key",
@@ -738,10 +738,10 @@ func TestFetch_AuthHeaderCustom(t *testing.T) {
 		stop: make(chan struct{}),
 	}
 
-	if err := mc.Fetch("agentrouter-openai"); err != nil {
+	if err := mc.Fetch("agentrouter"); err != nil {
 		t.Fatalf("Fetch with custom auth_header: %v", err)
 	}
-	models := mc.GetModels("agentrouter-openai")
+	models := mc.GetModels("agentrouter")
 	if len(models) != 1 || models[0].ID != "gpt-5.6-sol" {
 		t.Fatalf("expected fetched model list, got %v", models)
 	}

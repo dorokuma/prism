@@ -817,7 +817,7 @@ func TestDoUpstreamAccountHeadersOverride(t *testing.T) {
 		Name:     "test",
 		Key:      "sk-test-key",
 		BaseURL:  upstream.URL,
-		Provider: "agentrouter-openai",
+		Provider: "agentrouter",
 		Headers: map[string]string{
 			"User-Agent": "codex-cli/1.0.0",
 			"Originator": "codex_cli_rs",
@@ -830,7 +830,7 @@ func TestDoUpstreamAccountHeadersOverride(t *testing.T) {
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}`)))
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("User-Agent", "client-ua-should-lose")
-	r.Header.Set("X-Prism-Provider", "agentrouter-openai")
+	r.Header.Set("X-Prism-Provider", "agentrouter")
 
 	proxyChatWithBody(p, rec, r, []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}`), time.Now(), ChatForwardOpts{}, cfg)
 
