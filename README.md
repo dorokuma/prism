@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.26.0  Date: 2026-09-01  Status: living document
+> Version: v0.26.1  Date: 2026-09-01  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -226,6 +226,7 @@ MIT
 
 ## Changelog
 
+- **2026-09-01** — v0.26.1 — fix(models): left-align the updated-at column in the models snapshot table to match its header.
 - **2026-09-01** — v0.26.0 — feat(models): models snapshot table revamp and agentrouter provider rename. Switched models snapshot table to compact Chinese 3-column render.Table (供应商/模型/更新时间), removed BACKOFF column, shortened time format to MM-DD HH:MM, translated refresh/error status messages to Chinese, and renamed agentrouter-openai to agentrouter with anthropic protocol example cleaned up.
 - **2026-09-01** — v0.25.0 — feat(usage): usage report revamp. Formatted model names (strip provider prefixes, date/-latest suffixes, truncate to max 20 chars), simplified top-level summary to one line per metric (requests, total tokens, total cost) and removed hit rate lines, dropped input/output token and cost columns from detail tables, and removed period header lines.
 - **2026-08-31** — v0.24.0 — feat: 3h periodic full model cache refresh, administrative manual refresh HTTP API (`POST /prism/v1/models/refresh`), thin CLI (`prism models refresh`), and dual-review residue cleanup. Added configurable `model_cache_refresh_interval` (default 3h, 0 to disable) and `model_cache_refresh_strategy` (default "full", optional "stale"). Includes +/-10% periodic jitter, 0-2s provider stagger, failure exponential backoff (30s*2^(n-1) capped at 1h), deduped unique provider rounds, singleflight leader sharing, pending queue upgrades, dedicated 10s/req token-bucket rate limiting with admin auth, and `--direct` local CLI execution.

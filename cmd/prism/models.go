@@ -341,7 +341,7 @@ func printSnapshotTable(snapshots map[string]cache.ProviderSnapshot) {
 		Columns: []render.Column{
 			{Title: "供应商", Align: render.AlignLeft},
 			{Title: "模型", Align: render.AlignRight},
-			{Title: "更新时间", Align: render.AlignRight},
+			{Title: "更新时间", Align: render.AlignLeft},
 		},
 		Rows:   rows,
 		Indent: "  ",
