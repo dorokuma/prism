@@ -2,6 +2,7 @@ package usage
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -68,8 +69,6 @@ func DescribePeriod(from, to, now int64) string {
 // ReportOptions controls the shared report renderer used by both the prism
 // usage CLI and the HTTP format=table output.
 type ReportOptions struct {
-	// Period is the human-readable time-range description (DescribePeriod).
-	Period string
 	// Color enables ANSI coloring (bold header). Alignment is computed on
 	// the de-colored text, so colored output stays aligned; with Color
 	// false, ANSI sequences are stripped and piped output is plain text.
@@ -87,22 +86,9 @@ type ReportOptions struct {
 func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts ReportOptions) string {
 	var b strings.Builder
 	b.WriteString(render.RenderSummary(render.Summary{
-		Period:   opts.Period,
 		Requests: ov.Requests,
 		Tokens:   ov.TotalTokens,
 		Cost:     ov.TotalCost,
-		// Cache-hit segments are split by usage_source with per-family
-		// denominators: OpenAI-form rows (usage_source = 'openai', legacy
-		// NULL/empty rows) count cached/prompt — cached is a subset of
-		// prompt there. Anthropic-form rows (usage_source = 'anthropic' or
-		// 'pi') count cache_read against the assembled total input (input +
-		// cache_read + cache_creation),
-		// because Anthropic input_tokens excludes the cache counters; that
-		// keeps the ratio ≤ 100% and matches the upstream billing basis. A
-		// source family with zero requests gets no segment at all.
-		OpenAI: segment(ov.OpenAIRequests, ov.OpenAICachedTokens, ov.OpenAIPromptTokens),
-		Anthropic: segment(ov.AnthropicRequests, ov.AnthropicCachedTokens,
-			ov.AnthropicPromptTokens+ov.AnthropicCachedTokens+ov.AnthropicCacheWriteTokens),
 	}))
 	b.WriteByte('\n')
 	cols, cells := usageTableData(rows, groupBy)
@@ -110,43 +96,30 @@ func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts R
 	return b.String()
 }
 
-// segment builds a render.CacheStats for one source family, or nil when that
-// family had no requests in range (the renderer then omits the segment
-// entirely instead of showing "0 (0.0%)"). Hits and input are already the
-// family-specific numbers; the Anthropic caller passes the assembled total
-// input as input.
-func segment(requests, hits, input int64) *render.CacheStats {
-	if requests == 0 {
-		return nil
-	}
-	return &render.CacheStats{Hits: hits, Input: input}
-}
-
 // usageTableData builds the detail section's column definitions and cell
 // rows from the summary rows: one column per group_by key (the model group
 // uses the "模型" title, other group keys keep their short name), then
-// 请求 / 输入词元 / 缓存 / 命中率 / 输出词元 / 花费. The Total column is
-// deliberately not rendered. Request/token cells use the compact k/M
-// notation (display precision only — the stored aggregates are unchanged),
-// the cost cell uses the compact cost format. Group values are never
-// truncated: the group column is sized to its widest cell, so model names
-// and other group values render in full.
+// 请求 / 缓存 / 命中率. The Total column is
+// deliberately not rendered. Request cells use the compact k/M
+// notation (display precision only — the stored aggregates are unchanged).
+// When the first group column is "model", it is capped at MaxWidth 20 with ellipsis truncation.
 func usageTableData(rows []SummaryRow, groupBy []string) ([]render.Column, [][]string) {
-	cols := make([]render.Column, 0, len(groupBy)+6)
-	for _, g := range groupBy {
+	cols := make([]render.Column, 0, len(groupBy)+3)
+	for i, g := range groupBy {
 		title := g
+		maxWidth := 0
 		if g == "model" {
 			title = "模型"
+			if i == 0 {
+				maxWidth = 20
+			}
 		}
-		cols = append(cols, render.Column{Title: title, Align: render.AlignLeft})
+		cols = append(cols, render.Column{Title: title, Align: render.AlignLeft, MaxWidth: maxWidth})
 	}
 	cols = append(cols,
 		render.Column{Title: "请求", Align: render.AlignRight},
-		render.Column{Title: "输入词元", Align: render.AlignRight},
 		render.Column{Title: "缓存", Align: render.AlignRight},
 		render.Column{Title: "命中率", Align: render.AlignRight},
-		render.Column{Title: "输出词元", Align: render.AlignRight},
-		render.Column{Title: "花费", Align: render.AlignRight},
 	)
 	cells := make([][]string, 0, len(rows))
 	for _, r := range rows {
@@ -156,11 +129,8 @@ func usageTableData(rows []SummaryRow, groupBy []string) ([]render.Column, [][]s
 		}
 		row = append(row,
 			formatRequests(r.Requests),
-			render.FormatTokens(r.PromptTokens),
 			render.FormatTokens(r.CachedTokens),
 			cacheHitRate(r.CachedTokens, r.cacheHitInput()),
-			render.FormatTokens(r.CompletionTokens),
-			render.FormatCostCompact(r.CostUSD),
 		)
 		cells = append(cells, row)
 	}
@@ -203,15 +173,47 @@ func cacheHitRate(cached, input int64) string {
 	return render.FormatPercent(float64(cached), float64(input))
 }
 
+var modelDateSuffixRe = regexp.MustCompile(`-(?:\d{8}|\d{4}-\d{2}-\d{2})$`)
+
+// FormatModelName formats a model name for table display:
+// 1. Strips the provider prefix (the substring after the last '/'; if empty, keeps original).
+// 2. Strips trailing date suffixes (-YYYYMMDD, -YYYY-MM-DD) and trailing -latest.
+// Other suffixes (such as -4.5, -flash, -preview, :free) are preserved.
+func FormatModelName(name string) string {
+	orig := name
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		short := name[idx+1:]
+		if short != "" {
+			name = short
+		}
+	}
+	for {
+		trimmed := modelDateSuffixRe.ReplaceAllString(name, "")
+		trimmed = strings.TrimSuffix(trimmed, "-latest")
+		if trimmed == name || trimmed == "" {
+			break
+		}
+		name = trimmed
+	}
+	if name == "" {
+		return orig
+	}
+	return name
+}
+
 // formatGroupValue renders one group key value for the table. Time buckets
 // (hour/day) are unix seconds and are shown as local-time dates; stream and
-// success are 0/1 integers and are shown as words; everything else is the
-// stored string.
+// success are 0/1 integers and are shown as words; model names are formatted
+// via FormatModelName; everything else is the stored string.
 func formatGroupValue(g string, v any) string {
 	if v == nil {
 		return ""
 	}
 	switch g {
+	case "model":
+		if s, ok := v.(string); ok {
+			return FormatModelName(s)
+		}
 	case "hour", "day":
 		if n, ok := v.(int64); ok {
 			t := time.Unix(n, 0)

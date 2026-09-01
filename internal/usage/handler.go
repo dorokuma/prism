@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/dorokuma/prism/internal/adminauth"
 	"github.com/dorokuma/prism/internal/util"
@@ -67,7 +66,9 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeSummaryError(w, err)
 		return
 	}
-	weekDefault := h.applyDefaultRange(r, &q)
+	// applyDefaultRange mutates q with the default time range when the
+	// request omits from/to; the resolved range is used by every format.
+	h.applyDefaultRange(r, &q)
 	// format=table renders the same report as the prism usage CLI (shared
 	// render code); format=json (default) is the existing behavior.
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
@@ -75,7 +76,7 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "", "json":
 		// existing JSON behavior, unchanged
 	case "table":
-		h.serveTable(w, r, q, weekDefault)
+		h.serveTable(w, r, q)
 		return
 	default:
 		writeSummaryError(w, &QueryError{Msg: "invalid format"})
@@ -106,7 +107,7 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // produced by the same code. The compact single-line table is the only
 // layout — there are no layout/width params and no terminal-width
 // dependency.
-func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q SummaryQuery, weekDefault bool) {
+func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q SummaryQuery) {
 	ov, err := h.Store.Overview(r.Context(), q)
 	if err != nil {
 		slog.Error("usage: overview query failed", "error", err)
@@ -128,13 +129,7 @@ func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q Su
 		})
 		return
 	}
-	period := DescribePeriod(q.From, q.To, time.Now().Unix())
-	if weekDefault {
-		period = PeriodWeek
-	}
-	body := RenderUsageReport(ov, rows, q.GroupBy, ReportOptions{
-		Period: period,
-	})
+	body := RenderUsageReport(ov, rows, q.GroupBy, ReportOptions{})
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, body)

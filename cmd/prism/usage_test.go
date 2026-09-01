@@ -476,35 +476,37 @@ func TestRunUsageTable(t *testing.T) {
 	out := buf.String()
 	// summary from Overview: all 5 requests, 750 total tokens, 4 priced
 	// events × $0.15 (price 1000/1000 on 150 tokens each)
-	if !strings.Contains(out, "本周  ·  5 请求  ·  750 词元  ·  $0.600") {
+	if !strings.Contains(out, "  请求     5\n  总词元   750\n  总开销   $0.600\n") {
 		t.Errorf("summary line missing/wrong:\n%s", out)
 	}
 	// missing-price hint must not appear
 	if strings.Contains(out, "未算出金额") {
 		t.Errorf("missing-price warning must not appear:\n%s", out)
 	}
-	// compact table: one header line carrying both token labels, with the
+	// compact table: one header line, with the
 	// short 请求/缓存 headers (never the long 请求数/缓存命中)
 	h := usageTableHeader(out)
 	if h == "" {
 		t.Fatalf("default output must be the compact single-line table:\n%s", out)
 	}
-	for _, want := range []string{"模型", "请求", "输入词元", "缓存", "命中率", "输出词元", "花费"} {
+	for _, want := range []string{"模型", "请求", "缓存", "命中率"} {
 		if !strings.Contains(h, want) {
 			t.Errorf("table header missing %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(h, "未计价") {
-		t.Errorf("未计价 column must not appear:\n%s", out)
+	for _, gone := range []string{"输入词元", "输出词元", "未计价", "花费"} {
+		if strings.Contains(h, gone) {
+			t.Errorf("%q must not appear:\n%s", gone, out)
+		}
 	}
 	if strings.Contains(out, "请求数") {
 		t.Errorf("the long 请求数 header must be gone:\n%s", out)
 	}
-	// one row per model, each row carrying all its values; nil cost as dash
+	// one row per model, each row carrying all its values
 	rows := map[string][]string{
-		"alpha": {"2", "200", "0.0%", "100", "$0.30"},
-		"beta":  {"1", "100", "0.0%", "50", "-"},
-		"gamma": {"2", "200", "0.0%", "100", "$0.30"},
+		"alpha": {"2", "0", "0.0%"},
+		"beta":  {"1", "0", "0.0%"},
+		"gamma": {"2", "0", "0.0%"},
 	}
 	for m, vals := range rows {
 		lines := 0
@@ -799,14 +801,12 @@ func TestRunUsageSplitCacheSegments(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	// openai bucket = openai row + NULL legacy row: (900+80)/(1000+100) =
-	// 980/1100 = 89.1%; anthropic bucket: 500/(1+500+0) = 99.8%.
-	if !strings.Contains(out, "命中(OpenAI) 980 (89.1%)   命中(Anthropic) 500 (99.8%)") {
-		t.Errorf("split cache segments missing or wrong:\n%s", out)
+	// Overview does not render cache hit lines
+	if strings.Contains(out, "命中(OpenAI)") || strings.Contains(out, "命中(Anthropic)") || strings.Contains(out, "缓存命中") {
+		t.Errorf("cache segments must not appear in overview:\n%s", out)
 	}
-	// The old single-segment format must be gone.
-	if strings.Contains(out, "缓存命中 980 (") || strings.Contains(out, "缓存命中 500 (") {
-		t.Errorf("old single-segment format still present:\n%s", out)
+	if !strings.Contains(out, "  请求     3\n") {
+		t.Errorf("expected 3-line overview:\n%s", out)
 	}
 	if strings.Contains(out, "50000") {
 		t.Errorf("claude table row still uses cached/prompt:\n%s", out)
@@ -843,10 +843,10 @@ func TestRunUsageSplitCacheSegments(t *testing.T) {
 
 // usageTableHeader returns the header line of the CLI usage report (the
 // compact single-line table is the only layout), or "" when the report has
-// no single header line carrying both token labels.
+// no single header line carrying the expected headers.
 func usageTableHeader(s string) string {
 	for _, line := range strings.Split(s, "\n") {
-		if strings.Contains(line, "输入词元") && strings.Contains(line, "输出词元") {
+		if strings.Contains(line, "请求") && strings.Contains(line, "缓存") {
 			return line
 		}
 	}

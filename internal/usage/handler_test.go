@@ -323,20 +323,21 @@ func TestHandlerTableFormat(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
 		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
-	// widths: 模型 4 | 请求 4 | 输入词元 8 | 缓存 4 | 命中率 6 | 输出词元 8 | 花费 5
-	want := "  全部时间  ·  2 请求  ·  300 词元  ·  $0.150\n" +
-		"  命中(OpenAI) 0 (0.0%)\n" +
+	// widths: 模型 4 | 请求 4 | 缓存 4 | 命中率 6
+	want := "  请求     2\n" +
+		"  总词元   300\n" +
+		"  总开销   $0.150\n" +
 		"\n" +
-		"  模型" + strings.Repeat(" ", 1) + "请求 输入词元 缓存 命中率 输出词元  花费\n" +
-		"  a" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 6) + "100" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%" + strings.Repeat(" ", 7) + "50 $0.15\n" +
-		"  b" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 6) + "100" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%" + strings.Repeat(" ", 7) + "50     -\n"
+		"  模型" + strings.Repeat(" ", 1) + "请求 缓存 命中率\n" +
+		"  a" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%\n" +
+		"  b" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%\n"
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("table body mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}
 
 	// format=table must be equivalent to the CLI renderer: the summary
 	// counts come from Overview (not from the LIMIT-truncated rows).
-	if !strings.Contains(rec.Body.String(), "2 请求  ·  300 词元") {
+	if !strings.Contains(rec.Body.String(), "请求     2") || !strings.Contains(rec.Body.String(), "总词元   300") {
 		t.Errorf("table summary must come from Overview:\n%s", rec.Body.String())
 	}
 }
@@ -363,10 +364,12 @@ func TestHandlerTableFormatMixedSources(t *testing.T) {
 		t.Fatalf("table: got %d, body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	// openai 900/1000 = 90.0%; anthropic 500/(1+500+0) = 99.8% — both
-	// independent, neither above 100%.
-	if !strings.Contains(body, "命中(OpenAI) 900 (90.0%)   命中(Anthropic) 500 (99.8%)") {
-		t.Errorf("split cache segments missing or wrong:\n%s", body)
+	// Cache hit lines must not appear in overview.
+	if strings.Contains(body, "命中(OpenAI)") || strings.Contains(body, "命中(Anthropic)") || strings.Contains(body, "缓存命中") {
+		t.Errorf("cache segments must not appear in overview:\n%s", body)
+	}
+	if !strings.Contains(body, "  请求     2\n") {
+		t.Errorf("expected 3-line overview:\n%s", body)
 	}
 	// Ungrouped table row: 1400 hits over openai prompt 1000 + anthropic
 	// assembled 501 = 1501 → 93.3%. cached/prompt (1400/1001 = 139.9%)
@@ -425,7 +428,7 @@ func TestHandlerTableNoData(t *testing.T) {
 		t.Errorf("Content-Type = %q", ct)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "全部时间  ·  0 请求") {
+	if !strings.Contains(body, "  请求     0") {
 		t.Errorf("empty-range summary missing:\n%s", body)
 	}
 	if !strings.Contains(body, "(no data)") {
@@ -591,8 +594,8 @@ func TestHandlerDefaultFromWeek(t *testing.T) {
 		t.Fatalf("table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "本周") {
-		t.Errorf("default table must label 本周:\n%s", body)
+	if strings.Contains(body, "本周") {
+		t.Errorf("table must not label the period:\n%s", body)
 	}
 	if strings.Contains(body, "全部时间") {
 		t.Errorf("default table must not be 全部时间:\n%s", body)
@@ -609,9 +612,8 @@ func TestHandlerDefaultFromWeek(t *testing.T) {
 		t.Fatalf("from=0: got %d", rec.Code)
 	}
 	all := rec.Body.String()
-	if !strings.Contains(all, "全部时间") {
-		t.Errorf("from=0 must stay 全部时间:\n%s", all)
-	}
+	// The period label is no longer rendered; from=0 is verified by the
+	// pre-week row being included below.
 	if !strings.Contains(all, "  old") {
 		t.Errorf("from=0 must include old row:\n%s", all)
 	}

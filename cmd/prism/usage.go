@@ -190,8 +190,7 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 		// never depends on the terminal width, so --watch redraws are
 		// stable and non-TTY output (e.g. a π panel capture) is identical.
 		_, err = io.WriteString(out, usage.RenderUsageReport(ov, rows, q.GroupBy, usage.ReportOptions{
-			Period: period,
-			Color:  color,
+			Color: color,
 		}))
 		return err
 	}
