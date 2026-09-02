@@ -13,3 +13,4 @@ context_mode.db-wal
 *.db
 *.db-shm
 *.db-wal
+config.yaml.bak-*

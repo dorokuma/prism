@@ -70,10 +70,20 @@ func (c Config) withDefaults() Config {
 }
 
 // clientSecret resolves the desktop-client credential: an explicit Config
-// value wins (tests, alternate clients), otherwise the environment variable.
+// value wins (tests, alternate clients), then the systemd LoadCredential
+// directory (mirrors config.getCredential — on this host LoadCredential
+// files are exposed under $CREDENTIALS_DIRECTORY, not as env vars), then
+// the environment variable.
 func clientSecret(c Config) string {
 	if c.ClientSecret != "" {
 		return c.ClientSecret
+	}
+	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
+		if data, err := os.ReadFile(filepath.Join(dir, ClientSecretEnv)); err == nil {
+			if s := strings.TrimSpace(string(data)); s != "" {
+				return s
+			}
+		}
 	}
 	return os.Getenv(ClientSecretEnv)
 }
