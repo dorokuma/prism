@@ -4724,3 +4724,38 @@ func TestModelCache_Snapshot_ConcurrentStress(t *testing.T) {
 	close(stopStress)
 	wg.Wait()
 }
+
+// TestFetchSkippedProviderReturnsError pins skip_model_cache: a direct
+// Fetch for the skipped provider returns ErrModelCacheSkipped (never a
+// silent nil), so /v1/models answers an error instead of a 200 empty list.
+func TestFetchSkippedProviderReturnsError(t *testing.T) {
+	cfg := &config.Config{Accounts: []config.AccountConfig{
+		{Name: "Gemini", Provider: "gemini", BaseURL: "https://cloudcode-pa.googleapis.com", SkipModelCache: true},
+	}}
+	mc, err := New(t.TempDir(), pool.NewPool(cfg.Accounts), cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := mc.Fetch("gemini"); !errors.Is(err, ErrModelCacheSkipped) {
+		t.Fatalf("Fetch(skipped) = %v, want ErrModelCacheSkipped", err)
+	}
+}
+
+// TestRefreshAllSkipsSkippedProviderSilently pins that background refresh
+// rounds skip quota-only providers BEFORE fetching: no request, no backoff.
+func TestRefreshAllSkipsSkippedProviderSilently(t *testing.T) {
+	cfg := &config.Config{Accounts: []config.AccountConfig{
+		{Name: "Gemini", Provider: "gemini", BaseURL: "https://cloudcode-pa.googleapis.com", SkipModelCache: true},
+	}}
+	mc, err := New(t.TempDir(), pool.NewPool(cfg.Accounts), cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	mc.RefreshAll() // synchronous round
+	mc.refreshMu.Lock()
+	_, hasBackoff := mc.backoffs["gemini"]
+	mc.refreshMu.Unlock()
+	if hasBackoff {
+		t.Fatal("skipped provider must not record a backoff")
+	}
+}

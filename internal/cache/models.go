@@ -49,6 +49,14 @@ var ErrFetchSaturated = errors.New("model cache fetch saturated")
 // the leader's stack; fetchWithContext only guarantees the cleanup.
 var ErrFetchAborted = errors.New("model fetch leader aborted")
 
+// ErrModelCacheSkipped is returned by Fetch for a provider whose accounts
+// set skip_model_cache (quota-only upstreams like Gemini / Antigravity).
+// internal/proxy maps it to HTTP 502 model_fetch_failed on the /v1/models
+// cache-miss path so a skipped provider never answers a 200 empty list
+// (clients would cache "no models" forever). Background refresh rounds skip
+// such providers BEFORE calling fetch, so they stay silent.
+var ErrModelCacheSkipped = errors.New("model cache skipped for provider")
+
 // ModelCache manages per-provider model list caches persisted to disk.
 type ModelCache struct {
 	dir    string
@@ -256,6 +264,23 @@ func providerSkipPISync(cfg *config.Config, provider string) bool {
 	}
 	for _, acc := range cfg.Accounts {
 		if acc.Provider == provider && acc.SkipPISync {
+			return true
+		}
+	}
+	return false
+}
+
+// providerSkipModelCache reports whether a provider is excluded from
+// upstream model fetching entirely (skip_model_cache on any account).
+// Quota-only accounts (Gemini / Antigravity) answer neither /v1/models
+// nor a model list; fetching them would only produce 404 noise in the
+// refresh loop. The provider stays visible to planusage quota polling.
+func providerSkipModelCache(cfg *config.Config, provider string) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, acc := range cfg.Accounts {
+		if acc.Provider == provider && acc.SkipModelCache {
 			return true
 		}
 	}
@@ -566,6 +591,14 @@ func (mc *ModelCache) fetchWithContext(ctx context.Context, provider string) err
 // the wakeup would strand waiters until some business request happened to
 // release the same account.
 func (mc *ModelCache) fetchWait(waitCtx, workCtx context.Context, provider string) (err error) {
+	// Quota-only providers never hit the upstream /v1/models: skip before
+	// any inflight registration so followers park on nothing and the
+	// background refresh loop stays silent for them. The explicit error
+	// (not nil) keeps the /v1/models cache-miss invariant: a skipped
+	// provider must not look like a successful fetch of zero models.
+	if providerSkipModelCache(mc.snapshotConfig(), provider) {
+		return fmt.Errorf("%w: provider %q", ErrModelCacheSkipped, provider)
+	}
 	// Join an in-flight same-provider fetch when one exists. A follower
 	// waits on the leader's done channel OUTSIDE fetchMu (the lock never
 	// spans the wait) and can cancel its OWN wait independently: a follower
@@ -1104,6 +1137,12 @@ func (mc *ModelCache) runRefresh(ctx context.Context, kind roundKind, target str
 
 	for idx, provider := range providers {
 		if provider == "" {
+			continue
+		}
+		// Quota-only providers are skipped silently BEFORE the fetch: no
+		// request, no backoff, no error log. (The fetch path itself also
+		// guards with ErrModelCacheSkipped for direct Fetch callers.)
+		if providerSkipModelCache(cfg, provider) {
 			continue
 		}
 		if idx > 0 && staggerMax > 0 && len(providers) > 1 {

@@ -250,7 +250,7 @@ model_remap:
 #   default_key_id: anonymous
 
 # ---------------------------------------------------------------------------
-# 可选：quota —— 上游套餐用量快照（当前：SuperGrok 周限）。
+# 可选：quota —— 上游套餐用量快照（SuperGrok 周限 + Gemini 5小时/周限）。
 # 和上面的 usage 不是一层：usage 是本地词元账本，quota 是官方限额百分比。
 # 关掉 usage.enabled 不影响 quota。
 #
@@ -267,8 +267,9 @@ model_remap:
 #   refresh_interval: 120s
 #   request_timeout: 5s
 
-# oauth_dir: SuperGrok / xAI device-code tokens (0600 JSON). Default
-# /var/lib/prism/oauth/<account>.json. Written by `prism auth xai`.
+# oauth_dir: SuperGrok / Gemini OAuth tokens (0600 JSON). Default
+# /var/lib/prism/oauth/<account>.json. Written by `prism auth xai` /
+# `prism auth google`.
 # oauth_dir: /var/lib/prism/oauth
 
 accounts:
@@ -299,10 +300,24 @@ accounts:
   # SuperGrok / xAI OAuth (no static key). Then run: prism auth xai
   # Tokens refresh on the request path. Base URL is api.x.ai (Pi's built-in
   # xAI provider), not cli-chat-proxy.
-  # - name: supergrok
+  # - name: SuperGrok
   #   provider: xai
   #   oauth: xai
   #   base_url: https://api.x.ai/v1
+  #
+  # Gemini / Antigravity OAuth (no static key). Then run:
+  #   prism auth google [--from ~/.gemini/antigravity-cli/antigravity-oauth-token]
+  # Quota-only: skip_pi_sync + skip_model_cache + probe_path disabled so
+  # prism does not treat Cloud Code as a chat upstream. NOTE: the provider
+  # name "gemini" is taken by this quota-only account — do not point a
+  # chat provider at the same name.
+  # - name: Gemini
+  #   provider: gemini
+  #   oauth: google
+  #   base_url: https://cloudcode-pa.googleapis.com
+  #   skip_pi_sync: true
+  #   skip_model_cache: true
+  #   probe_path: disabled
 
 # ---------------------------------------------------------------------------
 # 可选：default_provider —— 请求未带 X-Prism-Provider 头时的兜底 provider。

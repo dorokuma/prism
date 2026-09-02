@@ -15,6 +15,7 @@ import (
 
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/oauth"
+	"github.com/dorokuma/prism/internal/oauth/google"
 	"github.com/dorokuma/prism/internal/oauth/xai"
 	"github.com/dorokuma/prism/internal/planusage"
 	"github.com/dorokuma/prism/internal/usage"
@@ -73,20 +74,31 @@ func applyQuotaGrokEstimate(ctx context.Context, cfg *config.Config, snap planus
 	return planusage.ApplyGrokWeekEstimate(ctx, snap, store.SumGrokTokens, planusage.DefaultGrokEstimatePath, time.Now())
 }
 
-// quotaCredential is the upstream credential for prism quota. SuperGrok
-// oauth accounts have no static YAML key; the CLI reads the same token
-// file the service uses (`prism auth xai`).
+// quotaCredential is the upstream credential for prism quota. OAuth
+// accounts have no static YAML key; the CLI reads the same token file
+// the service uses (`prism auth xai` / `prism auth google`).
 func quotaCredential(cfg *config.Config, a config.AccountConfig) string {
-	if strings.TrimSpace(a.OAuth) != "xai" {
-		return a.Key
-	}
 	if strings.TrimSpace(a.Key) != "" {
 		return a.Key
 	}
 	client := &http.Client{Timeout: 20 * time.Second}
-	src := oauth.NewXAISource(cfg.OAuthDir, a.Name, func(ctx context.Context, refresh string) (xai.Tokens, error) {
-		return xai.Refresh(ctx, xai.Config{HTTP: client}, refresh)
-	})
+	var src *oauth.Source
+	switch strings.TrimSpace(a.OAuth) {
+	case "xai":
+		src = oauth.NewSource(cfg.OAuthDir, a.Name, "xai", func(ctx context.Context, refresh string) (xai.Tokens, error) {
+			return xai.Refresh(ctx, xai.Config{HTTP: client}, refresh)
+		})
+	case "google":
+		src = oauth.NewSource(cfg.OAuthDir, a.Name, "google", func(ctx context.Context, refresh string) (xai.Tokens, error) {
+			tok, err := google.Refresh(ctx, google.Config{HTTP: client}, refresh)
+			if err != nil {
+				return xai.Tokens{}, err
+			}
+			return xai.Tokens{Access: tok.Access, Refresh: tok.Refresh, ExpiresAt: tok.ExpiresAt}, nil
+		})
+	default:
+		return a.Key
+	}
 	tok, err := src.Token(context.Background())
 	if err != nil {
 		return ""
@@ -103,7 +115,7 @@ func runQuotaWith(args []string, out io.Writer) error {
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), `用法: prism quota [flags]
 
-查询 SuperGrok 周池占用（cli-chat-proxy /billing，OAuth token）。
+查询 SuperGrok 周池与 Gemini 5小时/周限占用。
 不依赖 prism 服务进程。这不是 prism usage 的本地词元账本。
 
 flags:
@@ -159,7 +171,24 @@ flags:
 			failed++
 			snap.Err = planusage.ErrorCode(ferr)
 		} else {
-			snap = applyQuotaGrokEstimate(ctx, cfg, snap)
+			if snap.Provider == "xai" {
+				snap = applyQuotaGrokEstimate(ctx, cfg, snap)
+			}
+			switch snap.Provider {
+			case "gemini":
+				path := cfg.Usage.DBPath
+				if path != "" {
+					if fi, serr := os.Stat(path); serr == nil && fi.Mode().IsRegular() {
+						store := usage.NewReadOnlyStore(path)
+						if serr := store.Open(); serr == nil {
+							snap = planusage.ApplyWeekEstimate(ctx, snap, func(c context.Context, f, t int64) (int64, error) {
+								return store.SumTokensLike(c, f, t, "gemini-%", "gemini")
+							}, planusage.DefaultGeminiEstimatePath, time.Now())
+							store.Close()
+						}
+					}
+				}
+			}
 		}
 		cancel()
 		snaps = append(snaps, snap)

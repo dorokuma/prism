@@ -114,7 +114,7 @@ type UsageConfig struct {
 	retentionDaysSet bool
 }
 
-// QuotaConfig is the yaml `quota` section: SuperGrok weekly pool snapshots.
+// QuotaConfig is the yaml `quota` section: SuperGrok weekly + Gemini 5h/weekly snapshots.
 // Independent of UsageConfig.
 //
 // enabled defaults to true when the field is absent. refresh_interval
@@ -197,14 +197,22 @@ type AccountConfig struct {
 	// overwritten by prism. It does NOT affect upstream model fetching —
 	// the model cache still fetches this provider like any other.
 	SkipPISync bool `yaml:"skip_pi_sync,omitempty"`
+	// SkipModelCache excludes the provider from upstream model fetching
+	// entirely: no /v1/models request is ever sent and no cache file is
+	// written. For quota-only accounts (e.g. Gemini / Antigravity, whose
+	// base URL answers neither /v1/models nor a model list) this stops
+	// the 404 noise from the background refresh loop. The provider is
+	// still routed for quota polling (planusage).
+	SkipModelCache bool `yaml:"skip_model_cache,omitempty"`
 	// PublicService marks an account as a zero-balance/public-service upstream.
 	// HTTP 402 and structured PermanentQuota errors will not MarkExhausted or
 	// apply QuotaReviveAfter.
 	PublicService bool `yaml:"public_service,omitempty"`
-	// OAuth names a built-in OAuth provider for this account. Currently
-	// only "xai" (Grok-CLI device-code against auth.x.ai). When set, the
-	// account has no static key: `prism auth xai` writes tokens under
-	// oauth_dir and the request path refreshes them. Empty = static key.
+	// OAuth names a built-in OAuth provider for this account: "xai"
+	// (Grok-CLI device-code against auth.x.ai) or "google" (Antigravity /
+	// Gemini Cloud Code). When set, the account has no static key:
+	// `prism auth xai` / `prism auth google` writes tokens under oauth_dir
+	// and the request path refreshes them. Empty = static key.
 	OAuth string `yaml:"oauth,omitempty"`
 }
 
@@ -621,8 +629,8 @@ func LoadConfig(path string) (*Config, error) {
 	for i := range cfg.Accounts {
 		oauth := strings.TrimSpace(cfg.Accounts[i].OAuth)
 		if oauth != "" {
-			if oauth != "xai" {
-				return nil, fmt.Errorf("account %s: unknown oauth %q (supported: xai)", cfg.Accounts[i].Name, oauth)
+			if oauth != "xai" && oauth != "google" {
+				return nil, fmt.Errorf("account %s: unknown oauth %q (supported: xai, google)", cfg.Accounts[i].Name, oauth)
 			}
 			if cfg.Accounts[i].Key != "" {
 				return nil, fmt.Errorf("account %s: oauth accounts must not set key in config", cfg.Accounts[i].Name)

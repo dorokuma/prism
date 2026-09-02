@@ -18,6 +18,9 @@ func TestRunAuthHelp(t *testing.T) {
 	if !strings.Contains(help, "prism auth xai") {
 		t.Fatalf("help = %s", help)
 	}
+	if !strings.Contains(help, "prism auth google") {
+		t.Fatalf("help missing google: %s", help)
+	}
 	if !strings.Contains(help, "/var/lib/prism/config.yaml") {
 		t.Fatalf("help missing fallback path: %s", help)
 	}
@@ -166,6 +169,42 @@ accounts:
 	f.Close()
 	err = runAuthWith([]string{"xai", "--config", f.Name()}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "--account") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRunAuthGoogleNoAccount(t *testing.T) {
+	f, err := os.CreateTemp("", "cfg-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	_, _ = f.WriteString(authTestStaticYAML)
+	f.Close()
+	err = runAuthWith([]string{"google", "--config", f.Name()}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "no account with oauth: google") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRunAuthGoogleMissingFrom(t *testing.T) {
+	f, err := os.CreateTemp("", "cfg-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	_, _ = f.WriteString(`
+listen: 127.0.0.1:18790
+accounts:
+  - name: Gemini
+    oauth: google
+    provider: gemini
+    base_url: https://cloudcode-pa.googleapis.com
+`)
+	f.Close()
+	missing := filepath.Join(t.TempDir(), "no-agy-token")
+	err = runAuthWith([]string{"google", "--config", f.Name(), "--from", missing}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "read antigravity token") {
 		t.Fatalf("err = %v", err)
 	}
 }

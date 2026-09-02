@@ -22,8 +22,8 @@ import (
 // DefaultDir is the on-disk token directory (0600 files, 0700 dir).
 const DefaultDir = "/var/lib/prism/oauth"
 
-// ErrNotLoggedIn is returned when the account has oauth: xai but no
-// token file yet (`prism auth xai` has not been run).
+// ErrNotLoggedIn is returned when the account has oauth: xai/google but no
+// token file yet (`prism auth xai` / `prism auth google` has not been run).
 var ErrNotLoggedIn = errors.New("oauth: not logged in")
 
 // File is the JSON document written under DefaultDir.
@@ -53,18 +53,34 @@ type Source struct {
 	terminalInvalid bool
 }
 
-// NewXAISource builds a file-backed source for one xai oauth account.
-func NewXAISource(dir, account string, refresh RefreshFunc) *Source {
+// NewSource builds a file-backed source for one oauth account.
+func NewSource(dir, account, provider string, refresh RefreshFunc) *Source {
 	if dir == "" {
 		dir = DefaultDir
+	}
+	if provider == "" {
+		provider = "xai"
 	}
 	return &Source{
 		dir:      dir,
 		account:  account,
-		provider: "xai",
+		provider: provider,
 		refresh:  refresh,
 		now:      time.Now,
 	}
+}
+
+// NewXAISource builds a file-backed source for one xai oauth account.
+func NewXAISource(dir, account string, refresh RefreshFunc) *Source {
+	return NewSource(dir, account, "xai", refresh)
+}
+
+func (s *Source) loginHint() string {
+	p := strings.TrimSpace(s.provider)
+	if p == "" {
+		p = "xai"
+	}
+	return fmt.Sprintf("prism auth %s --account %s", p, s.account)
 }
 
 func (s *Source) path() string {
@@ -173,7 +189,7 @@ func isTerminalRefreshError(err error) bool {
 
 func (s *Source) refreshLocked(ctx context.Context, force bool) (string, error) {
 	if s.terminalInvalid {
-		return "", fmt.Errorf("oauth: terminal token invalid (run: prism auth xai --account %s)", s.account)
+		return "", fmt.Errorf("oauth: terminal token invalid (run: %s)", s.loginHint())
 	}
 	if !force && s.now().Before(s.cred.ExpiresAt) {
 		return s.cred.AccessToken, nil
@@ -251,10 +267,10 @@ func (s *Source) RefreshIfStale(ctx context.Context, staleToken string) (string,
 			return err
 		}
 		if s.terminalInvalid {
-			return fmt.Errorf("oauth: terminal token invalid (run: prism auth xai --account %s)", s.account)
+			return fmt.Errorf("oauth: terminal token invalid (run: %s)", s.loginHint())
 		}
 		if s.cred.AccessToken == "" || s.cred.RefreshToken == "" {
-			return fmt.Errorf("%w (run: prism auth xai --account %s)", ErrNotLoggedIn, s.account)
+			return fmt.Errorf("%w (run: %s)", ErrNotLoggedIn, s.loginHint())
 		}
 		if s.cred.AccessToken != staleToken {
 			// A concurrent caller already rotated: reuse its result.
@@ -269,7 +285,7 @@ func (s *Source) RefreshIfStale(ctx context.Context, staleToken string) (string,
 }
 
 // Token returns a non-expired access token, refreshing and rewriting the
-// file when needed. A login completed by `prism auth xai` is picked up via
+// file when needed. A login completed by `prism auth` is picked up via
 // the file mtime without a process restart.
 func (s *Source) Token(ctx context.Context) (string, error) {
 	s.mu.Lock()
@@ -278,10 +294,10 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if s.terminalInvalid {
-		return "", fmt.Errorf("oauth: terminal token invalid (run: prism auth xai --account %s)", s.account)
+		return "", fmt.Errorf("oauth: terminal token invalid (run: %s)", s.loginHint())
 	}
 	if s.cred.AccessToken == "" || s.cred.RefreshToken == "" {
-		return "", fmt.Errorf("%w (run: prism auth xai --account %s)", ErrNotLoggedIn, s.account)
+		return "", fmt.Errorf("%w (run: %s)", ErrNotLoggedIn, s.loginHint())
 	}
 	if s.now().Before(s.cred.ExpiresAt) {
 		return s.cred.AccessToken, nil
@@ -295,7 +311,7 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 			return err
 		}
 		if s.cred.AccessToken == "" || s.cred.RefreshToken == "" {
-			return fmt.Errorf("%w (run: prism auth xai --account %s)", ErrNotLoggedIn, s.account)
+			return fmt.Errorf("%w (run: %s)", ErrNotLoggedIn, s.loginHint())
 		}
 		var refreshErr error
 		result, refreshErr = s.refreshLocked(ctx, false)
@@ -332,7 +348,7 @@ func (s *Source) reloadLocked() error {
 	return nil
 }
 
-// Save writes tokens for account under dir. Used by `prism auth xai`.
+// Save writes tokens for account under dir. Used by `prism auth xai` / `prism auth google`.
 // The token write and the .invalid removal run under the SAME flock as the
 // server's refreshes: a refresh in flight when the login completes must
 // finish first, otherwise it would either overwrite the fresh login with

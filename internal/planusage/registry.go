@@ -5,11 +5,11 @@ import (
 	"encoding/hex"
 )
 
-// DefaultFetchers is the built-in registry. SuperGrok weekly pool only
-// (cli-chat-proxy billing with the Grok-CLI OAuth token). OpenCode Go
-// windows are not polled.
+// DefaultFetchers is the built-in registry: SuperGrok weekly pool
+// (cli-chat-proxy billing) and Gemini 5h/weekly (retrieveUserQuotaSummary).
+// OpenCode Go windows are not polled.
 func DefaultFetchers() []Fetcher {
-	return []Fetcher{XAIFetcher{}}
+	return []Fetcher{XAIFetcher{}, GeminiFetcher{}}
 }
 
 // MatchFetcher returns the first fetcher that owns this account, or nil.

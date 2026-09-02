@@ -106,7 +106,7 @@ func TestLoadConfigOAuthXAISkipsStaticKey(t *testing.T) {
 	content := `
 listen: 127.0.0.1:18790
 accounts:
-  - name: supergrok
+  - name: SuperGrok
     base_url: https://api.x.ai/v1
     provider: xai
     oauth: xai
@@ -132,6 +132,36 @@ accounts:
 	}
 	if cfg.OAuthDir != "/var/lib/prism/oauth" {
 		t.Errorf("oauth_dir = %q", cfg.OAuthDir)
+	}
+}
+
+func TestLoadConfigOAuthGoogleSkipsStaticKey(t *testing.T) {
+	content := `
+listen: 127.0.0.1:18790
+accounts:
+  - name: Gemini
+    base_url: https://cloudcode-pa.googleapis.com
+    provider: gemini
+    oauth: google
+`
+	f, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cfg, err := LoadConfig(f.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Accounts[0].OAuth != "google" {
+		t.Errorf("oauth = %q", cfg.Accounts[0].OAuth)
+	}
+	if cfg.Accounts[0].Key != "" {
+		t.Errorf("key must stay empty for oauth accounts")
 	}
 }
 

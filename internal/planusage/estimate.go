@@ -17,6 +17,13 @@ import (
 // reset is not estimated from empty usage.
 const DefaultGrokEstimatePath = "/var/lib/prism/quota/grok-week-estimate.json"
 
+// DefaultGeminiEstimatePath is the on-disk freeze of the Gemini week-pool
+// inference (usage-db gemini-* tokens ÷ week percent). The estimate only
+// exists while usage rows for gemini-* models are recorded (currently
+// none: Antigravity usage does not pass through prism, so the column stays
+// -- until a consumption source lands).
+const DefaultGeminiEstimatePath = "/var/lib/prism/quota/gemini-week-estimate.json"
+
 // GrokBuildImportWindow is the [from,to] unix range for Grok Build session
 // import: previous SuperGrok week plus the current week through now.
 func GrokBuildImportWindow(snap Snapshot, now time.Time) (from, to int64) {
@@ -58,13 +65,19 @@ func rollWeekStart(start time.Time, span time.Duration, now time.Time) time.Time
 }
 
 // WeekStartUnix is the SuperGrok week-window start used as the default
-// usage range. Live weekly snapshots win, then the estimate file, then
-// now minus 7 days so a cold start still bounds the query. Whichever source
-// provides the anchor, it is rolled forward to the latest weekly boundary
-// not after now, so the range resets in step with the grok quota period even
-// when the source is stale.
+// usage range. Live weekly snapshots of the xai provider win, then the
+// estimate file, then now minus 7 days so a cold start still bounds the
+// query. Whichever source provides the anchor, it is rolled forward to the
+// latest weekly boundary not after now, so the range resets in step with
+// the grok quota period even when the source is stale. Only xai weekly
+// windows are considered: Gemini (and any future provider) has its own
+// weekly window with a different period start, and the usage default must
+// stay pinned to the SuperGrok week (documented contract).
 func WeekStartUnix(snaps []Snapshot, estimatePath string, now time.Time) int64 {
 	for _, snap := range snaps {
+		if snap.Provider != "xai" {
+			continue
+		}
 		for _, w := range snap.Windows {
 			if w.Name != "weekly" || w.PeriodStart == nil || w.PeriodStart.IsZero() {
 				continue
@@ -110,18 +123,10 @@ func StoredPeriodStart(path string) (time.Time, bool) {
 type GrokTokenSum func(ctx context.Context, fromUnix, toUnix int64) (int64, error)
 
 type grokWeekEstimate struct {
-	PeriodStart     string `json:"period_start"`
-	LiveTokens      int64  `json:"live_tokens"`
-	LivePercent     int    `json:"live_percent"`
-	LiveEstimate    int64  `json:"live_estimate"`
-	DisplayEstimate int64  `json:"display_estimate"`
-}
-
-func (st grokWeekEstimate) shown() int64 {
-	if st.DisplayEstimate > 0 {
-		return st.DisplayEstimate
-	}
-	return st.LiveEstimate
+	PeriodStart  string `json:"period_start"`
+	LiveTokens   int64  `json:"live_tokens"`
+	LivePercent  int    `json:"live_percent"`
+	LiveEstimate int64  `json:"live_estimate"`
 }
 
 func withEstimateLock(path string, fn func() error) error {
@@ -143,11 +148,14 @@ func withEstimateLock(path string, fn func() error) error {
 	return fn()
 }
 
-// ApplyGrokWeekEstimate fills LimitTokensEstimate on the weekly window.
-// Live tokens/percent update every call; the shown value is the previous
-// period's estimate. The first period (no freeze yet) shows the live
-// estimate so the column is not empty until the first rollover.
-func ApplyGrokWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum, path string, now time.Time) Snapshot {
+// ApplyWeekEstimate fills LimitTokensEstimate on the weekly window of
+// any provider with the LIVE reversal: consumed tokens in the current
+// period ÷ the period's used percent × 100. The estimate therefore moves
+// with real usage (percent and consumption), unlike the old frozen
+// previous-week value. The on-disk file keeps period_start (used by
+// WeekStartUnix) plus the live snapshot for inspection; sum errors leave
+// the estimate empty rather than showing a stale value.
+func ApplyWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum, path string, now time.Time) Snapshot {
 	if sum == nil || path == "" {
 		return snap
 	}
@@ -167,23 +175,17 @@ func ApplyGrokWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum,
 	if w.ResetsAt != nil && !w.ResetsAt.After(now) {
 		to = w.ResetsAt.Unix()
 	}
+	tokens, err := sum(ctx, from, to)
+	if err != nil {
+		slog.Warn("quota week token sum failed", "error", err)
+		return snap
+	}
+	if w.Percent > 0 && tokens > 0 {
+		snap.Windows[idx].LimitTokensEstimate = tokens * 100 / int64(w.Percent)
+	}
 	if err := withEstimateLock(path, func() error {
 		st, _ := loadGrokWeekEstimate(path)
-		if stored, err := time.Parse(time.RFC3339Nano, st.PeriodStart); err == nil && w.PeriodStart.Before(stored) {
-			snap.Windows[idx].LimitTokensEstimate = st.shown()
-			return nil
-		}
-		tokens, err := sum(ctx, from, to)
-		if err != nil {
-			slog.Warn("quota grok token sum failed", "error", err)
-			snap.Windows[idx].LimitTokensEstimate = st.shown()
-			return nil
-		}
-		newStart := w.PeriodStart.UTC().Format(time.RFC3339Nano)
-		if st.PeriodStart != "" && st.PeriodStart != newStart && st.LiveEstimate > 0 {
-			st.DisplayEstimate = st.LiveEstimate
-		}
-		st.PeriodStart = newStart
+		st.PeriodStart = w.PeriodStart.UTC().Format(time.RFC3339Nano)
 		st.LiveTokens = tokens
 		st.LivePercent = w.Percent
 		if w.Percent > 0 && tokens > 0 {
@@ -191,15 +193,17 @@ func ApplyGrokWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum,
 		} else {
 			st.LiveEstimate = 0
 		}
-		if err := saveGrokWeekEstimate(path, st); err != nil {
-			slog.Warn("quota grok estimate save failed", "error", err)
-		}
-		snap.Windows[idx].LimitTokensEstimate = st.shown()
-		return nil
+		return saveGrokWeekEstimate(path, st)
 	}); err != nil {
-		slog.Warn("quota grok estimate lock failed", "error", err)
+		slog.Warn("quota week estimate lock failed", "error", err)
 	}
 	return snap
+}
+
+// ApplyGrokWeekEstimate fills LimitTokensEstimate on the SuperGrok weekly
+// window (see ApplyWeekEstimate).
+func ApplyGrokWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum, path string, now time.Time) Snapshot {
+	return ApplyWeekEstimate(ctx, snap, sum, path, now)
 }
 
 func loadGrokWeekEstimate(path string) (grokWeekEstimate, error) {

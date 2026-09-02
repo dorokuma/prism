@@ -19,6 +19,7 @@ import (
 	"github.com/dorokuma/prism/internal/mcp"
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/oauth"
+	"github.com/dorokuma/prism/internal/oauth/google"
 	"github.com/dorokuma/prism/internal/oauth/xai"
 	"github.com/dorokuma/prism/internal/planusage"
 	"github.com/dorokuma/prism/internal/pool"
@@ -524,6 +525,9 @@ func main() {
 			_, err := usage.ImportGrokBuild(ctx, ss, usage.DefaultGrokSessionsDir(), from, to, grokPriceFor(holder.Load()))
 			return err
 		})
+		quotaPoller.SetGeminiEstimate(func(ctx context.Context, from, to int64) (int64, error) {
+			return ss.SumTokensLike(ctx, from, to, "gemini-%", "gemini")
+		}, planusage.DefaultGeminiEstimatePath)
 	}
 	quotaPoller.Start()
 	quotaHandler := planusage.NewHandler(quotaCache, quotaPoller.Enabled)
@@ -663,18 +667,29 @@ func main() {
 	}
 }
 
-// attachOAuth wires file-backed xAI token sources onto oauth: xai accounts.
+// attachOAuth wires file-backed token sources onto oauth accounts.
 func attachOAuth(p *pool.Pool, cfg *config.Config) context.CancelFunc {
 	client := &http.Client{Timeout: 20 * time.Second}
 	ctx, cancel := context.WithCancel(context.Background())
 	for _, acc := range p.AllAccounts() {
-		if acc.OAuth() != "xai" {
+		name := acc.Name()
+		var src *oauth.Source
+		switch acc.OAuth() {
+		case "xai":
+			src = oauth.NewSource(cfg.OAuthDir, name, "xai", func(ctx context.Context, refresh string) (xai.Tokens, error) {
+				return xai.Refresh(ctx, xai.Config{HTTP: client}, refresh)
+			})
+		case "google":
+			src = oauth.NewSource(cfg.OAuthDir, name, "google", func(ctx context.Context, refresh string) (xai.Tokens, error) {
+				tok, err := google.Refresh(ctx, google.Config{HTTP: client}, refresh)
+				if err != nil {
+					return xai.Tokens{}, err
+				}
+				return xai.Tokens{Access: tok.Access, Refresh: tok.Refresh, ExpiresAt: tok.ExpiresAt}, nil
+			})
+		default:
 			continue
 		}
-		name := acc.Name()
-		src := oauth.NewXAISource(cfg.OAuthDir, name, func(ctx context.Context, refresh string) (xai.Tokens, error) {
-			return xai.Refresh(ctx, xai.Config{HTTP: client}, refresh)
-		})
 		acc.SetTokenSource(src)
 		go func(acc *pool.Account, src *oauth.Source) {
 			ticker := time.NewTicker(2 * time.Hour)
@@ -685,7 +700,7 @@ func attachOAuth(p *pool.Pool, cfg *config.Config) context.CancelFunc {
 					return
 				case <-ticker.C:
 					if _, err := src.ForceRefresh(ctx); err != nil {
-						slog.Warn("xAI OAuth keepalive refresh failed", "account", acc.Name(), "error", err)
+						slog.Warn("OAuth keepalive refresh failed", "account", acc.Name(), "oauth", acc.OAuth(), "error", err)
 					}
 				}
 			}

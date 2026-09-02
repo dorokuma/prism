@@ -156,9 +156,20 @@ func buildSummaryWhere(q SummaryQuery) (string, []any) {
 }
 
 // SumGrokTokens sums 词元 for model ids matching grok-% in [fromUnix, toUnix]
-// (unix seconds, inclusive). The per-row total is the same expression
-// Overview uses (stored total_tokens, else prompt+completion).
+// (unix seconds, inclusive).
 func (s *SQLiteStore) SumGrokTokens(ctx context.Context, fromUnix, toUnix int64) (int64, error) {
+	return s.SumTokensLike(ctx, fromUnix, toUnix, "grok-%", "")
+}
+
+// SumTokensLike sums 词元 for model ids matching a LIKE pattern
+// (e.g. "grok-%", "gemini-%") in [fromUnix, toUnix] (unix seconds,
+// inclusive). provider optionally restricts the rows to one provider
+// ("" = any): the Gemini estimate passes provider "gemini" so model rows
+// recorded under OTHER upstreams (e.g. a third-party gateway serving
+// gemini-* ids) never pollute the Antigravity week-pool reversal. The
+// per-row total is the same expression Overview uses (stored total_tokens,
+// else prompt+completion).
+func (s *SQLiteStore) SumTokensLike(ctx context.Context, fromUnix, toUnix int64, pattern, provider string) (int64, error) {
 	db := s.readPool()
 	if db == nil {
 		return 0, errors.New("usage: store not open")
@@ -167,9 +178,14 @@ func (s *SQLiteStore) SumGrokTokens(ctx context.Context, fromUnix, toUnix int64)
 		return 0, nil
 	}
 	q := `SELECT COALESCE(SUM(CASE WHEN total_tokens > 0 THEN total_tokens ELSE prompt_tokens + completion_tokens END), 0)
-FROM usage_events WHERE ts_unix >= ? AND ts_unix <= ? AND LOWER(model) LIKE 'grok-%'`
+FROM usage_events WHERE ts_unix >= ? AND ts_unix <= ? AND LOWER(model) LIKE ?`
+	args := []any{fromUnix, toUnix, pattern}
+	if provider != "" {
+		q += ` AND provider = ?`
+		args = append(args, provider)
+	}
 	var n int64
-	if err := db.QueryRowContext(ctx, q, fromUnix, toUnix).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
 		return 0, err
 	}
 	return n, nil

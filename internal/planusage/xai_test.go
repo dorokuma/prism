@@ -47,7 +47,7 @@ func TestXAIFetcherOK(t *testing.T) {
 
 	f := XAIFetcher{BillingURL: srv.URL + "?format=credits", Timeout: time.Second}
 	snap, err := f.Fetch(context.Background(), fakeAcc{
-		name: "supergrok", provider: "xai", base: "https://api.x.ai/v1", key: "tok",
+		name: "SuperGrok", provider: "xai", base: "https://api.x.ai/v1", key: "tok",
 		client: srv.Client(),
 	})
 	if err != nil {

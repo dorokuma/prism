@@ -18,7 +18,7 @@ func TestWeekStartUnix(t *testing.T) {
 	}
 
 	live := start.Add(-time.Hour)
-	got := WeekStartUnix([]Snapshot{{Windows: []Window{{
+	got := WeekStartUnix([]Snapshot{{Provider: "xai", Windows: []Window{{
 		Name: "weekly", PeriodStart: &live,
 	}}}}, path, now)
 	if got != live.Unix() {
@@ -65,7 +65,7 @@ func TestWeekStartUnixRollsPastReset(t *testing.T) {
 	// the result lands exactly on the live window boundary even when the
 	// span is not exactly 7 days.
 	p2 := anchor.Add(7*24*time.Hour + 30*time.Minute)
-	got = WeekStartUnix([]Snapshot{{Windows: []Window{{
+	got = WeekStartUnix([]Snapshot{{Provider: "xai", Windows: []Window{{
 		Name: "weekly", PeriodStart: &anchor, ResetsAt: &p2,
 	}}}}, path, now)
 	if got != p2.Unix() {
@@ -124,6 +124,28 @@ func TestRollWeekStartFallbackAndFuture(t *testing.T) {
 	}
 }
 
+// TestWeekStartUnixIgnoresGeminiWeekly pins the default usage range to the
+// SuperGrok week: a Gemini weekly snapshot (own period start) must never
+// win the anchor — the map-ordered cache could otherwise flip the
+// /admin/usage/summary default window between the two providers.
+func TestWeekStartUnixIgnoresGeminiWeekly(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	gemStart := now.Add(-2 * time.Hour)
+	xaiStart := now.Add(-5 * 24 * time.Hour)
+	snaps := []Snapshot{
+		{Provider: "gemini", Windows: []Window{{
+			Name: "weekly", PeriodStart: &gemStart,
+		}}},
+		{Provider: "xai", Windows: []Window{{
+			Name: "weekly", PeriodStart: &xaiStart,
+		}}},
+	}
+	got := WeekStartUnix(snaps, "", now)
+	if got != xaiStart.Unix() {
+		t.Fatalf("WeekStartUnix = %d, want xai week %d (gemini must not win)", got, xaiStart.Unix())
+	}
+}
+
 func TestApplyGrokWeekEstimateFirstPeriodUsesLive(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "est.json")
 	start := time.Date(2026, 8, 22, 8, 0, 0, 0, time.UTC)
@@ -138,7 +160,7 @@ func TestApplyGrokWeekEstimateFirstPeriodUsesLive(t *testing.T) {
 	}
 }
 
-func TestApplyGrokWeekEstimateShowsPreviousAfterRollover(t *testing.T) {
+func TestApplyGrokWeekEstimateShowsLiveAfterRollover(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "est.json")
 	p1 := time.Date(2026, 8, 15, 8, 0, 0, 0, time.UTC)
 	p1end := p1.Add(7 * 24 * time.Hour)
@@ -155,9 +177,10 @@ func TestApplyGrokWeekEstimateShowsPreviousAfterRollover(t *testing.T) {
 		Name: "weekly", Percent: 1, PeriodStart: &p2, ResetsAt: &p2end,
 	}}}
 	got := ApplyGrokWeekEstimate(context.Background(), snap2, sum2, path, p2.Add(time.Hour))
-	want := int64(5700 * 100 / 57)
-	if got.Windows[0].LimitTokensEstimate != want {
-		t.Fatalf("after rollover = %d, want previous %d", got.Windows[0].LimitTokensEstimate, want)
+	// LIVE reversal: 10 tokens at 1% used → pool ≈ 1000, not the previous
+	// period's frozen value.
+	if got.Windows[0].LimitTokensEstimate != 1000 {
+		t.Fatalf("after rollover = %d, want live 1000", got.Windows[0].LimitTokensEstimate)
 	}
 }
 
@@ -174,22 +197,20 @@ func TestApplyGrokWeekEstimateIgnoresNonGrokSumZeroPercent(t *testing.T) {
 	}
 }
 
-func TestApplyGrokWeekEstimateSumErrorUsesLive(t *testing.T) {
+func TestApplyGrokWeekEstimateSumErrorLeavesEmpty(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "est.json")
 	start := time.Date(2026, 8, 22, 8, 0, 0, 0, time.UTC)
 	end := start.Add(7 * 24 * time.Hour)
 	win := Window{Name: "weekly", Percent: 50, PeriodStart: &start, ResetsAt: &end}
-	okSum := func(context.Context, int64, int64) (int64, error) { return 1000, nil }
-	ApplyGrokWeekEstimate(context.Background(), Snapshot{Windows: []Window{win}}, okSum, path, start.Add(time.Hour))
 
 	failSum := func(context.Context, int64, int64) (int64, error) { return 0, errors.New("db busy") }
-	got := ApplyGrokWeekEstimate(context.Background(), Snapshot{Windows: []Window{win}}, failSum, path, start.Add(2*time.Hour))
-	if got.Windows[0].LimitTokensEstimate != 2000 {
-		t.Fatalf("sum error shown = %d, want live 2000", got.Windows[0].LimitTokensEstimate)
+	got := ApplyGrokWeekEstimate(context.Background(), Snapshot{Windows: []Window{win}}, failSum, path, start.Add(time.Hour))
+	if got.Windows[0].LimitTokensEstimate != 0 {
+		t.Fatalf("sum error must leave estimate empty, got %d", got.Windows[0].LimitTokensEstimate)
 	}
 }
 
-func TestApplyGrokWeekEstimateRejectsStalePeriod(t *testing.T) {
+func TestApplyGrokWeekEstimateLiveEveryPeriod(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "est.json")
 	p1 := time.Date(2026, 8, 15, 8, 0, 0, 0, time.UTC)
 	p1end := p1.Add(7 * 24 * time.Hour)
@@ -204,16 +225,14 @@ func TestApplyGrokWeekEstimateRejectsStalePeriod(t *testing.T) {
 	ApplyGrokWeekEstimate(context.Background(), Snapshot{Windows: []Window{{
 		Name: "weekly", Percent: 1, PeriodStart: &p2, ResetsAt: &p2end,
 	}}}, sum2, path, p2.Add(time.Hour))
-	want := int64(5700 * 100 / 57)
 
-	staleSum := func(context.Context, int64, int64) (int64, error) {
-		t.Fatal("stale period must not query usage")
-		return 0, nil
-	}
+	// The same (older) snapshot queried again still reverses live from its
+	// own period data — there is no stale freeze any more.
+	liveSum := func(context.Context, int64, int64) (int64, error) { return 5700, nil }
 	got := ApplyGrokWeekEstimate(context.Background(), Snapshot{Windows: []Window{{
 		Name: "weekly", Percent: 57, PeriodStart: &p1, ResetsAt: &p1end,
-	}}}, staleSum, path, p1.Add(6*24*time.Hour))
-	if got.Windows[0].LimitTokensEstimate != want {
-		t.Fatalf("stale period shown = %d, want frozen %d", got.Windows[0].LimitTokensEstimate, want)
+	}}}, liveSum, path, p1.Add(6*24*time.Hour))
+	if got.Windows[0].LimitTokensEstimate != 10000 {
+		t.Fatalf("older snapshot reversed live = %d, want 10000", got.Windows[0].LimitTokensEstimate)
 	}
 }

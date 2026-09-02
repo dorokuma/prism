@@ -31,6 +31,9 @@ type Poller struct {
 	grokSum      GrokTokenSum
 	estimatePath string
 	grokImport   GrokBuildImporter
+
+	geminiSum          GrokTokenSum
+	geminiEstimatePath string
 }
 
 // GrokBuildImporter pulls Grok Build CLI session usage into the usage
@@ -89,6 +92,17 @@ func (p *Poller) SetGrokEstimate(sum GrokTokenSum, path string) {
 	p.mu.Unlock()
 }
 
+// SetGeminiEstimate wires Gemini 限额估算 (usage-db gemini-* tokens /
+// week-pool percent). path is DefaultGeminiEstimatePath in production.
+func (p *Poller) SetGeminiEstimate(sum GrokTokenSum, path string) {
+	p.mu.Lock()
+	p.geminiSum = sum
+	p.geminiEstimatePath = path
+	p.mu.Unlock()
+}
+
+// SetGrokBuildImport wires the Grok Build CLI session importer used
+// before the SuperGrok week estimate runs.
 func (p *Poller) SetGrokBuildImport(imp GrokBuildImporter) {
 	p.mu.Lock()
 	p.grokImport = imp
@@ -196,10 +210,16 @@ func (p *Poller) fetchOne(parent context.Context, g KeyGroup, timeout time.Durat
 		p.cache.StoreFailed(g.Fingerprint, snap.Provider, names, code)
 		return
 	}
+	var sum GrokTokenSum
+	var estPath string
+	var imp GrokBuildImporter
 	p.mu.Lock()
-	sum := p.grokSum
-	estPath := p.estimatePath
-	imp := p.grokImport
+	switch snap.Provider {
+	case "xai":
+		sum, estPath, imp = p.grokSum, p.estimatePath, p.grokImport
+	case "gemini":
+		sum, estPath = p.geminiSum, p.geminiEstimatePath
+	}
 	p.mu.Unlock()
 	if imp != nil {
 		from, to := GrokBuildImportWindow(snap, time.Now())
@@ -210,7 +230,7 @@ func (p *Poller) fetchOne(parent context.Context, g KeyGroup, timeout time.Durat
 		icancel()
 	}
 	if sum != nil {
-		snap = ApplyGrokWeekEstimate(ctx, snap, sum, estPath, time.Now())
+		snap = ApplyWeekEstimate(ctx, snap, sum, estPath, time.Now())
 	}
 	p.cache.Store(g.Fingerprint, snap)
 }

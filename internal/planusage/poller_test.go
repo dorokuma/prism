@@ -1,9 +1,11 @@
 package planusage
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -126,5 +128,43 @@ func TestErrorCode(t *testing.T) {
 	}
 	if ErrorCode(io.EOF) != "fetch_failed" {
 		t.Fatal(ErrorCode(io.EOF))
+	}
+}
+
+// TestPollerGeminiEstimateApplied pins the per-provider estimate split:
+// a gemini snapshot gets the gemini sum applied to its weekly window
+// (period inferred from ResetsAt-7d), without touching the grok side.
+func TestPollerGeminiEstimateApplied(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, geminiSummaryBody)
+	}))
+	defer srv.Close()
+	c := NewCache()
+	p := NewPoller([]Fetcher{GeminiFetcher{QuotaURL: srv.URL, Timeout: time.Second}}, c, 30*time.Second, time.Second)
+	p.SetAccounts([]AccountView{fakeAcc{
+		name: "Gemini", provider: "gemini", base: "https://cloudcode-pa.googleapis.com",
+		key: "k", client: srv.Client(),
+	}})
+	p.SetGeminiEstimate(func(context.Context, int64, int64) (int64, error) {
+		return 1000, nil
+	}, filepath.Join(t.TempDir(), "gem.json"))
+	p.Refresh()
+	snaps := c.List()
+	if len(snaps) != 1 {
+		t.Fatalf("snapshots = %d, want 1", len(snaps))
+	}
+	var weekly *Window
+	for i := range snaps[0].Windows {
+		if snaps[0].Windows[i].Name == "weekly" {
+			weekly = &snaps[0].Windows[i]
+		}
+	}
+	if weekly == nil {
+		t.Fatalf("weekly window missing: %+v", snaps[0].Windows)
+	}
+	// geminiSummaryBody: weekly remainingFraction 0.0558405 → 94% used.
+	want := int64(1000 * 100 / 94)
+	if weekly.LimitTokensEstimate != want {
+		t.Fatalf("gemini weekly estimate = %d, want %d", weekly.LimitTokensEstimate, want)
 	}
 }

@@ -83,6 +83,8 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 				status, code, msg = http.StatusServiceUnavailable, "no_healthy", "no healthy account"
 			case errors.Is(err, cache.ErrFetchSaturated):
 				status, code, msg = http.StatusServiceUnavailable, "model_fetch_saturated", "model fetch saturated"
+			case errors.Is(err, cache.ErrModelCacheSkipped):
+				status, code, msg = http.StatusBadGateway, "model_fetch_failed", "model fetch skipped for provider"
 			default:
 				code, msg = "model_fetch_failed", "model fetch failed"
 			}

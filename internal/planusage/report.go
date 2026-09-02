@@ -2,6 +2,7 @@ package planusage
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,13 +21,13 @@ func RenderTable(snaps []Snapshot) string {
 }
 
 // RenderTableAt is RenderTable with an injectable clock (tests). Each
-// window is one row; every account name renders once per window group,
-// vertically centered on the weekly row when one exists, otherwise on
-// the group's middle row (see accountRowIndex). Load-balanced plans are
-// never merged. Snapshots without windows keep the account line and the
-// error line, if any. Error lines always carry the account attribution
-// ("  provider/account: fetch_failed") so failures from different
-// accounts stay distinguishable.
+// account is one MODULE: its windows are consecutive rows, the account
+// name sits on the module's first window row, later rows leave the
+// account cell empty. Modules are sorted by account name so they never
+// interleave (a bare row can not look like it belongs to the previous
+// module). Load-balanced plans are never merged. Snapshots without
+// windows keep the account line and the error line, if any. Error lines
+// always carry the account attribution ("  account: fetch_failed").
 func RenderTableAt(snaps []Snapshot, now time.Time) string {
 	if len(snaps) == 0 {
 		return "  没有套餐数据\n"
@@ -36,16 +37,22 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 		{Title: "账号", Align: render.AlignLeft},
 		{Title: "窗口", Align: render.AlignLeft},
 		{Title: "状态", Align: render.AlignLeft},
-		{Title: "占用", Align: render.AlignRight},
-		{Title: "重置", Align: render.AlignRight},
-		{Title: "限额估算", Align: render.AlignRight},
+		{Title: "占用", Align: render.AlignLeft},
+		{Title: "重置", Align: render.AlignLeft},
+		{Title: "限额估算", Align: render.AlignLeft},
 	}
+
+	// Stable sort by the first account name so modules stay contiguous
+	// and in a readable order (Cache.List is map-ordered).
+	sorted := append([]Snapshot(nil), snaps...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return accountSortKey(sorted[i]) < accountSortKey(sorted[j])
+	})
 
 	var rows [][]string
 	var notes strings.Builder
 
-	multiProvider := hasMultipleProviders(snaps)
-	for _, s := range snaps {
+	for _, s := range sorted {
 		titles := s.Accounts
 		if len(titles) == 0 {
 			title := s.Provider
@@ -55,7 +62,7 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 			titles = []string{title}
 		}
 		for _, title := range titles {
-			account := accountCell(s, title, multiProvider)
+			account := accountCell(s, title)
 			if len(s.Windows) == 0 {
 				notes.WriteString(reportIndent + account + "\n")
 				if s.Err != "" {
@@ -66,10 +73,9 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 			if s.Err != "" {
 				notes.WriteString(reportIndent + account + ": " + s.Err + "\n")
 			}
-			accountRow := accountRowIndex(s.Windows)
 			for i, w := range s.Windows {
 				cell := ""
-				if i == accountRow {
+				if i == 0 {
 					cell = account
 				}
 				rows = append(rows, []string{
@@ -93,62 +99,34 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 	return b.String()
 }
 
-// hasMultipleProviders reports whether the snapshots span more than one
-// provider; the account cell then prefixes the provider so sources stay
-// distinguishable.
-func hasMultipleProviders(snaps []Snapshot) bool {
-	seen := ""
-	for _, s := range snaps {
-		if s.Provider == "" {
-			continue
-		}
-		if seen != "" && s.Provider != seen {
-			return true
-		}
-		if seen == "" {
-			seen = s.Provider
-		}
+// accountSortKey orders snapshots by their first account name (provider
+// as fallback), so modules never interleave in the table.
+func accountSortKey(s Snapshot) string {
+	if len(s.Accounts) > 0 {
+		return s.Accounts[0]
 	}
-	return false
+	return s.Provider
 }
 
-// accountCell is the first-column value for one account. A stale snapshot
-// keeps the 旧 marker, and a multi-provider report prefixes the provider.
-func accountCell(s Snapshot, title string, multiProvider bool) string {
+// accountCell is the first-column value for one account. The provider
+// prefix is deliberately NOT shown: account names are globally unique in
+// prism, and each module's first window row carries its account so a
+// module's other rows (account cell empty) can not be mistaken for a
+// neighbour's windows. A stale snapshot keeps the 旧 marker.
+func accountCell(s Snapshot, title string) string {
 	account := title
-	if multiProvider && s.Provider != "" {
-		account = s.Provider + "/" + title
-	}
 	if s.Stale {
 		account += " 旧"
 	}
 	return account
 }
 
-// accountRowIndex returns the row within one account's window group that
-// carries the account name, so the name renders once and is vertically
-// centered in the group. The weekly window is the preferred home whenever
-// it exists — even when the group is not a plain three-window
-// rolling/weekly/monthly stack (missing or custom windows). Without a
-// weekly window the middle row of the actual window count wins: the
-// unique middle for odd counts, the lower middle (len/2, 0-based) for
-// even counts. The caller never passes an empty group (len == 0 is
-// handled before rows are built); 0 is returned defensively.
-func accountRowIndex(windows []Window) int {
-	for i, w := range windows {
-		if w.Name == "weekly" {
-			return i
-		}
-	}
-	return len(windows) / 2
-}
-
 func windowLabel(name string) string {
 	switch name {
-	case "rolling":
+	case "rolling", "5h":
 		return "短期"
 	case "weekly":
-		return "周限"
+		return "中期"
 	case "monthly":
 		return "长期"
 	default:
@@ -172,14 +150,19 @@ func statusLabel(status string) string {
 	}
 }
 
-// formatEstimate prefers SuperGrok token-pool inference, then the old
-// OpenCode dollar window estimate.
+// formatEstimate prefers the token-pool inference, then the old OpenCode
+// dollar window estimate. A weekly window with a wired estimate mechanism
+// but no data yet renders -- (placeholder); plain "-" means the window
+// has no estimate concept at all (e.g. the 5h Gemini window).
 func formatEstimate(w Window) string {
 	if w.LimitTokensEstimate > 0 {
 		return render.FormatTokens(w.LimitTokensEstimate)
 	}
 	if w.LimitUSDEstimate > 0 && w.USDStatus == "estimated" {
 		return fmt.Sprintf("$%d.00", w.LimitUSDEstimate)
+	}
+	if w.Name == "weekly" {
+		return "--"
 	}
 	return "-"
 }

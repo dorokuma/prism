@@ -357,6 +357,34 @@ func TestSumGrokTokensOnlyGrokModels(t *testing.T) {
 	}
 }
 
+func TestSumTokensLikeProviderFilter(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	ts := time.Unix(1_700_000_000, 0).UTC()
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: ts, Model: "gemini-2.5-pro", Provider: "gemini", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Success: true, Status: 200},
+		// 第三方网关的 gemini 行：provider 不同，估算不得计入
+		{Ts: ts, Model: "gemini-2.5-pro", Provider: "anyrouter-openai", PromptTokens: 1000, CompletionTokens: 1000, TotalTokens: 2000, Success: true, Status: 200},
+		{Ts: ts, Model: "claude-sonnet", Provider: "gemini", PromptTokens: 1000, CompletionTokens: 1000, TotalTokens: 2000, Success: true, Status: 200},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.SumTokensLike(ctx, ts.Unix(), ts.Unix(), "gemini-%", "gemini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 150 {
+		t.Fatalf("SumTokensLike(gemini-%% gemini) = %d, want 150 (only the gemini provider row)", n)
+	}
+	nAny, err := s.SumTokensLike(ctx, ts.Unix(), ts.Unix(), "gemini-%", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nAny != 2150 {
+		t.Fatalf("SumTokensLike(gemini-%% any) = %d, want 2150", nAny)
+	}
+}
+
 func TestSummaryOrderByHitRateDescending(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

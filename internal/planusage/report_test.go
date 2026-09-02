@@ -4,8 +4,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/dorokuma/prism/internal/render"
 )
 
 func TestRenderTableTable(t *testing.T) {
@@ -34,13 +32,13 @@ func TestRenderTableTable(t *testing.T) {
 		},
 	}, now)
 	want := "" +
-		"  账号 窗口 状态 占用  重置 限额估算\n" +
-		"       短期 ok    12% 2h13m        -\n" +
-		"  go-1 周限 ok     8%  3d4h        -\n" +
-		"       长期 ok    40%   12d        -\n" +
-		"       短期 限流 100% 2h13m        -\n" +
-		"  go-2 周限 ok    30%  3d4h        -\n" +
-		"       长期 ok    55%   12d        -\n"
+		"  账号 窗口 状态 占用 重置  限额估算\n" +
+		"  go-1 短期 ok   12%  2h13m -       \n" +
+		"       中期 ok   8%   3d4h  --      \n" +
+		"       长期 ok   40%  12d   -       \n" +
+		"  go-2 短期 限流 100% 2h13m -       \n" +
+		"       中期 ok   30%  3d4h  --      \n" +
+		"       长期 ok   55%  12d   -       \n"
 	if got != want {
 		t.Fatalf("layout\ngot:\n%s\nwant:\n%s", got, want)
 	}
@@ -56,27 +54,14 @@ func TestRenderTableTable(t *testing.T) {
 	if len(winLines) != 6 {
 		t.Fatalf("window lines: %q", winLines)
 	}
-	pctCol := colOf(winLines[0], "%")
-	// The remain column is right-aligned, so the token's right edge is the
-	// stable anchor, not its start.
-	remainEnd := colOf(winLines[0], "2h13m") + render.DisplayWidth("2h13m")
-	if pctCol < 0 || remainEnd < 0 {
-		t.Fatalf("anchor missing: %q", winLines[0])
+	// Module layout: each account name appears on the module's FIRST
+	// window row only; the module's other rows leave the account cell
+	// empty so windows stay grouped under their account.
+	if !strings.Contains(winLines[0], "go-1") || strings.Contains(winLines[1], "go-1") || strings.Contains(winLines[2], "go-1") {
+		t.Fatalf("go-1 module layout wrong: %q", winLines[:3])
 	}
-	for _, line := range winLines {
-		if c := colOf(line, "%"); c != pctCol {
-			t.Errorf("%q: %% at col %d, want %d", line, c, pctCol)
-		}
-		rest := line[strings.Index(line, "%")+1:]
-		rest = strings.TrimLeft(rest, " ")
-		tok := strings.Fields(rest)
-		if len(tok) == 0 {
-			t.Errorf("%q: no remain", line)
-			continue
-		}
-		if end := colOf(line, tok[0]) + render.DisplayWidth(tok[0]); end != remainEnd {
-			t.Errorf("%q: remain %q ends at col %d, want %d", line, tok[0], end, remainEnd)
-		}
+	if !strings.Contains(winLines[3], "go-2") || strings.Contains(winLines[4], "go-2") || strings.Contains(winLines[5], "go-2") {
+		t.Fatalf("go-2 module layout wrong: %q", winLines[3:])
 	}
 }
 
@@ -89,77 +74,45 @@ func TestRenderTableSplitsAccounts(t *testing.T) {
 	}}, now)
 	want := "" +
 		"  账号 窗口 状态 占用 重置 限额估算\n" +
-		"  a1   短期 ok     1%    -        -\n" +
-		"  a2   短期 ok     1%    -        -\n"
+		"  a1   短期 ok   1%   -    -       \n" +
+		"  a2   短期 ok   1%   -    -       \n"
 	if got != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
 	}
 }
 
-func colOf(s, sub string) int {
-	i := strings.Index(s, sub)
-	if i < 0 {
-		return -1
-	}
-	return render.DisplayWidth(s[:i])
-}
-
-// TestRenderTableAccountRowPlacement pins where the account name sits
-// inside one window group: the weekly row whenever a weekly window
-// exists (even when that is not the group's middle row), otherwise the
-// middle row of the actual window count — the lower middle (len/2,
-// 0-based) for even counts. Every other window row leaves the account
-// cell empty.
-func TestRenderTableAccountRowPlacement(t *testing.T) {
+// TestRenderTableModuleFirstRow pins the module layout: the account name
+// sits on the module's FIRST window row, every later row of the module
+// leaves the account cell empty (windows stay grouped under their
+// account, never mistaken for a neighbour's).
+func TestRenderTableModuleFirstRow(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h2 := now.Add(2*time.Hour + 13*time.Minute)
 	d3 := now.Add(3*24*time.Hour + 4*time.Hour)
 	d12 := now.Add(12 * 24 * time.Hour)
-	header := "  账号 窗口 状态 占用  重置 限额估算\n"
+	header := "  账号 窗口 状态 占用 重置  限额估算\n"
 	cases := []struct {
 		name    string
 		windows []Window
 		want    string
 	}{
 		{
-			name: "three windows, weekly is the middle row",
+			name: "three windows",
 			windows: []Window{
 				{Name: "rolling", Status: "ok", Percent: 12, ResetsAt: &h2},
 				{Name: "weekly", Status: "ok", Percent: 8, ResetsAt: &d3},
 				{Name: "monthly", Status: "ok", Percent: 40, ResetsAt: &d12},
 			},
 			want: header +
-				"       短期 ok    12% 2h13m        -\n" +
-				"  a1   周限 ok     8%  3d4h        -\n" +
-				"       长期 ok    40%   12d        -\n",
-		},
-		{
-			name: "weekly present but not the middle row",
-			windows: []Window{
-				{Name: "rolling", Status: "ok", Percent: 12, ResetsAt: &h2},
-				{Name: "monthly", Status: "ok", Percent: 40, ResetsAt: &d12},
-				{Name: "weekly", Status: "ok", Percent: 8, ResetsAt: &d3},
-			},
-			want: header +
-				"       短期 ok    12% 2h13m        -\n" +
-				"       长期 ok    40%   12d        -\n" +
-				"  a1   周限 ok     8%  3d4h        -\n",
-		},
-		{
-			name: "two windows, no weekly: lower middle row",
-			windows: []Window{
-				{Name: "rolling", Status: "ok", Percent: 12, ResetsAt: &h2},
-				{Name: "monthly", Status: "ok", Percent: 40, ResetsAt: &d12},
-			},
-			want: header +
-				"       短期 ok    12% 2h13m        -\n" +
-				"  a1   长期 ok    40%   12d        -\n",
+				"  a1   短期 ok   12%  2h13m -       \n" +
+				"       中期 ok   8%   3d4h  --      \n" +
+				"       长期 ok   40%  12d   -       \n",
 		},
 		{
 			name:    "single window",
 			windows: []Window{{Name: "rolling", Status: "ok", Percent: 12, ResetsAt: &h2}},
 			want: header +
-				"  a1   短期 ok    12% 2h13m        -\n",
+				"  a1   短期 ok   12%  2h13m -       \n",
 		},
 	}
 	for _, tc := range cases {
@@ -176,41 +129,35 @@ func TestRenderTableAccountRowPlacement(t *testing.T) {
 	}
 }
 
-// TestRenderTableAccountOncePerGroup pins that with several accounts on
-// one snapshot each name still renders exactly once, on its own weekly
-// row — never repeated across the group's other windows.
-func TestRenderTableAccountOncePerGroup(t *testing.T) {
+// TestRenderTableModuleSortAndEmptyCells pins that modules are sorted by
+// account name (never interleaving) and that only each module's first
+// window row carries the account name.
+func TestRenderTableModuleSortAndEmptyCells(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
-	got := RenderTableAt([]Snapshot{{
-		Provider: "opencode-go",
-		Accounts: []string{"a1", "a2"},
-		Windows: []Window{
+	got := RenderTableAt([]Snapshot{
+		{Provider: "opencode-go", Accounts: []string{"z9"}, Windows: []Window{
 			{Name: "rolling", Status: "ok", Percent: 12},
 			{Name: "weekly", Status: "ok", Percent: 8},
-			{Name: "monthly", Status: "ok", Percent: 40},
-		},
-	}}, now)
-	for _, acct := range []string{"a1", "a2"} {
-		var hits []string
-		for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
-			if strings.Contains(line, "%") && strings.Contains(line, acct) {
-				hits = append(hits, line)
-			}
-		}
-		if len(hits) != 1 {
-			t.Fatalf("%s appears in %d window rows, want exactly 1: %q\n%s", acct, len(hits), hits, got)
-		}
-		if !strings.Contains(hits[0], "周限") {
-			t.Fatalf("%s not on the weekly row: %q", acct, hits[0])
-		}
+		}},
+		{Provider: "opencode-go", Accounts: []string{"a1"}, Windows: []Window{
+			{Name: "rolling", Status: "ok", Percent: 1},
+		}},
+	}, now)
+	lines := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
+	// a1 module first (sorted), then z9 module.
+	if !strings.Contains(lines[1], "a1") || !strings.Contains(lines[2], "z9") {
+		t.Fatalf("modules not sorted:\n%s", got)
+	}
+	// z9 module: account on first window row, empty on the second.
+	if !strings.Contains(lines[2], "z9") || strings.Contains(lines[3], "z9") {
+		t.Fatalf("z9 module layout wrong:\n%s", got)
 	}
 }
 
-// TestRenderTableStaleProviderPlacement pins that the provider prefix and
-// the stale 旧 marker ride the account cell and appear only on the
-// account's single centered row, while error notes keep the full
-// provider/account attribution.
-func TestRenderTableStaleProviderPlacement(t *testing.T) {
+// TestRenderTableStaleModuleFirstRow pins that the stale 旧 marker rides
+// the account cell on the module's first window row (no provider prefix
+// any more), while error notes keep the plain account attribution.
+func TestRenderTableStaleModuleFirstRow(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h := now.Add(45 * time.Minute)
 	got := RenderTableAt([]Snapshot{
@@ -233,36 +180,22 @@ func TestRenderTableStaleProviderPlacement(t *testing.T) {
 			},
 		},
 	}, now)
-	// Error notes keep the complete provider/account attribution.
-	for _, s := range []string{"opencode-go/a1 旧: fetch_failed", "acme/b2 旧: timeout"} {
+	// Error notes keep the plain account attribution (no provider prefix).
+	for _, s := range []string{"a1 旧: fetch_failed", "b2 旧: timeout"} {
 		if !strings.Contains(got, s) {
 			t.Fatalf("error attribution %q missing:\n%s", s, got)
 		}
 	}
-	// Each full account cell (provider prefix + stale marker) appears
-	// exactly twice in the whole report: once on its single window row
-	// and once on its error note — never on the group's other rows.
-	for _, acct := range []string{"opencode-go/a1 旧", "acme/b2 旧"} {
-		if n := strings.Count(got, acct); n != 2 {
-			t.Fatalf("%q occurs %d times, want 2 (one window row + one error note):\n%s", acct, n, got)
-		}
+	if strings.Contains(got, "opencode-go/a1") || strings.Contains(got, "acme/b2") {
+		t.Fatalf("provider prefix leaked:\n%s", got)
 	}
-	// a1's only window is rolling; b2's group has a weekly window, so the
-	// name sits on the 周限 row.
-	var a1Row, b2Row string
-	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
-		switch {
-		case strings.Contains(line, "opencode-go/a1 旧") && strings.Contains(line, "%"):
-			a1Row = line
-		case strings.Contains(line, "acme/b2 旧") && strings.Contains(line, "%"):
-			b2Row = line
-		}
+	// The stale account cell appears once on the module's first window
+	// row plus once on the error note.
+	if n := strings.Count(got, "a1 旧"); n != 2 {
+		t.Fatalf("a1 旧 occurs %d times, want 2:\n%s", n, got)
 	}
-	if !strings.Contains(a1Row, "短期") {
-		t.Fatalf("a1 not on its single window row: %q", a1Row)
-	}
-	if !strings.Contains(b2Row, "周限") {
-		t.Fatalf("b2 not on the weekly row: %q", b2Row)
+	if n := strings.Count(got, "b2 旧"); n != 2 {
+		t.Fatalf("b2 旧 occurs %d times, want 2:\n%s", n, got)
 	}
 	if !strings.Contains(got, "3%") || !strings.Contains(got, "7%") {
 		t.Fatalf("window rows missing:\n%s", got)
@@ -309,7 +242,7 @@ func TestRenderTableAtErrorAndStale(t *testing.T) {
 
 // TestRenderTableErrorAttribution pins the per-account error ownership:
 // stale snapshots that still carry windows must not degrade into bare,
-// indistinguishable error lines — each error keeps its provider/account.
+// indistinguishable error lines — each error keeps its account.
 func TestRenderTableErrorAttribution(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h := now.Add(45 * time.Minute)
@@ -329,23 +262,27 @@ func TestRenderTableErrorAttribution(t *testing.T) {
 			Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 7, ResetsAt: &h}},
 		},
 	}, now)
-	// Each error line carries its own provider/account attribution.
-	for _, s := range []string{"opencode-go/a1 旧: fetch_failed", "acme/b2 旧: timeout"} {
+	// Each error line carries its own account attribution (no provider
+	// prefix any more).
+	for _, s := range []string{"a1 旧: fetch_failed", "b2 旧: timeout"} {
 		if !strings.Contains(got, s) {
 			t.Fatalf("error attribution %q missing:\n%s", s, got)
 		}
 	}
+	if strings.Contains(got, "opencode-go/a1") || strings.Contains(got, "acme/b2") {
+		t.Fatalf("provider prefix leaked:\n%s", got)
+	}
 	// No bare error line may survive without its attribution.
 	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
-		if strings.Contains(line, "fetch_failed") && !strings.Contains(line, "opencode-go/a1 旧: ") {
+		if strings.Contains(line, "fetch_failed") && !strings.Contains(line, "a1 旧: ") {
 			t.Fatalf("bare error line: %q", line)
 		}
-		if strings.Contains(line, "timeout") && !strings.Contains(line, "acme/b2 旧: ") {
+		if strings.Contains(line, "timeout") && !strings.Contains(line, "b2 旧: ") {
 			t.Fatalf("bare error line: %q", line)
 		}
 	}
 	// Normal window rows and the stale markers are preserved.
-	if !strings.Contains(got, "opencode-go/a1 旧") || !strings.Contains(got, "acme/b2 旧") {
+	if !strings.Contains(got, "a1 旧") || !strings.Contains(got, "b2 旧") {
 		t.Fatalf("stale markers missing:\n%s", got)
 	}
 	if !strings.Contains(got, "3%") || !strings.Contains(got, "7%") {
@@ -378,11 +315,54 @@ func TestFormatRemain(t *testing.T) {
 	}
 }
 
+func TestRenderTableGeminiFiveHourAndWeekly(t *testing.T) {
+	now := time.Date(2026, 9, 2, 8, 0, 0, 0, time.UTC)
+	h5 := now.Add(5 * time.Hour)
+	wk := now.Add(49 * time.Minute)
+	got := RenderTableAt([]Snapshot{{
+		Provider: "gemini",
+		Accounts: []string{"Gemini"},
+		Windows: []Window{
+			{Name: "5h", Status: "ok", Percent: 0, ResetsAt: &h5},
+			{Name: "weekly", Status: "ok", Percent: 94, ResetsAt: &wk},
+		},
+	}}, now)
+	if !strings.Contains(got, "短期") {
+		t.Fatalf("5h label missing:\n%s", got)
+	}
+	if !strings.Contains(got, "中期") {
+		t.Fatalf("weekly label missing:\n%s", got)
+	}
+	if strings.Contains(got, "Claude") || strings.Contains(got, "3p-") || strings.Contains(got, "5小时") || strings.Contains(got, "周限") {
+		t.Fatalf("old labels/claude leaked:\n%s", got)
+	}
+	// Module layout: account on the first (5h) row, weekly row leaves the
+	// account cell empty so both rows read as one Gemini module.
+	lines := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
+	var first, second string
+	for _, line := range lines {
+		if strings.Contains(line, "%") && first == "" {
+			first = line
+		}
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "%") && line != first {
+			second = line
+		}
+	}
+	if !strings.Contains(first, "Gemini") {
+		t.Fatalf("account missing on first window row:\n%s", got)
+	}
+	if strings.Contains(second, "Gemini") {
+		t.Fatalf("weekly row should leave the account cell empty:\n%s", got)
+	}
+}
+
 func TestRenderTableTokenEstimateColumn(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	got := RenderTableAt([]Snapshot{{
 		Provider: "xai",
-		Accounts: []string{"supergrok"},
+		Accounts: []string{"SuperGrok"},
 		Windows: []Window{
 			{Name: "weekly", Status: "ok", Percent: 57, LimitTokensEstimate: 1_540_000},
 		},
@@ -416,23 +396,18 @@ func TestRenderTableEstimateColumn(t *testing.T) {
 	}
 }
 
-func TestRenderTableProviderPrefix(t *testing.T) {
+// TestRenderTableNoProviderPrefix pins that the provider prefix is gone
+// from the account cell even across providers: account names are globally
+// unique in prism, and every window row carries its own account.
+func TestRenderTableNoProviderPrefix(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	win := []Window{{Name: "rolling", Status: "ok", Percent: 1}}
 	got := RenderTableAt([]Snapshot{
 		{Provider: "opencode-go", Accounts: []string{"a1"}, Windows: win},
-		{Provider: "acme", Accounts: []string{"a1"}, Windows: win},
+		{Provider: "acme", Accounts: []string{"b2"}, Windows: win},
 	}, now)
-	if !strings.Contains(got, "opencode-go/a1") || !strings.Contains(got, "acme/a1") {
-		t.Fatalf("provider prefix missing:\n%s", got)
-	}
-	// Same provider: account names alone are enough.
-	got = RenderTableAt([]Snapshot{
-		{Provider: "opencode-go", Accounts: []string{"a1"}, Windows: win},
-		{Provider: "opencode-go", Accounts: []string{"b2"}, Windows: win},
-	}, now)
-	if strings.Contains(got, "opencode-go/a1") || strings.Contains(got, "opencode-go/b2") {
-		t.Fatalf("unneeded provider prefix:\n%s", got)
+	if strings.Contains(got, "opencode-go/") || strings.Contains(got, "acme/") {
+		t.Fatalf("provider prefix still rendered:\n%s", got)
 	}
 	if !strings.Contains(got, "a1") || !strings.Contains(got, "b2") {
 		t.Fatalf("accounts missing:\n%s", got)
