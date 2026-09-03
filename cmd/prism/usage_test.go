@@ -409,6 +409,35 @@ func TestUsageDBPathResolution(t *testing.T) {
 			t.Errorf("source = %q, want it to name the fallback config", source)
 		}
 	})
+
+	t.Run("cwd config with usage disabled falls through to fallback config", func(t *testing.T) {
+		cwd := t.TempDir()
+		fallbackDir := t.TempDir()
+		fallbackDB := filepath.Join(fallbackDir, "fallback.db")
+		// cwd config.yaml is valid (has an account) but usage.enabled is
+		// false with no db_path. LoadConfig fills the code default into
+		// Usage.DBPath on load, so a plain "DBPath non-empty" check would
+		// wrongly accept this candidate and block the fallback. enabled:
+		// false must skip the candidate and continue to the fallback
+		// config's real db_path.
+		cwdCfg := "accounts:\n  - name: test\n    base_url: https://api.example.com/v1\n    provider: p\n    key: sk-test\nusage:\n  enabled: false\n"
+		if err := os.WriteFile(filepath.Join(cwd, "config.yaml"), []byte(cwdCfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeUsageTestConfig(t, fallbackDir, fallbackDB)
+		withLookup(t, cwd, filepath.Join(fallbackDir, "config.yaml"))
+
+		_, _, dbPath, source, err := parseUsageArgs(nil, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dbPath != fallbackDB {
+			t.Errorf("dbPath = %q, want fallback db_path %q after cwd config had usage disabled", dbPath, fallbackDB)
+		}
+		if !strings.Contains(source, "回退配置") {
+			t.Errorf("source = %q, want it to name the fallback config", source)
+		}
+	})
 }
 
 func TestRunUsageJSON(t *testing.T) {

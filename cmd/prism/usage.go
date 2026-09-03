@@ -94,16 +94,20 @@ var grokEstimatePath = planusage.DefaultGrokEstimatePath
 // messages. A cwd config.yaml that exists but fails to load (invalid
 // content, no accounts, ...) is skipped in favor of the fallback: the CLI
 // only needs db_path, and the cwd may hold an unrelated same-named file
-// (e.g. another project's config.yaml in the user's home directory).
+// (e.g. another project's config.yaml in the user's home directory). A
+// config that loads successfully but has usage.enabled: false is skipped
+// the same way: dev directories commonly carry such a config, and its
+// default-filled db_path must not block the fallback config's real
+// database.
 func resolveUsageDBPath(explicit string) (dbPath, source string) {
 	if explicit != "" {
 		return explicit, "--db 显式指定"
 	}
 	cwdCfg := filepath.Join(usageConfigDir(), "config.yaml")
-	if cfg, err := config.LoadConfig(cwdCfg); err == nil && cfg.Usage.DBPath != "" {
+	if cfg, err := config.LoadConfig(cwdCfg); err == nil && cfg.Usage.Enabled && cfg.Usage.DBPath != "" {
 		return cfg.Usage.DBPath, fmt.Sprintf("当前目录配置 %s 的 db_path", cwdCfg)
 	}
-	if cfg, err := config.LoadConfig(usageConfigFallbackPath); err == nil && cfg.Usage.DBPath != "" {
+	if cfg, err := config.LoadConfig(usageConfigFallbackPath); err == nil && cfg.Usage.Enabled && cfg.Usage.DBPath != "" {
 		return cfg.Usage.DBPath, fmt.Sprintf("回退配置 %s 的 db_path", usageConfigFallbackPath)
 	}
 	return defaultUsageDBPath, "代码默认值"
