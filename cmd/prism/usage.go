@@ -367,8 +367,9 @@ var relTimeArg = regexp.MustCompile(`^(\d+)([smhd])$`)
 // (From/To <= 0 are the "no bound" sentinels), the same silent-unbounded
 // class the HTTP path rejects. Only pathological inputs reach it — a full
 // date at/before 1970 ("1969-12-31", "0001-01-01"; "1970-01-01" in a
-// positive-offset timezone) or an absurd relative duration
-// ("999999999d") — normal relative forms cannot go negative.
+// positive-offset timezone) — normal relative forms cannot go negative,
+// and an oversized day count (e.g. "999999999d") is caught earlier by the
+// d cap below, erroring as 时间跨度过大 before the epoch check.
 //
 // Relative h/m/s also reject an overflow before the Duration multiply:
 // n > math.MaxInt64/int64(unit) (about 292 years; 2562048h and above).

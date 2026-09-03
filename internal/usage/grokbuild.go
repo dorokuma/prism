@@ -206,10 +206,10 @@ func eventsFromSegment(seg grokSegment, priceFor func(model string, contextToken
 //
 // Every skip logs one slog.Warn tagged with source ("grok-build" /
 // "pi-sessions") so the two call sites stay distinguishable. Skip includes
-// the window DELETE — the "先删后插零" no-op. One warn per xai group per
-// poller round (~120s); no sync.Once, so a recovery-then-re-failure still
-// surfaces. Runtime permission check, not a hard-coded user: `prism quota`
-// as root still lists the directory and imports normally.
+// the window DELETE — the "先删后插零" no-op. Manual CLI call records a
+// single warn (the service-side poller no longer imports). Runtime
+// permission check, not a hard-coded user: `prism quota` as root still
+// lists the directory and imports normally.
 func probeWalkableDir(path, source string) (realPath string, ok bool) {
 	info, err := os.Stat(path)
 	if err != nil {
