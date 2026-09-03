@@ -192,8 +192,23 @@ func ImportGrokBuild(ctx context.Context, store *SQLiteStore, sessionsDir string
 	if toUnix <= 0 {
 		toUnix = time.Now().Unix()
 	}
+	// Unreadable (missing, or no permission) sessions dir: skip the whole
+	// import INCLUDING the DELETE below. Without this probe the walk yields
+	// zero events on an unreadable dir and DeleteKeyIDRange still runs —
+	// the "先删后插零" no-op that wipes previously imported grok-build
+	// rows on every poller round when the service user cannot read the
+	// CLI's session tree (e.g. /root/.grok/sessions). The probe is an
+	// Open, not a Stat: Stat succeeds on a directory whose READ permission
+	// is missing, which is exactly the case to skip. It is a runtime
+	// permission check, not a hard-coded user: the `prism quota` CLI
+	// running as root still opens the directory and imports normally.
+	f, err := os.Open(sessionsDir)
+	if err != nil {
+		return 0, nil
+	}
+	f.Close()
 	var events []Event
-	err := filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			if os.IsPermission(err) {
 				return filepath.SkipDir

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCollectGrokSegmentsSplitsOnTurnReset(t *testing.T) {
@@ -65,6 +66,67 @@ func TestImportGrokBuildReplacesWeekRows(t *testing.T) {
 	}
 	if ov.TotalCost == nil || *ov.TotalCost < 1.9 || *ov.TotalCost > 2.1 {
 		t.Fatalf("cost = %v, want ~2 from ticks", ov.TotalCost)
+	}
+}
+
+func TestImportGrokBuildUnreadableDirKeepsRows(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	price := &Price{Input: 1, Output: 1}
+	c, _ := costOf(10, 10, 0, 0, "", price)
+	now := time.Now().Unix()
+	seed := Event{
+		Ts: time.Unix(now, 0), RequestID: "seed", Path: grokBuildPath, Model: "grok-4.6",
+		Provider: "xai", Account: GrokBuildAccount, KeyID: GrokBuildKeyID,
+		Success: true, Status: 200,
+		PromptTokens: 10, CompletionTokens: 10, TotalTokens: 20,
+		Cost: c, CostStatus: CostStatusOK,
+	}
+	if err := s.InsertBatch(ctx, []Event{seed}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Missing dir: the import must skip the whole harvest INCLUDING the
+	// window DELETE — the seeded grok-build row in the import window
+	// survives (no "先删后插零" on an empty harvest).
+	missing := filepath.Join(t.TempDir(), "no-such-sessions")
+	n, err := ImportGrokBuild(ctx, s, missing, now-3600, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("missing dir: imported %d, want 0", n)
+	}
+	if got, err := s.SumGrokTokens(ctx, now-3600, now); err != nil {
+		t.Fatal(err)
+	} else if got != 20 {
+		t.Fatalf("missing dir: SumGrokTokens = %d, want 20 (seeded row must survive)", got)
+	}
+
+	// Dir present but unreadable (no read permission): same skip. The
+	// probe is a runtime permission check — when the test runs as root
+	// the permission bit is bypassed and the import legitimately
+	// proceeds, so that branch is skipped rather than asserted.
+	perm := filepath.Join(t.TempDir(), "no-perm-sessions")
+	if err := os.Mkdir(perm, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Open(perm); err != nil {
+		n, err = ImportGrokBuild(ctx, s, perm, now-3600, now, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("unreadable dir: imported %d, want 0", n)
+		}
+		if got, err := s.SumGrokTokens(ctx, now-3600, now); err != nil {
+			t.Fatal(err)
+		} else if got != 20 {
+			t.Fatalf("unreadable dir: SumGrokTokens = %d, want 20 (seeded row must survive)", got)
+		}
+	}
+	if err := os.Chmod(perm, 0o700); err != nil {
+		t.Fatal(err)
 	}
 }
 

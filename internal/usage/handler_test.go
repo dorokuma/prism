@@ -214,6 +214,7 @@ func TestHandlerInvalidGroupBy(t *testing.T) {
 		"/admin/usage/summary?stream=banana",
 		"/admin/usage/summary?success=maybe",
 		"/admin/usage/summary?from=abc",
+		"/admin/usage/summary?to=abc",
 		"/admin/usage/summary?limit=-3",
 		"/admin/usage/summary?limit=zzz",
 	} {
@@ -637,10 +638,12 @@ func TestHandlerToOnlyRange(t *testing.T) {
 	now := time.Now()
 	weekStart := now.Add(-3 * 24 * time.Hour)
 	old := now.Add(-10 * 24 * time.Hour)
+	future := now.Add(24 * time.Hour) // after `to=now`: must stay OUT of the window
 	ctx := context.Background()
 	if err := s.InsertBatch(ctx, []Event{
 		{Ts: old, RequestID: "old", Model: "old", PromptTokens: 10, CompletionTokens: 10, TotalTokens: 20},
 		{Ts: now, RequestID: "cur", Model: "cur", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150},
+		{Ts: future, RequestID: "future", Model: "future", PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -679,6 +682,89 @@ func TestHandlerToOnlyRange(t *testing.T) {
 	}
 	if strings.Contains(body, "  old") {
 		t.Errorf("to-only detail must exclude the pre-week row:\n%s", body)
+	}
+	// Upper bound pinned: the event AFTER `to` must appear in neither the
+	// rows nor the header count (header stays 1 even though the store now
+	// holds three events).
+	if strings.Contains(body, "  future") {
+		t.Errorf("to-only detail must exclude the post-to row:\n%s", body)
+	}
+	if strings.Contains(body, "1100") || strings.Contains(body, "1000") {
+		t.Errorf("to-only must not aggregate the post-to event's tokens:\n%s", body)
+	}
+
+	// JSON path: the same window — the ungrouped aggregate covers exactly
+	// the in-window event (future is excluded by the pinned upper bound).
+	rec = doRequest(h, http.MethodGet, "/admin/usage/summary?to="+strconv.FormatInt(now.Unix(), 10), "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("to-only json: got %d", rec.Code)
+	}
+	var jr struct {
+		Rows []SummaryRow `json:"rows"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &jr); err != nil {
+		t.Fatal(err)
+	}
+	if len(jr.Rows) != 1 || jr.Rows[0].Requests != 1 || jr.Rows[0].TotalTokens != 150 {
+		t.Fatalf("to-only json rows = %+v, want exactly the in-window event (requests=1, total=150)", jr.Rows)
+	}
+}
+
+// TestHandlerInvalidRange pins the from>to validation aligned with the CLI
+// `--since 晚于 --until` error: after the default window is applied, an
+// inverted [from, to] range is a 400 on both the JSON and format=table
+// paths. This includes the to-only case where `to` falls BEFORE the
+// default week start — the window [week start, to] is empty and inverted,
+// so it is rejected instead of serving an empty 200. A present-but-empty
+// `from` (`?from=`) counts as not passed, so the default still applies
+// and a valid window is NOT rejected.
+func TestHandlerInvalidRange(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
+	s := openTestStore(t)
+	now := time.Now()
+	weekStart := now.Add(-3 * 24 * time.Hour)
+	h := NewSummaryHandler(s)
+	h.DefaultFrom = func() int64 { return weekStart.Unix() }
+
+	// Explicit from after to → 400 on both output formats, with the
+	// QueryError message.
+	from := now.Add(-24 * time.Hour).Unix()
+	to := now.Add(-48 * time.Hour).Unix()
+	for _, target := range []string{
+		"/admin/usage/summary?from=" + strconv.FormatInt(from, 10) + "&to=" + strconv.FormatInt(to, 10),
+		"/admin/usage/summary?from=" + strconv.FormatInt(from, 10) + "&to=" + strconv.FormatInt(to, 10) + "&format=table",
+	} {
+		rec := doRequest(h, http.MethodGet, target, "127.0.0.1:1", "")
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: got %d, want 400", target, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "invalid range: from after to") {
+			t.Errorf("%s: body must carry the QueryError message, got %s", target, rec.Body.String())
+		}
+	}
+
+	// to-only with to BEFORE the default week start → 400 (the window
+	// [week start, to] is empty and inverted; must not serve an empty 200).
+	early := weekStart.Add(-1 * time.Hour).Unix()
+	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?to="+strconv.FormatInt(early, 10), "127.0.0.1:1", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("to-only before week start: got %d, want 400", rec.Code)
+	}
+
+	// Valid windows are untouched (from <= to, or a side unbounded):
+	// including empty-value params, which count as not passed.
+	for _, target := range []string{
+		"/admin/usage/summary",
+		"/admin/usage/summary?from=",
+		"/admin/usage/summary?to=",
+		"/admin/usage/summary?to=" + strconv.FormatInt(now.Unix(), 10),
+		"/admin/usage/summary?from=" + strconv.FormatInt(weekStart.Unix(), 10) + "&to=" + strconv.FormatInt(now.Unix(), 10),
+		"/admin/usage/summary?from=0",
+	} {
+		rec := doRequest(h, http.MethodGet, target, "127.0.0.1:1", "")
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: got %d, want 200", target, rec.Code)
+		}
 	}
 }
 

@@ -68,6 +68,16 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// applyDefaultRange mutates q with the default time range when the
 	defaulted := h.applyDefaultRange(r, &q)
+	// Range validation runs AFTER the window is final (applyDefaultRange
+	// fills the default lower bound): a to-only request whose `to` falls
+	// before the default week start has an empty, inverted [week start,
+	// to] window and is rejected the same way the CLI rejects
+	// `--since 晚于 --until`. Both the JSON and the format=table paths
+	// are covered here, before any query runs.
+	if q.From > 0 && q.To > 0 && q.From > q.To {
+		writeSummaryError(w, &QueryError{Msg: "invalid range: from after to"})
+		return
+	}
 	// format=table renders the same report as the prism usage CLI (shared
 	// render code); format=json (default) is the existing behavior.
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
@@ -197,8 +207,11 @@ func parseSummaryQuery(r *http.Request) (SummaryQuery, error) {
 }
 
 func (h *SummaryHandler) applyDefaultRange(r *http.Request, q *SummaryQuery) bool {
-	if _, ok := r.URL.Query()["from"]; ok {
-		// from is explicit: the caller fully owns the lower bound.
+	if queryParamPresent(r, "from") {
+		// from is explicit (non-empty value): the caller fully owns the
+		// lower bound. A present-but-empty `from` (`?from=`) counts as
+		// NOT passed, matching parseSummaryQuery's empty-value skip and
+		// the CLI's --since "".
 		return false
 	}
 	if h == nil || h.DefaultFrom == nil {
@@ -209,14 +222,25 @@ func (h *SummaryHandler) applyDefaultRange(r *http.Request, q *SummaryQuery) boo
 		return false
 	}
 	q.From = v
-	if _, ok := r.URL.Query()["to"]; ok {
+	if queryParamPresent(r, "to") {
 		// to-only (to without from): the caller pins only the upper
 		// bound; the lower bound still falls back to the default window
 		// start, mirroring the CLI's --until-only path ([week start, to]).
 		// The overview stays on the same window — not all history.
+		// A present-but-empty `to` (`?to=`) counts as NOT passed, like
+		// the CLI's --until "".
 		return false
 	}
 	return true
+}
+
+// queryParamPresent reports whether the URL query carries key with a
+// non-empty value. A key whose value is empty (`?to=`) counts as NOT
+// passed: parseSummaryQuery skips it the same way (qp.Get returns "" and
+// the parse is skipped), matching the CLI where --until "" / --since ""
+// are ignored.
+func queryParamPresent(r *http.Request, key string) bool {
+	return r.URL.Query().Get(key) != ""
 }
 
 func parseBoolParam(v string) (bool, error) {
