@@ -67,8 +67,7 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// applyDefaultRange mutates q with the default time range when the
-	// request omits from/to; the resolved range is used by every format.
-	h.applyDefaultRange(r, &q)
+	defaulted := h.applyDefaultRange(r, &q)
 	// format=table renders the same report as the prism usage CLI (shared
 	// render code); format=json (default) is the existing behavior.
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
@@ -76,7 +75,7 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "", "json":
 		// existing JSON behavior, unchanged
 	case "table":
-		h.serveTable(w, r, q)
+		h.serveTable(w, r, q, defaulted)
 		return
 	default:
 		writeSummaryError(w, &QueryError{Msg: "invalid format"})
@@ -107,8 +106,13 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // produced by the same code. The compact single-line table is the only
 // layout — there are no layout/width params and no terminal-width
 // dependency.
-func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q SummaryQuery) {
-	ov, err := h.Store.Overview(r.Context(), q)
+func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q SummaryQuery, defaulted bool) {
+	qOverview := q
+	if defaulted {
+		qOverview.From = 0
+		qOverview.To = 0
+	}
+	ov, err := h.Store.Overview(r.Context(), qOverview)
 	if err != nil {
 		slog.Error("usage: overview query failed", "error", err)
 		util.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
@@ -194,6 +198,9 @@ func parseSummaryQuery(r *http.Request) (SummaryQuery, error) {
 
 func (h *SummaryHandler) applyDefaultRange(r *http.Request, q *SummaryQuery) bool {
 	if _, ok := r.URL.Query()["from"]; ok {
+		return false
+	}
+	if _, ok := r.URL.Query()["to"]; ok {
 		return false
 	}
 	if h == nil || h.DefaultFrom == nil {

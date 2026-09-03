@@ -933,3 +933,62 @@ func TestRunUsageSortsByHitRateDescending(t *testing.T) {
 		}
 	}
 }
+
+func TestRunUsageWeekDefaultOverviewAllHistory(t *testing.T) {
+	base := time.Date(2026, 3, 10, 15, 4, 5, 0, time.Local)
+	path := filepath.Join(t.TempDir(), "usage.db")
+	s := usage.NewSQLiteStore(path)
+	if err := s.Open(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	events := []usage.Event{
+		// old event: 14 days ago (prior week)
+		{Ts: base.Add(-14 * 24 * time.Hour), RequestID: "old", Model: "old-model", PromptTokens: 100, TotalTokens: 100, Source: usage.SourceOpenAI, Success: true},
+		// cur event: 1 hour ago (within current week)
+		{Ts: base.Add(-time.Hour), RequestID: "cur", Model: "cur-model", PromptTokens: 100, TotalTokens: 100, Source: usage.SourceOpenAI, Success: true},
+	}
+	if err := s.InsertBatch(ctx, events); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Default (no --since): Overview covers all history (2 requests), Summary covers only current week (1 request)
+	var buf bytes.Buffer
+	if err := runUsageWith([]string{"--db", path, "--json"}, &buf, base); err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Overview *usage.Overview    `json:"overview"`
+		Rows     []usage.SummaryRow `json:"rows"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Overview.Requests != 2 {
+		t.Errorf("default Overview.Requests = %d, want 2 (all history)", doc.Overview.Requests)
+	}
+	if len(doc.Rows) != 1 || doc.Rows[0].Groups["model"] != "cur-model" {
+		t.Errorf("default Rows = %+v, want only cur-model", doc.Rows)
+	}
+
+	// Explicit --since 2h: Overview and Summary both cover only cur-model (1 request)
+	buf.Reset()
+	if err := runUsageWith([]string{"--db", path, "--since", "2h", "--json"}, &buf, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Overview.Requests != 1 {
+		t.Errorf("explicit --since Overview.Requests = %d, want 1", doc.Overview.Requests)
+	}
+	if len(doc.Rows) != 1 || doc.Rows[0].Groups["model"] != "cur-model" {
+		t.Errorf("explicit --since Rows = %+v, want only cur-model", doc.Rows)
+	}
+}
+

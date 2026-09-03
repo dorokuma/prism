@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"testing"
 	"time"
 
 	"github.com/dorokuma/prism/internal/config"
@@ -144,17 +143,6 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 		return fmt.Errorf("无法访问 usage 数据库 %s: %v", dbPath, err)
 	}
 
-	if !testing.Testing() {
-		if cfg, _, err := loadCLIConfig(""); err == nil {
-			wstore := usage.NewSQLiteStore(dbPath)
-			if err := wstore.Open(); err == nil {
-				from, to := q.From, q.To
-				_, _ = usage.ImportGrokBuild(context.Background(), wstore, usage.DefaultGrokSessionsDir(), from, to, grokPriceFor(cfg))
-				_, _ = usage.ImportPiSessions(context.Background(), wstore, usage.DefaultPiSessionsDir(), from, to)
-				_ = wstore.Close()
-			}
-		}
-	}
 
 	store := usage.NewReadOnlyStore(dbPath)
 	if err := store.Open(); err != nil {
@@ -167,7 +155,12 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 		period = usage.PeriodWeek
 	}
 	render := func() error {
-		ov, err := store.Overview(context.Background(), q)
+		qOverview := q
+		if o.weekDefault {
+			qOverview.From = 0
+			qOverview.To = 0
+		}
+		ov, err := store.Overview(context.Background(), qOverview)
 		if err != nil {
 			return fmt.Errorf("usage 汇总查询失败: %v", err)
 		}
