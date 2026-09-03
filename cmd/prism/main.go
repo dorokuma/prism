@@ -521,10 +521,6 @@ func main() {
 	quotaPoller.SetOptions(cfg.Quota.Enabled, cfg.Quota.RefreshInterval, cfg.Quota.RequestTimeout)
 	if ss, ok := usageStore.(*usage.SQLiteStore); ok && ss != nil {
 		quotaPoller.SetGrokEstimate(ss.SumGrokTokens, planusage.DefaultGrokEstimatePath)
-		quotaPoller.SetGrokBuildImport(func(ctx context.Context, from, to int64) error {
-			_, err := usage.ImportGrokBuild(ctx, ss, usage.DefaultGrokSessionsDir(), from, to, grokPriceFor(holder.Load()))
-			return err
-		})
 		quotaPoller.SetGeminiEstimate(func(ctx context.Context, from, to int64) (int64, error) {
 			return ss.SumTokensLike(ctx, from, to, "gemini-%", "gemini")
 		}, planusage.DefaultGeminiEstimatePath)

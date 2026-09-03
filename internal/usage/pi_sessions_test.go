@@ -64,6 +64,40 @@ func TestImportPiSessionsRangeAndFiles(t *testing.T) {
 	}
 }
 
+// TestImportPiSessionsMissingDirKeepsRows pins the shared walkable-dir
+// probe on ImportPiSessions: a missing sessions dir must skip the whole
+// import INCLUDING the window DELETE — the seeded pi-session row survives.
+func TestImportPiSessionsMissingDirKeepsRows(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	seed := Event{
+		Ts: time.Unix(now, 0), RequestID: "seed-pi", Path: "pi-session",
+		Model: "m", Provider: "p", Account: PiSessionAccount, KeyID: PiSessionKeyID,
+		Success: true, Status: 200,
+		PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3,
+		Source: PiSessionSource,
+	}
+	if err := s.InsertBatch(ctx, []Event{seed}); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "no-such-pi-sessions")
+	n, err := ImportPiSessions(ctx, s, missing, now-3600, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("missing dir: imported %d, want 0", n)
+	}
+	overview, err := s.Overview(ctx, SummaryQuery{From: now - 3600, To: now, KeyID: PiSessionKeyID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.Requests != 1 || overview.TotalTokens != 3 {
+		t.Fatalf("missing dir: overview = %+v, seeded pi-session row must survive", overview)
+	}
+}
+
 func TestPiEventRejectsMissingProviderOrModel(t *testing.T) {
 	for _, raw := range []string{
 		`{"type":"message","message":{"role":"assistant","model":"m","timestamp":1700000000000,"usage":{"input":1,"output":2}}}`,
@@ -107,4 +141,40 @@ func TestPiEventTotalTokensPreferred(t *testing.T) {
 // be tested without exposing another production helper.
 func unmarshalPi(data []byte, line *piMessageLine) error {
 	return json.Unmarshal(data, line)
+}
+
+// TestImportPiSessionsWalkAbortKeepsRows pins the abort-without-DELETE
+// contract via walkErrForTest (same root-DAC reason as grok-build).
+func TestImportPiSessionsWalkAbortKeepsRows(t *testing.T) {
+	walkErrForTest = os.ErrPermission
+	t.Cleanup(func() { walkErrForTest = nil })
+
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	seed := Event{
+		Ts: time.Unix(now, 0), RequestID: "seed-pi", Path: "pi-session",
+		Model: "m", Provider: "p", Account: PiSessionAccount, KeyID: PiSessionKeyID,
+		Success: true, Status: 200,
+		PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3,
+		Source: PiSessionSource,
+	}
+	if err := s.InsertBatch(ctx, []Event{seed}); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	n, err := ImportPiSessions(ctx, s, dir, now-3600, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("aborted import: imported %d, want 0", n)
+	}
+	overview, err := s.Overview(ctx, SummaryQuery{From: now - 3600, To: now, KeyID: PiSessionKeyID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.Requests != 1 || overview.TotalTokens != 3 {
+		t.Fatalf("aborted import: overview = %+v, seeded pi-session row must survive", overview)
+	}
 }

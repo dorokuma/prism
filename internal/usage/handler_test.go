@@ -224,6 +224,44 @@ func TestHandlerInvalidGroupBy(t *testing.T) {
 	}
 }
 
+// TestHandlerNegativeTimeParams pins the negative-timestamp rejection:
+// an explicitly passed from/to < 0 is a 400 (a negative bound would
+// silently degrade to an unbounded window and mask a bad value), while
+// from=0 stays legal (explicit all-history) and to=0 keeps its existing
+// no-upper-bound semantics.
+func TestHandlerNegativeTimeParams(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
+	h := NewSummaryHandler(openTestStore(t))
+
+	// negative from/to → 400, alone or combined
+	for _, target := range []string{
+		"/admin/usage/summary?from=-1",
+		"/admin/usage/summary?from=-100",
+		"/admin/usage/summary?to=-1",
+		"/admin/usage/summary?to=-100",
+		"/admin/usage/summary?from=-1&to=-100",
+	} {
+		rec := doRequest(h, http.MethodGet, target, "127.0.0.1:1", "")
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: got %d, want 400", target, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "invalid") {
+			t.Errorf("%s: body must carry the invalid from/to message, got %s", target, rec.Body.String())
+		}
+	}
+
+	// from=0 (explicit all-history) and to=0 (no upper bound) stay 200
+	for _, target := range []string{
+		"/admin/usage/summary?from=0",
+		"/admin/usage/summary?to=0",
+		"/admin/usage/summary?from=0&to=0",
+	} {
+		if rec := doRequest(h, http.MethodGet, target, "127.0.0.1:1", ""); rec.Code != http.StatusOK {
+			t.Errorf("%s: got %d, want 200", target, rec.Code)
+		}
+	}
+}
+
 func TestHandlerMethodNotAllowed(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	h := NewSummaryHandler(openTestStore(t))

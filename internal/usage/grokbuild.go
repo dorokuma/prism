@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -181,6 +182,71 @@ func eventsFromSegment(seg grokSegment, priceFor func(model string, contextToken
 	return out
 }
 
+// probeWalkableDir is the shared sessions-dir importability probe used by
+// ImportGrokBuild and ImportPiSessions. Three steps, all-or-nothing:
+//
+//  1. os.Stat — missing path or !IsDir (regular file, FIFO, symlink→file)
+//     skips. Stat follows the last component, so a FIFO/file at the
+//     sessionsDir ROOT is gated here and never opened (no O_NONBLOCK
+//     needed). In-tree non-regular files are skipped later by walkFn.
+//  2. filepath.EvalSymlinks — Walk uses Lstat, so a symlink→dir passes
+//     Stat+IsDir but Walk treats the root as a file and harvests nothing,
+//     then DELETE+insert-0 wipes previously imported rows. Resolving to
+//     the real path makes probe semantics match Walk consumption: a legal
+//     symlink→dir imports normally; a broken link (or EvalSymlinks race)
+//     errors and skips. The caller MUST Walk the returned realPath.
+//  3. os.ReadDir(realPath) — --x (execute, no read) fails open and is
+//     blocked here. r-- (read, no execute) PASSES this probe
+//     (open+getdents only need r) but Walk's per-entry lstat needs x;
+//     those permission errors abort the import in walkFn (no DELETE)
+//     rather than harvesting zero then wiping old rows. Any ReadDir
+//     error (EACCES, vanished, …) skips. Probe pass ⇒ Walk can at
+//     least list the root level; deeper permission problems are walkFn's
+//     job.
+//
+// Every skip logs one slog.Warn tagged with source ("grok-build" /
+// "pi-sessions") so the two call sites stay distinguishable. Skip includes
+// the window DELETE — the "先删后插零" no-op. One warn per xai group per
+// poller round (~120s); no sync.Once, so a recovery-then-re-failure still
+// surfaces. Runtime permission check, not a hard-coded user: `prism quota`
+// as root still lists the directory and imports normally.
+func probeWalkableDir(path, source string) (realPath string, ok bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		slog.Warn("usage: "+source+" import skipped: sessions dir stat failed", "error", err, "path", path)
+		return "", false
+	}
+	if !info.IsDir() {
+		slog.Warn("usage: "+source+" import skipped: sessions dir is not a directory", "path", path, "mode", info.Mode().String())
+		return "", false
+	}
+	realPath, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		slog.Warn("usage: "+source+" import skipped: sessions dir evalsymlinks failed", "error", err, "path", path)
+		return "", false
+	}
+	if _, err := os.ReadDir(realPath); err != nil {
+		slog.Warn("usage: "+source+" import skipped: sessions dir unreadable", "error", err, "path", realPath)
+		return "", false
+	}
+	return realPath, true
+}
+
+// shouldAbortWalk reports whether a Walk-supplied error should abort the
+// whole import (no DELETE). Any non-nil error aborts: swallowing
+// IsPermission as SkipDir/return-nil used to harvest zero then
+// DELETE+insert-0. Conservative — a single-file lstat EACCES also
+// aborts — because uncertain harvest completeness must not wipe old rows.
+func shouldAbortWalk(err error) bool {
+	return err != nil
+}
+
+// walkErrForTest is a test-only hook. When non-nil, walkFn treats it as
+// a Walk-supplied error (as if lstat failed). Production stays nil. Root
+// DAC override makes a real in-tree EACCES unreproducible, so tests inject
+// the error to pin "abort ⇒ no DELETE".
+var walkErrForTest error
+
 // ImportGrokBuild replaces grok-build usage rows in [fromUnix, toUnix] with
 // session snapshots from the Grok Build CLI tree. Segments split when
 // numTurns drops (new conversation / rewind). Each segment contributes its
@@ -192,33 +258,29 @@ func ImportGrokBuild(ctx context.Context, store *SQLiteStore, sessionsDir string
 	if toUnix <= 0 {
 		toUnix = time.Now().Unix()
 	}
-	// Unreadable (missing, or no permission) sessions dir: skip the whole
-	// import INCLUDING the DELETE below. Without this probe the walk yields
-	// zero events on an unreadable dir and DeleteKeyIDRange still runs —
-	// the "先删后插零" no-op that wipes previously imported grok-build
-	// rows on every poller round when the service user cannot read the
-	// CLI's session tree (e.g. /root/.grok/sessions). The probe is an
-	// Open, not a Stat: Stat succeeds on a directory whose READ permission
-	// is missing, which is exactly the case to skip. It is a runtime
-	// permission check, not a hard-coded user: the `prism quota` CLI
-	// running as root still opens the directory and imports normally.
-	f, err := os.Open(sessionsDir)
-	if err != nil {
+	realPath, ok := probeWalkableDir(sessionsDir, "grok-build")
+	if !ok {
 		return 0, nil
 	}
-	f.Close()
 	var events []Event
-	err = filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			if os.IsPermission(err) {
-				return filepath.SkipDir
-			}
-			return nil
+	var aborted bool
+	err := filepath.Walk(realPath, func(path string, info os.FileInfo, err error) error {
+		if err == nil && walkErrForTest != nil {
+			err = walkErrForTest
+		}
+		if shouldAbortWalk(err) {
+			slog.Warn("usage: grok-build import aborted: walk error", "path", path, "error", err)
+			aborted = true
+			return err
 		}
 		if info.IsDir() {
 			return nil
 		}
 		if info.Name() != "updates.jsonl" {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			slog.Warn("usage: grok-build import skipped: not a regular file", "path", path, "mode", info.Mode().String())
 			return nil
 		}
 		if info.ModTime().Unix() < fromUnix {
@@ -227,6 +289,7 @@ func ImportGrokBuild(ctx context.Context, store *SQLiteStore, sessionsDir string
 		f, err := os.Open(path)
 		if err != nil {
 			if os.IsPermission(err) {
+				slog.Warn("usage: grok-build import skipped: open permission denied", "path", path, "error", err)
 				return nil
 			}
 			return nil
@@ -241,6 +304,10 @@ func ImportGrokBuild(ctx context.Context, store *SQLiteStore, sessionsDir string
 		}
 		return nil
 	})
+	if aborted {
+		slog.Warn("usage: grok-build import aborted: skip window delete", "path", realPath)
+		return 0, nil
+	}
 	if err != nil && !os.IsNotExist(err) && !os.IsPermission(err) {
 		return 0, err
 	}

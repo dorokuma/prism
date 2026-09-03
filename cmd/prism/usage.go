@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -146,7 +147,6 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 		}
 		return fmt.Errorf("无法访问 usage 数据库 %s: %v", dbPath, err)
 	}
-
 
 	store := usage.NewReadOnlyStore(dbPath)
 	if err := store.Open(); err != nil {
@@ -361,8 +361,25 @@ var relTimeArg = regexp.MustCompile(`^(\d+)([smhd])$`)
 //   - month-day: "08-01" — the current year; when the date is still in the
 //     future it falls back to the previous year.
 //   - full date: "2026-08-01" — midnight local time.
+//
+// A resolved time BEFORE the Unix epoch is an error: a negative bound
+// would silently degrade to an unbounded window in the summary query
+// (From/To <= 0 are the "no bound" sentinels), the same silent-unbounded
+// class the HTTP path rejects. Only pathological inputs reach it — a full
+// date at/before 1970 ("1969-12-31", "0001-01-01"; "1970-01-01" in a
+// positive-offset timezone) or an absurd relative duration
+// ("999999999d") — normal relative forms cannot go negative.
+//
+// Relative h/m/s also reject an overflow before the Duration multiply:
+// n > math.MaxInt64/int64(unit) (about 292 years; 2562048h and above).
+// Without the check, time.Duration(n)*unit wraps and can land inside the
+// legal window (e.g. 5124094h) instead of erroring.
+// Relative d rejects n > 3652500 (~10,000 years) up front; AddDate is
+// calendar math so the MaxInt64/unit formula does not apply, and an
+// unchecked n≈1.15e18 wraps into a silent past window.
 func parseTimeArg(s string, now time.Time) (time.Time, error) {
 	s = strings.TrimSpace(s)
+	var t time.Time
 	if m := relTimeArg.FindStringSubmatch(s); m != nil {
 		n, err := strconv.Atoi(m[1])
 		if err != nil {
@@ -370,26 +387,44 @@ func parseTimeArg(s string, now time.Time) (time.Time, error) {
 		}
 		switch m[2] {
 		case "d":
-			return now.AddDate(0, 0, -n), nil
-		case "h":
-			return now.Add(-time.Duration(n) * time.Hour), nil
-		case "m":
-			return now.Add(-time.Duration(n) * time.Minute), nil
-		default: // "s"
-			return now.Add(-time.Duration(n) * time.Second), nil
+			// Calendar arithmetic (AddDate), not Duration multiply —
+			// cannot reuse MaxInt64/unit. 3652500 days ≈ 10,000 years;
+			// any realistic input stays under. Without the cap, n≈1.15e18
+			// wraps AddDate into a past window (e.g. 2023) and is
+			// silently accepted.
+			if n > 3652500 {
+				return time.Time{}, fmt.Errorf("时间跨度 %q 过大", s)
+			}
+			t = now.AddDate(0, 0, -n)
+		default: // "h" / "m" / "s" — Duration multiply, overflow-checked
+			unit := time.Second
+			switch m[2] {
+			case "h":
+				unit = time.Hour
+			case "m":
+				unit = time.Minute
+			}
+			// Predicate: n > MaxInt64/int64(unit) iff n*unit overflows
+			// int64. One formula for every unit; no per-case thresholds.
+			if int64(n) > math.MaxInt64/int64(unit) {
+				return time.Time{}, fmt.Errorf("时间跨度 %q 过大", s)
+			}
+			t = now.Add(-time.Duration(n) * unit)
 		}
-	}
-	if t, err := time.ParseInLocation("2006-01-02", s, now.Location()); err == nil {
-		return t, nil
-	}
-	if t, err := time.ParseInLocation("01-02", s, now.Location()); err == nil {
-		t = time.Date(now.Year(), t.Month(), t.Day(), 0, 0, 0, 0, now.Location())
+	} else if t2, err := time.ParseInLocation("2006-01-02", s, now.Location()); err == nil {
+		t = t2
+	} else if t2, err := time.ParseInLocation("01-02", s, now.Location()); err == nil {
+		t = time.Date(now.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, now.Location())
 		if t.After(now) {
 			t = t.AddDate(-1, 0, 0)
 		}
-		return t, nil
+	} else {
+		return time.Time{}, fmt.Errorf("无法解析时间 %q（支持 30m/24h/7d 相对写法、08-01 月日、2026-08-01 完整日期）", s)
 	}
-	return time.Time{}, fmt.Errorf("无法解析时间 %q（支持 30m/24h/7d 相对写法、08-01 月日、2026-08-01 完整日期）", s)
+	if t.Unix() < 0 {
+		return time.Time{}, fmt.Errorf("无法解析时间 %q（早于 Unix 纪元 1970-01-01）", s)
+	}
+	return t, nil
 }
 
 // formatTimeArg renders a resolved time for error messages.

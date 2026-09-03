@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,12 +111,29 @@ func ImportPiSessions(ctx context.Context, store *SQLiteStore, sessionsDir strin
 	if toUnix <= 0 {
 		toUnix = time.Now().Unix()
 	}
+	// Same walkable-dir probe as ImportGrokBuild: skip the whole import
+	// INCLUDING the DELETE below when the tree cannot be enumerated.
+	// Tree-internal permission errors likewise abort without DELETE.
+	realPath, ok := probeWalkableDir(sessionsDir, "pi-sessions")
+	if !ok {
+		return 0, nil
+	}
 	var events []Event
-	err := filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
+	var aborted bool
+	err := filepath.Walk(realPath, func(path string, info os.FileInfo, err error) error {
+		if err == nil && walkErrForTest != nil {
+			err = walkErrForTest
+		}
+		if shouldAbortWalk(err) {
+			slog.Warn("usage: pi-sessions import aborted: walk error", "path", path, "error", err)
+			aborted = true
+			return err
 		}
 		if info == nil || info.IsDir() || filepath.Ext(info.Name()) != ".jsonl" {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			slog.Warn("usage: pi-sessions import skipped: not a regular file", "path", path, "mode", info.Mode().String())
 			return nil
 		}
 		if info.ModTime().Unix() < fromUnix-86400 {
@@ -123,6 +141,9 @@ func ImportPiSessions(ctx context.Context, store *SQLiteStore, sessionsDir strin
 		}
 		f, err := os.Open(path)
 		if err != nil {
+			if os.IsPermission(err) {
+				slog.Warn("usage: pi-sessions import skipped: open permission denied", "path", path, "error", err)
+			}
 			return nil
 		}
 		defer f.Close()
@@ -146,6 +167,10 @@ func ImportPiSessions(ctx context.Context, store *SQLiteStore, sessionsDir strin
 		}
 		return nil
 	})
+	if aborted {
+		slog.Warn("usage: pi-sessions import aborted: skip window delete", "path", realPath)
+		return 0, nil
+	}
 	if err != nil && !os.IsNotExist(err) && !os.IsPermission(err) {
 		return 0, err
 	}

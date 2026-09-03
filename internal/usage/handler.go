@@ -165,9 +165,20 @@ func parseSummaryQuery(r *http.Request) (SummaryQuery, error) {
 		if q.From, err = strconv.ParseInt(v, 10, 64); err != nil {
 			return q, &QueryError{Msg: "invalid from"}
 		}
+		// Negative explicit bounds would silently degrade to an unbounded
+		// window (From <= 0 means all history) and mask a bad value:
+		// reject them. 0 stays legal (explicit all-history).
+		if q.From < 0 {
+			return q, &QueryError{Msg: "invalid from"}
+		}
 	}
 	if v := qp.Get("to"); v != "" {
 		if q.To, err = strconv.ParseInt(v, 10, 64); err != nil {
+			return q, &QueryError{Msg: "invalid to"}
+		}
+		// to=0 keeps its existing no-upper-bound semantics; only explicit
+		// negatives are rejected (same silent-unbounded class as from).
+		if q.To < 0 {
 			return q, &QueryError{Msg: "invalid to"}
 		}
 	}

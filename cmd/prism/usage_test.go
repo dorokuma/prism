@@ -118,6 +118,42 @@ func TestParseTimeArg(t *testing.T) {
 			t.Errorf("parseTimeArg(%q) must fail", bad)
 		}
 	}
+
+	// Resolved times before the Unix epoch are rejected too: a negative
+	// bound would silently degrade to an unbounded window (the same class
+	// the HTTP path rejects). Only pathological inputs reach this — a
+	// year-1 full date, a pre-epoch date, or an absurd relative duration.
+	// ("1970-01-01" is deliberately NOT in the list: in UTC it resolves to
+	// ts=0, the legal explicit-all-history sentinel; its rejection in
+	// positive-offset timezones is a timezone artifact, not a contract.)
+	for _, bad := range []string{"0001-01-01", "1969-12-31", "999999999d"} {
+		if _, err := parseTimeArg(bad, now); err == nil {
+			t.Errorf("parseTimeArg(%q) must fail (resolves before the Unix epoch)", bad)
+		}
+	}
+
+	// Duration overflow: n*Hour wrapping int64 used to land inside the
+	// legal window (5124094h) or before the epoch (2562048h). The multiply
+	// is now rejected up front (n > MaxInt64/int64(unit)).
+	if _, err := parseTimeArg("5124094h", now); err == nil || !strings.Contains(err.Error(), "过大") {
+		t.Errorf("parseTimeArg(5124094h) must fail as 过大, got %v", err)
+	}
+	if _, err := parseTimeArg("2562048h", now); err == nil {
+		t.Errorf("parseTimeArg(2562048h) must fail (过大 or before epoch)")
+	}
+
+	// Day-unit cap: AddDate is calendar math, not Duration multiply, so
+	// MaxInt64/unit does not apply. n > 3652500 (~10,000 years) is 过大.
+	// 1152921504606848158d used to wrap AddDate into a silent 2023 window.
+	if _, err := parseTimeArg("3652501d", now); err == nil || !strings.Contains(err.Error(), "过大") {
+		t.Errorf("parseTimeArg(3652501d) must fail as 过大, got %v", err)
+	}
+	if _, err := parseTimeArg("3652500d", now); err != nil && strings.Contains(err.Error(), "过大") {
+		t.Errorf("parseTimeArg(3652500d) must not be 过大 (boundary; epoch reject is ok), got %v", err)
+	}
+	if _, err := parseTimeArg("1152921504606848158d", now); err == nil || !strings.Contains(err.Error(), "过大") {
+		t.Errorf("parseTimeArg(1152921504606848158d) must fail as 过大, got %v", err)
+	}
 }
 
 func TestParseUsageArgsPresets(t *testing.T) {
@@ -1020,4 +1056,3 @@ func TestRunUsageWeekDefaultOverviewAllHistory(t *testing.T) {
 		t.Errorf("explicit --since Rows = %+v, want only cur-model", doc.Rows)
 	}
 }
-
