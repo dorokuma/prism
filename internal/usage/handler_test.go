@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -606,6 +607,11 @@ func TestHandlerDefaultFromWeek(t *testing.T) {
 	if strings.Contains(body, "  old") {
 		t.Errorf("pre-week row must be excluded:\n%s", body)
 	}
+	// defaulted=true: the table header aggregates ALL history (old + cur =
+	// 2), never the week window (cur only = 1) the detail rows show.
+	if !strings.Contains(body, "  总请求   2\n") {
+		t.Errorf("defaulted table header must be the all-history total (2), not the week-window count (1):\n%s", body)
+	}
 
 	rec = doRequest(h, http.MethodGet, "/admin/usage/summary?from=0&group_by=model&format=table", "127.0.0.1:1", "")
 	if rec.Code != http.StatusOK {
@@ -616,5 +622,117 @@ func TestHandlerDefaultFromWeek(t *testing.T) {
 	// pre-week row being included below.
 	if !strings.Contains(all, "  old") {
 		t.Errorf("from=0 must include old row:\n%s", all)
+	}
+}
+
+// TestHandlerToOnlyRange pins the to-only semantics aligned with the CLI
+// --until-only path: a request with `to` but no `from` is NOT defaulted
+// (defaulted=false), yet its lower bound falls back to DefaultFrom() (the
+// week start) instead of 0 — to only pins the upper bound. The table
+// overview therefore stays on the same [week start, to] window as the
+// detail rows: never [0, to] and never all history.
+func TestHandlerToOnlyRange(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
+	s := openTestStore(t)
+	now := time.Now()
+	weekStart := now.Add(-3 * 24 * time.Hour)
+	old := now.Add(-10 * 24 * time.Hour)
+	ctx := context.Background()
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: old, RequestID: "old", Model: "old", PromptTokens: 10, CompletionTokens: 10, TotalTokens: 20},
+		{Ts: now, RequestID: "cur", Model: "cur", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewSummaryHandler(s)
+	h.DefaultFrom = func() int64 { return weekStart.Unix() }
+
+	// applyDefaultRange itself: to-only → defaulted=false, From = the
+	// default week start (NOT 0), To = the caller's value untouched (the
+	// caller's To is already parsed by parseSummaryQuery; the range
+	// helper only fills the default lower bound).
+	req := httptest.NewRequest(http.MethodGet, "/admin/usage/summary?to="+strconv.FormatInt(now.Unix(), 10), nil)
+	q := SummaryQuery{To: now.Unix()}
+	if defaulted := h.applyDefaultRange(req, &q); defaulted {
+		t.Fatal("to-only request must not be defaulted")
+	}
+	if q.From != weekStart.Unix() {
+		t.Errorf("to-only From = %d, want week start %d (lower bound must fall back to the default, not 0)", q.From, weekStart.Unix())
+	}
+	if q.To != now.Unix() {
+		t.Errorf("to-only To = %d, want %d (caller's value untouched)", q.To, now.Unix())
+	}
+
+	// The full table path: overview and detail rows share [week start, to]
+	// — header counts the in-window event only (1), the pre-week row is
+	// excluded from both the header and the rows.
+	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?to="+strconv.FormatInt(now.Unix(), 10)+"&group_by=model&format=table", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("to-only table: got %d body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "  总请求   1\n") {
+		t.Errorf("to-only header must be the [week start, to] window total (1), not all history (2):\n%s", body)
+	}
+	if !strings.Contains(body, "  cur") {
+		t.Errorf("to-only detail must include the in-window row:\n%s", body)
+	}
+	if strings.Contains(body, "  old") {
+		t.Errorf("to-only detail must exclude the pre-week row:\n%s", body)
+	}
+}
+
+// TestHandlerTableOverviewAllHistoryDefaulted drives the defaulted
+// format=table header through real events in two windows (the current week
+// and an earlier week, several each): with no time params the header must
+// aggregate ALL history (both windows summed) while the detail rows stay on
+// the default week window; an explicit from=0 keeps both on the full range.
+func TestHandlerTableOverviewAllHistoryDefaulted(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
+	s := openTestStore(t)
+	now := time.Now()
+	weekStart := now.Add(-3 * 24 * time.Hour)
+	old := now.Add(-10 * 24 * time.Hour)
+	ctx := context.Background()
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: old, RequestID: "old-a", Model: "old-a", PromptTokens: 10, CompletionTokens: 10, TotalTokens: 20},
+		{Ts: old, RequestID: "old-b", Model: "old-b", PromptTokens: 20, CompletionTokens: 10, TotalTokens: 30},
+		{Ts: now, RequestID: "cur-a", Model: "cur-a", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150},
+		{Ts: now, RequestID: "cur-b", Model: "cur-b", PromptTokens: 200, CompletionTokens: 50, TotalTokens: 250},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewSummaryHandler(s)
+	h.DefaultFrom = func() int64 { return weekStart.Unix() }
+
+	// No time params → defaulted=true: header = all four events, detail
+	// rows = the two in-window models only.
+	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?group_by=model&format=table", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("defaulted table: got %d body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "  总请求   4\n") {
+		t.Errorf("defaulted header must sum both windows (4), not the week window (2):\n%s", body)
+	}
+	if !strings.Contains(body, "  cur-a") || !strings.Contains(body, "  cur-b") {
+		t.Errorf("defaulted detail must list the in-window models:\n%s", body)
+	}
+	if strings.Contains(body, "  old-a") || strings.Contains(body, "  old-b") {
+		t.Errorf("defaulted detail must exclude the earlier-week models:\n%s", body)
+	}
+
+	// from=0 (defaulted=false, fully explicit) → header AND rows cover all
+	// four events.
+	rec = doRequest(h, http.MethodGet, "/admin/usage/summary?from=0&group_by=model&format=table", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("from=0 table: got %d body %s", rec.Code, rec.Body.String())
+	}
+	explicit := rec.Body.String()
+	if !strings.Contains(explicit, "  总请求   4\n") {
+		t.Errorf("from=0 header must also total 4:\n%s", explicit)
+	}
+	if !strings.Contains(explicit, "  old-a") || !strings.Contains(explicit, "  old-b") {
+		t.Errorf("from=0 detail must include the earlier-week models:\n%s", explicit)
 	}
 }

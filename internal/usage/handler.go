@@ -198,9 +198,7 @@ func parseSummaryQuery(r *http.Request) (SummaryQuery, error) {
 
 func (h *SummaryHandler) applyDefaultRange(r *http.Request, q *SummaryQuery) bool {
 	if _, ok := r.URL.Query()["from"]; ok {
-		return false
-	}
-	if _, ok := r.URL.Query()["to"]; ok {
+		// from is explicit: the caller fully owns the lower bound.
 		return false
 	}
 	if h == nil || h.DefaultFrom == nil {
@@ -211,6 +209,13 @@ func (h *SummaryHandler) applyDefaultRange(r *http.Request, q *SummaryQuery) boo
 		return false
 	}
 	q.From = v
+	if _, ok := r.URL.Query()["to"]; ok {
+		// to-only (to without from): the caller pins only the upper
+		// bound; the lower bound still falls back to the default window
+		// start, mirroring the CLI's --until-only path ([week start, to]).
+		// The overview stays on the same window — not all history.
+		return false
+	}
 	return true
 }
 
