@@ -128,7 +128,7 @@ func TestRenderUsageReportStructure(t *testing.T) {
 
 	// Summary header comes from Overview (2.23M total), not from summing the
 	// rows (which would be fine here, but the point is the source is Overview).
-	if !strings.Contains(got, "  请求     1,783\n  总词元   2.23M\n  总开销   $0.836\n") {
+	if !strings.Contains(got, "  总请求   1,783\n  总词元   2.23M\n  总开销   $0.836\n") {
 		t.Errorf("summary line missing or wrong:\n%s", got)
 	}
 	// Cache hit lines must not appear in the overview.
@@ -170,7 +170,7 @@ func TestRenderUsageReportAlignment(t *testing.T) {
 		{Groups: map[string]any{"model": "glm-5.2"}, Requests: 283, PromptTokens: 500_000, CompletionTokens: 30_000, TotalTokens: 530_000, CachedTokens: 100_000, CostUSD: nil},
 	}
 	// widths: 模型 15 (deepseek-v4-pro) | 请求 4 | 缓存 4 | 命中率 6
-	want := "  请求     1,783\n" +
+	want := "  总请求   1,783\n" +
 		"  总词元   2.23M\n" +
 		"  总开销   $0.836\n" +
 		"\n" +
@@ -188,7 +188,7 @@ func TestRenderUsageReportNoData(t *testing.T) {
 	if !strings.Contains(got, "(no data)") {
 		t.Errorf("empty table must render the no-data hint:\n%s", got)
 	}
-	if !strings.Contains(got, "请求     0") {
+	if !strings.Contains(got, "总请求   0") {
 		t.Errorf("summary must still render from Overview on an empty range:\n%s", got)
 	}
 }
@@ -403,7 +403,7 @@ func TestRenderUsageReportNoCacheSegmentsInOverview(t *testing.T) {
 	if strings.Contains(got, "命中(OpenAI)") || strings.Contains(got, "命中(Anthropic)") || strings.Contains(got, "缓存命中") {
 		t.Errorf("cache segments must not appear in overview:\n%s", got)
 	}
-	if !strings.Contains(got, "  请求     2\n") {
+	if !strings.Contains(got, "  总请求   2\n") {
 		t.Errorf("expected 3-line overview:\n%s", got)
 	}
 }

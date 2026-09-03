@@ -15,14 +15,14 @@ type Summary struct {
 
 // RenderSummary renders s as three indented lines:
 //
-//	请求     {requests}
+//	总请求   {requests}
 //	总词元   {tokens}
 //	总开销   {cost}
 //
 // The result ends with a newline.
 func RenderSummary(s Summary) string {
 	var b strings.Builder
-	b.WriteString("  请求     ")
+	b.WriteString("  总请求   ")
 	b.WriteString(FormatInt(s.Requests))
 	b.WriteByte('\n')
 	b.WriteString("  总词元   ")

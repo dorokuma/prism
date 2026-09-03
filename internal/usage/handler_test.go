@@ -324,7 +324,7 @@ func TestHandlerTableFormat(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
 	// widths: 模型 4 | 请求 4 | 缓存 4 | 命中率 6
-	want := "  请求     2\n" +
+	want := "  总请求   2\n" +
 		"  总词元   300\n" +
 		"  总开销   $0.150\n" +
 		"\n" +
@@ -337,7 +337,7 @@ func TestHandlerTableFormat(t *testing.T) {
 
 	// format=table must be equivalent to the CLI renderer: the summary
 	// counts come from Overview (not from the LIMIT-truncated rows).
-	if !strings.Contains(rec.Body.String(), "请求     2") || !strings.Contains(rec.Body.String(), "总词元   300") {
+	if !strings.Contains(rec.Body.String(), "总请求   2") || !strings.Contains(rec.Body.String(), "总词元   300") {
 		t.Errorf("table summary must come from Overview:\n%s", rec.Body.String())
 	}
 }
@@ -368,7 +368,7 @@ func TestHandlerTableFormatMixedSources(t *testing.T) {
 	if strings.Contains(body, "命中(OpenAI)") || strings.Contains(body, "命中(Anthropic)") || strings.Contains(body, "缓存命中") {
 		t.Errorf("cache segments must not appear in overview:\n%s", body)
 	}
-	if !strings.Contains(body, "  请求     2\n") {
+	if !strings.Contains(body, "  总请求   2\n") {
 		t.Errorf("expected 3-line overview:\n%s", body)
 	}
 	// Ungrouped table row: 1400 hits over openai prompt 1000 + anthropic
@@ -428,7 +428,7 @@ func TestHandlerTableNoData(t *testing.T) {
 		t.Errorf("Content-Type = %q", ct)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "  请求     0") {
+	if !strings.Contains(body, "  总请求   0") {
 		t.Errorf("empty-range summary missing:\n%s", body)
 	}
 	if !strings.Contains(body, "(no data)") {

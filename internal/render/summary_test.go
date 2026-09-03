@@ -12,7 +12,7 @@ func TestRenderSummaryExample(t *testing.T) {
 		Tokens:   2_230_000,
 		Cost:     &cost,
 	}
-	want := "  请求     1,783\n" +
+	want := "  总请求   1,783\n" +
 		"  总词元   2.23M\n" +
 		"  总开销   $0.836\n"
 	if got := RenderSummary(s); got != want {
@@ -26,7 +26,7 @@ func TestRenderSummaryNilCost(t *testing.T) {
 		Tokens:   500_000,
 		Cost:     nil,
 	}
-	want := "  请求     100\n" +
+	want := "  总请求   100\n" +
 		"  总词元   500k\n" +
 		"  总开销   -\n"
 	got := RenderSummary(s)
@@ -46,7 +46,7 @@ func TestRenderSummaryEmpty(t *testing.T) {
 	if strings.Contains(got, "$0.000") {
 		t.Errorf("nil cost must not render as $0.000, got %q", got)
 	}
-	if !strings.Contains(got, "请求     0") {
+	if !strings.Contains(got, "总请求   0") {
 		t.Errorf("expected zero requests, got %q", got)
 	}
 	if strings.Contains(got, "命中") {
@@ -55,7 +55,7 @@ func TestRenderSummaryEmpty(t *testing.T) {
 	if !strings.HasSuffix(got, "\n") {
 		t.Errorf("output must end with a newline, got %q", got)
 	}
-	want := "  请求     0\n" +
+	want := "  总请求   0\n" +
 		"  总词元   0\n" +
 		"  总开销   -\n"
 	if got != want {

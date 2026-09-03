@@ -476,7 +476,7 @@ func TestRunUsageTable(t *testing.T) {
 	out := buf.String()
 	// summary from Overview: all 5 requests, 750 total tokens, 4 priced
 	// events × $0.15 (price 1000/1000 on 150 tokens each)
-	if !strings.Contains(out, "  请求     5\n  总词元   750\n  总开销   $0.600\n") {
+	if !strings.Contains(out, "  总请求   5\n  总词元   750\n  总开销   $0.600\n") {
 		t.Errorf("summary line missing/wrong:\n%s", out)
 	}
 	// missing-price hint must not appear
@@ -805,7 +805,7 @@ func TestRunUsageSplitCacheSegments(t *testing.T) {
 	if strings.Contains(out, "命中(OpenAI)") || strings.Contains(out, "命中(Anthropic)") || strings.Contains(out, "缓存命中") {
 		t.Errorf("cache segments must not appear in overview:\n%s", out)
 	}
-	if !strings.Contains(out, "  请求     3\n") {
+	if !strings.Contains(out, "  总请求   3\n") {
 		t.Errorf("expected 3-line overview:\n%s", out)
 	}
 	if strings.Contains(out, "50000") {
