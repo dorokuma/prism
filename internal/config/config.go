@@ -344,6 +344,15 @@ type Config struct {
 
 	// modelCacheRefreshIntervalSet records whether model_cache_refresh_interval was explicitly present.
 	modelCacheRefreshIntervalSet bool
+
+	// QuotaReviveAfter is the window duration a quota-exhausted account remains
+	// exhausted before it may be revived. Default 30m.
+	QuotaReviveAfter time.Duration `yaml:"-"`
+
+	// QuotaReviveAfterRaw is the unmarshaled raw string for quota_revive_after.
+	QuotaReviveAfterRaw string `yaml:"quota_revive_after,omitempty"`
+
+	quotaReviveAfterSet bool
 }
 
 // UnmarshalYAML decodes Config and remembers whether
@@ -356,9 +365,13 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 	}
 	if value.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(value.Content); i += 2 {
-			if value.Content[i].Value == "model_cache_refresh_interval" {
+			k := value.Content[i].Value
+			if k == "model_cache_refresh_interval" {
 				c.modelCacheRefreshIntervalSet = true
-				break
+			}
+			if k == "quota_revive_after" {
+				c.quotaReviveAfterSet = true
+				c.QuotaReviveAfterRaw = value.Content[i+1].Value
 			}
 		}
 	}
@@ -385,6 +398,22 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.ProbeInterval > 0 && cfg.ProbeInterval < time.Second {
 		slog.Warn("probe_interval too small, falling back to 10m", "probe_interval", cfg.ProbeInterval)
 		cfg.ProbeInterval = 10 * time.Minute
+	}
+	if !cfg.quotaReviveAfterSet || cfg.QuotaReviveAfterRaw == "" {
+		cfg.QuotaReviveAfter = DefaultQuotaReviveAfter
+	} else {
+		d, err := time.ParseDuration(cfg.QuotaReviveAfterRaw)
+		if err != nil || d < 0 {
+			msg := fmt.Sprintf("invalid quota_revive_after, falling back to %v", DefaultQuotaReviveAfter)
+			if err != nil {
+				slog.Warn(msg, "quota_revive_after", cfg.QuotaReviveAfterRaw, "error", err)
+			} else {
+				slog.Warn(msg, "quota_revive_after", cfg.QuotaReviveAfterRaw)
+			}
+			cfg.QuotaReviveAfter = DefaultQuotaReviveAfter
+		} else {
+			cfg.QuotaReviveAfter = d
+		}
 	}
 	if cfg.WireAPI == "" {
 		cfg.WireAPI = "both"
@@ -1368,6 +1397,9 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 	}
 	if oldCfg.ProbeInterval != newCfg.ProbeInterval {
 		warnings = append(warnings, "probe_interval changed: restart required to take effect")
+	}
+	if oldCfg.QuotaReviveAfter != newCfg.QuotaReviveAfter {
+		warnings = append(warnings, "quota_revive_after changed: restart required to take effect")
 	}
 	if oldCfg.ModelCacheRefreshInterval != newCfg.ModelCacheRefreshInterval {
 		warnings = append(warnings, "model_cache_refresh_interval changed: restart required to take effect")

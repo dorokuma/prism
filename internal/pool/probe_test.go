@@ -855,3 +855,87 @@ func TestProbeExhausted_StaticAccountStillProbed(t *testing.T) {
 		t.Error("static-key exhausted account should be probed and revived")
 	}
 }
+
+func TestProbeExhausted_DisabledQuotaRevivesAfterWindow(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "disabled-quota", Key: "k1", BaseURL: upstream.URL, ProbePath: "disabled"},
+	})
+	p.SetQuotaReviveAfter(30 * time.Minute)
+	accs := p.AllAccounts()
+	accs[0].MarkExhaustedWithClass(ExhaustPermanentQuota)
+	accs[0].mu.Lock()
+	accs[0].exhaustedAt = time.Now().Add(-31 * time.Minute)
+	accs[0].mu.Unlock()
+
+	ProbeExhausted(p)
+
+	if !accs[0].IsHealthy() {
+		t.Error("disabled probe account with expired quota window must be auto-revived")
+	}
+	if hits != 0 {
+		t.Errorf("expected 0 HTTP requests for disabled probe, got %d", hits)
+	}
+}
+
+func TestProbeExhausted_DisabledQuotaStaysExhaustedWithinWindow(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "disabled-quota-active", Key: "k1", BaseURL: upstream.URL, ProbePath: "disabled"},
+	})
+	p.SetQuotaReviveAfter(30 * time.Minute)
+	accs := p.AllAccounts()
+	accs[0].MarkExhaustedWithClass(ExhaustPermanentQuota)
+	accs[0].mu.Lock()
+	accs[0].exhaustedAt = time.Now().Add(-10 * time.Minute)
+	accs[0].mu.Unlock()
+
+	ProbeExhausted(p)
+
+	if accs[0].IsHealthy() {
+		t.Error("disabled probe account within quota window must stay exhausted")
+	}
+	if hits != 0 {
+		t.Errorf("expected 0 HTTP requests for disabled probe, got %d", hits)
+	}
+}
+
+func TestProbeExhausted_DisabledCredentialNeverRevives(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	p := NewPool([]config.AccountConfig{
+		{Name: "disabled-cred", Key: "k1", BaseURL: upstream.URL, ProbePath: "disabled"},
+	})
+	p.SetQuotaReviveAfter(30 * time.Minute)
+	accs := p.AllAccounts()
+	accs[0].MarkExhaustedWithClass(ExhaustPermanentCredential)
+	accs[0].mu.Lock()
+	accs[0].exhaustedAt = time.Now().Add(-100 * time.Hour)
+	accs[0].mu.Unlock()
+
+	ProbeExhausted(p)
+
+	if accs[0].IsHealthy() {
+		t.Error("disabled probe account with permanent credential failure must never auto-revive")
+	}
+	if hits != 0 {
+		t.Errorf("expected 0 HTTP requests for disabled probe, got %d", hits)
+	}
+}

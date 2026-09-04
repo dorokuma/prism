@@ -597,7 +597,7 @@ func TestOverviewJSONFields(t *testing.T) {
 	ov := &Overview{
 		Requests: 3, PromptTokens: 1101, CompletionTokens: 210, TotalTokens: 1311,
 		CachedTokens: 1480, ReasoningTokens: 0, CacheWriteTokens: 40,
-		TotalCost: ptr64(0.5),
+		TotalCost:      ptr64(0.5),
 		FailedRequests: 1, StreamingRequests: 2,
 		OpenAIRequests: 2, OpenAIPromptTokens: 1100, OpenAICachedTokens: 980,
 		AnthropicRequests: 1, AnthropicPromptTokens: 1, AnthropicCachedTokens: 500, AnthropicCacheWriteTokens: 40,

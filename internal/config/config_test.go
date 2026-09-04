@@ -3506,3 +3506,64 @@ accounts:
 		t.Errorf("model_cache_refresh_strategy is hot-reloadable and should not warn restart, got: %v", warnings)
 	}
 }
+
+func TestLoadConfig_QuotaReviveAfter(t *testing.T) {
+	t.Run("default when absent", func(t *testing.T) {
+		content := `
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`
+		cfg := loadCfgString(t, content)
+		if cfg.QuotaReviveAfter != 30*time.Minute {
+			t.Errorf("quota_revive_after default = %v, want 30m", cfg.QuotaReviveAfter)
+		}
+	})
+
+	t.Run("valid duration string", func(t *testing.T) {
+		tests := []struct {
+			raw  string
+			want time.Duration
+		}{
+			{"1h", 1 * time.Hour},
+			{"45m", 45 * time.Minute},
+			{"10s", 10 * time.Second},
+			{"0s", 0},
+			{"0", 0},
+		}
+		for _, tc := range tests {
+			content := fmt.Sprintf(`
+quota_revive_after: %s
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`, tc.raw)
+			cfg := loadCfgString(t, content)
+			if cfg.QuotaReviveAfter != tc.want {
+				t.Errorf("quota_revive_after %q = %v, want %v", tc.raw, cfg.QuotaReviveAfter, tc.want)
+			}
+		}
+	})
+
+	t.Run("invalid duration falls back to default 30m", func(t *testing.T) {
+		invalidInputs := []string{"invalid", "abc", "-10m", "-1s"}
+		for _, inv := range invalidInputs {
+			content := fmt.Sprintf(`
+quota_revive_after: %s
+accounts:
+  - name: test-acc
+    key: test-key-12345
+    base_url: https://api.example.com
+    provider: test
+`, inv)
+			cfg := loadCfgString(t, content)
+			if cfg.QuotaReviveAfter != 30*time.Minute {
+				t.Errorf("quota_revive_after %q fallback = %v, want 30m", inv, cfg.QuotaReviveAfter)
+			}
+		}
+	})
+}

@@ -15,11 +15,15 @@ var (
 	// the default 30s is unchanged.
 	AccountSelectTimeout = 30 * time.Second
 
+	// DefaultQuotaReviveAfter is the default duration a quota-exhausted account
+	// stays exhausted before reviving (30m).
+	DefaultQuotaReviveAfter = 30 * time.Minute
+
 	// QuotaReviveAfter is how long a quota-exhausted account stays
 	// exhausted before a successful probe HTTP 200 may MarkHealthy.
 	// A variable (not a const) so tests can set it to 0 or a short
-	// duration; the default 6h is unchanged.
-	QuotaReviveAfter = 6 * time.Hour
+	// duration; default is 30m.
+	QuotaReviveAfter = 30 * time.Minute
 
 	// DefaultModelCacheRefreshInterval is the default periodic interval for
 	// model cache background refresh (3 hours).

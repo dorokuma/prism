@@ -153,14 +153,25 @@ func probeExhaustedAccount(pool *Pool, acc *Account) {
 		stop := func() bool {
 			statusCode, respBody, skipped, err := ProbeAccountOnce(acc)
 			if skipped {
-				// probe_path disabled: no HTTP request is sent and the
-				// account state is deliberately NOT touched. An exhausted
-				// account must not be optimistically revived here: the
-				// exhausted flag is only set for permanent upstream
-				// rejection (401/402 or a recognized structured
-				// credential/quota error), and "probing disabled" does
-				// not mean "the credential recovered". The operator
-				// restores the account (or re-enables probing) explicitly.
+				// probe_path disabled: no HTTP request is sent.
+				// When probing is disabled and the account was marked exhausted due to
+				// quota (ExhaustPermanentQuota), auto-revive the account once the
+				// revive window has expired, relying on request-side error handling as fallback.
+				// For credential failure (ExhaustPermanentCredential) or unexpired quota,
+				// the account remains exhausted without state changes.
+				if acc.LastExhaustClass() == ExhaustPermanentQuota {
+					window := pool.QuotaReviveAfter()
+					if acc.quotaReviveReady(window) {
+						pool.MarkHealthy(acc)
+						slog.Info("probe disabled account auto-revived after revive window",
+							"account", acc.Name(), "window", window,
+							"reason", "quota window expired and probe disabled, auto restored to pool with request-side fallback")
+						return true
+					}
+					slog.Info("probe disabled account still in quota revive window",
+						"account", acc.Name(), "window", window)
+					return true
+				}
 				slog.Info("probe disabled, keeping account state unchanged", "account", acc.Name())
 				return true
 			}
@@ -175,7 +186,7 @@ func probeExhaustedAccount(pool *Pool, acc *Account) {
 			if statusCode == 200 {
 				// /v1/models 200 does not by itself mean chat quota
 				// recovered. PermanentQuota revives only after
-				// config.QuotaReviveAfter since exhaustedAt.
+				// pool.QuotaReviveAfter() since exhaustedAt.
 				// Permanent credential (and unspecified MarkExhausted)
 				// may revive on 200 immediately. Public service
 				// accounts ignore QuotaReviveAfter and revive immediately.
@@ -185,9 +196,10 @@ func probeExhaustedAccount(pool *Pool, acc *Account) {
 						slog.Info("probe recovered public_service account", "account", acc.Name(), "status", 200)
 						return true
 					}
-					if !acc.quotaReviveReady(config.QuotaReviveAfter) {
+					window := pool.QuotaReviveAfter()
+					if !acc.quotaReviveReady(window) {
 						slog.Info("probe 200 ignored for quota-exhausted account until revive window",
-							"account", acc.Name(), "status", 200, "window", config.QuotaReviveAfter)
+							"account", acc.Name(), "status", 200, "window", window)
 						return true
 					}
 					pool.MarkHealthy(acc)

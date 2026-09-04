@@ -85,6 +85,20 @@ listen: "127.0.0.1:18790"
 #   - "127.0.0.0/8"
 
 probe_interval: 10m
+
+# ---------------------------------------------------------------------------
+# 可选：quota_revive_after —— 额度耗尽（quota exhausted）账号的冷却自愈窗口。
+# 默认 30m；支持 Go duration 格式（如 30m、1h、0s、0 等）；配 0 或 0s 禁用窗口等待（立即具备恢复资格）。
+# 负数配置告警并回退 30m（非报错拒绝）。
+# 改动需重启生效（SIGHUP 热重载会打印 warning）。
+#
+# 自愈语义：
+#   - 启用探活的账号：quota 耗尽超过此窗口后，后继探活成功（HTTP 200）即恢复回池（MarkHealthy）；启用探活的 credential 账号探活 200 即回池（既有行为，不受此窗口限制）。
+#   - probe_path: disabled 的账号：quota 耗尽超过此窗口后无需探活请求，自动回池自愈（依赖请求侧错误处理兜底）；probe_path: disabled 的凭证失效（credential，如 401）账号不自动自愈。
+#   - 修复 disabled 凭证需人工介入并重启生效——热重载不重置池内账号状态。
+# ---------------------------------------------------------------------------
+# quota_revive_after: 30m
+
 # wire_api: legacy | responses | both
 wire_api: both
 
@@ -371,8 +385,8 @@ mcp_tools_json: "/var/lib/prism/mcp_tools.json"
 # （账号名连字符转下划线后大写，规则同 account-1 → PRISM_KEY_ACCOUNT_1）
 #
 # probe_path: disabled —— 探活端点（GET /v1/models）未实测，disabled 表示
-# 不发探活请求，也不改变账号状态：exhausted 账号保持 exhausted，直到运营者
-# 手动恢复或重新启用探活（“不探测”不等于“凭据已恢复”）。若确认 GET
+# 不发探活请求。quota 耗尽账号在超过 quota_revive_after 窗口后自动回池自愈；
+# disabled 下 credential 凭证失效账号不自动自愈（修复需人工介入并重启生效）。若确认 GET
 # /v1/models 可用，把该行改成 probe_path: /v1/models 或删掉即可，不需要改代码。
 #
 # auth_header（可选，账号级）：默认写 Authorization: Bearer <key>；若上游

@@ -27,6 +27,7 @@ type Pool struct {
 	nextIdx          uint64
 	mu               sync.Mutex
 	waiters          *list.List
+	quotaReviveAfter time.Duration
 }
 
 // NewPool builds a pool without an account-wide aggregate concurrency
@@ -69,7 +70,29 @@ func newPool(cfgs []config.AccountConfig, totalCap int) *Pool {
 		providerAccounts: providerAccounts,
 		providerNextIdx:  make(map[string]uint64),
 		waiters:          list.New(),
+		quotaReviveAfter: config.QuotaReviveAfter,
 	}
+}
+
+// SetQuotaReviveAfter sets the duration a quota-exhausted account remains
+// exhausted before it may be revived.
+func (p *Pool) SetQuotaReviveAfter(d time.Duration) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.quotaReviveAfter = d
+}
+
+// QuotaReviveAfter returns the duration a quota-exhausted account remains exhausted.
+func (p *Pool) QuotaReviveAfter() time.Duration {
+	if p == nil {
+		return config.QuotaReviveAfter
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.quotaReviveAfter
 }
 
 // Release frees the concurrency slot of the given lease and wakes the

@@ -455,6 +455,7 @@ func main() {
 	util.DebugMode.Store(cfg.Debug)
 	mcp.LoadMCPTools(cfg.MCPToolsJSON)
 	p := pool.NewPoolWithTotalCap(cfg.Accounts, config.ResolveAccountTotalCap(cfg))
+	p.SetQuotaReviveAfter(cfg.QuotaReviveAfter)
 	oauthCancel := attachOAuth(p, cfg)
 	wire, _ := config.ParseWireAPIMode(cfg.WireAPI)
 	slog.Info("prism starting", "accounts", len(cfg.Accounts), "wire_api", string(wire), "listen", cfg.Listen, "debug", util.DebugMode.Load(), "auth", len(cfg.APIKeys) > 0, "auth_keys", len(cfg.APIKeys), "tls", cfg.TLSCertFile != "")
