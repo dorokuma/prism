@@ -66,6 +66,9 @@ func TestGeminiFetcherMatch(t *testing.T) {
 	if !f.Match("other", "https://cloudcode-pa.googleapis.com/v1") {
 		t.Fatal("cloudcode host")
 	}
+	if !f.Match("other", "https://daily-cloudcode-pa.googleapis.com/v1") {
+		t.Fatal("daily cloudcode host")
+	}
 	if f.Match("xai", "https://api.x.ai/v1") {
 		t.Fatal("xai must not match")
 	}

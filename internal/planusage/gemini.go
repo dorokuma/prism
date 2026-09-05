@@ -16,7 +16,7 @@ import (
 
 const (
 	geminiProviderName = "gemini"
-	geminiQuotaURL     = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+	geminiQuotaURL     = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
 	geminiUserAgent    = "antigravity"
 )
 
@@ -57,7 +57,7 @@ func (f GeminiFetcher) Match(provider, baseURL string) bool {
 		return false
 	}
 	host := strings.ToLower(u.Hostname())
-	return host == "cloudcode-pa.googleapis.com" || host == "daily-cloudcode-pa.sandbox.googleapis.com"
+	return host == "cloudcode-pa.googleapis.com" || host == "daily-cloudcode-pa.googleapis.com" || host == "daily-cloudcode-pa.sandbox.googleapis.com"
 }
 
 type geminiBucket struct {
