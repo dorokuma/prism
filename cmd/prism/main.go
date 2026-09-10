@@ -668,6 +668,7 @@ func main() {
 func attachOAuth(p *pool.Pool, cfg *config.Config) context.CancelFunc {
 	client := &http.Client{Timeout: 20 * time.Second}
 	ctx, cancel := context.WithCancel(context.Background())
+	agyBound := false
 	for _, acc := range p.AllAccounts() {
 		name := acc.Name()
 		var src *oauth.Source
@@ -684,6 +685,16 @@ func attachOAuth(p *pool.Pool, cfg *config.Config) context.CancelFunc {
 				}
 				return xai.Tokens{Access: tok.Access, Refresh: tok.Refresh, ExpiresAt: tok.ExpiresAt}, nil
 			})
+			// The Antigravity CLI token file is a single shared login. Bind
+			// it to the first google account in config order only — every
+			// google Source sharing it would fight over the same RT.
+			if !agyBound {
+				src.SetAgyTokenPath(google.CanonicalAgyTokenPath)
+				agyBound = true
+				slog.Info("oauth: attached agy token file", "account", name, "path", google.CanonicalAgyTokenPath)
+			} else {
+				slog.Info("oauth: google account not attached to agy token file", "account", name)
+			}
 		default:
 			continue
 		}

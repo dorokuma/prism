@@ -8,6 +8,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -457,5 +458,652 @@ func TestSaveWaitsForInFlightRefreshLock(t *testing.T) {
 	}
 	if _, err := os.Stat(invalidPath); !os.IsNotExist(err) {
 		t.Fatal("in-flight refresh re-wrote .invalid after the login — the login is voided")
+	}
+}
+
+func writeAgyTokenFile(t *testing.T, path, access, refresh string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"auth_method": "consumer",
+		"id_token":    "keep-this-id-token",
+		"token": map[string]any{
+			"access_token":  access,
+			"refresh_token": refresh,
+			"token_type":    "Bearer",
+			"expiry":        time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGoogleRefreshAdoptsAgyRefreshToken(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref-prism", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agyPath := filepath.Join(t.TempDir(), "antigravity-oauth-token")
+	writeAgyTokenFile(t, agyPath, "agy-acc", "ref-agy")
+	got := ""
+	src := NewSource(dir, "Gemini", "google", func(_ context.Context, refresh string) (xai.Tokens, error) {
+		got = refresh
+		return xai.Tokens{Access: "new", Refresh: "ref-new", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+	src.SetAgyTokenPath(agyPath)
+	tok, err := src.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "new" {
+		t.Fatalf("token = %q", tok)
+	}
+	if got != "ref-agy" {
+		t.Fatalf("used refresh = %q, want ref-agy (agy is the authority)", got)
+	}
+}
+
+func TestGoogleRefreshAdoptsDifferentRTIgnoringExpiry(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref-prism", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := ""
+	src := NewSource(dir, "Gemini", "google", func(_ context.Context, refresh string) (xai.Tokens, error) {
+		got = refresh
+		return xai.Tokens{Access: "new", Refresh: "ref-new", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+	src.SetAgyTokenPath(filepath.Join(t.TempDir(), "agy"))
+	src.loadAgy = func(string) (xai.Tokens, error) {
+		return xai.Tokens{
+			Refresh:   "ref-agy-relogin",
+			ExpiresAt: time.Now().Add(-time.Hour), // older expiry must not block adopt
+		}, nil
+	}
+	src.storeAgy = func(string, xai.Tokens) error { return nil }
+	if _, err := src.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got != "ref-agy-relogin" {
+		t.Fatalf("used refresh = %q, want ref-agy-relogin (RT different = re-login)", got)
+	}
+}
+
+func TestGoogleRefreshDualWritesAgyRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref-old", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agyPath := filepath.Join(t.TempDir(), "antigravity-oauth-token")
+	writeAgyTokenFile(t, agyPath, "old-acc", "ref-old")
+	src := NewSource(dir, "Gemini", "google", func(_ context.Context, refresh string) (xai.Tokens, error) {
+		if refresh != "ref-old" {
+			t.Errorf("refresh = %q", refresh)
+		}
+		return xai.Tokens{Access: "new-acc", Refresh: "ref-new", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+	src.SetAgyTokenPath(agyPath)
+	tok, err := src.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "new-acc" {
+		t.Fatalf("token = %q", tok)
+	}
+	raw, err := os.ReadFile(agyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope["auth_method"] != "consumer" {
+		t.Fatalf("auth_method = %v", envelope["auth_method"])
+	}
+	if envelope["id_token"] != "keep-this-id-token" {
+		t.Fatalf("id_token lost: %v", envelope["id_token"])
+	}
+	nested, ok := envelope["token"].(map[string]any)
+	if !ok {
+		t.Fatalf("nested token missing: %s", raw)
+	}
+	if nested["access_token"] != "new-acc" || nested["refresh_token"] != "ref-new" {
+		t.Fatalf("agy token = %+v", nested)
+	}
+	if nested["token_type"] != "Bearer" {
+		t.Fatalf("token_type = %v", nested["token_type"])
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "Gemini.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f File
+	if err := json.Unmarshal(data, &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.AccessToken != "new-acc" || f.RefreshToken != "ref-new" {
+		t.Fatalf("prism copy = %+v", f)
+	}
+}
+
+func TestGoogleRefreshAgyUnwritableDegrades(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref-old", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agyPath := filepath.Join(t.TempDir(), "antigravity-oauth-token")
+	writeAgyTokenFile(t, agyPath, "old-acc", "ref-old")
+	origAgy, err := os.ReadFile(agyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := NewSource(dir, "Gemini", "google", func(context.Context, string) (xai.Tokens, error) {
+		return xai.Tokens{Access: "new", Refresh: "ref-new", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+	src.SetAgyTokenPath(agyPath)
+	src.storeAgy = func(string, xai.Tokens) error {
+		return errors.New("permission denied")
+	}
+	tok, err := src.Token(context.Background())
+	if err != nil {
+		t.Fatalf("unwritable agy must not fail the refresh: %v", err)
+	}
+	if tok != "new" {
+		t.Fatalf("token = %q", tok)
+	}
+	after, err := os.ReadFile(agyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(origAgy) {
+		t.Fatalf("agy file mutated on unwritable degrade")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "Gemini.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f File
+	if err := json.Unmarshal(data, &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.AccessToken != "new" || f.RefreshToken != "ref-new" {
+		t.Fatalf("prism copy not updated: %+v", f)
+	}
+}
+
+func TestGoogleInvalidGrantTriesBothRTsThenBackoff(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref-prism", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var nowMu sync.Mutex
+	now := time.Now()
+	var calls []string
+	src := NewSource(dir, "Gemini", "google", func(_ context.Context, refresh string) (xai.Tokens, error) {
+		calls = append(calls, refresh)
+		return xai.Tokens{}, errors.New("Google OAuth token refresh failed: invalid_grant: Token has been expired or revoked.")
+	})
+	src.now = func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	src.SetAgyTokenPath(filepath.Join(t.TempDir(), "agy"))
+	src.loadAgy = func(string) (xai.Tokens, error) {
+		return xai.Tokens{Refresh: "ref-agy"}, nil
+	}
+	src.storeAgy = func(string, xai.Tokens) error { return nil }
+	_, err := src.Token(context.Background())
+	if err == nil {
+		t.Fatal("expected invalid_grant")
+	}
+	if src.OAuthTerminalInvalid() {
+		t.Fatal("google invalid_grant must not set the permanent terminal latch")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "Gemini.json.invalid")); !os.IsNotExist(statErr) {
+		t.Fatalf(".invalid marker must not be written for google, stat err = %v", statErr)
+	}
+	if len(calls) != 2 || calls[0] != "ref-agy" || calls[1] != "ref-prism" {
+		t.Fatalf("calls = %v, want [ref-agy ref-prism] (agy then prism)", calls)
+	}
+	if !strings.Contains(err.Error(), "invalid_grant") {
+		t.Fatalf("err = %v, want invalid_grant", err)
+	}
+	_, err2 := src.Token(context.Background())
+	if err2 == nil || !strings.Contains(err2.Error(), "backoff") {
+		t.Fatalf("in-backoff Token must fail fast, err = %v", err2)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("backoff must not refresh again, calls = %d", len(calls))
+	}
+}
+
+func TestGoogleInvalidGrantRetrySucceedsWithoutLatch(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref-prism", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	nLoad := 0
+	src := NewSource(dir, "Gemini", "google", func(_ context.Context, refresh string) (xai.Tokens, error) {
+		if refresh == "ref-prism" {
+			return xai.Tokens{}, errors.New("invalid_grant")
+		}
+		if refresh == "ref-agy" {
+			return xai.Tokens{Access: "recovered", Refresh: "ref-new", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		}
+		return xai.Tokens{}, errors.New("unexpected refresh " + refresh)
+	})
+	src.SetAgyTokenPath(filepath.Join(t.TempDir(), "agy"))
+	src.loadAgy = func(string) (xai.Tokens, error) {
+		nLoad++
+		if nLoad == 1 {
+			return xai.Tokens{Refresh: "ref-prism"}, nil
+		}
+		return xai.Tokens{Refresh: "ref-agy"}, nil
+	}
+	src.storeAgy = func(string, xai.Tokens) error { return nil }
+	tok, err := src.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "recovered" {
+		t.Fatalf("token = %q", tok)
+	}
+	if src.OAuthTerminalInvalid() {
+		t.Fatal("successful retry must not latch")
+	}
+}
+
+func TestGoogleInvalidGrantSameRTBacksOffWithoutRetry(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref-same", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	src := NewSource(dir, "Gemini", "google", func(context.Context, string) (xai.Tokens, error) {
+		n++
+		return xai.Tokens{}, errors.New("invalid_grant")
+	})
+	src.SetAgyTokenPath(filepath.Join(t.TempDir(), "agy"))
+	src.loadAgy = func(string) (xai.Tokens, error) {
+		return xai.Tokens{Refresh: "ref-same"}, nil
+	}
+	src.storeAgy = func(string, xai.Tokens) error { return nil }
+	_, err := src.Token(context.Background())
+	if err == nil {
+		t.Fatal("expected invalid_grant")
+	}
+	if n != 1 {
+		t.Fatalf("refresh calls = %d, want 1 (same RT, no retry)", n)
+	}
+	if src.OAuthTerminalInvalid() {
+		t.Fatal("google same-RT invalid_grant must backoff, not terminal-latch")
+	}
+}
+
+func TestNewSourceDoesNotBindCanonicalAgyPath(t *testing.T) {
+	src := NewSource(t.TempDir(), "Gemini", "google", nil)
+	if src.agyPath != "" {
+		t.Fatalf("agyPath = %q, want empty (NewSource must not touch the live file)", src.agyPath)
+	}
+	if src.loadAgy != nil || src.storeAgy != nil {
+		t.Fatal("agy helpers must be nil until SetAgyTokenPath")
+	}
+}
+
+func TestGoogleAgyPathIsolatedAcrossAccounts(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old-a", Refresh: "ref-a", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(dir, "Gemini2", "google", xai.Tokens{
+		Access: "old-b", Refresh: "ref-b", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pathA := filepath.Join(t.TempDir(), "agy-a")
+	writeAgyTokenFile(t, pathA, "agy-acc", "ref-agy-a")
+	var callsA, callsB []string
+	srcA := NewSource(dir, "Gemini", "google", func(_ context.Context, refresh string) (xai.Tokens, error) {
+		callsA = append(callsA, refresh)
+		return xai.Tokens{Access: "new-a", Refresh: "ref-a", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+	srcB := NewSource(dir, "Gemini2", "google", func(_ context.Context, refresh string) (xai.Tokens, error) {
+		callsB = append(callsB, refresh)
+		return xai.Tokens{Access: "new-b", Refresh: "ref-b", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+	srcA.SetAgyTokenPath(pathA)
+	// srcB deliberately unbound — must not see pathA.
+	tokA, err := srcA.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokB, err := srcB.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokA != "new-a" || tokB != "new-b" {
+		t.Fatalf("tokens a=%q b=%q", tokA, tokB)
+	}
+	if len(callsA) != 1 || callsA[0] != "ref-agy-a" {
+		t.Fatalf("account A calls = %v, want [ref-agy-a]", callsA)
+	}
+	if len(callsB) != 1 || callsB[0] != "ref-b" {
+		t.Fatalf("account B calls = %v, want [ref-b] (must not adopt A's agy RT)", callsB)
+	}
+}
+
+func TestGoogleBackoffClearedOnSuccessfulRefresh(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var nowMu sync.Mutex
+	now := time.Now()
+	n := 0
+	src := NewSource(dir, "Gemini", "google", func(context.Context, string) (xai.Tokens, error) {
+		n++
+		if n == 1 {
+			return xai.Tokens{}, errors.New("invalid_grant")
+		}
+		return xai.Tokens{Access: "recovered", Refresh: "ref", ExpiresAt: now.Add(time.Hour)}, nil
+	})
+	src.now = func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	src.SetAgyTokenPath(filepath.Join(t.TempDir(), "agy"))
+	src.loadAgy = func(string) (xai.Tokens, error) { return xai.Tokens{Refresh: "ref"}, nil }
+	src.storeAgy = func(string, xai.Tokens) error { return nil }
+	if _, err := src.Token(context.Background()); err == nil {
+		t.Fatal("expected first invalid_grant")
+	}
+	if n != 1 {
+		t.Fatalf("calls = %d, want 1", n)
+	}
+	nowMu.Lock()
+	now = now.Add(time.Minute)
+	nowMu.Unlock()
+	tok, err := src.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "recovered" {
+		t.Fatalf("token = %q", tok)
+	}
+	if src.googleBackoffStep != 0 || !src.googleBackoffUntil.IsZero() {
+		t.Fatalf("backoff not cleared after success: step=%d until=%s", src.googleBackoffStep, src.googleBackoffUntil)
+	}
+}
+
+func TestGoogleBackoffClearedWhenAgyRTChanges(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref-old", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var nowMu sync.Mutex
+	now := time.Now()
+	agyRT := "ref-old"
+	var agyMu sync.Mutex
+	n := 0
+	src := NewSource(dir, "Gemini", "google", func(_ context.Context, refresh string) (xai.Tokens, error) {
+		n++
+		if refresh == "ref-old" {
+			return xai.Tokens{}, errors.New("invalid_grant")
+		}
+		if refresh == "ref-relogin" {
+			return xai.Tokens{Access: "from-relogin", Refresh: "ref-relogin", ExpiresAt: now.Add(time.Hour)}, nil
+		}
+		return xai.Tokens{}, errors.New("unexpected refresh " + refresh)
+	})
+	src.now = func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	src.SetAgyTokenPath(filepath.Join(t.TempDir(), "agy"))
+	src.loadAgy = func(string) (xai.Tokens, error) {
+		agyMu.Lock()
+		defer agyMu.Unlock()
+		return xai.Tokens{Refresh: agyRT}, nil
+	}
+	src.storeAgy = func(string, xai.Tokens) error { return nil }
+	if _, err := src.Token(context.Background()); err == nil {
+		t.Fatal("expected invalid_grant")
+	}
+	if n != 1 {
+		t.Fatalf("calls = %d, want 1", n)
+	}
+	// Still inside the 1m backoff window: changing agy RT must unlatch immediately.
+	agyMu.Lock()
+	agyRT = "ref-relogin"
+	agyMu.Unlock()
+	tok, err := src.Token(context.Background())
+	if err != nil {
+		t.Fatalf("agy RT change must clear backoff immediately: %v", err)
+	}
+	if tok != "from-relogin" {
+		t.Fatalf("token = %q", tok)
+	}
+	if n != 2 {
+		t.Fatalf("calls = %d, want 2", n)
+	}
+}
+
+func TestGoogleBackoffEmptyBaselineDoesNotUnlatch(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var nowMu sync.Mutex
+	now := time.Now()
+	var agyMu sync.Mutex
+	agyFail := true
+	n := 0
+	src := NewSource(dir, "Gemini", "google", func(context.Context, string) (xai.Tokens, error) {
+		n++
+		return xai.Tokens{}, errors.New("invalid_grant")
+	})
+	src.now = func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	src.SetAgyTokenPath(filepath.Join(t.TempDir(), "agy"))
+	src.loadAgy = func(string) (xai.Tokens, error) {
+		agyMu.Lock()
+		defer agyMu.Unlock()
+		if agyFail {
+			return xai.Tokens{}, errors.New("agy unavailable")
+		}
+		return xai.Tokens{Refresh: "ref"}, nil
+	}
+	src.storeAgy = func(string, xai.Tokens) error { return nil }
+	if _, err := src.Token(context.Background()); err == nil {
+		t.Fatal("expected first invalid_grant")
+	}
+	if src.googleBackoffAgyRT != "" {
+		t.Fatalf("baseline = %q, want empty after agy read failure", src.googleBackoffAgyRT)
+	}
+	if n != 1 {
+		t.Fatalf("calls = %d, want 1", n)
+	}
+	// Agy read recovers with the same RT while still inside the 1m window.
+	// Empty baseline must not be treated as re-login.
+	agyMu.Lock()
+	agyFail = false
+	agyMu.Unlock()
+	if _, err := src.Token(context.Background()); err == nil || !strings.Contains(err.Error(), "backoff") {
+		t.Fatalf("empty baseline + recovered same RT must stay latched: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("in-window refresh calls = %d, want 1", n)
+	}
+}
+
+func TestGoogleBackoffExponentialThenCap(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var nowMu sync.Mutex
+	now := time.Now()
+	n := 0
+	src := NewSource(dir, "Gemini", "google", func(context.Context, string) (xai.Tokens, error) {
+		n++
+		return xai.Tokens{}, errors.New("invalid_grant")
+	})
+	src.now = func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	src.SetAgyTokenPath(filepath.Join(t.TempDir(), "agy"))
+	src.loadAgy = func(string) (xai.Tokens, error) { return xai.Tokens{Refresh: "ref"}, nil }
+	src.storeAgy = func(string, xai.Tokens) error { return nil }
+	advance := func(d time.Duration) {
+		nowMu.Lock()
+		now = now.Add(d)
+		nowMu.Unlock()
+	}
+	wantUntil := []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, 15 * time.Minute}
+	for i, d := range wantUntil {
+		if _, err := src.Token(context.Background()); err == nil {
+			t.Fatalf("step %d: expected invalid_grant", i)
+		}
+		nowMu.Lock()
+		until := src.googleBackoffUntil
+		cur := now
+		nowMu.Unlock()
+		got := until.Sub(cur)
+		if got != d {
+			t.Fatalf("step %d: backoff = %s, want %s", i, got, d)
+		}
+		// Still inside the window: no extra refresh.
+		calls := n
+		if _, err := src.Token(context.Background()); err == nil || !strings.Contains(err.Error(), "backoff") {
+			t.Fatalf("step %d in-window: err = %v", i, err)
+		}
+		if n != calls {
+			t.Fatalf("step %d in-window refreshed, calls %d → %d", i, calls, n)
+		}
+		advance(d)
+	}
+	if n != len(wantUntil) {
+		t.Fatalf("refresh calls = %d, want %d", n, len(wantUntil))
+	}
+}
+
+func TestGoogleAccessFreshnessUsesRefreshSkew(t *testing.T) {
+	dir := t.TempDir()
+	var nowMu sync.Mutex
+	now := time.Now()
+	realExp := now.Add(time.Hour)
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "acc", Refresh: "ref", ExpiresAt: realExp,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	src := NewSource(dir, "Gemini", "google", func(context.Context, string) (xai.Tokens, error) {
+		n++
+		return xai.Tokens{Access: "refreshed", Refresh: "ref", ExpiresAt: now.Add(2 * time.Hour)}, nil
+	})
+	src.now = func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	tok, err := src.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "acc" || n != 0 {
+		t.Fatalf("fresh token must not refresh, tok=%q n=%d", tok, n)
+	}
+	nowMu.Lock()
+	now = now.Add(56 * time.Minute) // past 5m skew, still before real expiry
+	nowMu.Unlock()
+	tok, err = src.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "refreshed" || n != 1 {
+		t.Fatalf("after skew window must refresh, tok=%q n=%d", tok, n)
+	}
+}
+
+func TestGooglePersistRefusesInvalidAgyJSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := Save(dir, "Gemini", "google", xai.Tokens{
+		Access: "old", Refresh: "ref-old", ExpiresAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agyPath := filepath.Join(t.TempDir(), "antigravity-oauth-token")
+	orig := []byte("not-json{")
+	if err := os.WriteFile(agyPath, orig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := NewSource(dir, "Gemini", "google", func(context.Context, string) (xai.Tokens, error) {
+		return xai.Tokens{Access: "new", Refresh: "ref-new", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+	src.SetAgyTokenPath(agyPath) // real Load/Store helpers
+	tok, err := src.Token(context.Background())
+	if err != nil {
+		t.Fatalf("invalid agy JSON must not fail the refresh: %v", err)
+	}
+	if tok != "new" {
+		t.Fatalf("token = %q", tok)
+	}
+	after, err := os.ReadFile(agyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(orig) {
+		t.Fatalf("agy file overwritten on parse failure: %q", after)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "Gemini.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f File
+	if err := json.Unmarshal(data, &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.AccessToken != "new" || f.RefreshToken != "ref-new" {
+		t.Fatalf("prism copy not updated: %+v", f)
 	}
 }

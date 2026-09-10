@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/oauth/google"
 	"github.com/dorokuma/prism/internal/oauth/xai"
 )
 
@@ -51,6 +52,32 @@ type Source struct {
 	loaded bool
 
 	terminalInvalid bool
+
+	// googleBackoffUntil is the earliest time a google source will retry
+	// after invalid_grant. Zero means not in backoff. Google refresh
+	// tokens for this client are durable; invalid_grant is often a
+	// transient rate-limit, so this is a soft latch (not a permanent
+	// .invalid marker). xai still uses terminalInvalid.
+	googleBackoffUntil time.Time
+	googleBackoffStep  int
+	googleBackoffAgyRT string // agy RT observed when backoff started; a different value is a local re-login
+
+	// agyPath, when set, makes the Antigravity CLI token file the
+	// refresh-token authority for this source (google accounts). loadAgy
+	// / storeAgy default to the google package helpers; tests override.
+	// NewSource leaves this empty; production wiring (attachOAuth) sets
+	// it on at most one google account.
+	agyPath  string
+	loadAgy  func(path string) (xai.Tokens, error)
+	storeAgy func(path string, tok xai.Tokens) error
+}
+
+// googleBackoffSchedule is the invalid_grant retry spacing: 1m, 5m, then
+// 15m capped. Success or an agy/prism RT change resets to the first step.
+var googleBackoffSchedule = []time.Duration{
+	time.Minute,
+	5 * time.Minute,
+	15 * time.Minute,
 }
 
 // NewSource builds a file-backed source for one oauth account.
@@ -68,6 +95,22 @@ func NewSource(dir, account, provider string, refresh RefreshFunc) *Source {
 		refresh:  refresh,
 		now:      time.Now,
 	}
+}
+
+// SetAgyTokenPath overrides the Antigravity CLI token file used as the
+// refresh-token authority. Empty path disables dual-write/adopt. Production
+// must call this explicitly (NewSource does not). Tests must pass a temp
+// path so they never touch the live agy file. Multi-account setups bind
+// the canonical path to at most one google Source.
+func (s *Source) SetAgyTokenPath(path string) {
+	s.agyPath = strings.TrimSpace(path)
+	if s.agyPath == "" {
+		s.loadAgy = nil
+		s.storeAgy = nil
+		return
+	}
+	s.loadAgy = loadAgyAsXAI
+	s.storeAgy = storeAgyAsXAI
 }
 
 // NewXAISource builds a file-backed source for one xai oauth account.
@@ -151,6 +194,7 @@ func (s *Source) reloadFromDiskLocked() error {
 	if err != nil {
 		return err
 	}
+	oldRT := s.cred.RefreshToken
 	// The in-memory pair may be NEWER than the disk one: a refresh
 	// consumed the refresh token and then the persist failed, leaving
 	// the disk with the dead-on-arrival pair. Re-reading it unconditionally
@@ -162,6 +206,9 @@ func (s *Source) reloadFromDiskLocked() error {
 	// comparison is unambiguous (memory already empty → always adopt).
 	if s.cred.RefreshToken == "" || cred.ExpiresAt.After(s.cred.ExpiresAt) {
 		s.cred = cred
+	}
+	if s.provider == "google" && s.cred.RefreshToken != "" && s.cred.RefreshToken != oldRT {
+		s.clearGoogleBackoffLocked("prism refresh_token changed")
 	}
 	if fi, e := os.Stat(s.path()); e == nil {
 		s.mtime = fi.ModTime()
@@ -178,8 +225,22 @@ func (s *Source) reloadFromDiskLocked() error {
 // process restart. A one-way latch (only ever set) strands the account in
 // the terminal state after login until the service is restarted.
 func (s *Source) syncTerminalInvalidFromDisk() {
+	if s.provider == "google" {
+		// Google uses in-memory backoff, never a permanent .invalid latch.
+		// Ignore leftover markers from older prism versions.
+		s.terminalInvalid = false
+		return
+	}
 	_, err := os.Stat(s.invalidPath())
 	s.terminalInvalid = (err == nil)
+}
+
+func (s *Source) accessFreshLocked() bool {
+	exp := s.cred.ExpiresAt
+	if s.provider == "google" {
+		exp = google.SkewedExpiry(exp)
+	}
+	return s.now().Before(exp)
 }
 
 func isTerminalRefreshError(err error) bool {
@@ -188,19 +249,37 @@ func isTerminalRefreshError(err error) bool {
 }
 
 func (s *Source) refreshLocked(ctx context.Context, force bool) (string, error) {
-	if s.terminalInvalid {
+	if s.provider != "google" && s.terminalInvalid {
 		return "", fmt.Errorf("oauth: terminal token invalid (run: %s)", s.loginHint())
 	}
-	if !force && s.now().Before(s.cred.ExpiresAt) {
+	if s.provider == "google" {
+		if err := s.maybeClearGoogleBackoffLocked(); err != nil {
+			return "", err
+		}
+	}
+	if !force && s.accessFreshLocked() {
 		return s.cred.AccessToken, nil
 	}
-	tok, err := s.refresh(ctx, s.cred.RefreshToken)
+	usedRT := s.cred.RefreshToken
+	if s.provider == "google" {
+		usedRT = s.adoptAgyRefreshLocked()
+	}
+	tok, err := s.refresh(ctx, usedRT)
 	if err != nil {
-		if isTerminalRefreshError(err) {
-			s.terminalInvalid = true
-			_ = os.WriteFile(s.invalidPath(), []byte("invalid\n"), 0o600)
+		if s.provider == "google" && isTerminalRefreshError(err) {
+			tok, err = s.retryGoogleRefreshLocked(ctx, usedRT, err)
 		}
-		return "", err
+		if err != nil {
+			if isTerminalRefreshError(err) {
+				if s.provider == "google" {
+					s.enterGoogleBackoffLocked()
+				} else {
+					s.terminalInvalid = true
+					_ = os.WriteFile(s.invalidPath(), []byte("invalid\n"), 0o600)
+				}
+			}
+			return "", err
+		}
 	}
 	next := File{Provider: s.provider, AccessToken: tok.Access, RefreshToken: tok.Refresh, ExpiresAt: tok.ExpiresAt}
 	// The refresh token was just CONSUMED by the rotation: when the
@@ -213,14 +292,161 @@ func (s *Source) refreshLocked(ctx context.Context, force bool) (string, error) 
 	if err := writeFileFn(s.path(), next); err != nil {
 		slog.Warn("oauth token persist failed, keeping new token in memory", "account", s.account, "error", err)
 	}
+	s.persistAgyLocked(tok)
 	s.cred = next
 	s.loaded = true
 	s.terminalInvalid = false
+	s.clearGoogleBackoffLocked("refresh succeeded")
 	if fi, e := os.Stat(s.path()); e == nil {
 		s.mtime = fi.ModTime()
 	}
 	_ = os.Remove(s.invalidPath())
 	return next.AccessToken, nil
+}
+
+// adoptAgyRefreshLocked, holding the token flock, prefers the refresh_token
+// in the agy file when it is non-empty and differs from prism's copy.
+// Google RTs do not rotate, so a different RT means a local re-login;
+// expiry is not compared.
+func (s *Source) adoptAgyRefreshLocked() string {
+	rt := s.cred.RefreshToken
+	agyRT, err := s.loadAgyRefreshLocked()
+	if err != nil {
+		slog.Warn("oauth: agy token read failed during adopt", "account", s.account, "path", s.agyPath, "error", err)
+		return rt
+	}
+	if agyRT == "" || agyRT == rt {
+		return rt
+	}
+	slog.Info("oauth: adopting refresh_token from agy token file", "account", s.account, "path", s.agyPath)
+	return agyRT
+}
+
+func (s *Source) loadAgyRefreshLocked() (string, error) {
+	if s.agyPath == "" || s.loadAgy == nil {
+		return "", nil
+	}
+	ext, err := s.loadAgy(s.agyPath)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(ext.Refresh), nil
+}
+
+// retryGoogleRefreshLocked, after the first invalid_grant, tries remaining
+// refresh tokens in order: agy file RT (if different from usedRT), then
+// prism's own cred RT. All must fail before the caller enters backoff.
+func (s *Source) retryGoogleRefreshLocked(ctx context.Context, usedRT string, origErr error) (xai.Tokens, error) {
+	seen := map[string]struct{}{strings.TrimSpace(usedRT): {}}
+	var alts []struct{ rt, from string }
+	add := func(rt, from string) {
+		rt = strings.TrimSpace(rt)
+		if rt == "" {
+			return
+		}
+		if _, ok := seen[rt]; ok {
+			return
+		}
+		seen[rt] = struct{}{}
+		alts = append(alts, struct{ rt, from string }{rt, from})
+	}
+	agyRT, err := s.loadAgyRefreshLocked()
+	if err != nil {
+		slog.Warn("oauth: agy token read failed during invalid_grant retry", "account", s.account, "path", s.agyPath, "error", err)
+	} else {
+		add(agyRT, "agy")
+	}
+	add(s.cred.RefreshToken, "prism")
+	last := origErr
+	for _, alt := range alts {
+		slog.Info("oauth: google invalid_grant retry with alternate refresh_token", "account", s.account, "source", alt.from)
+		tok, err := s.refresh(ctx, alt.rt)
+		if err == nil {
+			return tok, nil
+		}
+		last = err
+		if !isTerminalRefreshError(err) {
+			return xai.Tokens{}, err
+		}
+	}
+	return xai.Tokens{}, last
+}
+
+func (s *Source) maybeClearGoogleBackoffLocked() error {
+	if s.googleBackoffUntil.IsZero() || !s.now().Before(s.googleBackoffUntil) {
+		return nil
+	}
+	agyRT, err := s.loadAgyRefreshLocked()
+	if err != nil {
+		// Read failure is pure time backoff. Do not treat a later
+		// successful read as re-login: enterGoogleBackoffLocked leaves
+		// googleBackoffAgyRT empty when the agy file is unreadable, and
+		// agyRT != "" would otherwise always look like a change.
+		slog.Warn("oauth: agy token read failed during backoff", "account", s.account, "path", s.agyPath, "error", err)
+	} else if s.googleBackoffAgyRT != "" && agyRT != "" && agyRT != s.googleBackoffAgyRT {
+		// Unlatch only with a known baseline that differs. Empty
+		// baseline means the agy file was unreadable at enter.
+		s.clearGoogleBackoffLocked("agy refresh_token changed")
+		return nil
+	}
+	return fmt.Errorf("oauth: google invalid_grant backoff until %s", s.googleBackoffUntil.UTC().Format(time.RFC3339))
+}
+
+func (s *Source) enterGoogleBackoffLocked() {
+	step := s.googleBackoffStep
+	if step >= len(googleBackoffSchedule) {
+		step = len(googleBackoffSchedule) - 1
+	}
+	d := googleBackoffSchedule[step]
+	s.googleBackoffUntil = s.now().Add(d)
+	s.googleBackoffStep++
+	if agyRT, err := s.loadAgyRefreshLocked(); err != nil {
+		slog.Warn("oauth: agy token read failed when entering backoff", "account", s.account, "path", s.agyPath, "error", err)
+		s.googleBackoffAgyRT = "" // unknown baseline: unlatch only after the timer
+	} else {
+		s.googleBackoffAgyRT = agyRT
+	}
+	slog.Warn("oauth: google invalid_grant backoff",
+		"account", s.account,
+		"backoff", d.String(),
+		"until", s.googleBackoffUntil.UTC().Format(time.RFC3339),
+		"step", s.googleBackoffStep,
+	)
+}
+
+func (s *Source) clearGoogleBackoffLocked(reason string) {
+	if s.googleBackoffUntil.IsZero() && s.googleBackoffStep == 0 && s.googleBackoffAgyRT == "" {
+		return
+	}
+	slog.Info("oauth: google invalid_grant backoff cleared", "account", s.account, "reason", reason)
+	s.googleBackoffUntil = time.Time{}
+	s.googleBackoffStep = 0
+	s.googleBackoffAgyRT = ""
+}
+
+func (s *Source) persistAgyLocked(tok xai.Tokens) {
+	if s.agyPath == "" || s.storeAgy == nil {
+		return
+	}
+	if err := s.storeAgy(s.agyPath, tok); err != nil {
+		if errors.Is(err, google.ErrAgyInvalidJSON) {
+			slog.Error("oauth: agy token file not valid JSON, refusing to overwrite", "account", s.account, "path", s.agyPath, "error", err)
+			return
+		}
+		slog.Warn("oauth: agy token file not writable, prism copy updated only", "account", s.account, "path", s.agyPath, "error", err)
+	}
+}
+
+func loadAgyAsXAI(path string) (xai.Tokens, error) {
+	tok, err := google.LoadAgyToken(path)
+	if err != nil {
+		return xai.Tokens{}, err
+	}
+	return xai.Tokens{Access: tok.Access, Refresh: tok.Refresh, ExpiresAt: tok.ExpiresAt}, nil
+}
+
+func storeAgyAsXAI(path string, tok xai.Tokens) error {
+	return google.StoreAgyToken(path, google.Tokens{Access: tok.Access, Refresh: tok.Refresh, ExpiresAt: tok.ExpiresAt})
 }
 
 // writeFileFn is the token-file write used by refreshLocked. It is a
@@ -299,7 +525,7 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 	if s.cred.AccessToken == "" || s.cred.RefreshToken == "" {
 		return "", fmt.Errorf("%w (run: %s)", ErrNotLoggedIn, s.loginHint())
 	}
-	if s.now().Before(s.cred.ExpiresAt) {
+	if s.accessFreshLocked() {
 		return s.cred.AccessToken, nil
 	}
 	if s.refresh == nil {

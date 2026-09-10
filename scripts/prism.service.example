@@ -44,6 +44,12 @@ ReadOnlyPaths=/var/lib/prism
 ReadWritePaths=/var/lib/prism
 ReadWritePaths=/var/lib/prism/model_cache
 # ReadWritePaths=/home/<user>/.pi/agent
+# Gemini OAuth dual-write (agy token authority). Bind the parent directory
+# so tmp+rename works; conversations/logs in the same dir become visible to
+# User=prism. Host-specific /root path; do not emit it from `prism setup`.
+# Install scripts/agy-oauth-sync/ drop-in + path unit instead
+# (ProtectHome=true otherwise hides /root).
+# ReadWritePaths=/root/.gemini/antigravity-cli
 # Do NOT set PRISM_AUTH_KEY here (breaks some local clients).
 
 [Install]

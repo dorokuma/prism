@@ -1,0 +1,11 @@
+[Unit]
+Description=Grant prism group read/write on Antigravity OAuth token
+Documentation=file:///root/prism/scripts/agy-oauth-sync/README.md
+
+[Service]
+Type=oneshot
+# agy rewrites this file as 0600 root:root; prism (User=prism) then cannot
+# dual-write. Restore group write without giving the file to the prism user
+# (agy stays root-owned).
+ExecStart=/bin/chown root:prism /root/.gemini/antigravity-cli/antigravity-oauth-token
+ExecStart=/bin/chmod 0660 /root/.gemini/antigravity-cli/antigravity-oauth-token

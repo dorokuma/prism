@@ -7,6 +7,9 @@
 #
 # 部署前提：代码改动已 commit + tag（本地）。本脚本编译当前工作区代码。
 # 退出码：0 成功；1 新版失败已回退旧版；2 回退后仍不健康或恢复失败（需人工）；3 前置失败（编译/备份/安装/restart 失败/参数校验，部署中止；restart 失败时服务状态未知，备份保留在 $BACKUP 供人工回退）。
+#
+# Gemini OAuth dual-write（agy token 权威源）的 systemd 片段不在本脚本里安装。
+# 见 scripts/agy-oauth-sync/README.md（drop-in ReadWritePaths + path unit）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"

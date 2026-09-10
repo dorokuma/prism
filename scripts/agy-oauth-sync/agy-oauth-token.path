@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch Antigravity OAuth token file and restore prism group access
+Documentation=file:///root/prism/scripts/agy-oauth-sync/README.md
+
+[Path]
+PathChanged=/root/.gemini/antigravity-cli/antigravity-oauth-token
+PathModified=/root/.gemini/antigravity-cli/antigravity-oauth-token
+Unit=agy-oauth-token-acl.service
+
+[Install]
+WantedBy=multi-user.target

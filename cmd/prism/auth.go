@@ -186,6 +186,9 @@ func runAuthGoogle(args []string, out io.Writer) error {
 		fmt.Fprintf(out, "refresh 失败，沿用文件里未过期的 access token: %v\n", rerr)
 	} else {
 		tok = refreshed
+		if werr := google.StoreAgyToken(src, tok); werr != nil {
+			fmt.Fprintf(out, "agy token 回写失败（prism 副本仍会写入）: %v\n", werr)
+		}
 	}
 	if err := oauth.Save(storeDir, chosen.Name, "google", xai.Tokens{
 		Access:    tok.Access,
