@@ -199,9 +199,7 @@ func (p *Poller) fetchOne(parent context.Context, g KeyGroup, timeout time.Durat
 		names = append(names, a.Name())
 	}
 	acc := g.Accounts[0]
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
-	snap, err := g.Fetcher.Fetch(ctx, acc)
+	snap, err := FetchWithRetry(parent, g.Fetcher, acc, timeout)
 	snap.Accounts = names
 	if err != nil {
 		fetchErrors.Add(1)
@@ -230,7 +228,9 @@ func (p *Poller) fetchOne(parent context.Context, g KeyGroup, timeout time.Durat
 		icancel()
 	}
 	if sum != nil {
+		ctx, cancel := context.WithTimeout(parent, timeout)
 		snap = ApplyWeekEstimate(ctx, snap, sum, estPath, time.Now())
+		cancel()
 	}
 	p.cache.Store(g.Fingerprint, snap)
 }

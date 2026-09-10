@@ -164,8 +164,8 @@ flags:
 		for _, a := range g.Accounts {
 			names = append(names, a.Name())
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		snap, ferr := g.Fetcher.Fetch(ctx, g.Accounts[0])
+		ctx := context.Background()
+		snap, ferr := planusage.FetchWithRetry(ctx, g.Fetcher, g.Accounts[0], timeout)
 		snap.Accounts = names
 		if ferr != nil {
 			failed++
@@ -190,7 +190,6 @@ flags:
 				}
 			}
 		}
-		cancel()
 		snaps = append(snaps, snap)
 	}
 
