@@ -25,6 +25,10 @@ const (
 const (
 	SourceOpenAI    = "openai"
 	SourceAnthropic = "anthropic"
+	// SourcePi is usage_source for historical Pi-session import rows.
+	// Overview and hit-rate SQL treat it like Anthropic (cache counters
+	// excluded from input_tokens). New rows are no longer imported.
+	SourcePi = "pi"
 )
 
 // ComputeCost computes the USD cost of a usage record. It is the single

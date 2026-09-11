@@ -24,26 +24,6 @@ const DefaultGrokEstimatePath = "/var/lib/prism/quota/grok-week-estimate.json"
 // -- until a consumption source lands).
 const DefaultGeminiEstimatePath = "/var/lib/prism/quota/gemini-week-estimate.json"
 
-// GrokBuildImportWindow is the [from,to] unix range for Grok Build session
-// import: previous SuperGrok week plus the current week through now.
-func GrokBuildImportWindow(snap Snapshot, now time.Time) (from, to int64) {
-	to = now.Unix()
-	from = now.Add(-14 * 24 * time.Hour).Unix()
-	for _, w := range snap.Windows {
-		if w.Name != "weekly" || w.PeriodStart == nil {
-			continue
-		}
-		span := 7 * 24 * time.Hour
-		if w.ResetsAt != nil {
-			if d := w.ResetsAt.Sub(*w.PeriodStart); d > 0 {
-				span = d
-			}
-		}
-		return w.PeriodStart.Add(-span).Unix(), to
-	}
-	return from, to
-}
-
 const weekFallback = 7 * 24 * time.Hour
 
 // rollWeekStart advances a weekly period start by whole window spans until

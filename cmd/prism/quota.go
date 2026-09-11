@@ -36,41 +36,20 @@ func runQuota(args []string) error {
 	return runQuotaWith(args, os.Stdout)
 }
 
-func grokPriceFor(cfg *config.Config) func(string, int64) *usage.Price {
-	return func(model string, contextTokens int64) *usage.Price {
-		if cfg == nil {
-			return nil
-		}
-		m := strings.TrimSuffix(model, "-build")
-		meta, ok := cfg.LookupModelMetadata("xai", m)
-		if !ok || meta.Cost == nil {
-			meta, ok = cfg.LookupModelMetadata("", m)
-		}
-		if !ok || meta.Cost == nil {
-			return nil
-		}
-		c := meta.Cost.EffectiveCost(contextTokens)
-		if c.Input == 0 && c.Output == 0 && c.CacheRead == 0 && c.CacheWrite == 0 {
-			return nil
-		}
-		return &usage.Price{Input: c.Input, Output: c.Output, CacheRead: c.CacheRead, CacheWrite: c.CacheWrite}
-	}
-}
-
 func applyQuotaGrokEstimate(ctx context.Context, cfg *config.Config, snap planusage.Snapshot) planusage.Snapshot {
 	path := cfg.Usage.DBPath
 	if path == "" {
 		return snap
 	}
-	store := usage.NewSQLiteStore(path)
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return snap
+	}
+	store := usage.NewReadOnlyStore(path)
 	if err := store.Open(); err != nil {
 		return snap
 	}
 	defer store.Close()
-	from, to := planusage.GrokBuildImportWindow(snap, time.Now())
-	if _, err := usage.ImportGrokBuild(ctx, store, usage.DefaultGrokSessionsDir(), from, to, grokPriceFor(cfg)); err != nil {
-		// estimate still runs on whatever is already in the database
-	}
 	return planusage.ApplyGrokWeekEstimate(ctx, snap, store.SumGrokTokens, planusage.DefaultGrokEstimatePath, time.Now())
 }
 

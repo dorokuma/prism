@@ -17,9 +17,9 @@ const (
 	xaiProviderName = "xai"
 	xaiAPIHost      = "api.x.ai"
 	xaiTokenAuth    = "xai-grok-cli"
-	// cli-chat-proxy billing is what Grok Build / SuperGrok OAuth actually
-	// answers. It is not on docs.x.ai; api.x.ai has no equivalent /billing
-	// for this token type.
+	// cli-chat-proxy billing is what SuperGrok OAuth actually answers.
+	// It is not on docs.x.ai; api.x.ai has no equivalent /billing for
+	// this token type.
 	xaiDefaultBillingURL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 )
 

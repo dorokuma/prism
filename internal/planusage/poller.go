@@ -30,15 +30,10 @@ type Poller struct {
 
 	grokSum      GrokTokenSum
 	estimatePath string
-	grokImport   GrokBuildImporter
 
 	geminiSum          GrokTokenSum
 	geminiEstimatePath string
 }
-
-// GrokBuildImporter pulls Grok Build CLI session usage into the usage
-// database for [fromUnix, toUnix] before the week-limit estimate runs.
-type GrokBuildImporter func(ctx context.Context, fromUnix, toUnix int64) error
 
 func NewPoller(fetchers []Fetcher, cache *Cache, interval, timeout time.Duration) *Poller {
 	if interval < 30*time.Second {
@@ -98,14 +93,6 @@ func (p *Poller) SetGeminiEstimate(sum GrokTokenSum, path string) {
 	p.mu.Lock()
 	p.geminiSum = sum
 	p.geminiEstimatePath = path
-	p.mu.Unlock()
-}
-
-// SetGrokBuildImport wires the Grok Build CLI session importer used
-// before the SuperGrok week estimate runs.
-func (p *Poller) SetGrokBuildImport(imp GrokBuildImporter) {
-	p.mu.Lock()
-	p.grokImport = imp
 	p.mu.Unlock()
 }
 
@@ -210,23 +197,14 @@ func (p *Poller) fetchOne(parent context.Context, g KeyGroup, timeout time.Durat
 	}
 	var sum GrokTokenSum
 	var estPath string
-	var imp GrokBuildImporter
 	p.mu.Lock()
 	switch snap.Provider {
 	case "xai":
-		sum, estPath, imp = p.grokSum, p.estimatePath, p.grokImport
+		sum, estPath = p.grokSum, p.estimatePath
 	case "gemini":
 		sum, estPath = p.geminiSum, p.geminiEstimatePath
 	}
 	p.mu.Unlock()
-	if imp != nil {
-		from, to := GrokBuildImportWindow(snap, time.Now())
-		ictx, icancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if ierr := imp(ictx, from, to); ierr != nil {
-			slog.Warn("quota grok-build import failed", "error", ierr)
-		}
-		icancel()
-	}
 	if sum != nil {
 		ctx, cancel := context.WithTimeout(parent, timeout)
 		snap = ApplyWeekEstimate(ctx, snap, sum, estPath, time.Now())

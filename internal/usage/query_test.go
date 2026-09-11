@@ -15,7 +15,7 @@ func TestSummaryPiUsesAnthropicCacheDenominator(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	if err := s.InsertBatch(ctx, []Event{{
-		Ts: time.Now(), RequestID: "pi-hit", Model: "claude", Source: PiSessionSource,
+		Ts: time.Now(), RequestID: "pi-hit", Model: "claude", Source: SourcePi,
 		PromptTokens: 100, CachedTokens: 500, CacheWriteTokens: 50,
 		TotalTokens: 650,
 	}}); err != nil {
