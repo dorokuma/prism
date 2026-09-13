@@ -146,6 +146,99 @@ func TestWeekStartUnixIgnoresGeminiWeekly(t *testing.T) {
 	}
 }
 
+func TestGeminiWeekStartUnixIgnoresXAI(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	gemStart := now.Add(-2 * time.Hour)
+	xaiStart := now.Add(-5 * 24 * time.Hour)
+	snaps := []Snapshot{
+		{Provider: "xai", Windows: []Window{{
+			Name: "weekly", PeriodStart: &xaiStart,
+		}}},
+		{Provider: "gemini", Windows: []Window{{
+			Name: "weekly", PeriodStart: &gemStart,
+		}}},
+	}
+	got := GeminiWeekStartUnix(snaps, "", now)
+	if got != gemStart.Unix() {
+		t.Fatalf("GeminiWeekStartUnix = %d, want gemini week %d (xai must not win)", got, gemStart.Unix())
+	}
+	// The SuperGrok helper must still ignore the gemini window.
+	if got := WeekStartUnix(snaps, "", now); got != xaiStart.Unix() {
+		t.Fatalf("WeekStartUnix = %d, want xai week %d", got, xaiStart.Unix())
+	}
+}
+
+func TestWeekStartUnixGeminiOnlyFallsBack(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	gemStart := now.Add(-2 * time.Hour)
+	snaps := []Snapshot{{Provider: "gemini", Windows: []Window{{
+		Name: "weekly", PeriodStart: &gemStart,
+	}}}}
+	want := now.Add(-7 * 24 * time.Hour).Unix()
+	if got := WeekStartUnix(snaps, "", now); got != want {
+		t.Fatalf("gemini-only must not win WeekStartUnix: got %d want 7d fallback %d", got, want)
+	}
+	if got := GeminiWeekStartUnix(snaps, "", now); got != gemStart.Unix() {
+		t.Fatalf("GeminiWeekStartUnix = %d want %d", got, gemStart.Unix())
+	}
+}
+
+func TestApplyWeekEstimateEatsCombinedAgySum(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gem.json")
+	start := time.Date(2026, 8, 22, 8, 0, 0, 0, time.UTC)
+	end := start.Add(7 * 24 * time.Hour)
+	snap := Snapshot{Provider: "gemini", Windows: []Window{{
+		Name: "weekly", Percent: 50, PeriodStart: &start, ResetsAt: &end,
+	}}}
+	usageSum := func(context.Context, int64, int64) (int64, error) { return 400, nil }
+	agySum := func(context.Context, int64, int64) (int64, error) { return 600, nil }
+	got := ApplyWeekEstimate(context.Background(), snap, CombineTokenSums(usageSum, agySum), path, start.Add(time.Hour))
+	// 400+600 = 1000 tokens at 50% → pool 2000. ApplyWeekEstimate itself
+	// is unchanged; the combined sum is what feeds it.
+	if got.Windows[0].LimitTokensEstimate != 2000 {
+		t.Fatalf("combined estimate = %d, want 2000", got.Windows[0].LimitTokensEstimate)
+	}
+}
+
+func TestApplyWeekEstimateUsesUnflooredFraction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gem.json")
+	start := time.Date(2026, 8, 22, 8, 0, 0, 0, time.UTC)
+	end := start.Add(7 * 24 * time.Hour)
+	// 12.7% used floors to Percent=12. Integer reversal would be
+	// 1270*100/12 = 10583; unfloored 1270/0.127 = 10000.
+	snap := Snapshot{Provider: "gemini", Windows: []Window{{
+		Name: "weekly", Percent: 12, UsedFraction: 0.127,
+		PeriodStart: &start, ResetsAt: &end,
+	}}}
+	sum := func(context.Context, int64, int64) (int64, error) { return 1270, nil }
+	got := ApplyWeekEstimate(context.Background(), snap, sum, path, start.Add(time.Hour))
+	if got.Windows[0].LimitTokensEstimate != 10000 {
+		t.Fatalf("unfloored estimate = %d, want 10000", got.Windows[0].LimitTokensEstimate)
+	}
+}
+
+func TestApplyWeekEstimateSubPercentStillInverts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gem.json")
+	start := time.Date(2026, 8, 22, 8, 0, 0, 0, time.UTC)
+	end := start.Add(7 * 24 * time.Hour)
+	// 0.4% used floors to Percent=0; old path left the estimate empty.
+	snap := Snapshot{Provider: "gemini", Windows: []Window{{
+		Name: "weekly", Percent: 0, UsedFraction: 0.004,
+		PeriodStart: &start, ResetsAt: &end,
+	}}}
+	sum := func(context.Context, int64, int64) (int64, error) { return 4000, nil }
+	got := ApplyWeekEstimate(context.Background(), snap, sum, path, start.Add(time.Hour))
+	if got.Windows[0].LimitTokensEstimate != 1_000_000 {
+		t.Fatalf("sub-percent estimate = %d, want 1000000", got.Windows[0].LimitTokensEstimate)
+	}
+}
+
+func TestCombineTokenSumsNil(t *testing.T) {
+	if CombineTokenSums() != nil || CombineTokenSums(nil, nil) != nil {
+		t.Fatal("all-nil must return nil so ApplyWeekEstimate no-ops")
+	}
+}
+
 func TestApplyGrokWeekEstimateFirstPeriodUsesLive(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "est.json")
 	start := time.Date(2026, 8, 22, 8, 0, 0, 0, time.UTC)

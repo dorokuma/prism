@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +34,14 @@ type SummaryHandler struct {
 	// (unix seconds). Used to pin Pi /usage to the SuperGrok week.
 	// Nil or a non-positive result leaves From unbounded (全部时间).
 	DefaultFrom func() int64
+	// GeminiFrom, when the request omits both from and to (defaulted
+	// SuperGrok week), sets the agy query window start. Explicit from/to
+	// keep the same window on both sources. Nil falls back to q.From.
+	GeminiFrom func() int64
+	// AgyQuery, if non-nil, is merged into Summary/Overview. Failures are
+	// logged and skipped (usage_events still serve). The function must not
+	// write usage_events.
+	AgyQuery func(ctx context.Context, q SummaryQuery) ([]SummaryRow, error)
 }
 
 // NewSummaryHandler creates a summary handler. The admin token is NOT read
@@ -104,6 +113,7 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	rows = MergeSummaryRows(rows, h.agyRows(r.Context(), q, defaulted), q.GroupBy)
 	if rows == nil {
 		rows = []SummaryRow{}
 	}
@@ -143,10 +153,31 @@ func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q Su
 		})
 		return
 	}
+	extra := h.agyRows(r.Context(), q, defaulted)
+	rows = MergeSummaryRows(rows, extra, q.GroupBy)
+	AddOverview(ov, extra)
 	body := RenderUsageReport(ov, rows, q.GroupBy, ReportOptions{})
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, body)
+}
+
+func (h *SummaryHandler) agyRows(ctx context.Context, q SummaryQuery, defaulted bool) []SummaryRow {
+	if h == nil || h.AgyQuery == nil {
+		return nil
+	}
+	aq := q
+	if defaulted && h.GeminiFrom != nil {
+		if v := h.GeminiFrom(); v > 0 {
+			aq.From = v
+		}
+	}
+	extra, err := h.AgyQuery(ctx, aq)
+	if err != nil {
+		slog.Warn("usage: agy query failed", "error", err)
+		return nil
+	}
+	return extra
 }
 
 func writeSummaryError(w http.ResponseWriter, err error) {

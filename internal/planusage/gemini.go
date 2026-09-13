@@ -195,11 +195,19 @@ func geminiBucketWindow(name string, b geminiBucket) Window {
 	if remaining > 1 {
 		remaining = 1
 	}
-	used := (1 - remaining) * 100
+	usedFrac := 1 - remaining
+	if usedFrac < 0 {
+		usedFrac = 0
+	}
+	if usedFrac > 1 {
+		usedFrac = 1
+	}
+	used := usedFrac * 100
 	w := Window{
-		Name:    name,
-		Status:  "ok",
-		Percent: int(math.Floor(used + 1e-9)),
+		Name:         name,
+		Status:       "ok",
+		Percent:      int(math.Floor(used + 1e-9)),
+		UsedFraction: usedFrac,
 	}
 	if w.Percent < 0 {
 		w.Percent = 0

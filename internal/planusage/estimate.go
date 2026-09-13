@@ -18,10 +18,9 @@ import (
 const DefaultGrokEstimatePath = "/var/lib/prism/quota/grok-week-estimate.json"
 
 // DefaultGeminiEstimatePath is the on-disk freeze of the Gemini week-pool
-// inference (usage-db gemini-* tokens ÷ week percent). The estimate only
-// exists while usage rows for gemini-* models are recorded (currently
-// none: Antigravity usage does not pass through prism, so the column stays
-// -- until a consumption source lands).
+// inference (usage-db gemini-* tokens plus the agy local index, ÷ week
+// percent). Period_start in this file is the Gemini week anchor used by
+// GeminiWeekStartUnix; WeekStartUnix never reads it.
 const DefaultGeminiEstimatePath = "/var/lib/prism/quota/gemini-week-estimate.json"
 
 const weekFallback = 7 * 24 * time.Hour
@@ -77,6 +76,66 @@ func WeekStartUnix(snaps []Snapshot, estimatePath string, now time.Time) int64 {
 	return now.Add(-weekFallback).Unix()
 }
 
+// GeminiWeekStartUnix is the Gemini week-window start used for agy token
+// queries when the usage CLI/handler is on its default range. Live weekly
+// snapshots of the gemini provider win, then DefaultGeminiEstimatePath, then
+// now minus 7 days. xai (SuperGrok) windows are ignored: the documented
+// contract is that usage's default lower bound stays SuperGrok via
+// WeekStartUnix, and Gemini consumption uses this sibling.
+func GeminiWeekStartUnix(snaps []Snapshot, estimatePath string, now time.Time) int64 {
+	for _, snap := range snaps {
+		if snap.Provider != "gemini" {
+			continue
+		}
+		for _, w := range snap.Windows {
+			if w.Name != "weekly" || w.PeriodStart == nil || w.PeriodStart.IsZero() {
+				continue
+			}
+			span := weekFallback
+			if w.ResetsAt != nil && !w.ResetsAt.IsZero() {
+				if d := w.ResetsAt.Sub(*w.PeriodStart); d > 0 {
+					span = d
+				}
+			}
+			return rollWeekStart(*w.PeriodStart, span, now).Unix()
+		}
+	}
+	if t, ok := StoredPeriodStart(estimatePath); ok {
+		return rollWeekStart(t, weekFallback, now).Unix()
+	}
+	return now.Add(-weekFallback).Unix()
+}
+
+// CombineTokenSums adds token sums. Nil parts are skipped. An empty list
+// returns nil so ApplyWeekEstimate keeps its no-sum early return. Used so
+// the Gemini week-pool reversal can add usage_events gemini-* tokens and
+// the agy local index without changing ApplyWeekEstimate itself.
+func CombineTokenSums(parts ...GrokTokenSum) GrokTokenSum {
+	var fns []GrokTokenSum
+	for _, p := range parts {
+		if p != nil {
+			fns = append(fns, p)
+		}
+	}
+	if len(fns) == 0 {
+		return nil
+	}
+	if len(fns) == 1 {
+		return fns[0]
+	}
+	return func(ctx context.Context, from, to int64) (int64, error) {
+		var n int64
+		for _, fn := range fns {
+			x, err := fn(ctx, from, to)
+			if err != nil {
+				return 0, err
+			}
+			n += x
+		}
+		return n, nil
+	}
+}
+
 // StoredPeriodStart reads period_start from the grok week-estimate file.
 func StoredPeriodStart(path string) (time.Time, bool) {
 	if path == "" {
@@ -103,10 +162,32 @@ func StoredPeriodStart(path string) (time.Time, bool) {
 type GrokTokenSum func(ctx context.Context, fromUnix, toUnix int64) (int64, error)
 
 type grokWeekEstimate struct {
-	PeriodStart  string `json:"period_start"`
-	LiveTokens   int64  `json:"live_tokens"`
-	LivePercent  int    `json:"live_percent"`
-	LiveEstimate int64  `json:"live_estimate"`
+	PeriodStart      string  `json:"period_start"`
+	LiveTokens       int64   `json:"live_tokens"`
+	LivePercent      int     `json:"live_percent"`
+	LiveUsedFraction float64 `json:"live_used_fraction,omitempty"`
+	LiveEstimate     int64   `json:"live_estimate"`
+}
+
+// windowUsedFraction is the reversal denominator. Prefer the unfloored
+// share when the fetcher set it (Gemini remainingFraction); otherwise
+// Percent/100 (Grok). Values too small to invert stably return 0.
+func windowUsedFraction(w Window) float64 {
+	f := w.UsedFraction
+	if f <= 0 && w.Percent > 0 {
+		f = float64(w.Percent) / 100
+	}
+	if f < 1e-9 || f > 1 {
+		return 0
+	}
+	return f
+}
+
+func reversePool(tokens int64, frac float64) int64 {
+	if tokens <= 0 || frac <= 0 {
+		return 0
+	}
+	return int64(float64(tokens)/frac + 0.5)
 }
 
 func withEstimateLock(path string, fn func() error) error {
@@ -130,10 +211,10 @@ func withEstimateLock(path string, fn func() error) error {
 
 // ApplyWeekEstimate fills LimitTokensEstimate on the weekly window of
 // any provider with the LIVE reversal: consumed tokens in the current
-// period ÷ the period's used percent × 100. The estimate therefore moves
-// with real usage (percent and consumption), unlike the old frozen
-// previous-week value. The on-disk file keeps period_start (used by
-// WeekStartUnix) plus the live snapshot for inspection; sum errors leave
+// period ÷ used fraction. Gemini supplies UsedFraction from the quota
+// remainingFraction so a sub-1% week still inverts and a 12.7% week is
+// not treated as 12%. Grok keeps Percent/100. The on-disk file keeps
+// period_start plus the live snapshot for inspection; sum errors leave
 // the estimate empty rather than showing a stale value.
 func ApplyWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum, path string, now time.Time) Snapshot {
 	if sum == nil || path == "" {
@@ -160,19 +241,16 @@ func ApplyWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum, pat
 		slog.Warn("quota week token sum failed", "error", err)
 		return snap
 	}
-	if w.Percent > 0 && tokens > 0 {
-		snap.Windows[idx].LimitTokensEstimate = tokens * 100 / int64(w.Percent)
-	}
+	frac := windowUsedFraction(w)
+	est := reversePool(tokens, frac)
+	snap.Windows[idx].LimitTokensEstimate = est
 	if err := withEstimateLock(path, func() error {
 		st, _ := loadGrokWeekEstimate(path)
 		st.PeriodStart = w.PeriodStart.UTC().Format(time.RFC3339Nano)
 		st.LiveTokens = tokens
 		st.LivePercent = w.Percent
-		if w.Percent > 0 && tokens > 0 {
-			st.LiveEstimate = tokens * 100 / int64(w.Percent)
-		} else {
-			st.LiveEstimate = 0
-		}
+		st.LiveUsedFraction = frac
+		st.LiveEstimate = est
 		return saveGrokWeekEstimate(path, st)
 	}); err != nil {
 		slog.Warn("quota week estimate lock failed", "error", err)

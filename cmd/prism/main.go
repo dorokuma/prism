@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/dorokuma/prism/internal/adminauth"
+	"github.com/dorokuma/prism/internal/agyusage"
 	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/mcp"
@@ -520,19 +521,54 @@ func main() {
 	}
 	quotaPoller.SetAccounts(quotaViews)
 	quotaPoller.SetOptions(cfg.Quota.Enabled, cfg.Quota.RefreshInterval, cfg.Quota.RequestTimeout)
+
+	var agyIdx *agyusage.Index
+	if idx, err := agyusage.Open(agyusage.DefaultIndexPath, agyusage.DefaultConversationsDir()); err != nil {
+		slog.Warn("agy usage index unavailable", "error", err)
+	} else {
+		agyIdx = idx
+	}
+
+	var usageGemini planusage.GrokTokenSum
 	if ss, ok := usageStore.(*usage.SQLiteStore); ok && ss != nil {
 		quotaPoller.SetGrokEstimate(ss.SumGrokTokens, planusage.DefaultGrokEstimatePath)
-		quotaPoller.SetGeminiEstimate(func(ctx context.Context, from, to int64) (int64, error) {
+		usageGemini = func(ctx context.Context, from, to int64) (int64, error) {
 			return ss.SumTokensLike(ctx, from, to, "gemini-%", "gemini")
-		}, planusage.DefaultGeminiEstimatePath)
+		}
+	}
+	if gem := planusage.CombineTokenSums(usageGemini, agySumFunc(agyIdx)); gem != nil {
+		quotaPoller.SetGeminiEstimate(gem, planusage.DefaultGeminiEstimatePath)
 	}
 	quotaPoller.Start()
 	quotaHandler := planusage.NewHandler(quotaCache, quotaPoller.Enabled)
 	summaryHandler.DefaultFrom = func() int64 {
 		return planusage.WeekStartUnix(quotaCache.List(), planusage.DefaultGrokEstimatePath, time.Now())
 	}
+	summaryHandler.GeminiFrom = func() int64 {
+		return planusage.GeminiWeekStartUnix(quotaCache.List(), planusage.DefaultGeminiEstimatePath, time.Now())
+	}
+	summaryHandler.AgyQuery = agyQueryFunc(agyIdx)
 
 	metricCtx, metricCancel := context.WithCancel(context.Background())
+	if agyIdx != nil {
+		go func() {
+			if err := agyIdx.Refresh(metricCtx); err != nil && metricCtx.Err() == nil {
+				slog.Warn("agy usage refresh failed", "error", err)
+			}
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-metricCtx.Done():
+					return
+				case <-ticker.C:
+					if err := agyIdx.Refresh(metricCtx); err != nil && metricCtx.Err() == nil {
+						slog.Warn("agy usage refresh failed", "error", err)
+					}
+				}
+			}
+		}()
+	}
 
 	// Rate limiter: 60 req/s per IP with burst of 100
 	rl := ratelimit.NewRateLimiter(config.RateLimitPerSecond, config.RateLimitBurst)
@@ -645,6 +681,9 @@ func main() {
 			// order (Close before Shutdown) silently dropped the usage of
 			// requests still in flight during graceful shutdown.
 			shutdownHTTPAndDrainUsage(srv, usageRec)
+			if agyIdx != nil {
+				_ = agyIdx.Close()
+			}
 			return
 		}
 	}()

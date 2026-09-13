@@ -162,8 +162,9 @@ func TestPollerGeminiEstimateApplied(t *testing.T) {
 	if weekly == nil {
 		t.Fatalf("weekly window missing: %+v", snaps[0].Windows)
 	}
-	// geminiSummaryBody: weekly remainingFraction 0.0558405 → 94% used.
-	want := int64(1000 * 100 / 94)
+	// geminiSummaryBody: remainingFraction 0.0558405 → used 0.9441595,
+	// not the floored 94% (1000*100/94 = 1063).
+	want := reversePool(1000, 1-0.0558405)
 	if weekly.LimitTokensEstimate != want {
 		t.Fatalf("gemini weekly estimate = %d, want %d", weekly.LimitTokensEstimate, want)
 	}

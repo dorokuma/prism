@@ -176,6 +176,9 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 			}
 			return fmt.Errorf("usage 分组查询失败: %v", err)
 		}
+		extra := loadAgyRows(context.Background(), q, o.weekDefault, now)
+		rows = usage.MergeSummaryRows(rows, extra, q.GroupBy)
+		usage.AddOverview(ov, extra)
 		if rows == nil {
 			rows = []usage.SummaryRow{}
 		}

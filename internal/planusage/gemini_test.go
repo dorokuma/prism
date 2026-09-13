@@ -106,8 +106,15 @@ func TestGeminiFetcherOKDropsClaude(t *testing.T) {
 	if snap.Windows[0].Name != "5h" || snap.Windows[0].Percent != 0 || snap.Windows[0].Status != "ok" || snap.Windows[0].ResetsAt == nil {
 		t.Fatalf("5h=%+v", snap.Windows[0])
 	}
+	if snap.Windows[0].UsedFraction != 0 {
+		t.Fatalf("5h used_fraction=%v, want 0 (remaining=1)", snap.Windows[0].UsedFraction)
+	}
 	if snap.Windows[1].Name != "weekly" || snap.Windows[1].Percent != 94 || snap.Windows[1].Status != "ok" || snap.Windows[1].ResetsAt == nil {
 		t.Fatalf("weekly=%+v", snap.Windows[1])
+	}
+	wantFrac := 1 - 0.0558405
+	if snap.Windows[1].UsedFraction < wantFrac-1e-9 || snap.Windows[1].UsedFraction > wantFrac+1e-9 {
+		t.Fatalf("weekly used_fraction=%v, want %v", snap.Windows[1].UsedFraction, wantFrac)
 	}
 	for _, w := range snap.Windows {
 		if strings.Contains(strings.ToLower(w.Name), "claude") || w.Name == "3p-weekly" || w.Name == "3p-5h" {

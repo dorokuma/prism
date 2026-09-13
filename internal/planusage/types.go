@@ -15,9 +15,14 @@ type Window struct {
 	PeriodStart      *time.Time `json:"period_start,omitempty"`
 	LimitUSDEstimate int        `json:"limit_usd_estimate,omitempty"`
 	USDStatus        string     `json:"usd_status,omitempty"`
-	// LimitTokensEstimate is the SuperGrok weekly pool size in tokens,
-	// inferred from grok-* usage rows and last period's week-pool
-	// percent. Zero means not yet available (no completed period).
+	// UsedFraction is the unfloored used share of this window (0..1),
+	// when the upstream reports it. Gemini week reversal uses this
+	// instead of Percent so a 0.4% week is not lost to int floor=0,
+	// and a 12.7% week is not reversed as 12%.
+	UsedFraction float64 `json:"used_fraction,omitempty"`
+	// LimitTokensEstimate is the weekly pool size in tokens, inferred
+	// from consumed tokens ÷ used fraction. Zero means not yet
+	// available (no usage, or used fraction unknown).
 	LimitTokensEstimate int64 `json:"limit_tokens_estimate,omitempty"`
 }
 

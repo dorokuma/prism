@@ -1,6 +1,6 @@
 # prism
 
-> Version: v0.27.7  Date: 2026-09-11  Status: living document
+> Version: v0.28.0  Date: 2026-09-13  Status: living document
 
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
@@ -227,6 +227,7 @@ MIT
 
 ## Changelog
 
+- **2026-09-13** — v0.28.0 — feat(usage): index agy Gemini week tokens. Sidecar 索引 antigravity-cli conversations（不写入 usage_events），四袋 token（prompt/completion/thinking/cache）并入 `prism usage` / `/admin/usage/summary`；Gemini 周限由 UsedFraction 反推；命中率分母为 fresh+cache。
 - **2026-09-11** — v0.27.7 — fix(quota/usage): drop Grok Build CLI session import. `prism quota` and the quota poller no longer read grok CLI session trees; SuperGrok week estimate is usage-DB only (read-only, existence check). Deleted `ImportGrokBuild` and the unused `ImportPiSessions` library (no production caller since v0.27.2). Historical `usage_source=pi` rows still use the Anthropic cache-hit bucket.
 - **2026-09-05** — v0.27.6 — fix(planusage): poll Gemini quota from daily-cloudcode-pa pool. Gemini 配额轮询端点从 cloudcode-pa.googleapis.com 切到 daily-cloudcode-pa.googleapis.com（AGY 实际消耗池），旧端点 5h 恒 0%；GeminiFetcher.Match 补齐 daily-cloudcode-pa host 匹配。
 - **2026-09-04** — v0.27.5 — feat(pool): configurable quota_revive_after (default 30m) and probe-disabled quota auto-revive. Quota 耗尽恢复窗口由硬编码 6h 改为可配置项 `quota_revive_after`（默认 30m，支持标准 duration 格式；配 0/0s 禁用窗口等待），启用探活的账号在窗口期满后探活成功即可回池；`probe_path: disabled` 的 quota 耗尽账号在窗口期满后自动回池自愈（依赖请求侧错误处理兜底）；`probe_path: disabled` 的凭证失效（credential，如 401）账号不自动自愈；启用探活的 credential 账号探活 200 即回池（既有行为，与本次改动无关）。修复 disabled 凭证需人工介入并重启生效——热重载不重置池内账号状态。

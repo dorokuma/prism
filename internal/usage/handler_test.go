@@ -860,3 +860,72 @@ func TestHandlerTableOverviewAllHistoryDefaulted(t *testing.T) {
 		t.Errorf("from=0 detail must include the earlier-week models:\n%s", explicit)
 	}
 }
+
+func TestHandlerMergesAgyGeminiRow(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "")
+	s := openTestStore(t)
+	h := NewSummaryHandler(s)
+	h.DefaultFrom = func() int64 { return time.Now().Add(-7 * 24 * time.Hour).Unix() }
+	h.GeminiFrom = func() int64 { return time.Now().Add(-3 * 24 * time.Hour).Unix() }
+	var gotFrom int64
+	h.AgyQuery = func(_ context.Context, q SummaryQuery) ([]SummaryRow, error) {
+		gotFrom = q.From
+		return []SummaryRow{{
+			Groups:             map[string]any{"model": "gemini-3.7-flash"},
+			Requests:           2,
+			PromptTokens:       100,
+			CachedTokens:       400,
+			CompletionTokens:   20,
+			ReasoningTokens:    50,
+			TotalTokens:        570,
+			HitRateInputTokens: 500,
+		}}, nil
+	}
+
+	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?group_by=model&format=table", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "gemini-3.7-flash") {
+		t.Errorf("table missing gemini row:\n%s", body)
+	}
+	if !strings.Contains(body, "80.0%") {
+		t.Errorf("agy hit rate must be 400/500 = 80.0%% (not 0%%):\n%s", body)
+	}
+	if !strings.Contains(body, "  总请求   2\n") {
+		t.Errorf("header must include agy requests:\n%s", body)
+	}
+	if !strings.Contains(body, "  总词元   570\n") {
+		t.Errorf("header must include agy tokens:\n%s", body)
+	}
+	wantGemini := h.GeminiFrom()
+	if gotFrom != wantGemini {
+		t.Fatalf("defaulted agy From = %d, want GeminiWeekStart %d (not SuperGrok DefaultFrom)", gotFrom, wantGemini)
+	}
+
+	// Explicit from/to: both sources share the window; agy From must equal the request.
+	explicitFrom := time.Now().Add(-24 * time.Hour).Unix()
+	explicitTo := time.Now().Unix()
+	rec = doRequest(h, http.MethodGet,
+		"/admin/usage/summary?group_by=model&from="+strconv.FormatInt(explicitFrom, 10)+"&to="+strconv.FormatInt(explicitTo, 10),
+		"127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("explicit: got %d", rec.Code)
+	}
+	if gotFrom != explicitFrom {
+		t.Fatalf("explicit agy From = %d, want %d", gotFrom, explicitFrom)
+	}
+	var jr struct {
+		Rows []SummaryRow `json:"rows"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &jr); err != nil {
+		t.Fatal(err)
+	}
+	if len(jr.Rows) != 1 || jr.Rows[0].Groups["model"] != "gemini-3.7-flash" {
+		t.Fatalf("json rows = %+v", jr.Rows)
+	}
+	if jr.Rows[0].HitRateInputTokens != 500 {
+		t.Fatalf("json hit-rate denom = %d, want 500", jr.Rows[0].HitRateInputTokens)
+	}
+}

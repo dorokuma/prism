@@ -20,6 +20,11 @@ func TestMain(m *testing.M) {
 	// Keep CLI tests off the production estimate file so a live SuperGrok
 	// period_start cannot empty March-dated fixtures or shift default From.
 	grokEstimatePath = filepath.Join(os.TempDir(), "prism-cli-usage-test-no-est.json")
+	// A live ~/.gemini/antigravity-cli/conversations tree must not leak
+	// gemini rows into CLI fixtures (row counts are exact).
+	agyConvDir = filepath.Join(os.TempDir(), "prism-cli-agy-conv-missing")
+	agyIndexPath = filepath.Join(os.TempDir(), "prism-cli-agy-idx-unused.db")
+	geminiEstimatePath = filepath.Join(os.TempDir(), "prism-cli-gemini-est-missing.json")
 	os.Exit(m.Run())
 }
 

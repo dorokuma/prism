@@ -36,6 +36,36 @@ func runQuota(args []string) error {
 	return runQuotaWith(args, os.Stdout)
 }
 
+func applyQuotaGeminiEstimate(ctx context.Context, cfg *config.Config, snap planusage.Snapshot) planusage.Snapshot {
+	var parts []planusage.GrokTokenSum
+	var store *usage.SQLiteStore
+	path := cfg.Usage.DBPath
+	if path != "" {
+		if fi, err := os.Stat(path); err == nil && fi.Mode().IsRegular() {
+			s := usage.NewReadOnlyStore(path)
+			if err := s.Open(); err == nil {
+				store = s
+				parts = append(parts, func(c context.Context, f, t int64) (int64, error) {
+					return store.SumTokensLike(c, f, t, "gemini-%", "gemini")
+				})
+			}
+		}
+	}
+	if store != nil {
+		defer store.Close()
+	}
+	if idx := openAgyIndex(); idx != nil {
+		defer idx.Close()
+		_ = idx.Refresh(ctx)
+		parts = append(parts, idx.SumTokens)
+	}
+	sum := planusage.CombineTokenSums(parts...)
+	if sum == nil {
+		return snap
+	}
+	return planusage.ApplyWeekEstimate(ctx, snap, sum, planusage.DefaultGeminiEstimatePath, time.Now())
+}
+
 func applyQuotaGrokEstimate(ctx context.Context, cfg *config.Config, snap planusage.Snapshot) planusage.Snapshot {
 	path := cfg.Usage.DBPath
 	if path == "" {
@@ -153,20 +183,8 @@ flags:
 			if snap.Provider == "xai" {
 				snap = applyQuotaGrokEstimate(ctx, cfg, snap)
 			}
-			switch snap.Provider {
-			case "gemini":
-				path := cfg.Usage.DBPath
-				if path != "" {
-					if fi, serr := os.Stat(path); serr == nil && fi.Mode().IsRegular() {
-						store := usage.NewReadOnlyStore(path)
-						if serr := store.Open(); serr == nil {
-							snap = planusage.ApplyWeekEstimate(ctx, snap, func(c context.Context, f, t int64) (int64, error) {
-								return store.SumTokensLike(c, f, t, "gemini-%", "gemini")
-							}, planusage.DefaultGeminiEstimatePath, time.Now())
-							store.Close()
-						}
-					}
-				}
+			if snap.Provider == "gemini" {
+				snap = applyQuotaGeminiEstimate(ctx, cfg, snap)
 			}
 		}
 		snaps = append(snaps, snap)
