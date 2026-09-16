@@ -14,3 +14,4 @@ context_mode.db-wal
 *.db-shm
 *.db-wal
 config.yaml.bak-*
+.agents/notes/INDEX.md
