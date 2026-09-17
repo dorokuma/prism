@@ -34,6 +34,12 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 		return
 	}
 
+	if mc == nil {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []any{}})
+		slog.Debug("models returning empty (nil model cache)", "req", requestID)
+		return
+	}
+
 	// Aggregate entry (provider_routing: auto, no explicit header): one
 	// catalog across every provider. Models whose provider cannot be
 	// disambiguated are EXCLUDED from the catalog (never advertise a model

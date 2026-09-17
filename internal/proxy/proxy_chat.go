@@ -281,11 +281,37 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		res := resolveAggregateProvider(cfg, modelCacheFromContext(r.Context()), opts.Model)
 		if res.code == "" && res.provider != "" {
 			provider = res.provider
+			if res.normalizedModel != "" {
+				opts.Model = res.normalizedModel
+				aud.Model = opts.Model
+				var raw map[string]json.RawMessage
+				if err := json.Unmarshal(bodyBytes, &raw); err == nil {
+					if origModel, ok := util.RawStringField(raw, "model"); ok && origModel != res.routeModel {
+						rawBytes, _ := json.Marshal(res.routeModel)
+						raw["model"] = json.RawMessage(rawBytes)
+						if newBody, err := json.Marshal(raw); err == nil {
+							bodyBytes = newBody
+						}
+					}
+				}
+			}
 			if len(res.candidates) > 1 {
 				slog.Warn("aggregate provider collision resolved",
 					"request_id", requestID, "model", opts.Model,
 					"candidates", res.candidates, "winner", res.provider)
 			}
+		} else if res.code == "missing_model" {
+			aud.Error = res.message
+			aud.ErrorType = "missing_model"
+			slog.Warn("request rejected: missing model", "request_id", requestID, "path", r.URL.Path)
+			util.WriteJSON(sc, 400, map[string]any{
+				"error": map[string]any{
+					"message": res.message,
+					"type":    "invalid_request_error",
+					"code":    "missing_model",
+				},
+			})
+			return
 		} else if res.code == "ambiguous_provider" {
 			aud.Error = res.message
 			aud.ErrorType = "ambiguous_provider"
@@ -293,10 +319,9 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 				"model", opts.Model, "candidates", res.candidates)
 			util.WriteJSON(sc, 400, map[string]any{
 				"error": map[string]any{
-					"message":    res.message,
-					"type":       "invalid_request_error",
-					"code":       "ambiguous_provider",
-					"candidates": res.candidates,
+					"message": res.message,
+					"type":    "invalid_request_error",
+					"code":    "ambiguous_provider",
 				},
 			})
 			return

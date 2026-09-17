@@ -30,6 +30,10 @@ func modelCacheFromContext(ctx context.Context) *cache.ModelCache {
 type aggregateResolution struct {
 	// provider is non-empty iff the request should route to it.
 	provider string
+	// normalizedModel is the client-requested model name after strings.TrimSpace (virtual name, not remapped).
+	normalizedModel string
+	// routeModel is the model name used for upstream routing (remapped if model_remap_enabled).
+	routeModel string
 	// code is "" (resolved), "ambiguous_provider" or "unknown_model".
 	code string
 	// message is the structured error detail when code is non-empty.
@@ -53,28 +57,49 @@ func resolveAggregateProvider(cfg *config.Config, mc *cache.ModelCache, model st
 	if cfg == nil || mc == nil || cfg.ProviderRouting != "auto" {
 		return aggregateResolution{}
 	}
-	routeModel := model
+	normalized := strings.TrimSpace(model)
+	if normalized == "" {
+		return aggregateResolution{
+			code:    "missing_model",
+			message: "model is required",
+		}
+	}
+	routeModel := normalized
 	if cfg.ModelRemapEnabled {
-		if remapped := cfg.RemapModel(routeModel); remapped != "" {
+		if remapped := cfg.RemapModel(normalized); remapped != "" {
 			routeModel = remapped
 		}
 	}
 	provider, candidates, status := mc.ResolveProvider(routeModel)
 	switch status {
 	case cache.RoutingResolved:
-		return aggregateResolution{provider: provider, candidates: candidates}
+		return aggregateResolution{
+			provider:        provider,
+			normalizedModel: normalized,
+			routeModel:      routeModel,
+			candidates:      candidates,
+		}
 	case cache.RoutingAmbiguous:
 		return aggregateResolution{
-			code: "ambiguous_provider",
+			code:            "ambiguous_provider",
+			normalizedModel: normalized,
+			routeModel:      routeModel,
 			message: fmt.Sprintf(
-				"model %q is served by multiple providers (%s); configure model_provider_overrides or provider_priority",
-				routeModel, strings.Join(candidates, ", ")),
+				"model %q is served by multiple providers; configure model_provider_overrides or provider_priority",
+				routeModel),
 			candidates: candidates,
+		}
+	case cache.RoutingModelMissing:
+		return aggregateResolution{
+			code:    "missing_model",
+			message: "model is required",
 		}
 	default:
 		return aggregateResolution{
-			code:    "unknown_model",
-			message: fmt.Sprintf("model %q is not served by any configured provider", routeModel),
+			code:            "unknown_model",
+			normalizedModel: normalized,
+			routeModel:      routeModel,
+			message:         fmt.Sprintf("model %q is not served by any configured provider", routeModel),
 		}
 	}
 }

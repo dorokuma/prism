@@ -670,3 +670,62 @@ func TestProxyModels_FetchFailureConcurrentMissNo200Empty(t *testing.T) {
 		t.Errorf("upstream hits = %d, want 1 (the second request must join the leader, not refetch)", got)
 	}
 }
+
+func TestProxyModels_NilModelCacheDoesNotPanic(t *testing.T) {
+	testCases := []struct {
+		name     string
+		cfg      *config.Config
+		header   string
+	}{
+		{
+			name:   "explicit header non-aggregate",
+			cfg:    &config.Config{DefaultProvider: "xai"},
+			header: "xai",
+		},
+		{
+			name:   "default provider non-aggregate",
+			cfg:    &config.Config{DefaultProvider: "xai"},
+			header: "",
+		},
+		{
+			name:   "aggregate auto without header",
+			cfg:    &config.Config{ProviderRouting: "auto"},
+			header: "",
+		},
+		{
+			name:   "aggregate auto with explicit header",
+			cfg:    &config.Config{ProviderRouting: "auto"},
+			header: "xai",
+		},
+		{
+			name:   "disabled aggregate no header",
+			cfg:    &config.Config{},
+			header: "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			if tc.header != "" {
+				r.Header.Set("X-Prism-Provider", tc.header)
+			}
+			w := httptest.NewRecorder()
+			proxyModels(nil, w, r, tc.cfg)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			var resp struct {
+				Object string           `json:"object"`
+				Data   []map[string]any `json:"data"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if resp.Object != "list" || len(resp.Data) != 0 {
+				t.Fatalf("unexpected response: %+v", resp)
+			}
+		})
+	}
+}
