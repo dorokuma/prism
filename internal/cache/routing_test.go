@@ -195,10 +195,98 @@ func TestUnionModels_AmbiguousExcludedAndListed(t *testing.T) {
 			t.Fatalf("ambiguous model must be excluded from union, got %+v", um)
 		}
 	}
-	if len(out) != 3 {
+	if len(out) != 4 {
 		// only-xai + no-priority-model + the static-directory model
-		// (gemini-2.5-flash-static) from cfgContent.
-		t.Fatalf("union size = %d, want 3 (only-xai, no-priority-model, static)", len(out))
+		// (gemini-2.5-flash-static) + the override model (grok-4.5) from cfgContent.
+		t.Fatalf("union size = %d, want 4 (only-xai, no-priority-model, static, grok-4.5 override)", len(out))
+	}
+}
+
+func TestResolveProvider_EmptyModel(t *testing.T) {
+	cfg := loadRoutingCfg(t, cfgContent())
+	mc := &ModelCache{caches: map[string]*providerCache{
+		"xai": {Models: []ModelEntry{{ID: "grok-4.20"}}},
+	}, cfg: cfg}
+
+	for _, m := range []string{"", " ", "   ", "\t\n"} {
+		p, candidates, status := mc.ResolveProvider(m)
+		if status != RoutingModelMissing || p != "" || len(candidates) != 0 {
+			t.Fatalf("model %q = (%q, %v, %v), want (\"\", [], RoutingModelMissing)", m, p, candidates, status)
+		}
+	}
+}
+
+func TestUnionModels_PureOverridesAppearsInUnion(t *testing.T) {
+	content := `
+provider_routing: auto
+model_provider_overrides:
+  pure-override-model: xai
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+`
+	cfg := loadRoutingCfg(t, content)
+	mc := &ModelCache{caches: map[string]*providerCache{
+		"xai": {Models: []ModelEntry{{ID: "cached-model"}}},
+	}, cfg: cfg}
+
+	out, ambiguous := mc.UnionModels()
+	if len(ambiguous) != 0 {
+		t.Fatalf("ambiguous = %v, want none", ambiguous)
+	}
+	ids := idsOfUnion(out)
+	found := false
+	for _, id := range ids {
+		if id == "pure-override-model" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("pure-override-model not found in union models: %v", ids)
+	}
+}
+
+func TestUnionModels_PureStaticProviderWithoutAccounts(t *testing.T) {
+	content := `
+provider_routing: auto
+provider_priority: [gemini, xai]
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+  gemini:
+    models: [gemini-static-pure]
+`
+	cfg := loadRoutingCfg(t, content)
+	mc := &ModelCache{caches: map[string]*providerCache{
+		"xai": {Models: []ModelEntry{{ID: "xai-cached"}}},
+	}, cfg: cfg}
+
+	out, ambiguous := mc.UnionModels()
+	if len(ambiguous) != 0 {
+		t.Fatalf("ambiguous = %v, want none", ambiguous)
+	}
+	ids := idsOfUnion(out)
+	found := false
+	for _, id := range ids {
+		if id == "gemini-static-pure" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("gemini-static-pure should appear in union models, got %v", ids)
+	}
+
+	p, candidates, status := mc.ResolveProvider("gemini-static-pure")
+	if status != RoutingResolved || p != "gemini" || len(candidates) != 1 {
+		t.Fatalf("ResolveProvider(gemini-static-pure) = (%q, %v, %v), want (gemini, [gemini], resolved)", p, candidates, status)
 	}
 }
 
@@ -209,3 +297,4 @@ func idsOfUnion(us []UnionModel) []string {
 	}
 	return out
 }
+

@@ -2,6 +2,7 @@ package cache
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/dorokuma/prism/internal/config"
 )
@@ -21,6 +22,8 @@ const (
 	// RoutingUnknown means no provider advertises the model (and no override
 	// exists).
 	RoutingUnknown
+	// RoutingModelMissing means the model parameter is missing/empty.
+	RoutingModelMissing
 )
 
 // ResolveProvider resolves the provider for a model under aggregate routing
@@ -33,13 +36,17 @@ const (
 //     disambiguated them; the caller must reject with a structured error and
 //     never pick one silently.
 //   - RoutingUnknown: no provider advertises the model.
+//   - RoutingModelMissing: model name is empty.
 //
 // Callers must only consult it when the request carries no explicit
 // X-Prism-Provider header — explicit pins bypass aggregate resolution.
 func (mc *ModelCache) ResolveProvider(model string) (string, []string, RoutingStatus) {
 	cfg := mc.snapshotConfig()
-	if cfg == nil || cfg.ProviderRouting != "auto" || model == "" {
+	if cfg == nil || cfg.ProviderRouting != "auto" {
 		return "", nil, RoutingUnknown
+	}
+	if strings.TrimSpace(model) == "" {
+		return "", nil, RoutingModelMissing
 	}
 	if p, ok := cfg.ModelProviderOverrides[model]; ok {
 		return p, nil, RoutingResolved
@@ -61,14 +68,14 @@ func (mc *ModelCache) ResolveProvider(model string) (string, []string, RoutingSt
 	return "", candidates, RoutingAmbiguous
 }
 
-// providerCandidates returns the providers (in ProviderNames declaration
+// providerCandidates returns the providers (in DeclaredProviderNames declaration
 // order) whose model directory — cache snapshot or static config models —
 // contains the id.
 func (mc *ModelCache) providerCandidates(cfg *config.Config, model string) []string {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 	var candidates []string
-	for _, p := range cfg.ProviderNames() {
+	for _, p := range cfg.DeclaredProviderNames() {
 		if mc.providerHasModelLocked(cfg, p, model) {
 			candidates = append(candidates, p)
 		}
@@ -122,7 +129,7 @@ func (mc *ModelCache) UnionModels() ([]UnionModel, map[string][]string) {
 	defer mc.mu.RUnlock()
 
 	byModel := make(map[string][]string)
-	for _, p := range cfg.ProviderNames() {
+	for _, p := range cfg.DeclaredProviderNames() {
 		if pc := mc.caches[p]; pc != nil {
 			for _, m := range pc.Models {
 				if m.ID == "" {
@@ -137,6 +144,12 @@ func (mc *ModelCache) UnionModels() ([]UnionModel, map[string][]string) {
 			}
 			byModel[id] = appendUnique(byModel[id], p)
 		}
+	}
+	for model, targetProvider := range cfg.ModelProviderOverrides {
+		if model == "" {
+			continue
+		}
+		byModel[model] = appendUnique(byModel[model], targetProvider)
 	}
 
 	var out []UnionModel
