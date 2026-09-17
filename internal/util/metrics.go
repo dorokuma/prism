@@ -15,6 +15,11 @@ var (
 	MetricsAccountsHealthy          expvar.Int
 	MetricsAccountsExhausted        expvar.Int
 	MetricsModelCacheRefreshesTotal = expvar.NewInt("model_cache_refreshes_total")
+	// MetricsAggregateAmbiguousModels counts model ids that provider_routing:
+	// auto could not disambiguate (multiple providers, no
+	// model_provider_overrides / provider_priority). These are excluded from
+	// the aggregate catalog and rejected with 400 ambiguous_provider.
+	MetricsAggregateAmbiguousModels = expvar.NewInt("aggregate_ambiguous_models")
 
 	metricsRequestDurationMu sync.Mutex
 	metricsRequestDuration   time.Duration

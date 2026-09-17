@@ -34,6 +34,36 @@ func proxyModels(mc *cache.ModelCache, w http.ResponseWriter, r *http.Request, c
 		return
 	}
 
+	// Aggregate entry (provider_routing: auto, no explicit header): one
+	// catalog across every provider. Models whose provider cannot be
+	// disambiguated are EXCLUDED from the catalog (never advertise a model
+	// that cannot be routed) and surfaced via the ambiguous metric + WARN;
+	// per-entry metadata comes from the WINNER provider so the advertised
+	// context/cost match the pool the request will actually reach.
+	if cfg.ProviderRouting == "auto" && r.Header.Get("X-Prism-Provider") == "" {
+		models, ambiguous := mc.UnionModels()
+		if len(ambiguous) > 0 {
+			util.MetricsAggregateAmbiguousModels.Set(int64(len(ambiguous)))
+			slog.Warn("aggregate model catalog excludes ambiguous models",
+				"request_id", requestID, "ambiguous_models", ambiguous)
+		}
+		data := make([]map[string]any, 0, len(models))
+		for _, um := range models {
+			entry := map[string]any{
+				"id": um.Entry.ID, "object": um.Entry.Object,
+				"created": um.Entry.Created, "owned_by": um.Entry.OwnedBy,
+			}
+			if um.HasMeta {
+				applyUpstreamMetaSnake(entry, um.Meta)
+			}
+			enrichModel(entry, um.Provider, um.Entry.ID, cfg)
+			data = append(data, entry)
+		}
+		slog.Debug("models returning (aggregate)", "count", len(data), "req", requestID, "duration_ms", time.Since(start).Milliseconds())
+		util.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+		return
+	}
+
 	provider := r.Header.Get("X-Prism-Provider")
 	if provider == "" && cfg != nil {
 		// Same fallback as chat/completions: a configured default_provider

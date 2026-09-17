@@ -271,8 +271,42 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 
 	// Read the upstream provider up front so it can be reused both for the
 	// effort-mapping transform and for account selection (SelectByProvider).
-	// It selects the effort schema (opencode vs ollama).
+	// It selects the effort schema (opencode vs ollama). Resolution order:
+	// explicit X-Prism-Provider header > aggregate model routing
+	// (provider_routing: auto, model_provider_overrides > unique candidate >
+	// provider_priority; collisions fail closed) > default_provider > 400.
 	provider := r.Header.Get("X-Prism-Provider")
+	aggregateUnknownMessage := ""
+	if provider == "" && cfg.ProviderRouting == "auto" && modelCacheFromContext(r.Context()) != nil {
+		res := resolveAggregateProvider(cfg, modelCacheFromContext(r.Context()), opts.Model)
+		if res.code == "" && res.provider != "" {
+			provider = res.provider
+			if len(res.candidates) > 1 {
+				slog.Warn("aggregate provider collision resolved",
+					"request_id", requestID, "model", opts.Model,
+					"candidates", res.candidates, "winner", res.provider)
+			}
+		} else if res.code == "ambiguous_provider" {
+			aud.Error = res.message
+			aud.ErrorType = "ambiguous_provider"
+			slog.Warn("request rejected: ambiguous provider", "request_id", requestID, "path", r.URL.Path,
+				"model", opts.Model, "candidates", res.candidates)
+			util.WriteJSON(sc, 400, map[string]any{
+				"error": map[string]any{
+					"message":    res.message,
+					"type":       "invalid_request_error",
+					"code":       "ambiguous_provider",
+					"candidates": res.candidates,
+				},
+			})
+			return
+		} else if res.code == "unknown_model" {
+			// No provider advertises the model: fall through to
+			// default_provider; without it the 400 below reports the real
+			// cause (unknown_model) instead of a misleading missing_provider.
+			aggregateUnknownMessage = res.message
+		}
+	}
 	if provider == "" {
 		if cfg.DefaultProvider != "" {
 			// Config-driven fallback: route through the default provider's
@@ -281,13 +315,20 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		} else {
 			// No header and no default → reject. Never fall back to whole-pool
 			// selection (that could route an account to the wrong provider).
-			aud.Error = "missing X-Prism-Provider header"
-			aud.ErrorType = "missing_provider"
-			slog.Warn("request rejected: missing X-Prism-Provider header", "request_id", requestID, "path", r.URL.Path)
+			errCode := "missing_provider"
+			errMessage := "missing X-Prism-Provider header"
+			if aggregateUnknownMessage != "" {
+				errCode = "unknown_model"
+				errMessage = aggregateUnknownMessage
+			}
+			aud.Error = errMessage
+			aud.ErrorType = errCode
+			slog.Warn("request rejected: "+errCode, "request_id", requestID, "path", r.URL.Path, "model", opts.Model)
 			util.WriteJSON(sc, 400, map[string]any{
 				"error": map[string]any{
-					"message": "missing X-Prism-Provider header",
+					"message": errMessage,
 					"type":    "invalid_request_error",
+					"code":    errCode,
 				},
 			})
 			return

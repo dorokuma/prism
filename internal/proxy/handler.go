@@ -15,6 +15,11 @@ import (
 func NewProxyHandler(pp *pool.Pool, wire config.WireAPIMode, holder *config.ConfigHolder, mc *cache.ModelCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := holder.Load()
+		// Aggregate provider routing (provider_routing: auto) resolves the
+		// provider from the model name when no X-Prism-Provider header is
+		// present; the cache is carried in context so the shared
+		// chat/responses/messages handlers can reach it.
+		r = r.WithContext(withModelCache(r.Context(), mc))
 		if r.URL.Path == "/health" {
 			slog.Debug("health")
 			w.WriteHeader(200)
