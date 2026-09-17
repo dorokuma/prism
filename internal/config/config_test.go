@@ -3634,7 +3634,35 @@ providers:
 	}
 }
 
-func TestLoadConfig_AggregateRoutingUnknownPriority(t *testing.T) {
+func TestLoadConfig_AggregateRoutingDeclaredProviderNoAccountsWarns(t *testing.T) {
+	content := `
+provider_routing: auto
+provider_priority: [xai, gemini]
+model_provider_overrides:
+  gpt-5.4: gemini
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+  gemini:
+    models:
+      - gemini-2.5-pro
+`
+	cfg, err := LoadConfig(writeConfig(t, content))
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if len(cfg.ProviderPriority) != 2 || cfg.ProviderPriority[1] != "gemini" {
+		t.Errorf("provider_priority = %v, want [xai gemini]", cfg.ProviderPriority)
+	}
+	if got := cfg.ModelProviderOverrides["gpt-5.4"]; got != "gemini" {
+		t.Errorf("model_provider_overrides[gpt-5.4] = %q, want gemini", got)
+	}
+}
+
+func TestLoadConfig_AggregateRoutingUndeclaredProviderPriorityRejects(t *testing.T) {
 	content := `
 provider_routing: auto
 provider_priority: [xai, nope]
@@ -3645,12 +3673,13 @@ providers:
         key: k
         base_url: https://api.x.ai/v1
 `
-	if _, err := LoadConfig(writeConfig(t, content)); err == nil || !strings.Contains(err.Error(), "provider_priority") {
-		t.Fatalf("want provider_priority load error, got %v", err)
+	_, err := LoadConfig(writeConfig(t, content))
+	if err == nil || !strings.Contains(err.Error(), "provider_priority") || !strings.Contains(err.Error(), "not found among configured providers") {
+		t.Fatalf("want undeclared provider error, got %v", err)
 	}
 }
 
-func TestLoadConfig_AggregateRoutingUnknownOverride(t *testing.T) {
+func TestLoadConfig_AggregateRoutingUndeclaredOverrideRejects(t *testing.T) {
 	content := `
 provider_routing: auto
 model_provider_overrides:
@@ -3662,8 +3691,297 @@ providers:
         key: k
         base_url: https://api.x.ai/v1
 `
-	if _, err := LoadConfig(writeConfig(t, content)); err == nil || !strings.Contains(err.Error(), "model_provider_overrides") {
-		t.Fatalf("want model_provider_overrides load error, got %v", err)
+	_, err := LoadConfig(writeConfig(t, content))
+	if err == nil || !strings.Contains(err.Error(), "model_provider_overrides") || !strings.Contains(err.Error(), "not found among configured providers") {
+		t.Fatalf("want undeclared override error, got %v", err)
+	}
+}
+
+func TestLoadConfig_AggregateRoutingOverridesNormalization(t *testing.T) {
+	content := `
+provider_routing: auto
+model_provider_overrides:
+  "  gpt-5.4  ": "  xai  "
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+`
+	cfg, err := LoadConfig(writeConfig(t, content))
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if got, ok := cfg.ModelProviderOverrides["gpt-5.4"]; !ok || got != "xai" {
+		t.Errorf("model_provider_overrides[gpt-5.4] = %q (ok=%v), want xai", got, ok)
+	}
+	if _, ok := cfg.ModelProviderOverrides["  gpt-5.4  "]; ok {
+		t.Errorf("untrimmed key should not exist in model_provider_overrides")
+	}
+}
+
+func TestLoadConfig_AggregateRoutingFormatErrors(t *testing.T) {
+	// Empty provider name in priority
+	content1 := `
+provider_routing: auto
+provider_priority: [""]
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+`
+	if _, err := LoadConfig(writeConfig(t, content1)); err == nil || !strings.Contains(err.Error(), "provider_priority") {
+		t.Fatalf("want provider_priority empty error, got %v", err)
+	}
+
+	// Empty model name in overrides
+	content2 := `
+provider_routing: auto
+model_provider_overrides:
+  "": xai
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+`
+	if _, err := LoadConfig(writeConfig(t, content2)); err == nil || !strings.Contains(err.Error(), "model_provider_overrides") {
+		t.Fatalf("want model_provider_overrides empty model error, got %v", err)
+	}
+
+	// Empty provider name in overrides
+	content3 := `
+provider_routing: auto
+model_provider_overrides:
+  gpt-5: ""
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+`
+	if _, err := LoadConfig(writeConfig(t, content3)); err == nil || !strings.Contains(err.Error(), "model_provider_overrides") {
+		t.Fatalf("want model_provider_overrides empty provider error, got %v", err)
+	}
+}
+
+func TestReloadConfig_AggregateProviderPriorityAndOverridesRollback(t *testing.T) {
+	oldContent := `
+listen: 127.0.0.1:8080
+auth_token: tok
+provider_routing: auto
+provider_priority: [p1]
+model_provider_overrides:
+  m1: p1
+  m2: p1
+accounts:
+  - name: a1
+    key: k1
+    base_url: https://p1.example.com
+    provider: p1
+`
+	path := writeConfig(t, oldContent)
+	oldCfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig old: %v", err)
+	}
+	holder := NewConfigHolder(oldCfg)
+
+	newContent := `
+listen: 127.0.0.1:8080
+auth_token: tok
+provider_routing: auto
+provider_priority: [p2]
+model_provider_overrides:
+  m1: p2
+  m3: p2
+accounts:
+  - name: a2
+    key: k2
+    base_url: https://p2.example.com
+    provider: p2
+`
+	if err := os.WriteFile(path, []byte(newContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, path)
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	if len(warnings) == 0 {
+		t.Fatal("expected warnings on accounts rollback with invalid priority/overrides")
+	}
+
+	res := holder.Load()
+
+	// Accounts rolled back to oldCfg (p1)
+	if len(res.Accounts) != 1 || res.Accounts[0].Provider != "p1" {
+		t.Fatalf("Accounts = %v, want p1", res.Accounts)
+	}
+	// ProviderPriority rolled back to oldCfg because p2 not among declared providers
+	if len(res.ProviderPriority) != 1 || res.ProviderPriority[0] != "p1" {
+		t.Fatalf("ProviderPriority = %v, want [p1]", res.ProviderPriority)
+	}
+	// m1 had old override p1 -> rolled back to p1
+	if res.ModelProviderOverrides["m1"] != "p1" {
+		t.Fatalf("ModelProviderOverrides[m1] = %q, want p1", res.ModelProviderOverrides["m1"])
+	}
+	// m3 had no old override -> deleted
+	if _, ok := res.ModelProviderOverrides["m3"]; ok {
+		t.Fatalf("ModelProviderOverrides[m3] should have been deleted, got %q", res.ModelProviderOverrides["m3"])
+	}
+}
+
+func TestReloadConfig_AggregatePriorityStaticProviderPreserved(t *testing.T) {
+	oldContent := `
+listen: 127.0.0.1:8080
+auth_token: tok
+provider_routing: auto
+provider_priority: [p1]
+model_provider_overrides:
+  m1: p1
+providers:
+  p1:
+    accounts:
+      - name: a1
+        key: k1
+        base_url: https://p1.example.com
+  p2:
+    models: [m2]
+`
+	path := writeConfig(t, oldContent)
+	oldCfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig old: %v", err)
+	}
+	holder := NewConfigHolder(oldCfg)
+
+	// Priority changed to include p2 (pure static provider with no accounts) and added override pointing to p2
+	newContent := `
+listen: 127.0.0.1:8080
+auth_token: tok
+provider_routing: auto
+provider_priority: [p2, p1]
+model_provider_overrides:
+  m1: p2
+  m2: p2
+providers:
+  p1:
+    accounts:
+      - name: a1
+        key: k1
+        base_url: https://p1.example.com
+  p2:
+    models: [m2]
+`
+	if err := os.WriteFile(path, []byte(newContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, path)
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	for _, w := range warnings {
+		if strings.Contains(w, "p2") {
+			t.Fatalf("unexpected warning about declared static provider p2: %v", w)
+		}
+	}
+
+	res := holder.Load()
+	if len(res.ProviderPriority) != 2 || res.ProviderPriority[0] != "p2" || res.ProviderPriority[1] != "p1" {
+		t.Fatalf("ProviderPriority should be [p2, p1], got %v", res.ProviderPriority)
+	}
+	if res.ModelProviderOverrides["m1"] != "p2" || res.ModelProviderOverrides["m2"] != "p2" {
+		t.Fatalf("ModelProviderOverrides should keep overrides to p2, got %v", res.ModelProviderOverrides)
+	}
+}
+
+func TestReloadConfig_AggregatePriorityMultipleInvalidProviders(t *testing.T) {
+	oldContent := `
+listen: 127.0.0.1:8080
+auth_token: tok
+provider_routing: auto
+provider_priority: [p1]
+accounts:
+  - name: a1
+    key: k1
+    base_url: https://p1.example.com
+    provider: p1
+`
+	path := writeConfig(t, oldContent)
+	oldCfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig old: %v", err)
+	}
+	holder := NewConfigHolder(oldCfg)
+
+	newContent := `
+listen: 127.0.0.1:8080
+auth_token: tok
+provider_routing: auto
+provider_priority: [p2, p3]
+accounts:
+  - name: a2
+    key: k2
+    base_url: https://p2.example.com
+    provider: p2
+  - name: a3
+    key: k3
+    base_url: https://p3.example.com
+    provider: p3
+`
+	if err := os.WriteFile(path, []byte(newContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, path)
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "provider_priority references providers") && strings.Contains(w, "p2") && strings.Contains(w, "p3") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected single warning using plural 'providers' listing both p2 and p3, got %v", warnings)
+	}
+
+	res := holder.Load()
+	if len(res.ProviderPriority) != 1 || res.ProviderPriority[0] != "p1" {
+		t.Fatalf("ProviderPriority should rollback to [p1], got %v", res.ProviderPriority)
+	}
+}
+
+func TestDeclaredProviderNames(t *testing.T) {
+	content := `
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+  gemini:
+    models: [m1]
+`
+	cfg, err := LoadConfig(writeConfig(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.ProviderNames(); len(got) != 1 || got[0] != "xai" {
+		t.Fatalf("ProviderNames() = %v, want [xai]", got)
+	}
+	if got := cfg.DeclaredProviderNames(); len(got) != 2 || got[0] != "xai" || got[1] != "gemini" {
+		t.Fatalf("DeclaredProviderNames() = %v, want [xai gemini]", got)
 	}
 }
 
@@ -3686,5 +4004,116 @@ accounts:
 	got := cfg.ProviderNames()
 	if len(got) != 2 || got[0] != "beta" || got[1] != "alpha" {
 		t.Errorf("ProviderNames() = %v, want [beta alpha]", got)
+	}
+}
+
+func TestReloadConfig_WarningTextNotAmongConfiguredProviders(t *testing.T) {
+	oldContent := `
+listen: 127.0.0.1:8080
+auth_token: tok
+provider_routing: auto
+provider_priority: [p1]
+model_provider_overrides:
+  m1: p1
+accounts:
+  - name: a1
+    key: k1
+    base_url: https://p1.example.com
+    provider: p1
+`
+	path := writeConfig(t, oldContent)
+	oldCfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig old: %v", err)
+	}
+	holder := NewConfigHolder(oldCfg)
+
+	newContent := `
+listen: 127.0.0.1:8080
+auth_token: tok
+provider_routing: auto
+provider_priority: [p-unknown]
+model_provider_overrides:
+  m1: p-unknown
+  m2: p-unknown2
+accounts:
+  - name: a-unknown
+    key: k
+    base_url: https://p-unknown.example.com
+    provider: p-unknown
+  - name: a-unknown2
+    key: k
+    base_url: https://p-unknown2.example.com
+    provider: p-unknown2
+`
+	if err := os.WriteFile(path, []byte(newContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings, err := ReloadConfig(holder, path)
+	if err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	var sawPriorityWarn, sawOverrideKeepWarn, sawOverrideRemoveWarn bool
+	for _, w := range warnings {
+		if strings.Contains(w, "provider_priority references provider \"p-unknown\" which is not among configured providers: keeping previous provider_priority [p1]") {
+			sawPriorityWarn = true
+		}
+		if strings.Contains(w, "model_provider_overrides \"m1\" -> \"p-unknown\" references provider not among configured providers: keeping previous provider \"p1\"") {
+			sawOverrideKeepWarn = true
+		}
+		if strings.Contains(w, "model_provider_overrides \"m2\" -> \"p-unknown2\" references provider not among configured providers: removing override") {
+			sawOverrideRemoveWarn = true
+		}
+	}
+	if !sawPriorityWarn {
+		t.Errorf("missing expected provider_priority warning with 'not among configured providers' in %v", warnings)
+	}
+	if !sawOverrideKeepWarn {
+		t.Errorf("missing expected model_provider_overrides keep warning with 'not among configured providers' in %v", warnings)
+	}
+	if !sawOverrideRemoveWarn {
+		t.Errorf("missing expected model_provider_overrides remove warning with 'not among configured providers' in %v", warnings)
+	}
+}
+
+func TestLoadConfig_ProvidersBlockNameValidation(t *testing.T) {
+	// 1. Pure static provider with legal name passes
+	validContent := `
+listen: 127.0.0.1:8080
+auth_token: tok
+providers:
+  static-valid_123:
+    models: [model-a]
+  active-prov:
+    accounts:
+      - name: a1
+        key: k1
+        base_url: https://api.example.com
+`
+	if _, err := LoadConfig(writeConfig(t, validContent)); err != nil {
+		t.Fatalf("LoadConfig with valid static provider name failed: %v", err)
+	}
+
+	// 2. Providers block with invalid provider names fails load
+	invalidNames := []string{
+		"../bad/path",
+		"bad/name",
+		"..",
+		".",
+		"/abs/path",
+	}
+	for _, badName := range invalidNames {
+		badContent := fmt.Sprintf(`
+listen: 127.0.0.1:8080
+auth_token: tok
+providers:
+  %q:
+    models: [model-a]
+`, badName)
+		_, err := LoadConfig(writeConfig(t, badContent))
+		if err == nil {
+			t.Errorf("LoadConfig with invalid provider name %q should have failed", badName)
+		}
 	}
 }

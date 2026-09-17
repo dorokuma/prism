@@ -603,6 +603,9 @@ func LoadConfig(path string) (*Config, error) {
 			if !ok {
 				continue
 			}
+			if err := validateProviderName(providerName); err != nil {
+				return nil, err
+			}
 			cfg.providerDSMLGuard[providerName] = providerCfg.DSMLGuard
 			cfg.providerStaticModels[providerName] = dedupeStringList(providerCfg.Models)
 			for _, acc := range providerCfg.Accounts {
@@ -721,23 +724,46 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("provider_routing: unsupported value %q (allowed: auto, or omit to disable)", cfg.ProviderRouting)
 	}
 	// provider_priority and model_provider_overrides reference providers by
-	// name; a stale/typo'd name must fail loudly — resolving a request into
-	// a nonexistent pool is exactly the silent misrouting class this
-	// feature exists to prevent.
-	for _, p := range cfg.ProviderPriority {
-		if !cfg.HasProvider(p) {
-			return nil, fmt.Errorf("provider_priority: provider %q not found among configured providers", p)
+	// name; if a referenced provider is completely undeclared (not in the
+	// providers block and has no accounts), reject with an error to catch typos
+	// (matching default_provider). If it is declared in the providers block
+	// but has no configured accounts (e.g. static catalog only), warn instead
+	// of blocking startup (requests routed here will fail with no_healthy).
+	for i, p := range cfg.ProviderPriority {
+		trimmedP := strings.TrimSpace(p)
+		if trimmedP == "" {
+			return nil, fmt.Errorf("provider_priority: empty provider name")
+		}
+		cfg.ProviderPriority[i] = trimmedP
+		if !cfg.hasDeclaredProvider(trimmedP) {
+			return nil, fmt.Errorf("provider_priority %q not found among configured providers", trimmedP)
+		}
+		if !cfg.HasProvider(trimmedP) {
+			slog.Warn("provider_priority references provider with no configured accounts; requests routed here will fail with no_healthy",
+				"provider", trimmedP, "source", "provider_priority", "consequence", "no_accounts")
 		}
 	}
 	if len(cfg.ModelProviderOverrides) > 0 {
+		normalizedOverrides := make(map[string]string, len(cfg.ModelProviderOverrides))
 		for model, p := range cfg.ModelProviderOverrides {
-			if strings.TrimSpace(model) == "" {
+			trimmedModel := strings.TrimSpace(model)
+			trimmedP := strings.TrimSpace(p)
+			if trimmedModel == "" {
 				return nil, fmt.Errorf("model_provider_overrides: empty model name")
 			}
-			if !cfg.HasProvider(p) {
-				return nil, fmt.Errorf("model_provider_overrides: model %q -> provider %q not found among configured providers", model, p)
+			if trimmedP == "" {
+				return nil, fmt.Errorf("model_provider_overrides: empty provider name for model %q", model)
 			}
+			if !cfg.hasDeclaredProvider(trimmedP) {
+				return nil, fmt.Errorf("model_provider_overrides %q not found among configured providers", trimmedP)
+			}
+			if !cfg.HasProvider(trimmedP) {
+				slog.Warn("model_provider_overrides references provider with no configured accounts; requests routed here will fail with no_healthy",
+					"model", trimmedModel, "provider", trimmedP, "source", "model_provider_overrides", "consequence", "no_accounts")
+			}
+			normalizedOverrides[trimmedModel] = trimmedP
 		}
+		cfg.ModelProviderOverrides = normalizedOverrides
 	}
 	if cfg.ModelTiers == nil {
 		cfg.ModelTiers = map[string]string{}
@@ -1206,6 +1232,60 @@ func (c *Config) hasProvider(name string) bool {
 	return c.HasProvider(name)
 }
 
+func (c *Config) hasDeclaredProvider(name string) bool {
+	if c == nil {
+		return false
+	}
+	if c.HasProvider(name) {
+		return true
+	}
+	for _, p := range c.providerOrder {
+		if p == name {
+			return true
+		}
+	}
+	if c.providerStaticModels != nil {
+		if _, ok := c.providerStaticModels[name]; ok {
+			return true
+		}
+	}
+	if c.providerDSMLGuard != nil {
+		if _, ok := c.providerDSMLGuard[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// DeclaredProviderNames returns all declared provider names (including those without configured accounts)
+// in deterministic order: the providers block declaration order when present (preserved from YAML),
+// otherwise the first-seen account order.
+func (c *Config) DeclaredProviderNames() []string {
+	if c == nil {
+		return nil
+	}
+	if len(c.providerOrder) > 0 {
+		seen := make(map[string]bool, len(c.providerOrder))
+		var out []string
+		for _, p := range c.providerOrder {
+			if p != "" && !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, acc := range c.Accounts {
+		if acc.Provider != "" && !seen[acc.Provider] {
+			seen[acc.Provider] = true
+			out = append(out, acc.Provider)
+		}
+	}
+	return out
+}
+
 // ProviderNames returns all distinct provider names in deterministic order:
 // the providers block declaration order when present (preserved from YAML),
 // otherwise the first-seen account order.
@@ -1509,16 +1589,54 @@ func ReloadConfig(holder *ConfigHolder, path string) (warnings []string, err err
 		// running pool.
 		newCfg.providerSchema = buildProviderSchema(newCfg.Accounts)
 		newCfg.providerStripModelPrefix = buildProviderStripModelPrefix(newCfg.Accounts)
-		// default_provider must reference a provider that exists in the
-		// running accounts; if the new config's default_provider only exists
-		// in the (discarded) new accounts, keep the old default_provider and
-		// say so — a dangling default would route header-less requests into
-		// no_healthy.
-		if newCfg.DefaultProvider != "" && !hasProviderIn(newCfg.Accounts, newCfg.DefaultProvider) {
-			warnings = append(warnings, fmt.Sprintf(
-				"default_provider %q is not among the running accounts: keeping the previous default_provider %q",
-				newCfg.DefaultProvider, oldCfg.DefaultProvider))
-			newCfg.DefaultProvider = oldCfg.DefaultProvider
+	}
+	// default_provider must reference a provider that exists in the
+	// running accounts; if the new config's default_provider only exists
+	// in the (discarded) new accounts, keep the old default_provider and
+	// say so — a dangling default would route header-less requests into
+	// no_healthy.
+	if newCfg.DefaultProvider != "" && !hasProviderIn(newCfg.Accounts, newCfg.DefaultProvider) {
+		warnings = append(warnings, fmt.Sprintf(
+			"default_provider %q is not among the running accounts: keeping the previous default_provider %q",
+			newCfg.DefaultProvider, oldCfg.DefaultProvider))
+		newCfg.DefaultProvider = oldCfg.DefaultProvider
+	}
+	var invalidPriority []string
+	for _, p := range newCfg.ProviderPriority {
+		if !newCfg.hasDeclaredProvider(p) {
+			invalidPriority = append(invalidPriority, p)
+		}
+	}
+	if len(invalidPriority) > 0 {
+		quoted := make([]string, len(invalidPriority))
+		for i, p := range invalidPriority {
+			quoted[i] = fmt.Sprintf("%q", p)
+		}
+		provNoun := "provider"
+		if len(invalidPriority) > 1 {
+			provNoun = "providers"
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"provider_priority references %s %s which is not among configured providers: keeping previous provider_priority %v",
+			provNoun, strings.Join(quoted, ", "), oldCfg.ProviderPriority))
+		newCfg.ProviderPriority = append([]string(nil), oldCfg.ProviderPriority...)
+	}
+	if len(newCfg.ModelProviderOverrides) > 0 {
+		newCfg.ModelProviderOverrides = stringMapClone(newCfg.ModelProviderOverrides)
+		for model, p := range newCfg.ModelProviderOverrides {
+			if !newCfg.hasDeclaredProvider(p) {
+				if oldP, ok := oldCfg.ModelProviderOverrides[model]; ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"model_provider_overrides %q -> %q references provider not among configured providers: keeping previous provider %q",
+						model, p, oldP))
+					newCfg.ModelProviderOverrides[model] = oldP
+				} else {
+					warnings = append(warnings, fmt.Sprintf(
+						"model_provider_overrides %q -> %q references provider not among configured providers: removing override",
+						model, p))
+					delete(newCfg.ModelProviderOverrides, model)
+				}
+			}
 		}
 	}
 	if oldCfg.ProbeInterval != newCfg.ProbeInterval {
