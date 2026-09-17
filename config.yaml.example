@@ -334,6 +334,17 @@ accounts:
   #   probe_path: disabled
 
 # ---------------------------------------------------------------------------
+# 可选：provider_routing: auto —— 聚合入口。请求未带 X-Prism-Provider 头时按
+# 模型名自动解析 provider（model_provider_overrides > 唯一候选 > provider_priority >
+# default_provider > 400）。同名模型无裁决规则时会从聚合目录剔除并返回
+# 400 ambiguous_provider（fail-closed，绝不静默猜测）。缺省关闭，显式带头的
+# 客户端（pi 等）行为不变。
+# provider_routing: auto
+# 同名模型消歧优先级（顺序即优先级；引用的 provider 必须存在，否则启动报错）
+# provider_priority: [xai, gemini]
+# 单模型强制路由（最高优先级）
+# model_provider_overrides:
+#   gpt-5.4: gemini
 # 可选：default_provider —— 请求未带 X-Prism-Provider 头时的兜底 provider。
 # 不配（默认）= 聊天/补全拒绝无头请求：直接返回 HTTP 400
 #   {"error":{"message":"missing X-Prism-Provider header","type":"invalid_request_error"}}
@@ -412,6 +423,9 @@ mcp_tools_json: "/var/lib/prism/mcp_tools.json"
 # QuotaReviveAfter.
 # ---------------------------------------------------------------------------
 # providers:
+#   <provider-name>:
+#     models: [model-id-a, model-id-b]  # 可选：静态目录，参与聚合注册表（供
+#                                       # skip_model_cache / 配额型 provider 声明）
 #   agentrouter:
 #     # public_service: true
 #     accounts:
