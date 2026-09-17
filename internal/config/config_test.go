@@ -3567,3 +3567,124 @@ accounts:
 		}
 	})
 }
+
+// ---- Aggregate provider routing ----
+
+func TestLoadConfig_AggregateRoutingParses(t *testing.T) {
+	content := `
+provider_routing: auto
+provider_priority:
+  - xai
+  - gemini
+model_provider_overrides:
+  gpt-5.4: gemini
+providers:
+  xai:
+    accounts:
+      - name: SuperGrok
+        oauth: xai
+        base_url: https://api.x.ai/v1
+  gemini:
+    models:
+      - gemini-2.5-pro
+      - gemini-2.5-flash
+      - gemini-2.5-flash
+    accounts:
+      - name: Gemini
+        oauth: google
+        base_url: https://cloudcode-pa.googleapis.com
+`
+	cfg, err := LoadConfig(writeConfig(t, content))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.ProviderRouting != "auto" {
+		t.Errorf("provider_routing = %q, want auto", cfg.ProviderRouting)
+	}
+	if len(cfg.ProviderPriority) != 2 || cfg.ProviderPriority[0] != "xai" || cfg.ProviderPriority[1] != "gemini" {
+		t.Errorf("provider_priority = %v, want [xai gemini]", cfg.ProviderPriority)
+	}
+	if got := cfg.ModelProviderOverrides["gpt-5.4"]; got != "gemini" {
+		t.Errorf("model_provider_overrides[gpt-5.4] = %q, want gemini", got)
+	}
+	// ProviderNames must follow YAML declaration order, not map order.
+	if got := cfg.ProviderNames(); len(got) != 2 || got[0] != "xai" || got[1] != "gemini" {
+		t.Errorf("ProviderNames() = %v, want [xai gemini]", got)
+	}
+	if got := cfg.StaticModels("gemini"); len(got) != 2 || got[0] != "gemini-2.5-pro" || got[1] != "gemini-2.5-flash" {
+		t.Errorf("StaticModels(gemini) = %v, want deduped [gemini-2.5-pro gemini-2.5-flash]", got)
+	}
+	if got := cfg.StaticModels("xai"); len(got) != 0 {
+		t.Errorf("StaticModels(xai) = %v, want nil/empty", got)
+	}
+}
+
+func TestLoadConfig_AggregateRoutingInvalidValue(t *testing.T) {
+	content := `
+provider_routing: fuzzy
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+`
+	if _, err := LoadConfig(writeConfig(t, content)); err == nil || !strings.Contains(err.Error(), "provider_routing") {
+		t.Fatalf("want provider_routing load error, got %v", err)
+	}
+}
+
+func TestLoadConfig_AggregateRoutingUnknownPriority(t *testing.T) {
+	content := `
+provider_routing: auto
+provider_priority: [xai, nope]
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+`
+	if _, err := LoadConfig(writeConfig(t, content)); err == nil || !strings.Contains(err.Error(), "provider_priority") {
+		t.Fatalf("want provider_priority load error, got %v", err)
+	}
+}
+
+func TestLoadConfig_AggregateRoutingUnknownOverride(t *testing.T) {
+	content := `
+provider_routing: auto
+model_provider_overrides:
+  gpt-5.4: nope
+providers:
+  xai:
+    accounts:
+      - name: a
+        key: k
+        base_url: https://api.x.ai/v1
+`
+	if _, err := LoadConfig(writeConfig(t, content)); err == nil || !strings.Contains(err.Error(), "model_provider_overrides") {
+		t.Fatalf("want model_provider_overrides load error, got %v", err)
+	}
+}
+
+func TestProviderNames_LegacyAccountsOrder(t *testing.T) {
+	content := `
+accounts:
+  - name: b-acc
+    key: k
+    base_url: https://b.example.com
+    provider: beta
+  - name: a-acc
+    key: k
+    base_url: https://a.example.com
+    provider: alpha
+`
+	cfg, err := LoadConfig(writeConfig(t, content))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	got := cfg.ProviderNames()
+	if len(got) != 2 || got[0] != "beta" || got[1] != "alpha" {
+		t.Errorf("ProviderNames() = %v, want [beta alpha]", got)
+	}
+}

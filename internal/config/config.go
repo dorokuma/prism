@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -312,6 +313,28 @@ type Config struct {
 	// (which could route an account to the wrong provider).
 	DefaultProvider string `yaml:"default_provider"`
 
+	// ProviderRouting enables the aggregate entry: when "auto", requests
+	// without an explicit X-Prism-Provider header resolve the provider from
+	// the requested model name (model_provider_overrides > unique registry
+	// candidate > provider_priority; unresolvable collisions fail closed with
+	// 400 ambiguous_provider, unknown models 400 unknown_model or fall back to
+	// default_provider). Empty/absent (default) = off: the provider comes only
+	// from the header or default_provider, byte-for-byte today's behavior.
+	ProviderRouting string `yaml:"provider_routing,omitempty"`
+
+	// ProviderPriority is the disambiguation order for model names served by
+	// more than one provider (highest listed wins). Only consulted when
+	// ProviderRouting is "auto" and the model has no explicit
+	// model_provider_overrides entry. Every listed provider must exist.
+	ProviderPriority []string `yaml:"provider_priority,omitempty"`
+
+	// ModelProviderOverrides is the highest-precedence per-model provider
+	// resolution table for ProviderRouting "auto": model name -> provider.
+	// An override may pin a model to a provider even when that provider's
+	// catalog does not currently advertise the model (force-route). Every
+	// provider value must exist.
+	ModelProviderOverrides map[string]string `yaml:"model_provider_overrides,omitempty"`
+
 	// Usage is the optional token-usage recording section (see UsageConfig).
 	Usage UsageConfig `yaml:"usage"`
 
@@ -334,6 +357,19 @@ type Config struct {
 	// YAML providers.<name>.dsml_guard key. Missing or false means the
 	// legacy chat paths pass content through unchanged.
 	providerDSMLGuard map[string]bool
+
+	// providerOrder preserves the YAML declaration order of the providers
+	// block (recorded in UnmarshalYAML; Go maps are unordered, so the map
+	// iteration order must not become the observable provider order). Used
+	// by ProviderNames and by the aggregate model routing registry as the
+	// deterministic final tie-break/candidate order.
+	providerOrder []string
+
+	// providerStaticModels holds the operator-declared static model
+	// directory per provider (providers.<name>.models). These ids join the
+	// aggregate routing registry alongside the model cache, so
+	// skip_model_cache / quota-only providers can participate.
+	providerStaticModels map[string][]string
 
 	// ModelCacheRefreshInterval is the periodic interval for model cache background
 	// refresh. Default 3h. 0 disables periodic refresh.
@@ -372,6 +408,14 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 			if k == "quota_revive_after" {
 				c.quotaReviveAfterSet = true
 				c.QuotaReviveAfterRaw = value.Content[i+1].Value
+			}
+			if k == "providers" {
+				node := value.Content[i+1]
+				if node.Kind == yaml.MappingNode {
+					for j := 0; j+1 < len(node.Content); j += 2 {
+						c.providerOrder = append(c.providerOrder, node.Content[j].Value)
+					}
+				}
 			}
 		}
 	}
@@ -529,6 +573,7 @@ func LoadConfig(path string) (*Config, error) {
 	type providersConfig struct {
 		Providers map[string]struct {
 			Accounts      []AccountConfig `yaml:"accounts"`
+			Models        []string        `yaml:"models"`
 			DSMLGuard     bool            `yaml:"dsml_guard"`
 			PublicService bool            `yaml:"public_service"`
 		} `yaml:"providers"`
@@ -538,10 +583,28 @@ func LoadConfig(path string) (*Config, error) {
 		if len(cfg.Accounts) > 0 {
 			return nil, fmt.Errorf("config has both top-level accounts and a providers block; use one shape only — mixing them used to drop the top-level accounts list without error")
 		}
+		// Expand providers in YAML declaration order (UnmarshalYAML records
+		// providerOrder): Go map iteration is randomized and every
+		// provider-ordered surface (ProviderNames, snapshots, the aggregate
+		// routing registry) must be deterministic.
+		providerNames := cfg.providerOrder
+		if len(providerNames) == 0 {
+			providerNames = make([]string, 0, len(pc.Providers))
+			for name := range pc.Providers {
+				providerNames = append(providerNames, name)
+			}
+			sort.Strings(providerNames)
+		}
 		var allAccounts []AccountConfig
 		cfg.providerDSMLGuard = make(map[string]bool, len(pc.Providers))
-		for providerName, providerCfg := range pc.Providers {
+		cfg.providerStaticModels = make(map[string][]string, len(pc.Providers))
+		for _, providerName := range providerNames {
+			providerCfg, ok := pc.Providers[providerName]
+			if !ok {
+				continue
+			}
 			cfg.providerDSMLGuard[providerName] = providerCfg.DSMLGuard
+			cfg.providerStaticModels[providerName] = dedupeStringList(providerCfg.Models)
 			for _, acc := range providerCfg.Accounts {
 				acc.Provider = providerName
 				if providerCfg.PublicService {
@@ -651,6 +714,30 @@ func LoadConfig(path string) (*Config, error) {
 	// otherwise requests without X-Prism-Provider would silently break.
 	if cfg.DefaultProvider != "" && !cfg.hasProvider(cfg.DefaultProvider) {
 		return nil, fmt.Errorf("default_provider %q not found among configured providers", cfg.DefaultProvider)
+	}
+	// Aggregate provider routing: only "auto" (or absent = off) is accepted;
+	// a typo must fail the load, not silently disable provider resolution.
+	if cfg.ProviderRouting != "" && cfg.ProviderRouting != "auto" {
+		return nil, fmt.Errorf("provider_routing: unsupported value %q (allowed: auto, or omit to disable)", cfg.ProviderRouting)
+	}
+	// provider_priority and model_provider_overrides reference providers by
+	// name; a stale/typo'd name must fail loudly — resolving a request into
+	// a nonexistent pool is exactly the silent misrouting class this
+	// feature exists to prevent.
+	for _, p := range cfg.ProviderPriority {
+		if !cfg.HasProvider(p) {
+			return nil, fmt.Errorf("provider_priority: provider %q not found among configured providers", p)
+		}
+	}
+	if len(cfg.ModelProviderOverrides) > 0 {
+		for model, p := range cfg.ModelProviderOverrides {
+			if strings.TrimSpace(model) == "" {
+				return nil, fmt.Errorf("model_provider_overrides: empty model name")
+			}
+			if !cfg.HasProvider(p) {
+				return nil, fmt.Errorf("model_provider_overrides: model %q -> provider %q not found among configured providers", model, p)
+			}
+		}
 	}
 	if cfg.ModelTiers == nil {
 		cfg.ModelTiers = map[string]string{}
@@ -1119,8 +1206,21 @@ func (c *Config) hasProvider(name string) bool {
 	return c.HasProvider(name)
 }
 
-// ProviderNames returns all distinct provider names from account configs.
+// ProviderNames returns all distinct provider names in deterministic order:
+// the providers block declaration order when present (preserved from YAML),
+// otherwise the first-seen account order.
 func (c *Config) ProviderNames() []string {
+	if len(c.providerOrder) > 0 {
+		seen := make(map[string]bool, len(c.providerOrder))
+		var out []string
+		for _, p := range c.providerOrder {
+			if p != "" && !seen[p] && c.HasProvider(p) {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+		return out
+	}
 	seen := make(map[string]bool)
 	var out []string
 	for _, acc := range c.Accounts {
@@ -1128,6 +1228,32 @@ func (c *Config) ProviderNames() []string {
 			seen[acc.Provider] = true
 			out = append(out, acc.Provider)
 		}
+	}
+	return out
+}
+
+// StaticModels returns the operator-declared static model directory for a
+// provider (providers.<name>.models), nil when none is declared. These ids
+// participate in the aggregate routing registry alongside the model cache.
+func (c *Config) StaticModels(provider string) []string {
+	if c == nil {
+		return nil
+	}
+	return c.providerStaticModels[provider]
+}
+
+// dedupeStringList removes empty/whitespace strings and preserves first-seen
+// order. Used for provider static model directories.
+func dedupeStringList(items []string) []string {
+	seen := make(map[string]bool, len(items))
+	var out []string
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		out = append(out, trimmed)
 	}
 	return out
 }
