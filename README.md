@@ -5,6 +5,14 @@
 LLM API Load Balancer  
 Multi-account round-robin, exhaustion / cooldown, Chat↔Responses translation.
 
+## Development conventions
+
+Detailed development and contribution guidelines are maintained across three core documents:
+
+- [AGENTS.md](AGENTS.md) — Agent 协作与工程铁律（构建/测试命令、密钥红线、架构分层、ADR 触发条件）
+- [CONTRIBUTING.md](CONTRIBUTING.md) — 版本与发版规范（语义化版本、发版三同步、Changelog 格式）
+- [.agents/notes/README.md](.agents/notes/README.md) — 架构决策与踩坑笔记（ADR 机制、命名规则、superseded 原则）
+
 ## Quick start (local)
 
 ```bash
