@@ -339,8 +339,15 @@ accounts:
 # default_provider > 400）。同名模型无裁决规则时会从聚合目录剔除并返回
 # 400 ambiguous_provider（fail-closed，绝不静默猜测）。缺省关闭，显式带头的
 # 客户端（pi 等）行为不变。
+#
+# 【生产建议】：
+# 1. 启用 auto 时强烈建议配置 provider_priority，明确同名模型的消歧优先级，
+#    避免因多个 provider 同时提供相同模型（如 deepseek/claude）导致请求被拒。
+# 2. 关键上游建议配置 providers.<name>.models 静态目录。模型缓存为异步获取且
+#    默认周期刷新（约 3 小时，model_cache_refresh_interval），静态目录可消除
+#    进程冷启动阶段缓存未就绪时的空窗期，确保核心模型随时可用。
 # provider_routing: auto
-# 同名模型消歧优先级（顺序即优先级；引用的 provider 必须存在，否则启动报错）
+# 同名模型消歧优先级（顺序即优先级；引用无账号的 provider 记 WARN 并兜底 no_healthy）
 # provider_priority: [xai, gemini]
 # 单模型强制路由（最高优先级）
 # model_provider_overrides:
@@ -351,8 +358,6 @@ accounts:
 # GET /v1/models 在同样情况下返回空列表（不泄漏全部 provider 的目录）。
 # 不会回退到全池选择（回退会让任意账号被命中，导致账号跨 provider 串用）。
 # 配置后：无头聊天按该 provider 走正常的 per-provider 轮转；/v1/models 也返回该 provider 的目录。
-# 值必须是下方 providers（或 accounts 的 provider 字段）中已存在的 provider 名，
-# 否则启动报错退出。
 # ---------------------------------------------------------------------------
 # default_provider: "agentrouter"
 
