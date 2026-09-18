@@ -194,6 +194,8 @@ type Recorder struct {
 	// goroutine (and Close cannot block on it past its deadline).
 	workerDone chan struct{}
 
+	flushReq chan chan struct{}
+
 	// abortCtx is cancelled EARLY only when Close times out, to abort an
 	// in-flight store operation (InsertBatch/DeleteBefore) so the worker can
 	// exit; on the normal path Close cancels it once, at the very end, after
@@ -225,6 +227,7 @@ func NewRecorder(cfg Config, store Store) *Recorder {
 		store:       store,
 		cfg:         cfg,
 		ch:          make(chan Event, cfg.ChannelSize),
+		flushReq:    make(chan chan struct{}),
 		done:        make(chan struct{}),
 		workerDone:  make(chan struct{}),
 		abortCtx:    abortCtx,
@@ -381,6 +384,21 @@ func (r *Recorder) run() {
 			}
 		case <-ticker.C:
 			flush()
+		case req := <-r.flushReq:
+			for {
+				select {
+				case e := <-r.ch:
+					batch = append(batch, e)
+					if len(batch) >= r.cfg.BatchSize {
+						flush()
+					}
+				default:
+					flush()
+					goto flushReqDone
+				}
+			}
+		flushReqDone:
+			close(req)
 		case <-r.done:
 			// Drain everything still buffered, then flush and exit. No new
 			// event can arrive after done is closed: every accepted send is
@@ -526,6 +544,25 @@ func (r *Recorder) Close() {
 		// nothing left to count here (see the accounting comment above).
 		util.RecordUsageRecorderStatus("stopped")
 	})
+}
+
+// Flush flushes all currently buffered events to the underlying store.
+func (r *Recorder) Flush(ctx context.Context) error {
+	if r == nil || !r.cfg.Enabled || r.stopped.Load() || !r.started.Load() {
+		return nil
+	}
+	req := make(chan struct{})
+	select {
+	case r.flushReq <- req:
+		select {
+		case <-req:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // logDroppedRateLimited emits the rate-limited loss warning for one dropped

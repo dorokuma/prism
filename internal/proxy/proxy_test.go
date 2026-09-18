@@ -769,9 +769,8 @@ func TestCopyUpstreamHeaders_Allowlist(t *testing.T) {
 	src.Set("Via", "1.1 proxy")
 	src.Set("X-RateLimit-Remaining", "99")
 	src.Set("X-RateLimit-Limit", "100")
-	src.Set("X-Request-ID", "abc123")
-
-	copyUpstreamHeaders(rec, src)
+	disabled := false
+	copyUpstreamHeaders(rec, src, &config.HeaderPassthroughConfig{Enabled: &disabled}, "")
 
 	dst := rec.Header()
 

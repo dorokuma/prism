@@ -10,7 +10,7 @@ import (
 // divisor were 1e3 the result would be 1000x, if 1e9 it would be 1000x less.
 func TestCostFormulaDivisorOneMillion(t *testing.T) {
 	price := &Price{Input: 1.5, Output: 3.0, CacheRead: 0.3, CacheWrite: 0.6}
-	cost, status := ComputeCost(1_000_000, 2_000_000, 250_000, 100_000, SourceOpenAI, price)
+	cost, status := ComputeCost(1_000_000, 2_000_000, 250_000, 100_000, 0, SourceOpenAI, price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q, want ok", status)
 	}
@@ -26,7 +26,7 @@ func TestCostFormulaDivisorOneMillion(t *testing.T) {
 }
 
 func TestCostMissingPrice(t *testing.T) {
-	cost, status := ComputeCost(100, 50, 0, 0, SourceOpenAI, nil)
+	cost, status := ComputeCost(100, 50, 0, 0, 0, SourceOpenAI, nil)
 	if cost != nil {
 		t.Fatalf("cost = %v, want nil for missing price", *cost)
 	}
@@ -34,14 +34,14 @@ func TestCostMissingPrice(t *testing.T) {
 		t.Fatalf("status = %q, want missing_price", status)
 	}
 	// missing price takes precedence even when tokens are zero
-	cost, status = ComputeCost(0, 0, 0, 0, SourceOpenAI, nil)
+	cost, status = ComputeCost(0, 0, 0, 0, 0, SourceOpenAI, nil)
 	if cost != nil || status != CostStatusMissingPrice {
 		t.Fatalf("zero tokens + nil price: cost=%v status=%q, want nil/missing_price", cost, status)
 	}
 }
 
 func TestCostNoUsage(t *testing.T) {
-	cost, status := ComputeCost(0, 0, 0, 0, SourceOpenAI, &Price{Input: 1, Output: 1})
+	cost, status := ComputeCost(0, 0, 0, 0, 0, SourceOpenAI, &Price{Input: 1, Output: 1})
 	if status != CostStatusNoUsage {
 		t.Fatalf("status = %q, want no_usage", status)
 	}
@@ -52,7 +52,7 @@ func TestCostNoUsage(t *testing.T) {
 
 func TestCostZeroPriceStructIsPriced(t *testing.T) {
 	// a non-nil all-zero Price means "priced at 0", not "missing"
-	cost, status := ComputeCost(100, 0, 0, 0, SourceOpenAI, &Price{})
+	cost, status := ComputeCost(100, 0, 0, 0, 0, SourceOpenAI, &Price{})
 	if status != CostStatusOK {
 		t.Fatalf("status = %q, want ok", status)
 	}
@@ -67,7 +67,7 @@ func TestCostZeroPriceStructIsPriced(t *testing.T) {
 // TestCostCachedTokensUseCacheReadPrice).
 func TestCostZeroCacheReadFallsBackToInput(t *testing.T) {
 	price := &Price{Input: 1.0, Output: 2.0, CacheRead: 0, CacheWrite: 0}
-	cost, status := ComputeCost(1_000_000, 0, 1_000_000, 0, SourceOpenAI, price)
+	cost, status := ComputeCost(1_000_000, 0, 1_000_000, 0, 0, SourceOpenAI, price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q, want ok", status)
 	}
@@ -75,7 +75,7 @@ func TestCostZeroCacheReadFallsBackToInput(t *testing.T) {
 		t.Fatalf("cached cost = %v, want 1.0 (CacheRead 0 → Input)", cost)
 	}
 	// Anthropic: cached is billed on top of input, also at Input when CacheRead is 0.
-	cost, status = ComputeCost(1_000_000, 0, 1_000_000, 0, SourceAnthropic, price)
+	cost, status = ComputeCost(1_000_000, 0, 1_000_000, 0, 0, SourceAnthropic, price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q, want ok", status)
 	}
@@ -83,7 +83,7 @@ func TestCostZeroCacheReadFallsBackToInput(t *testing.T) {
 		t.Fatalf("anthropic cached cost = %v, want 2.0 (input + cache at Input)", cost)
 	}
 	// Non-cached remainder still uses Input only.
-	cost, status = ComputeCost(1_000_000, 0, 0, 0, SourceOpenAI, price)
+	cost, status = ComputeCost(1_000_000, 0, 0, 0, 0, SourceOpenAI, price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q, want ok", status)
 	}
@@ -95,7 +95,7 @@ func TestCostZeroCacheReadFallsBackToInput(t *testing.T) {
 func TestCostCachedTokensUseCacheReadPrice(t *testing.T) {
 	// cached tokens must be priced at CacheRead, not Input
 	price := &Price{Input: 1.0, CacheRead: 0.1, CacheWrite: 0.2}
-	cost, status := ComputeCost(1000, 0, 1000, 0, SourceOpenAI, price)
+	cost, status := ComputeCost(1000, 0, 1000, 0, 0, SourceOpenAI, price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q", status)
 	}
@@ -107,7 +107,7 @@ func TestCostCachedTokensUseCacheReadPrice(t *testing.T) {
 
 func TestCostCacheWriteTokensPricedSeparately(t *testing.T) {
 	price := &Price{Input: 1.0, Output: 2.0, CacheRead: 0.1, CacheWrite: 0.2}
-	cost, status := ComputeCost(0, 0, 0, 1_000_000, SourceOpenAI, price)
+	cost, status := ComputeCost(0, 0, 0, 1_000_000, 0, SourceOpenAI, price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q", status)
 	}
@@ -117,14 +117,65 @@ func TestCostCacheWriteTokensPricedSeparately(t *testing.T) {
 }
 
 // TestCostReasoningIncludedInCompletion documents that reasoning_tokens are
-// not an input to ComputeCost: they are already part of completion_tokens and
-// must never be priced a second time. The formula test above pins the
-// completion term to Output exactly.
+// included in completion_tokens under standard OpenAI subset semantics and
+// are not double-billed. The completion term evaluates to max(0, completion - reasoning)*Output + reasoning*ReasoningPrice.
 func TestCostReasoningIncludedInCompletion(t *testing.T) {
-	// completion 1M tokens at Output 2.0 → 2.0 regardless of reasoning split
-	cost, _ := ComputeCost(0, 1_000_000, 0, 0, SourceOpenAI, &Price{Input: 1, Output: 2})
-	if math.Abs(*cost-2.0) > 1e-12 {
-		t.Fatalf("completion cost = %v, want 2.0", *cost)
+	price := &Price{Input: 2.0, Output: 10.0}
+
+	// Case 1: Standard subset (completion 1M includes 500K reasoning):
+	// prompt 1M @ 2.0 = 2.0, (1M - 500K) @ 10.0 = 5.0, 500K reasoning @ 10.0 = 5.0 -> total 12.0
+	// Without subset deduplication, it would have been double-billed to 17.0.
+	cost, status := ComputeCost(1_000_000, 1_000_000, 0, 0, 500_000, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	want := 12.0
+	if math.Abs(*cost-want) > 1e-12 {
+		t.Fatalf("cost with reasoning subset = %v, want %v", *cost, want)
+	}
+
+	// Case 2: Reasoning equals completion (completion 500K all reasoning):
+	// prompt 1M @ 2.0 = 2.0, completion (500K reasoning) @ 10.0 = 5.0 -> total 7.0
+	cost, status = ComputeCost(1_000_000, 500_000, 0, 0, 500_000, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	want = 7.0
+	if math.Abs(*cost-want) > 1e-12 {
+		t.Fatalf("cost with all reasoning = %v, want %v", *cost, want)
+	}
+
+	// Case 3: Anomaly / superset (reasoning 1M > completion 500K):
+	// prompt 1M @ 2.0 = 2.0, max(0, 500K - 1M)=0 @ 10.0, reasoning 1M @ 10.0 = 10.0 -> total 12.0
+	cost, status = ComputeCost(1_000_000, 500_000, 0, 0, 1_000_000, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	want = 12.0
+	if math.Abs(*cost-want) > 1e-12 {
+		t.Fatalf("cost with reasoning superset = %v, want %v", *cost, want)
+	}
+
+	// Case 4: Zero completion with reasoning (completion 0, reasoning 500K):
+	// prompt 0, completion 0, reasoning 500K @ 10.0 = 5.0
+	cost, status = ComputeCost(0, 0, 0, 0, 500_000, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	want = 5.0
+	if math.Abs(*cost-want) > 1e-12 {
+		t.Fatalf("cost with zero completion reasoning = %v, want %v", *cost, want)
+	}
+
+	// Case 5: Zero reasoning with completion (completion 1M, reasoning 0):
+	// prompt 0, completion 1M @ 10.0 = 10.0
+	cost, status = ComputeCost(0, 1_000_000, 0, 0, 0, SourceOpenAI, price)
+	if status != CostStatusOK {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	want = 10.0
+	if math.Abs(*cost-want) > 1e-12 {
+		t.Fatalf("cost with zero reasoning = %v, want %v", *cost, want)
 	}
 }
 
@@ -138,7 +189,7 @@ func TestCostAnthropicCacheNotSubtracted(t *testing.T) {
 	price := &Price{Input: 1.5, Output: 3.0, CacheRead: 0.3, CacheWrite: 0.6}
 	// Same token counts as the OpenAI formula test: prompt 1M, cached 250K,
 	// cache_write 100K, completion 2M.
-	anth, status := ComputeCost(1_000_000, 2_000_000, 250_000, 100_000, SourceAnthropic, price)
+	anth, status := ComputeCost(1_000_000, 2_000_000, 250_000, 100_000, 0, SourceAnthropic, price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q, want ok", status)
 	}
@@ -154,7 +205,7 @@ func TestCostAnthropicCacheNotSubtracted(t *testing.T) {
 	// The same numbers through the OpenAI formula: 7.26 (cached repriced at
 	// CacheRead). The gap (0.375 = 250K/1e6*(1.5-0.3)) is exactly the
 	// undercount the old shared formula produced for Anthropic.
-	openai, _ := ComputeCost(1_000_000, 2_000_000, 250_000, 100_000, SourceOpenAI, price)
+	openai, _ := ComputeCost(1_000_000, 2_000_000, 250_000, 100_000, 0, SourceOpenAI, price)
 	if math.Abs(*openai-7.26) > 1e-9 {
 		t.Fatalf("openai cost = %v, want 7.26", *openai)
 	}
@@ -168,7 +219,7 @@ func TestCostAnthropicCacheNotSubtracted(t *testing.T) {
 // formula — the fix must not change their numbers.
 func TestCostUnknownSourceDefaultsToOpenAIFormula(t *testing.T) {
 	price := &Price{Input: 1.5, Output: 3.0, CacheRead: 0.3, CacheWrite: 0.6}
-	cost, status := ComputeCost(1_000_000, 2_000_000, 250_000, 100_000, "", price)
+	cost, status := ComputeCost(1_000_000, 2_000_000, 250_000, 100_000, 0, "", price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q, want ok", status)
 	}
@@ -186,7 +237,7 @@ func TestComputeCost_CachedClampedToPrompt(t *testing.T) {
 
 	// cached (100) > prompt (10): clamp to 10 → all prompt priced at
 	// CacheRead: 10/1e6*0.5 = 0.000005, never negative.
-	cost, status := ComputeCost(10, 0, 100, 0, SourceOpenAI, price)
+	cost, status := ComputeCost(10, 0, 100, 0, 0, SourceOpenAI, price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q, want ok", status)
 	}
@@ -199,7 +250,7 @@ func TestComputeCost_CachedClampedToPrompt(t *testing.T) {
 	}
 
 	// Negative cached: clamp to 0 → full prompt priced at Input.
-	cost, status = ComputeCost(10, 0, -5, 0, SourceOpenAI, price)
+	cost, status = ComputeCost(10, 0, -5, 0, 0, SourceOpenAI, price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q, want ok", status)
 	}
@@ -209,7 +260,7 @@ func TestComputeCost_CachedClampedToPrompt(t *testing.T) {
 	}
 
 	// Anthropic form never subtracts cached from prompt: unchanged.
-	cost, status = ComputeCost(10, 0, 100, 0, SourceAnthropic, price)
+	cost, status = ComputeCost(10, 0, 100, 0, 0, SourceAnthropic, price)
 	if status != CostStatusOK {
 		t.Fatalf("status = %q, want ok", status)
 	}
@@ -228,8 +279,8 @@ func TestComputeCost_CachedClampedToPrompt(t *testing.T) {
 func TestComputeCost_NegativeInputsClamped(t *testing.T) {
 	price := &Price{Input: 1.0, Output: 2.0, CacheRead: 0.5, CacheWrite: 0.5}
 
-	// All four negative → clamped to zero → no_usage, cost 0.
-	cost, status := ComputeCost(-10, -5, -3, -2, SourceOpenAI, price)
+	// All five negative → clamped to zero → no_usage, cost 0.
+	cost, status := ComputeCost(-10, -5, -3, -2, -1, SourceOpenAI, price)
 	if status != CostStatusNoUsage {
 		t.Errorf("all-negative OpenAI: status = %q, want no_usage", status)
 	}
@@ -240,7 +291,7 @@ func TestComputeCost_NegativeInputsClamped(t *testing.T) {
 	// Mixed: negative prompt/cached/cache_write with positive completion →
 	// only the positive completion is priced (2M at Output 2.0 = 4.0); the
 	// negative values must not leak into any term.
-	cost, status = ComputeCost(-100, 2_000_000, -50, -20, SourceOpenAI, price)
+	cost, status = ComputeCost(-100, 2_000_000, -50, -20, 0, SourceOpenAI, price)
 	if status != CostStatusOK {
 		t.Errorf("mixed OpenAI: status = %q, want ok", status)
 	}
@@ -250,7 +301,7 @@ func TestComputeCost_NegativeInputsClamped(t *testing.T) {
 
 	// OpenAI: negative cached with positive prompt → cached clamped to 0,
 	// full prompt priced at Input (cached ≤ prompt still enforced).
-	cost, status = ComputeCost(10, 0, -5, 0, SourceOpenAI, price)
+	cost, status = ComputeCost(10, 0, -5, 0, 0, SourceOpenAI, price)
 	if status != CostStatusOK {
 		t.Errorf("negative cached OpenAI: status = %q, want ok", status)
 	}
@@ -260,14 +311,14 @@ func TestComputeCost_NegativeInputsClamped(t *testing.T) {
 
 	// Anthropic: same negative-input shape — clamped to zero, never
 	// negative; formula semantics unchanged for valid inputs.
-	cost, status = ComputeCost(-10, -5, -3, -2, SourceAnthropic, price)
+	cost, status = ComputeCost(-10, -5, -3, -2, 0, SourceAnthropic, price)
 	if status != CostStatusNoUsage {
 		t.Errorf("all-negative Anthropic: status = %q, want no_usage", status)
 	}
 	if cost == nil || *cost != 0 {
 		t.Errorf("all-negative Anthropic: cost = %v, want 0", cost)
 	}
-	cost, status = ComputeCost(10, 0, -3, -2, SourceAnthropic, price)
+	cost, status = ComputeCost(10, 0, -3, -2, 0, SourceAnthropic, price)
 	if status != CostStatusOK {
 		t.Errorf("mixed Anthropic: status = %q, want ok", status)
 	}
@@ -277,11 +328,11 @@ func TestComputeCost_NegativeInputsClamped(t *testing.T) {
 
 	// Every result is non-negative across the whole negative-input space.
 	for _, src := range []string{SourceOpenAI, SourceAnthropic} {
-		for _, tc := range [][4]int64{
-			{-1, 0, 0, 0}, {0, -1, 0, 0}, {0, 0, -1, 0}, {0, 0, 0, -1},
-			{-5, -5, 0, 0}, {-5, 0, 100, 0}, {0, -5, 0, 100}, {-1, -1, -1, -1},
+		for _, tc := range [][5]int64{
+			{-1, 0, 0, 0, 0}, {0, -1, 0, 0, 0}, {0, 0, -1, 0, 0}, {0, 0, 0, -1, 0}, {0, 0, 0, 0, -1},
+			{-5, -5, 0, 0, 0}, {-5, 0, 100, 0, 0}, {0, -5, 0, 100, 0}, {-1, -1, -1, -1, -1},
 		} {
-			c, _ := ComputeCost(tc[0], tc[1], tc[2], tc[3], src, price)
+			c, _ := ComputeCost(tc[0], tc[1], tc[2], tc[3], tc[4], src, price)
 			if c != nil && *c < 0 {
 				t.Errorf("ComputeCost(%v, %q) = %v, must never be negative", tc, src, *c)
 			}

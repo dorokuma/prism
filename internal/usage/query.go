@@ -415,3 +415,93 @@ func (s *SQLiteStore) Overview(ctx context.Context, q SummaryQuery) (*Overview, 
 	o.AnthropicCacheWriteTokens = antCwt.Int64
 	return &o, nil
 }
+
+// UserSelf returns aggregated cost and request count for one key_id.
+// UserSelf returns aggregated cost and request count for one key_id.
+// It includes successful requests (success = 1) and broken stream / error records
+// where tokens were captured and priced (cost_usd > 0 or tokens > 0).
+func (s *SQLiteStore) UserSelf(ctx context.Context, keyID string) (*UserSelfData, error) {
+	db := s.readPool()
+	if db == nil {
+		return nil, errors.New("usage: store not open")
+	}
+	row := db.QueryRowContext(ctx, `SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*) FROM usage_events WHERE key_id = ? AND (success = 1 OR (cost_usd IS NOT NULL AND cost_usd > 0) OR prompt_tokens > 0 OR completion_tokens > 0)`, keyID)
+	var data UserSelfData
+	if err := row.Scan(&data.CostUSD, &data.RequestCount); err != nil {
+		return nil, err
+	}
+	return &data, nil
+}
+
+// LogSelf returns paginated usage logs for one key_id.
+func (s *SQLiteStore) LogSelf(ctx context.Context, q LogSelfQuery) (*LogSelfResult, error) {
+	db := s.readPool()
+	if db == nil {
+		return nil, errors.New("usage: store not open")
+	}
+	where := []string{"key_id = ?"}
+	args := []any{q.KeyID}
+	if q.Model != "" {
+		where = append(where, "model = ?")
+		args = append(args, q.Model)
+	}
+	if q.StartTimestamp > 0 {
+		where = append(where, "ts_unix >= ?")
+		args = append(args, q.StartTimestamp)
+	}
+	if q.EndTimestamp > 0 {
+		where = append(where, "ts_unix <= ?")
+		args = append(args, q.EndTimestamp)
+	}
+	whereClause := strings.Join(where, " AND ")
+
+	countQuery := `SELECT COUNT(*) FROM usage_events WHERE ` + whereClause
+	var total int64
+	if err := db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, err
+	}
+
+	page := q.Page
+	if page < 1 {
+		page = 1
+	}
+	size := q.Size
+	if size < 1 {
+		size = 20
+	}
+	if size > 100 {
+		size = 100
+	}
+	offset := (page - 1) * size
+
+	dataQuery := `SELECT id, ts_unix, model, stream, prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens, cache_write_tokens, cost_usd, duration_ms FROM usage_events WHERE ` + whereClause + ` ORDER BY ts_unix DESC, id DESC LIMIT ? OFFSET ?`
+	dataArgs := append(args, size, offset)
+
+	rows, err := db.QueryContext(ctx, dataQuery, dataArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]LogSelfRow, 0)
+	for rows.Next() {
+		var r LogSelfRow
+		if err := rows.Scan(
+			&r.ID, &r.TsUnix, &r.Model, &r.Stream,
+			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
+			&r.CachedTokens, &r.ReasoningTokens, &r.CacheWriteTokens,
+			&r.CostUSD, &r.DurationMS,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return &LogSelfResult{
+		Items: items,
+		Total: total,
+	}, nil
+}

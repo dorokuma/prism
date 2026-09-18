@@ -2,14 +2,21 @@ package stream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/usagemeta"
+)
+
+const (
+	streamDrainMaxBytes = 16 << 20 // 16 MB max drain buffer
+	streamDrainTimeout  = 30 * time.Second
 )
 
 // flushWriter wraps an http.ResponseWriter with automatic flushing after every Write.
@@ -538,11 +545,30 @@ func StreamResponseBody(w http.ResponseWriter, body io.ReadCloser, clientReq *ht
 	teeReader := io.TeeReader(body, capture)
 
 	n, err := io.Copy(dst, teeReader)
+	if err != nil {
+		if clientReq != nil && clientReq.Context().Err() != nil {
+			slog.Warn("client disconnected during stream", "account", account, "written", n, "error", err)
+		} else {
+			slog.Error("upstream stream error", "account", account, "written", n, "error", err)
+		}
+		// Drain the upstream body into capture with size limit (16MB) and timeout (30s)
+		// so the account connection is released cleanly and trailing usage events are captured
+		// without hanging the connection pool or consuming unbounded memory.
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), streamDrainTimeout)
+		defer drainCancel()
+		limited := io.LimitReader(body, streamDrainMaxBytes)
+		drained, drainErr := io.Copy(capture, ctxReader(drainCtx, limited))
+		if drainErr != nil {
+			slog.Warn("drain upstream body error", "account", account, "drained", drained, "error", drainErr)
+		} else if drained >= streamDrainMaxBytes {
+			slog.Warn("drain upstream body limit exceeded", "account", account, "limit", streamDrainMaxBytes)
+		}
+	}
+
 	// EOF flush: the last SSE event is not required to end with an empty
 	// line, so the capture must be finished before parsing — without it the
 	// final event (often the OpenAI usage chunk) would never be captured.
-	// Runs on the error path too: a dropped connection may still have
-	// delivered the usage carrier as the final partial event.
+	// Runs on the error/disconnect path too after draining the remaining upstream body.
 	capture.Finish()
 
 	// Capture token usage for audit (nil-safe; legacy streaming path). The
@@ -558,16 +584,6 @@ func StreamResponseBody(w http.ResponseWriter, body io.ReadCloser, clientReq *ht
 	}
 
 	if err != nil {
-		if clientReq != nil && clientReq.Context().Err() != nil {
-			slog.Warn("client disconnected during stream", "account", account, "written", n, "error", err)
-		} else {
-			slog.Error("upstream stream error", "account", account, "written", n, "error", err)
-		}
-		// Drain the upstream body so the account connection is released cleanly
-		// even when the downstream client has already gone away.
-		if _, drainErr := io.Copy(io.Discard, body); drainErr != nil {
-			slog.Warn("drain upstream body error", "account", account, "error", drainErr)
-		}
 		return n, err
 	}
 	return n, nil

@@ -221,8 +221,30 @@ type AccountConfig struct {
 // /v1/* endpoints. Name is the human-readable key identifier recorded in
 // audit logs; Token is the secret itself and must never be logged.
 type APIKey struct {
-	Name  string `yaml:"name"`
-	Token string `yaml:"token"`
+	Name     string   `yaml:"name"`
+	Token    string   `yaml:"token"`
+	QuotaUSD *float64 `yaml:"quota_usd,omitempty"`
+}
+
+// HeaderPassthroughConfig controls forwarding of upstream response headers to clients.
+type HeaderPassthroughConfig struct {
+	Enabled         *bool    `yaml:"enabled,omitempty"`
+	AllowedPrefixes []string `yaml:"allowed_prefixes,omitempty"`
+	DeniedHeaders   []string `yaml:"denied_headers,omitempty"`
+	Mode            string   `yaml:"mode,omitempty"`
+}
+
+// IsEnabled reports whether header passthrough is active (defaults to true).
+func (h *HeaderPassthroughConfig) IsEnabled() bool {
+	if h == nil || h.Enabled == nil {
+		return true
+	}
+	return *h.Enabled
+}
+
+// ProxyConfig holds proxy forwarding settings.
+type ProxyConfig struct {
+	HeaderPassthrough HeaderPassthroughConfig `yaml:"header_passthrough"`
 }
 
 // McpAdminIdentity is the reserved cache identity of the shared
@@ -341,6 +363,9 @@ type Config struct {
 	// Quota is upstream plan-usage snapshots (see QuotaConfig). Independent
 	// of Usage: disabling local token recording does not disable quota.
 	Quota QuotaConfig `yaml:"quota"`
+
+	// Proxy holds proxy forwarding configurations like header passthrough.
+	Proxy ProxyConfig `yaml:"proxy"`
 
 	// providerSchema maps a provider name to its effort schema ("ollama" or
 	// empty for opencode). Precomputed from account base_url hosts at load time.
@@ -565,6 +590,22 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Quota.RequestTimeout == 0 {
 		cfg.Quota.RequestTimeout = 5 * time.Second
+	}
+	if cfg.Proxy.HeaderPassthrough.Enabled == nil {
+		enabled := true
+		cfg.Proxy.HeaderPassthrough.Enabled = &enabled
+	}
+	if len(cfg.Proxy.HeaderPassthrough.AllowedPrefixes) == 0 {
+		cfg.Proxy.HeaderPassthrough.AllowedPrefixes = []string{"x-ratelimit-", "x-quota-", "anthropic-ratelimit-"}
+	}
+	if len(cfg.Proxy.HeaderPassthrough.DeniedHeaders) == 0 {
+		cfg.Proxy.HeaderPassthrough.DeniedHeaders = []string{
+			"x-ratelimit-user*", "x-ratelimit-account*", "x-ratelimit-org*",
+			"x-ratelimit-organization*", "x-ratelimit-project*", "x-quota-account*", "x-quota-user*",
+		}
+	}
+	if cfg.Proxy.HeaderPassthrough.Mode == "" {
+		cfg.Proxy.HeaderPassthrough.Mode = "passthrough"
 	}
 	if _, err := ParseWireAPIMode(cfg.WireAPI); err != nil {
 		return nil, err

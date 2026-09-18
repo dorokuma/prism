@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 )
@@ -446,5 +447,51 @@ func TestSummaryOrderByHitRateDescending(t *testing.T) {
 			t.Errorf("row %d: got model %v, want %v (hit rate: %s, requests: %d)",
 				i, gotModel, wantModel, cacheHitRate(rows[i].CachedTokens, rows[i].cacheHitInput()), rows[i].Requests)
 		}
+	}
+}
+
+func TestUserSelf_BrokenStreamCapturedTokensIncluded(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	cost1 := 0.0002
+	cost2 := 0.0002
+
+	events := []Event{
+		// 1. Successful request
+		{
+			Ts: now, RequestID: "req-1", KeyID: "user-1", Model: "gpt-4o",
+			PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150,
+			Success: true, Cost: &cost1, CostStatus: CostStatusOK,
+		},
+		// 2. Broken stream with captured tokens (success = false, e.g. stream_read_error)
+		{
+			Ts: now.Add(time.Second), RequestID: "req-2", KeyID: "user-1", Model: "gpt-4o",
+			PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150,
+			Success: false, ErrorType: "stream_read_error", Cost: &cost2, CostStatus: CostStatusOK,
+		},
+		// 3. Failed request with 0 tokens (e.g. auth failed before upstream)
+		{
+			Ts: now.Add(2 * time.Second), RequestID: "req-3", KeyID: "user-1", Model: "gpt-4o",
+			PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0,
+			Success: false, ErrorType: "auth_failed", Cost: nil, CostStatus: CostStatusNoUsage,
+		},
+	}
+
+	if err := s.InsertBatch(ctx, events); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.UserSelf(ctx, "user-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.RequestCount != 2 {
+		t.Errorf("res.RequestCount = %d, want 2 (1 success + 1 broken stream with captured tokens)", res.RequestCount)
+	}
+	if math.Abs(res.CostUSD-0.0004) > 1e-9 {
+		t.Errorf("res.CostUSD = %v, want 0.0004", res.CostUSD)
 	}
 }

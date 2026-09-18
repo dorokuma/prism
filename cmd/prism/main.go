@@ -19,6 +19,7 @@ import (
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/mcp"
 	"github.com/dorokuma/prism/internal/middleware"
+	"github.com/dorokuma/prism/internal/newapi"
 	"github.com/dorokuma/prism/internal/oauth"
 	"github.com/dorokuma/prism/internal/oauth/google"
 	"github.com/dorokuma/prism/internal/oauth/xai"
@@ -108,6 +109,7 @@ func (a *usageRecorderAdapter) Price(audit *middleware.RequestAudit) (*float64, 
 		int64(audit.CompletionTokens),
 		int64(audit.CachedTokens),
 		int64(audit.CacheWriteTokens),
+		int64(audit.ReasoningTokens),
 		audit.UsageSource,
 		price,
 	)
@@ -216,7 +218,7 @@ func validateEnvTokenLengths() error {
 // /admin/usage/summary admin endpoint, the global api_keys auth gate and the
 // proxy dispatch. Extracted from main so tests can exercise the wiring
 // invariant that usage degradation never breaks /v1 forwarding.
-func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *ratelimit.RateLimiter, trustedProxies []*net.IPNet, summaryHandler http.Handler, quotaHandler http.Handler, refreshHandler http.Handler) http.Handler {
+func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *ratelimit.RateLimiter, trustedProxies []*net.IPNet, summaryHandler http.Handler, quotaHandler http.Handler, refreshHandler http.Handler, newAPIHandler http.Handler) http.Handler {
 	// Bucket key is resolved per request from the live holder so api_keys
 	// hot-reloads take effect. Authenticated keys (len(api_keys)>0 and a
 	// matching Bearer) share a per-key-name bucket; auth failure and
@@ -313,6 +315,17 @@ func newHTTPHandler(holder *config.ConfigHolder, proxyHandler http.Handler, rl *
 			// usage key_id still follows config.
 			r = r.WithContext(middleware.WithAuthenticated(r.Context(), authed))
 			r = r.WithContext(middleware.WithAPIKey(r.Context(), keyName))
+		}
+		if r.URL.Path == "/api/user/self" || r.URL.Path == "/api/log/self" {
+			if newAPIHandler == nil {
+				util.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
+					"success": false,
+					"message": "service unavailable",
+				})
+				return
+			}
+			newAPIHandler.ServeHTTP(w, r)
+			return
 		}
 		// Timeout decisions are delegated to proxyChatWithBody which applies
 		// per-request timeouts based on the actual stream setting (parsed
@@ -617,9 +630,15 @@ func main() {
 		}
 	}()
 
+	var flushFunc func(context.Context) error
+	if usageRec != nil {
+		flushFunc = usageRec.Flush
+	}
+	newAPIHandler := newapi.NewHandler(usageStore, holder, flushFunc)
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           newHTTPHandler(holder, proxyHandler, rl, trustedProxies, summaryHandler, quotaHandler, refreshHandler),
+		Handler:           newHTTPHandler(holder, proxyHandler, rl, trustedProxies, summaryHandler, quotaHandler, refreshHandler, newAPIHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,

@@ -24,11 +24,35 @@ import (
 	"github.com/dorokuma/prism/internal/util"
 )
 
-var upstreamHeaderAllowlist = map[string]bool{
+var legacyUpstreamHeaderAllowlist = map[string]bool{
 	"Content-Type":        true,
 	"Content-Disposition": true,
 	"Content-Language":    true,
 	"Retry-After":         true,
+}
+
+var defaultDeniedHeaderPatterns = []string{
+	"x-ratelimit-user*",
+	"x-ratelimit-account*",
+	"x-ratelimit-org*",
+	"x-ratelimit-organization*",
+	"x-ratelimit-project*",
+	"x-quota-account*",
+	"x-quota-user*",
+	"x-request-id",
+	"x-amzn-trace-id",
+	"x-cloud-trace-context",
+	"x-upstream-*",
+	"server",
+	"via",
+	"x-powered-by",
+	"x-envoy-*",
+}
+
+var defaultAllowedPrefixes = []string{
+	"x-ratelimit-",
+	"x-quota-",
+	"anthropic-ratelimit-",
 }
 
 // upstreamCooldown is the cooldown applied to an account after a temporary
@@ -416,18 +440,114 @@ func clearResponsesStreamHeaders(w http.ResponseWriter) {
 	w.Header().Del("Connection")
 }
 
-// copyUpstreamHeaders copies only allowed response headers from the upstream
-// to the client. Only headers in upstreamHeaderAllowlist are forwarded;
-// headers that expose upstream identity (Server, Via, X-RateLimit-*,
-// X-Request-ID) are excluded.
-func copyUpstreamHeaders(dst http.ResponseWriter, src http.Header) {
+func matchHeaderPattern(pattern, key string) bool {
+	pattern = strings.ToLower(pattern)
+	key = strings.ToLower(key)
+	if strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(key, strings.TrimSuffix(pattern, "*"))
+	}
+	return pattern == key
+}
+
+func parseISO8601ToUnixSec(v string) string {
+	v = strings.TrimSpace(v)
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.999999999Z07:00",
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, v); err == nil {
+			return strconv.FormatInt(t.Unix(), 10)
+		}
+	}
+	return v
+}
+
+func shouldForwardHeader(key string, hp *config.HeaderPassthroughConfig, upstreamPath string) (string, bool) {
+	ck := http.CanonicalHeaderKey(key)
+	if legacyUpstreamHeaderAllowlist[ck] {
+		return key, true
+	}
+	if hp != nil && !hp.IsEnabled() {
+		return "", false
+	}
+	lower := strings.ToLower(key)
+	// Check hardcoded/default infrastructure and tenant denylists
+	for _, p := range defaultDeniedHeaderPatterns {
+		if matchHeaderPattern(p, lower) {
+			return "", false
+		}
+	}
+	if hp != nil {
+		for _, p := range hp.DeniedHeaders {
+			if matchHeaderPattern(p, lower) {
+				return "", false
+			}
+		}
+	}
+	// Check allowed prefixes
+	prefixes := defaultAllowedPrefixes
+	if hp != nil && len(hp.AllowedPrefixes) > 0 {
+		prefixes = hp.AllowedPrefixes
+	}
+	matched := false
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(lower, strings.ToLower(prefix)) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return "", false
+	}
+	mode := "passthrough"
+	if hp != nil && hp.Mode != "" {
+		mode = strings.ToLower(hp.Mode)
+	}
+	// Normalization only applies to OpenAI wire paths (/v1/chat/completions, /v1/responses),
+	// never to /v1/messages.
+	if mode == "normalize" && upstreamPath != "/v1/messages" {
+		switch lower {
+		case "anthropic-ratelimit-requests-limit":
+			return "X-RateLimit-Limit-Requests", true
+		case "anthropic-ratelimit-requests-remaining":
+			return "X-RateLimit-Remaining-Requests", true
+		case "anthropic-ratelimit-requests-reset":
+			return "X-RateLimit-Reset-Requests", true
+		case "anthropic-ratelimit-tokens-limit":
+			return "X-RateLimit-Limit-Tokens", true
+		case "anthropic-ratelimit-tokens-remaining":
+			return "X-RateLimit-Remaining-Tokens", true
+		case "anthropic-ratelimit-tokens-reset":
+			return "X-RateLimit-Reset-Tokens", true
+		}
+	}
+	return key, true
+}
+
+// copyUpstreamHeaders copies allowed response headers from the upstream
+// to the client according to header passthrough config.
+func copyUpstreamHeaders(dst http.ResponseWriter, src http.Header, hp *config.HeaderPassthroughConfig, upstreamPath string) {
+	mode := "passthrough"
+	if hp != nil && hp.Mode != "" {
+		mode = strings.ToLower(hp.Mode)
+	}
 	for k, vs := range src {
-		ck := http.CanonicalHeaderKey(k)
-		if !upstreamHeaderAllowlist[ck] {
+		targetKey, ok := shouldForwardHeader(k, hp, upstreamPath)
+		if !ok {
 			continue
 		}
+		lower := strings.ToLower(k)
+		isResetHeader := mode == "normalize" && upstreamPath != "/v1/messages" &&
+			(lower == "anthropic-ratelimit-requests-reset" || lower == "anthropic-ratelimit-tokens-reset")
 		for _, v := range vs {
-			dst.Header().Add(k, v)
+			if isResetHeader {
+				v = parseISO8601ToUnixSec(v)
+			}
+			dst.Header().Add(targetKey, v)
 		}
 	}
 }
@@ -695,7 +815,7 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 		// Transparent proxy: forward all non-hop-by-hop upstream headers
 		// (see copyUpstreamHeaders godoc for design rationale), then remove
 		// headers that become invalid after body redaction.
-		copyUpstreamHeaders(w, resp.Header)
+		copyUpstreamHeaders(w, resp.Header, opts.HeaderPassthrough, opts.UpstreamPath)
 		w.Header().Del("Content-Length")
 		w.Header().Del("Content-Encoding")
 		if w.Header().Get("Content-Type") == "" {
@@ -970,7 +1090,7 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 		// Streaming: pass through SSE chunks without token capture.
 		// Streaming token interception is complex and risks breaking
 		// the SSE stream; tokens_in/tokens_out remain 0 (acceptable).
-		copyUpstreamHeaders(w, resp.Header)
+		copyUpstreamHeaders(w, resp.Header, opts.HeaderPassthrough, opts.UpstreamPath)
 		// The HTTP status is deliberately NOT committed here: it is delayed
 		// until the first event write (legacyStreamWriter holds the upstream
 		// status and commits it on the first write/flush). A failure or an
@@ -1127,7 +1247,7 @@ func handleUpstreamResponse(acc *pool.Account, w responseCommitWriter, r *http.R
 	if opts.DSMLGuard {
 		rawBody = dsml.RewriteCompletion(rawBody)
 	}
-	copyUpstreamHeaders(w, resp.Header)
+	copyUpstreamHeaders(w, resp.Header, opts.HeaderPassthrough, opts.UpstreamPath)
 	w.WriteHeader(resp.StatusCode)
 	n, _ := w.Write(rawBody)
 	slog.Debug("legacy_nonstream done", "request_id", requestID, "account", acc.Name(), "status", resp.StatusCode, "written", n, "body_ms", bodyReadElapsed, "elapsed", time.Since(start))

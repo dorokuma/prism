@@ -44,6 +44,44 @@ type Store interface {
 	// DeleteBefore removes events older than the given unix timestamp and
 	// returns the number of deleted rows.
 	DeleteBefore(ctx context.Context, tsUnix int64) (int64, error)
+	// UserSelf returns aggregated cost and request count for one key_id.
+	UserSelf(ctx context.Context, keyID string) (*UserSelfData, error)
+	// LogSelf returns paginated usage logs for one key_id.
+	LogSelf(ctx context.Context, q LogSelfQuery) (*LogSelfResult, error)
+}
+
+type UserSelfData struct {
+	CostUSD      float64
+	RequestCount int64
+}
+
+type LogSelfQuery struct {
+	KeyID          string
+	Model          string
+	StartTimestamp int64
+	EndTimestamp   int64
+	Page           int
+	Size           int
+}
+
+type LogSelfRow struct {
+	ID               int64
+	TsUnix           int64
+	Model            string
+	Stream           int
+	PromptTokens     int64
+	CompletionTokens int64
+	TotalTokens      int64
+	CachedTokens     int64
+	ReasoningTokens  int64
+	CacheWriteTokens int64
+	CostUSD          *float64
+	DurationMS       float64
+}
+
+type LogSelfResult struct {
+	Items []LogSelfRow
+	Total int64
 }
 
 // Migration is a single schema migration step.

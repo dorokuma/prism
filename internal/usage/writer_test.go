@@ -34,6 +34,8 @@ func (f *fakeStore) Overview(context.Context, SummaryQuery) (*Overview, error) {
 	return nil, nil
 }
 func (f *fakeStore) DeleteBefore(context.Context, int64) (int64, error) { return 0, nil }
+func (f *fakeStore) UserSelf(context.Context, string) (*UserSelfData, error) { return nil, nil }
+func (f *fakeStore) LogSelf(context.Context, LogSelfQuery) (*LogSelfResult, error) { return nil, nil }
 
 func (f *fakeStore) InsertBatch(_ context.Context, events []Event) error {
 	f.mu.Lock()
@@ -407,6 +409,8 @@ func (h *hangStore) Overview(context.Context, SummaryQuery) (*Overview, error) {
 	return nil, nil
 }
 func (h *hangStore) DeleteBefore(context.Context, int64) (int64, error) { return 0, nil }
+func (h *hangStore) UserSelf(context.Context, string) (*UserSelfData, error) { return nil, nil }
+func (h *hangStore) LogSelf(context.Context, LogSelfQuery) (*LogSelfResult, error) { return nil, nil }
 
 func (h *hangStore) InsertBatch(ctx context.Context, events []Event) error {
 	h.mu.Lock()
@@ -613,6 +617,8 @@ func (s *abortAwareStore) Overview(context.Context, SummaryQuery) (*Overview, er
 	return nil, nil
 }
 func (s *abortAwareStore) DeleteBefore(context.Context, int64) (int64, error) { return 0, nil }
+func (s *abortAwareStore) UserSelf(context.Context, string) (*UserSelfData, error) { return nil, nil }
+func (s *abortAwareStore) LogSelf(context.Context, LogSelfQuery) (*LogSelfResult, error) { return nil, nil }
 
 func (s *abortAwareStore) InsertBatch(ctx context.Context, events []Event) error {
 	if ctx.Err() != nil {
@@ -683,6 +689,8 @@ func (s *neverExitsStore) Overview(context.Context, SummaryQuery) (*Overview, er
 	return nil, nil
 }
 func (s *neverExitsStore) DeleteBefore(context.Context, int64) (int64, error) { return 0, nil }
+func (s *neverExitsStore) UserSelf(context.Context, string) (*UserSelfData, error) { return nil, nil }
+func (s *neverExitsStore) LogSelf(context.Context, LogSelfQuery) (*LogSelfResult, error) { return nil, nil }
 
 func (s *neverExitsStore) InsertBatch(context.Context, []Event) error {
 	s.once.Do(func() { close(s.entered) })

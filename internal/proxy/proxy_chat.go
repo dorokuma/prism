@@ -45,6 +45,9 @@ type ChatForwardOpts struct {
 	// Responses translation paths, streaming and non-streaming. Filled
 	// from cfg.DSMLGuard(provider).
 	DSMLGuard bool
+
+	// HeaderPassthrough controls upstream response header forwarding.
+	HeaderPassthrough *config.HeaderPassthroughConfig
 }
 
 // maxRequestBodyBytes caps the client request body read for the three POST
@@ -388,6 +391,9 @@ func proxyChatWithBody(p *pool.Pool, w http.ResponseWriter, r *http.Request, bod
 		bodyBytes = sanitize.TransformRequestBodyForProvider(bodyBytes, cfg, provider)
 	}
 	opts.DSMLGuard = cfg != nil && cfg.DSMLGuard(provider)
+	if cfg != nil {
+		opts.HeaderPassthrough = &cfg.Proxy.HeaderPassthrough
+	}
 	// Usage-enabled OpenAI-compatible streaming: ensure the upstream reports
 	// usage in the stream (stream_options.include_usage=true) so the audit
 	// and usage store capture tokens. The client's other stream_options

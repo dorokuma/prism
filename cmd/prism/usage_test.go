@@ -44,7 +44,7 @@ func seedUsageDB(t *testing.T, base time.Time) string {
 	}
 	price := &usage.Price{Input: 1000, Output: 1000}
 	ev := func(id, model string, ts time.Time, success bool, total int64) usage.Event {
-		cost, status := usage.ComputeCost(100, 50, 0, 0, "", price)
+		cost, status := usage.ComputeCost(100, 50, 0, 0, 0, "", price)
 		if model == "beta" {
 			cost, status = nil, usage.CostStatusMissingPrice
 		}

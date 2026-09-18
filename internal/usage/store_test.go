@@ -36,7 +36,7 @@ func openTestStore(t *testing.T) *SQLiteStore {
 // pricing function (ComputeCost), exactly like the synchronous request path
 // does — test events never reimplement the formula.
 func costOf(prompt, completion, cached, cacheWrite int64, source string, price *Price) (*float64, string) {
-	return ComputeCost(prompt, completion, cached, cacheWrite, source, price)
+	return ComputeCost(prompt, completion, cached, cacheWrite, 0, source, price)
 }
 
 func testEvent(ts time.Time, model string, price *Price) Event {
