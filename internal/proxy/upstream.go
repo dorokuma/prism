@@ -482,12 +482,19 @@ func doUpstreamRequest(acc *pool.Account, r *http.Request, bodyBytes []byte, opt
 	}
 	// Header order (account headers can never override the credential):
 	//   1. copy safe client headers (Authorization/hop-by-hop/sensitive dropped)
-	//   2. apply account-level headers (override same-named client headers)
-	//   3. apply the account credential header (Authorization: Bearer <key>,
+	//   2. map xAI session affinity to X-Grok-Conv-Id (xai provider only)
+	//   3. apply account-level headers (override same-named client headers)
+	//   4. apply the account credential header (Authorization: Bearer <key>,
 	//      or the account's custom auth_header when configured)
-	//   4. default Content-Type to application/json when unset (accounts may
+	//   5. default Content-Type to application/json when unset (accounts may
 	//      explicitly set their own Content-Type)
 	copyClientHeaders(req.Header, r.Header)
+	// Map client session affinity headers (session_id, session-id,
+	// x-session-affinity) to X-Grok-Conv-Id for xAI upstreams.
+	// Placed after copyClientHeaders so explicit client x-grok-conv-id is preserved
+	// in req.Header, and placed before ApplyAccountHeaders so account-level custom
+	// headers can still take precedence if explicitly configured.
+	applyXaiConvID(req.Header, r.Header, acc)
 	pool.ApplyAccountHeaders(req.Header, acc)
 	// Resolve the credential exactly once and send the SAME value that is
 	// recorded on the result (doUpstreamResult.key) for the 401 reactive
