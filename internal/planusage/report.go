@@ -260,6 +260,13 @@ func cardTitleLine(service, account, window string, pal cardPalette) string {
 	// fill dash.
 	bodyMax := cardWidth - prefixW - suffixW - 2 // 54
 	svc, acc, win := service, account, window
+	// De-duplicate the account segment: when the account name is exactly the
+	// provider display name ("Gemini Gemini"), it adds no information, so drop
+	// it and show the service brand only once. Account names that differ from
+	// the service keep the usual brand + dim account pair.
+	if acc != "" && acc == svc {
+		acc = ""
+	}
 	// Shrink the variable segments until the body fits bodyMax. Every step
 	// re-measures with DisplayWidth, so a segment whose truncation stopped
 	// one column short is picked up by the next pass instead of pushing the

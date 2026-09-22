@@ -988,6 +988,36 @@ func TestRenderCardsZeroUsedWindow(t *testing.T) {
 	}
 }
 
+// TestRenderCardsTitleDeduplicatesServiceAndAccount: when the account name
+// is exactly the provider display name, the title carries the name ONCE
+// ("Gemini · 5小时限额") instead of the redundant "Gemini Gemini". An account
+// that differs from the service keeps the usual brand + dim account pair.
+func TestRenderCardsTitleDeduplicatesServiceAndAccount(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	got := RenderCards([]Snapshot{{
+		Provider: "gemini",
+		Accounts: []string{"Gemini"},
+		Windows:  []Window{{Name: "5h", Status: "ok", Percent: 12}},
+	}}, now)
+	lines := cardLines(t, got)
+	assertCardTitle(t, lines[0], "Gemini", "", "5小时限额")
+	if n := strings.Count(lines[0], "Gemini"); n != 1 {
+		t.Fatalf("service must appear exactly once, got %d:\n%q", n, lines[0])
+	}
+
+	// Same provider, different account: both segments stay.
+	got = RenderCards([]Snapshot{{
+		Provider: "gemini",
+		Accounts: []string{"gemini-acct-1"},
+		Windows:  []Window{{Name: "5h", Status: "ok", Percent: 12}},
+	}}, now)
+	lines = cardLines(t, got)
+	assertCardTitle(t, lines[0], "Gemini", "gemini-acct-1", "5小时限额")
+	if !strings.Contains(lines[0], "Gemini gemini-acct-1") {
+		t.Fatalf("distinct account must keep both title segments:\n%q", lines[0])
+	}
+}
+
 func TestRenderCardsErrorAndEmpty(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 
