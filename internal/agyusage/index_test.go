@@ -179,7 +179,8 @@ func TestRefreshMtimeSkipAndDeletedSourceKept(t *testing.T) {
 
 func TestQueryWeekWindowAndHitRate(t *testing.T) {
 	dir := t.TempDir()
-	weekStart := time.Date(2026, 9, 6, 8, 0, 0, 0, time.UTC).Unix()
+	now := time.Now().Unix()
+	weekStart := now - (now % (7 * 24 * 3600))
 	inWeek := weekStart + 3600
 	outWeek := weekStart - 3600
 	writeConv(t, dir, "win",
