@@ -23,13 +23,14 @@ func doRequest(h http.Handler, method, target, remoteAddr, auth string) *httptes
 }
 
 // tableDataRows returns the rendered table data rows from a format=table
-// body. It finds the header line containing the group-by title (e.g. "模型")
-// and returns the subsequent non-empty data lines.
+// body. It finds the header line — the one carrying the 命中率 column title,
+// which the title border never does — and returns the subsequent non-empty
+// data lines.
 func tableDataRows(body string) []string {
 	lines := strings.Split(body, "\n")
 	headerIdx := -1
 	for i, l := range lines {
-		if strings.Contains(l, "模型") {
+		if strings.Contains(l, "命中率") {
 			headerIdx = i
 			break
 		}
@@ -39,15 +40,37 @@ func tableDataRows(body string) []string {
 	}
 	var rows []string
 	for _, l := range lines[headerIdx+1:] {
-		if strings.TrimSpace(l) == "" {
+		t := strings.TrimSpace(l)
+		if t == "" {
 			continue
 		}
-		if strings.HasPrefix(strings.TrimSpace(l), "---") {
+		if strings.HasPrefix(t, "╰") {
+			continue // bottom border
+		}
+		// The card's body lines all start with │; the dim sub-separator under
+		// the header is a line of ─ behind that border and carries no data.
+		inner := strings.TrimSpace(strings.TrimPrefix(t, "│"))
+		if inner == "" || strings.HasPrefix(inner, "─") {
 			continue
 		}
 		rows = append(rows, l)
 	}
 	return rows
+}
+
+// hasModelRow reports whether one of the table's DATA rows carries the
+// given model group value. It looks at the extracted data rows and their
+// first (group) column, so it never depends on the card's internal
+// indentation: the body gutter is symmetric now and rows carry no leading
+// indent of their own.
+func hasModelRow(rows []string, model string) bool {
+	for _, r := range rows {
+		inner := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(r), "│"))
+		if fields := strings.Fields(inner); len(fields) > 0 && fields[0] == model {
+			return true
+		}
+	}
+	return false
 }
 
 func TestHandlerAuth(t *testing.T) {
@@ -392,20 +415,24 @@ func TestHandlerTableFormat(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
 	// widths: 模型 4 | 请求 4 | 缓存 4 | 命中率 6
-	want := "  总请求   2\n" +
-		"  总词元   300\n" +
-		"  总开销   $0.150\n" +
-		"\n" +
-		"  模型" + strings.Repeat(" ", 1) + "请求 缓存 命中率\n" +
-		"  a" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%\n" +
-		"  b" + strings.Repeat(" ", 7) + "1" + strings.Repeat(" ", 4) + "0" + strings.Repeat(" ", 3) + "0.0%\n"
+	// The same 60-column capsule card the CLI renders (see
+	// TestRenderUsageReportExact): title, summary row from Overview, ├─ rule,
+	// brand-bold header, dim sub-separator, one card row per group.
+	want := "╭─ 用量 · 按模型分组 ──────────────────────────────────────╮\n" +
+		"│ 请求 2 · 词元 300 · 开销 $0.150                          │\n" +
+		"├──────────────────────────────────────────────────────────┤\n" +
+		"│ 模型                       请求   缓存            命中率 │\n" +
+		"│ ──────────────────────────────────────────────────────── │\n" +
+		"│ a                             1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
+		"│ b                             1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
+		"╰──────────────────────────────────────────────────────────╯\n"
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("table body mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}
 
 	// format=table must be equivalent to the CLI renderer: the summary
 	// counts come from Overview (not from the LIMIT-truncated rows).
-	if !strings.Contains(rec.Body.String(), "总请求   2") || !strings.Contains(rec.Body.String(), "总词元   300") {
+	if !strings.Contains(rec.Body.String(), "请求 2 ·") || !strings.Contains(rec.Body.String(), "词元 300") {
 		t.Errorf("table summary must come from Overview:\n%s", rec.Body.String())
 	}
 }
@@ -475,7 +502,7 @@ func TestHandlerTableFormatGroupByModelFiltersBlankModel(t *testing.T) {
 		t.Fatalf("table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "  总请求   2\n") {
+	if !strings.Contains(body, "请求 2 ·") {
 		t.Errorf("overview must include blank-model events:\n%s", body)
 	}
 	// Table body must filter blank model rows and keep real model "a".
@@ -551,7 +578,7 @@ func TestHandlerOverviewIncludesAgyExtraBlankModel(t *testing.T) {
 	}
 	body := rec.Body.String()
 	// Overview must include both requests (1 usage_event + 2 blank-model agy).
-	if !strings.Contains(body, "  总请求   3\n") {
+	if !strings.Contains(body, "请求 3 ·") {
 		t.Errorf("overview must include blank-model agy events:\n%s", body)
 	}
 	// Table body must filter blank model rows and keep real model "a".
@@ -590,7 +617,7 @@ func TestHandlerTableFormatMixedSources(t *testing.T) {
 	if strings.Contains(body, "命中(OpenAI)") || strings.Contains(body, "命中(Anthropic)") || strings.Contains(body, "缓存命中") {
 		t.Errorf("cache segments must not appear in overview:\n%s", body)
 	}
-	if !strings.Contains(body, "  总请求   2\n") {
+	if !strings.Contains(body, "请求 2 ·") {
 		t.Errorf("expected 3-line overview:\n%s", body)
 	}
 	// Ungrouped table row: 1400 hits over openai prompt 1000 + anthropic
@@ -650,10 +677,10 @@ func TestHandlerTableNoData(t *testing.T) {
 		t.Errorf("Content-Type = %q", ct)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "  总请求   0") {
+	if !strings.Contains(body, "请求 0 ·") {
 		t.Errorf("empty-range summary missing:\n%s", body)
 	}
-	if !strings.Contains(body, "(no data)") {
+	if !strings.Contains(body, "（暂无数据）") {
 		t.Errorf("no-data hint missing:\n%s", body)
 	}
 }
@@ -822,15 +849,16 @@ func TestHandlerDefaultFromWeek(t *testing.T) {
 	if strings.Contains(body, "全部时间") {
 		t.Errorf("default table must not be 全部时间:\n%s", body)
 	}
-	if !strings.Contains(body, "  cur") {
+	rows := tableDataRows(body)
+	if !hasModelRow(rows, "cur") {
 		t.Errorf("current-week row missing:\n%s", body)
 	}
-	if strings.Contains(body, "  old") {
+	if hasModelRow(rows, "old") {
 		t.Errorf("pre-week row must be excluded:\n%s", body)
 	}
 	// defaulted=true: the table header aggregates ALL history (old + cur =
 	// 2), never the week window (cur only = 1) the detail rows show.
-	if !strings.Contains(body, "  总请求   2\n") {
+	if !strings.Contains(body, "请求 2 ·") {
 		t.Errorf("defaulted table header must be the all-history total (2), not the week-window count (1):\n%s", body)
 	}
 
@@ -841,7 +869,7 @@ func TestHandlerDefaultFromWeek(t *testing.T) {
 	all := rec.Body.String()
 	// The period label is no longer rendered; from=0 is verified by the
 	// pre-week row being included below.
-	if !strings.Contains(all, "  old") {
+	if !hasModelRow(tableDataRows(all), "old") {
 		t.Errorf("from=0 must include old row:\n%s", all)
 	}
 }
@@ -894,19 +922,20 @@ func TestHandlerToOnlyRange(t *testing.T) {
 		t.Fatalf("to-only table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "  总请求   1\n") {
+	if !strings.Contains(body, "请求 1 ·") {
 		t.Errorf("to-only header must be the [week start, to] window total (1), not all history (2):\n%s", body)
 	}
-	if !strings.Contains(body, "  cur") {
+	rows := tableDataRows(body)
+	if !hasModelRow(rows, "cur") {
 		t.Errorf("to-only detail must include the in-window row:\n%s", body)
 	}
-	if strings.Contains(body, "  old") {
+	if hasModelRow(rows, "old") {
 		t.Errorf("to-only detail must exclude the pre-week row:\n%s", body)
 	}
 	// Upper bound pinned: the event AFTER `to` must appear in neither the
 	// rows nor the header count (header stays 1 even though the store now
 	// holds three events).
-	if strings.Contains(body, "  future") {
+	if hasModelRow(rows, "future") {
 		t.Errorf("to-only detail must exclude the post-to row:\n%s", body)
 	}
 	if strings.Contains(body, "1100") || strings.Contains(body, "1000") {
@@ -1018,13 +1047,13 @@ func TestHandlerTableOverviewAllHistoryDefaulted(t *testing.T) {
 		t.Fatalf("defaulted table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "  总请求   4\n") {
+	if !strings.Contains(body, "请求 4 ·") {
 		t.Errorf("defaulted header must sum both windows (4), not the week window (2):\n%s", body)
 	}
-	if !strings.Contains(body, "  cur-a") || !strings.Contains(body, "  cur-b") {
+	if !hasModelRow(tableDataRows(body), "cur-a") || !hasModelRow(tableDataRows(body), "cur-b") {
 		t.Errorf("defaulted detail must list the in-window models:\n%s", body)
 	}
-	if strings.Contains(body, "  old-a") || strings.Contains(body, "  old-b") {
+	if hasModelRow(tableDataRows(body), "old-a") || hasModelRow(tableDataRows(body), "old-b") {
 		t.Errorf("defaulted detail must exclude the earlier-week models:\n%s", body)
 	}
 
@@ -1035,10 +1064,10 @@ func TestHandlerTableOverviewAllHistoryDefaulted(t *testing.T) {
 		t.Fatalf("from=0 table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	explicit := rec.Body.String()
-	if !strings.Contains(explicit, "  总请求   4\n") {
+	if !strings.Contains(explicit, "请求 4 ·") {
 		t.Errorf("from=0 header must also total 4:\n%s", explicit)
 	}
-	if !strings.Contains(explicit, "  old-a") || !strings.Contains(explicit, "  old-b") {
+	if !hasModelRow(tableDataRows(explicit), "old-a") || !hasModelRow(tableDataRows(explicit), "old-b") {
 		t.Errorf("from=0 detail must include the earlier-week models:\n%s", explicit)
 	}
 }
@@ -1075,10 +1104,10 @@ func TestHandlerMergesAgyGeminiRow(t *testing.T) {
 	if !strings.Contains(body, "80.0%") {
 		t.Errorf("agy hit rate must be 400/500 = 80.0%% (not 0%%):\n%s", body)
 	}
-	if !strings.Contains(body, "  总请求   2\n") {
+	if !strings.Contains(body, "请求 2 ·") {
 		t.Errorf("header must include agy requests:\n%s", body)
 	}
-	if !strings.Contains(body, "  总词元   570\n") {
+	if !strings.Contains(body, "词元 570") {
 		t.Errorf("header must include agy tokens:\n%s", body)
 	}
 	wantGemini := h.GeminiFrom()

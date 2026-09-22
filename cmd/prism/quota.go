@@ -120,6 +120,7 @@ func runQuotaWith(args []string, out io.Writer) error {
 	fs.SetOutput(os.Stderr)
 	jsonOut := fs.Bool("json", false, "输出 JSON")
 	provider := fs.String("provider", "", "只显示这个 provider")
+	noColor := fs.Bool("no-color", false, "强制关闭卡片配色（默认仅在 TTY 上配色）")
 	explicit := fs.String("config", "", "config.yaml 路径")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), `用法: prism quota [flags]
@@ -195,7 +196,10 @@ flags:
 			return err
 		}
 	} else {
-		if _, err := io.WriteString(out, planusage.RenderTable(snaps)); err != nil {
+		// The capsule cards carry ANSI colors; a pipe, a redirect or
+		// --no-color must get the same layout without them.
+		color := wantColor(out, *noColor)
+		if _, err := io.WriteString(out, planusage.RenderCards(snaps, time.Now(), planusage.CardOptions{NoColor: !color})); err != nil {
 			return err
 		}
 	}

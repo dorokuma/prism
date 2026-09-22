@@ -1,8 +1,6 @@
 package render
 
-import "strings"
-
-// Summary carries the aggregate numbers rendered by RenderSummary.
+// Summary carries the aggregate numbers rendered by SummaryLine.
 type Summary struct {
 	// Requests is the total request count.
 	Requests int64
@@ -13,23 +11,15 @@ type Summary struct {
 	Cost *float64
 }
 
-// RenderSummary renders s as three indented lines:
+// SummaryLine renders s as the single summary row of the usage report:
 //
-//	总请求   {requests}
-//	总词元   {tokens}
-//	总开销   {cost}
+//	请求 {requests} · 词元 {tokens} · 开销 {cost}
 //
-// The result ends with a newline.
-func RenderSummary(s Summary) string {
-	var b strings.Builder
-	b.WriteString("  总请求   ")
-	b.WriteString(FormatInt(s.Requests))
-	b.WriteByte('\n')
-	b.WriteString("  总词元   ")
-	b.WriteString(FormatTokens(s.Tokens))
-	b.WriteByte('\n')
-	b.WriteString("  总开销   ")
-	b.WriteString(FormatCost(s.Cost))
-	b.WriteByte('\n')
-	return b.String()
+// Requests use thousands separators, tokens the compact k/M notation of
+// FormatTokens and cost FormatCost (nil renders as "-"). No newline and no
+// padding: the caller places the row inside its own fixed-width layout.
+func SummaryLine(s Summary) string {
+	return "请求 " + FormatInt(s.Requests) +
+		" · 词元 " + FormatTokens(s.Tokens) +
+		" · 开销 " + FormatCost(s.Cost)
 }

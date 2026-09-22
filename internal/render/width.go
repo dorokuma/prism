@@ -163,6 +163,70 @@ func ansiSeqLen(s string) int {
 	}
 }
 
+// PadRight left-aligns s in w display columns. ANSI escape sequences
+// cost no width (see DisplayWidth), so a colored string is padded by its
+// visible width — never by its escape codes. A string wider than w is
+// shortened with an ellipsis (see Truncate), so padding can never overflow
+// a column. A w <= 0 returns the empty string.
+//
+// The truncation path tops the truncated string back up to exactly w
+// columns: Truncate reserves one column for the ellipsis, and a double-
+// width rune that cannot fit in what is left of that budget makes it stop
+// one column short (w-1 columns of text + "…"). Without the pad an
+// over-wide CJK/emoji string would leave the slot one column narrow and
+// the card border would drift (the "59-column pit").
+func PadRight(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	dw := DisplayWidth(s)
+	if dw > w {
+		return topUpRight(Truncate(s, w), w)
+	}
+	return s + strings.Repeat(" ", w-dw)
+}
+
+// PadLeft right-aligns s in w display columns, with the same ANSI-aware
+// measuring, ellipsis truncation and w <= 0 handling as PadRight.
+//
+// The truncated string is topped up on the LEFT, so the ellipsis stays
+// flush with the right-aligned edge the column promises (an over-wide
+// right-aligned value would otherwise float one column off it).
+func PadLeft(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	dw := DisplayWidth(s)
+	if dw > w {
+		return topUpLeft(Truncate(s, w), w)
+	}
+	return strings.Repeat(" ", w-dw) + s
+}
+
+// topUpRight / topUpLeft pad an ALREADY truncated string back up to
+// exactly w display columns, on the slot's alignment side. Truncate caps a
+// string at w columns but only "most of the time" at exactly w: the
+// ellipsis costs one column, so a budget that ends on an odd column cannot
+// take the following double-width rune and the result lands at w-1 (…
+// included). The pad buys that column back — the caller's alignment side
+// decides where — without touching the truncation semantics: an over-wide
+// string is still "kept prefix + …", never re-expanded and never longer
+// than w. A result already at w columns (ASCII truncation always lands
+// there) is returned unchanged.
+func topUpRight(s string, w int) string {
+	if pad := w - DisplayWidth(s); pad > 0 {
+		return s + strings.Repeat(" ", pad)
+	}
+	return s
+}
+
+func topUpLeft(s string, w int) string {
+	if pad := w - DisplayWidth(s); pad > 0 {
+		return strings.Repeat(" ", pad) + s
+	}
+	return s
+}
+
 // Truncate shortens s so that its display width is at most maxWidth,
 // appending the ellipsis "…". Truncation is measured in display columns
 // (see DisplayWidth) and never splits a multi-byte rune, so Chinese text or

@@ -1,6 +1,10 @@
 package render
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
 
 func TestDisplayWidth(t *testing.T) {
 	cases := []struct {
@@ -72,6 +76,126 @@ func TestDisplayWidthMixedASCIIChineseEmoji(t *testing.T) {
 	s := "a中b🔥c" // a=1 中=2 b=1 🔥=2 c=1
 	if got := DisplayWidth(s); got != 7 {
 		t.Fatalf("DisplayWidth(%q) = %d, want 7", s, got)
+	}
+}
+
+func TestDisplayWidthCapsuleGlyphs(t *testing.T) {
+	// The quota capsule bar is measured in cells: ▰ (used) and ▱
+	// (remaining) must each cost exactly one column, or every card row
+	// drifts off cardWidth.
+	if got := DisplayWidth("▰"); got != 1 {
+		t.Errorf("DisplayWidth(▰) = %d, want 1", got)
+	}
+	if got := DisplayWidth("▱"); got != 1 {
+		t.Errorf("DisplayWidth(▱) = %d, want 1", got)
+	}
+	if got := DisplayWidth("▰▰▰▱▱▱"); got != 6 {
+		t.Errorf("DisplayWidth(capsule) = %d, want 6", got)
+	}
+}
+
+func TestPadLeftPadRight(t *testing.T) {
+	cases := []struct {
+		name  string
+		s     string
+		w     int
+		right string
+		left  string
+	}{
+		{"ascii pad", "ab", 5, "ab   ", "   ab"},
+		{"exact", "abc", 3, "abc", "abc"},
+		{"cjk pad", "中", 3, "中 ", " 中"},
+		{"truncate right", "abcdef", 4, "abc…", "abc…"},
+		// Wide-character truncation: Truncate stops one column short when
+		// the double-width rune that follows does not fit the column the
+		// ellipsis needs, so the pad buys the slot its last column back.
+		{"cjk truncate odd budget", "中中中中中", 4, "中… ", " 中…"},
+		{"emoji truncate odd budget", "🔥🔥🔥", 4, "🔥… ", " 🔥…"},
+		{"zero width", "abc", 0, "", ""},
+		{"negative width", "abc", -2, "", ""},
+		{"ansi not counted", Brand("x"), 3, Brand("x") + "  ", "  " + Brand("x")},
+		{"empty string", "", 3, "   ", "   "},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := PadRight(c.s, c.w); got != c.right {
+				t.Errorf("PadRight(%q, %d) = %q, want %q", c.s, c.w, got, c.right)
+			}
+			if got := PadLeft(c.s, c.w); got != c.left {
+				t.Errorf("PadLeft(%q, %d) = %q, want %q", c.s, c.w, got, c.left)
+			}
+			if dw := DisplayWidth(PadRight(c.s, c.w)); dw != max(c.w, 0) {
+				t.Errorf("PadRight width = %d, want %d", dw, max(c.w, 0))
+			}
+			if dw := DisplayWidth(PadLeft(c.s, c.w)); dw != max(c.w, 0) {
+				t.Errorf("PadLeft width = %d, want %d", dw, max(c.w, 0))
+			}
+		})
+	}
+}
+
+func TestPadWideTruncationFillsToWidth(t *testing.T) {
+	// The "59-column pit": Truncate reserves one column for the ellipsis,
+	// so a truncation budget that ends on an odd column cannot take the
+	// next double-width rune and the result lands at w-1 columns. Every
+	// padded slot must still measure exactly w columns, whatever the
+	// content — that is the invariant the 60-column cards rely on.
+	// Truncation semantics are NOT changed by the pad: an over-wide string
+	// is still "kept prefix + …" and never longer than w.
+	inputs := map[string]string{
+		"cjk":        strings.Repeat("中", 40),
+		"cjk-odd":    strings.Repeat("度", 33) + "a",
+		"cjk-mixed":  "深" + strings.Repeat("度", 30) + "abc",
+		"emoji":      strings.Repeat("\U0001f525", 40),
+		"fullwidth":  strings.Repeat("Ａ", 40),
+		"cjk-suffix": strings.Repeat("模型", 20) + "-0123456789",
+	}
+	for name, in := range inputs {
+		if DisplayWidth(in) <= 60 {
+			t.Fatalf("%s: fixture must be wider than 60 columns", name)
+		}
+		for w := 1; w <= 60; w++ {
+			right, left := PadRight(in, w), PadLeft(in, w)
+			if dw := DisplayWidth(right); dw != w {
+				t.Fatalf("%s: PadRight(in, %d) is %d columns: %q", name, w, dw, right)
+			}
+			if dw := DisplayWidth(left); dw != w {
+				t.Fatalf("%s: PadLeft(in, %d) is %d columns: %q", name, w, dw, left)
+			}
+			for _, got := range []string{right, left} {
+				if !utf8.ValidString(got) {
+					t.Fatalf("%s: w=%d split a rune: %q", name, w, got)
+				}
+				if !strings.Contains(got, "…") {
+					t.Fatalf("%s: w=%d lost the ellipsis: %q", name, w, got)
+				}
+				if trimmed := strings.TrimRight(got, " "); DisplayWidth(trimmed) > w {
+					t.Fatalf("%s: w=%d truncated content overflows: %q", name, w, got)
+				}
+			}
+		}
+	}
+}
+
+// TestPadRightCJKTruncatePadsToWidth is the headline case: a 60-column budget
+// filled with CJK. Truncate keeps 29 中 and stops (the 30th needs the
+// column the ellipsis occupies), so the raw truncation is 59 columns and
+// the pad — NOT a change of the truncation rule — buys the 60th column
+// back. Without it every card row that outgrows its slot lands one column
+// narrow and the right border drifts.
+func TestPadRightCJKTruncatePadsToWidth(t *testing.T) {
+	in := strings.Repeat("中", 40) // 80 columns
+	want := strings.Repeat("中", 29) + "… "
+	if got := PadRight(in, 60); got != want {
+		t.Fatalf("PadRight(cjk, 60) = %q, want %q", got, want)
+	}
+	if got := PadLeft(in, 60); got != " "+strings.Repeat("中", 29)+"…" {
+		t.Fatalf("PadLeft(cjk, 60) = %q", got)
+	}
+	// A string that already fits is untouched: no ellipsis, no pad column.
+	exact := strings.Repeat("中", 30) // exactly 60 columns
+	if got := PadRight(exact, 60); got != exact {
+		t.Fatalf("an exact-fit string must not be touched: %q", got)
 	}
 }
 
