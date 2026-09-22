@@ -276,6 +276,16 @@ func EmitAudit(a *RequestAudit) {
 	if a.KeyID == "" {
 		a.KeyID = usageDefaultKeyIDValue()
 	}
+	// Model must never be persisted as an empty/blank string: a blank model
+	// would appear as an empty group key in the model summary table and
+	// split accounting for a real "<unknown>" placeholder. Requests whose
+	// body could not be parsed (readRequestBody failure) or whose model is
+	// missing/empty carry "" here; this single choke point replaces any
+	// scattered per-caller workarounds with a stable placeholder that can
+	// never be confused with a real provider model name.
+	if strings.TrimSpace(a.Model) == "" {
+		a.Model = "<unknown>"
+	}
 	// Compute the cost BEFORE the log line so the amount is visible in the
 	// audit log; the same value is forwarded with the usage event below, so
 	// the log and the database cannot diverge.

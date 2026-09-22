@@ -26,6 +26,10 @@ func proxyResponses(p *pool.Pool, w http.ResponseWriter, r *http.Request, cfg *c
 	var raw map[string]json.RawMessage
 	_ = json.Unmarshal(bodyBytes, &raw)
 	virtualModel, _ := util.RawStringField(raw, "model")
+	auditModel := virtualModel
+	if auditModel == "" {
+		auditModel = blankModelPlaceholder
+	}
 	requestID := util.RequestIDFromCtx(r.Context())
 
 	chatBody, stream, reqTools, err := convert.ResponsesToChatCompletions(bodyBytes, tenantID)
@@ -49,7 +53,7 @@ func proxyResponses(p *pool.Pool, w http.ResponseWriter, r *http.Request, cfg *c
 			reason = "unsupported_input"
 		}
 		slog.Warn("request_rejected", "req", requestID, "reason", reason, "model", virtualModel)
-		rejectAudit(r, start, http.StatusBadRequest, reason, virtualModel, errStr)
+		rejectAudit(r, start, http.StatusBadRequest, reason, auditModel, errStr)
 		errBody, marshalErr := json.Marshal(map[string]any{
 			"error": map[string]any{"message": err.Error(), "code": "invalid_request"},
 		})

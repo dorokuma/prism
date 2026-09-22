@@ -382,6 +382,115 @@ func TestHandlerTableFormat(t *testing.T) {
 	}
 }
 
+// TestFilterBlankModelRows covers the shared blank-model filter used by
+// both the CLI and the HTTP handler: empty string, pure whitespace (incl.
+// unicode whitespace), non-empty, and the placeholder "<unknown>" must
+// never be filtered. Groups==nil and empty slice are also exercised.
+func TestFilterBlankModelRows(t *testing.T) {
+	cases := []struct {
+		name   string
+		model  string
+		remove bool
+	}{
+		{"empty", "", true},
+		{"spaces", "   ", true},
+		{"tabs", "\t\t", true},
+		{"mixed", " \t\n", true},
+		{"unicode space", "\u00A0", true},
+		{"non-empty", "real-model", false},
+		{"placeholder", "<unknown>", false},
+	}
+	for _, c := range cases {
+		in := []SummaryRow{{Groups: map[string]any{"model": c.model}, Requests: 1}}
+		got := FilterBlankModelRows(in)
+		if c.remove {
+			if len(got) != 0 {
+				t.Errorf("%q: filtered %d rows, want 0", c.name, len(got))
+			}
+			if len(in) != 1 || in[0].Groups["model"] != c.model {
+				t.Errorf("%q: original slice mutated", c.name)
+			}
+		} else {
+			if len(got) != 1 || got[0].Groups["model"].(string) != c.model {
+				t.Errorf("%q: got %+v", c.name, got)
+			}
+		}
+	}
+	in := []SummaryRow{{Groups: nil, Requests: 1}}
+	if got := FilterBlankModelRows(in); len(got) != 1 {
+		t.Errorf("Groups==nil: filtered %d rows, want 1", len(got))
+	}
+	if got := FilterBlankModelRows(nil); got == nil {
+		t.Errorf("nil input: got nil, want []")
+	}
+}
+
+// TestHandlerTableFormatGroupByModelFiltersBlankModel pins the HTTP
+// format=table group_by=model filter: a row whose model group is empty
+// or whitespace must NOT appear in the table, while the overview header
+// still counts it.
+func TestHandlerTableFormatGroupByModelFiltersBlankModel(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "")
+	s := openTestStore(t)
+	ctx := context.Background()
+	price := &Price{Input: 1000, Output: 1000}
+	c, _ := costOf(100, 50, 0, 0, "", price)
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: time.Now(), RequestID: "r1", Model: "a", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: c, CostStatus: CostStatusOK},
+		{Ts: time.Now(), RequestID: "r2", Model: "", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: c, CostStatus: CostStatusOK},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewSummaryHandler(s)
+	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?group_by=model&format=table", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("table: got %d body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "  总请求   2\n") {
+		t.Errorf("overview must include blank-model events:\n%s", body)
+	}
+	for _, line := range strings.Split(body, "\n") {
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "" && i > 0 {
+				t.Errorf("blank model row leaked into table:\n%s", body)
+				return
+			}
+		}
+	}
+}
+
+// TestHandlerJSONGroupByModelFiltersBlankModel pins the JSON path: group_by=model
+// must also filter blank-model rows.
+func TestHandlerJSONGroupByModelFiltersBlankModel(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "")
+	s := openTestStore(t)
+	ctx := context.Background()
+	price := &Price{Input: 1000, Output: 1000}
+	c, _ := costOf(100, 50, 0, 0, "", price)
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: time.Now(), RequestID: "r1", Model: "a", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: c, CostStatus: CostStatusOK},
+		{Ts: time.Now(), RequestID: "r2", Model: "", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: c, CostStatus: CostStatusOK},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewSummaryHandler(s)
+	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?group_by=model", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("json: got %d body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Rows []SummaryRow `json:"rows"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Rows) != 1 || body.Rows[0].Groups["model"] != "a" {
+		t.Fatalf("json rows = %+v, want only model a", body.Rows)
+	}
+}
+
 // TestHandlerTableFormatMixedSources drives the two-segment cache summary
 // through the full HTTP format=table path (InsertBatch persists usage_source
 // → Overview splits → RenderUsageReport). It is the same renderer the CLI

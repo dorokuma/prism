@@ -113,7 +113,11 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	rows = MergeSummaryRows(rows, h.agyRows(r.Context(), q, defaulted), q.GroupBy)
+	extra := h.agyRows(r.Context(), q, defaulted)
+	rows = MergeSummaryRows(rows, extra, q.GroupBy)
+	if len(q.GroupBy) == 1 && q.GroupBy[0] == "model" {
+		rows = FilterBlankModelRows(rows)
+	}
 	if rows == nil {
 		rows = []SummaryRow{}
 	}
@@ -155,6 +159,9 @@ func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q Su
 	}
 	extra := h.agyRows(r.Context(), q, defaulted)
 	rows = MergeSummaryRows(rows, extra, q.GroupBy)
+	if len(q.GroupBy) == 1 && q.GroupBy[0] == "model" {
+		rows = FilterBlankModelRows(rows)
+	}
 	AddOverview(ov, extra)
 	body := RenderUsageReport(ov, rows, q.GroupBy, ReportOptions{})
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

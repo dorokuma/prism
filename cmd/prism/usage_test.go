@@ -1061,3 +1061,61 @@ func TestRunUsageWeekDefaultOverviewAllHistory(t *testing.T) {
 		t.Errorf("explicit --since Rows = %+v, want only cur-model", doc.Rows)
 	}
 }
+
+// TestRunUsageGroupByModelFiltersBlankModel pins the CLI --by model view:
+// blank-model rows are removed from the detail table, but the overview
+// header still includes them (the contract "overview does not follow the
+// group"). --by day must keep blank-model rows in both the header and the
+// table.
+func TestRunUsageGroupByModelFiltersBlankModel(t *testing.T) {
+	base := time.Date(2026, 3, 10, 15, 4, 5, 0, time.Local)
+	path := filepath.Join(t.TempDir(), "usage.db")
+	s := usage.NewSQLiteStore(path)
+	if err := s.Open(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	price := &usage.Price{Input: 1000, Output: 1000}
+	c, _ := usage.ComputeCost(100, 50, 0, 0, 0, "", price)
+	if err := s.InsertBatch(ctx, []usage.Event{
+		{Ts: base, RequestID: "r1", Model: "a", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: c, CostStatus: usage.CostStatusOK},
+		{Ts: base, RequestID: "r2", Model: "", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: c, CostStatus: usage.CostStatusOK},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// --by model (default): table has only model "a", overview has 2 requests.
+	var buf bytes.Buffer
+	if err := runUsageWith([]string{"--db", path}, &buf, base); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "  总请求   2\n") {
+		t.Errorf("default overview must include blank-model events:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 4 && fields[0] == "" {
+			t.Errorf("blank model row leaked into table:\n%s", out)
+			break
+		}
+	}
+
+	// --by day: both events are counted in the overview, and the day
+	// bucket includes both (no blank-model filtering).
+	buf.Reset()
+	if err := runUsageWith([]string{"--db", path, "--by", "day"}, &buf, base); err != nil {
+		t.Fatal(err)
+	}
+	out = buf.String()
+	if !strings.Contains(out, "  总请求   2\n") {
+		t.Errorf("day overview must include both events:\n%s", out)
+	}
+	if !strings.Contains(out, base.Format("01-02")) {
+		t.Errorf("day bucket missing for today:\n%s", out)
+	}
+}

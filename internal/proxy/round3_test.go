@@ -429,7 +429,7 @@ func TestMessages_ReadRejectionSingleAudit(t *testing.T) {
 	for _, want := range []string{
 		`"status":413`,
 		`"error_type":"request_too_large"`,
-		`"model":""`,
+		`"model":"<unknown>"`,
 		`"req":"audit-messages-1"`,
 		`"path":"/v1/messages"`,
 		`"success":false`,
@@ -473,7 +473,7 @@ func TestMessages_ReadErrorRejectionSingleAudit(t *testing.T) {
 	for _, want := range []string{
 		`"status":400`,
 		`"error_type":"invalid_request"`,
-		`"model":""`,
+		`"model":"<unknown>"`,
 		`"req":"audit-messages-2"`,
 		`"path":"/v1/messages"`,
 		`"success":false`,

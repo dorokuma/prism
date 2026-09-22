@@ -120,6 +120,7 @@ func resolveUsageDBPath(explicit string) (dbPath, source string) {
 // is not running. The database is read directly through a read-only
 // connection (mode=ro, WAL), so it is safe to run while the service is
 // actively writing.
+
 func runUsage(args []string) error {
 	return runUsageWith(args, os.Stdout, time.Now())
 }
@@ -178,6 +179,9 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 		}
 		extra := loadAgyRows(context.Background(), q, o.weekDefault, now)
 		rows = usage.MergeSummaryRows(rows, extra, q.GroupBy)
+		if len(q.GroupBy) == 1 && q.GroupBy[0] == "model" {
+			rows = usage.FilterBlankModelRows(rows)
+		}
 		usage.AddOverview(ov, extra)
 		if rows == nil {
 			rows = []usage.SummaryRow{}

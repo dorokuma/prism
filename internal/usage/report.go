@@ -5,9 +5,43 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/dorokuma/prism/internal/render"
 )
+
+// blankModel reports whether s is NULL-equivalent for the model field:
+// empty string or pure whitespace (including invisible whitespace runes).
+func blankModel(s string) bool {
+	for _, r := range s {
+		if !unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// FilterBlankModelRows drops rows whose model group value is blank.
+// It is used when the summary view is grouped by model; other group-by
+// modes keep these rows because their non-model grouping values are
+// still meaningful. Rows with Groups==nil are kept: they carry no model
+// key (they come from an ungrouped aggregate), and the caller can decide
+// whether they should appear in a grouped view.
+func FilterBlankModelRows(rows []SummaryRow) []SummaryRow {
+	out := make([]SummaryRow, 0, len(rows))
+	for _, r := range rows {
+		if r.Groups == nil {
+			out = append(out, r)
+			continue
+		}
+		s, _ := r.Groups["model"].(string)
+		if blankModel(s) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
 
 // PeriodWeek is the header label when usage defaults to the SuperGrok week.
 const PeriodWeek = "本周"

@@ -56,6 +56,13 @@ type ChatForwardOpts struct {
 // buffered whole into memory.
 const maxRequestBodyBytes = 10 << 20
 
+// blankModelPlaceholder is written to audit records when the request body
+// cannot be parsed for a model name. It is chosen so it can never be
+// confused with a real model: angle brackets are not valid in OpenAI or
+// Anthropic model identifiers, and the literal "<unknown>" is not a
+// registered model on any supported provider.
+const blankModelPlaceholder = "<unknown>"
+
 // ensureStreamOptionsIncludeUsage returns body with
 // stream_options.include_usage=true, preserving every other client-supplied
 // stream_options field (OpenAI chat-completions semantics). It is a no-op
@@ -167,9 +174,10 @@ func rebuildBodyWithStreamOptions(body []byte, so map[string]any) []byte {
 // failures). It is the single early-rejection audit path shared by
 // proxyChat / proxyResponses / proxyMessages (via readRequestBody and the
 // responses conversion failure), so every surface records the same fields:
-// status, error_type, model (empty when the body could not be parsed) and
-// request_id. The forwarding path (proxyChatWithBody) emits its own audit in
-// a defer, so a request is audited exactly once — never zero, never twice.
+// status, error_type, model (blank model is replaced with "<unknown>" by
+// the EmitAudit choke) and request_id. The forwarding path
+// (proxyChatWithBody) emits its own audit in a defer, so a request is
+// audited exactly once — never zero, never twice.
 func rejectAudit(r *http.Request, start time.Time, status int, errorType, model, errMsg string) {
 	middleware.EmitAudit(&middleware.RequestAudit{
 		Req:        util.RequestIDFromCtx(r.Context()),
@@ -209,14 +217,14 @@ func readRequestBody(w http.ResponseWriter, r *http.Request, start time.Time, wh
 			util.WriteJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
 				"error": map[string]any{"message": "request body too large", "code": "request_too_large"},
 			})
-			rejectAudit(r, start, http.StatusRequestEntityTooLarge, "request_too_large", "", err.Error())
+			rejectAudit(r, start, http.StatusRequestEntityTooLarge, "request_too_large", blankModelPlaceholder, err.Error())
 			return nil, false
 		}
 		slog.Error(what+" body read error", "error", err)
 		util.WriteJSON(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]any{"message": "failed to read body", "code": "invalid_request"},
 		})
-		rejectAudit(r, start, http.StatusBadRequest, "invalid_request", "", err.Error())
+		rejectAudit(r, start, http.StatusBadRequest, "invalid_request", blankModelPlaceholder, err.Error())
 		return nil, false
 	}
 	return body, true
