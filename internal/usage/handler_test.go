@@ -22,6 +22,34 @@ func doRequest(h http.Handler, method, target, remoteAddr, auth string) *httptes
 	return rec
 }
 
+// tableDataRows returns the rendered table data rows from a format=table
+// body. It finds the header line containing the group-by title (e.g. "模型")
+// and returns the subsequent non-empty data lines.
+func tableDataRows(body string) []string {
+	lines := strings.Split(body, "\n")
+	headerIdx := -1
+	for i, l := range lines {
+		if strings.Contains(l, "模型") {
+			headerIdx = i
+			break
+		}
+	}
+	if headerIdx == -1 {
+		return nil
+	}
+	var rows []string
+	for _, l := range lines[headerIdx+1:] {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(l), "---") {
+			continue
+		}
+		rows = append(rows, l)
+	}
+	return rows
+}
+
 func TestHandlerAuth(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "sekret")
 	s := openTestStore(t)
@@ -450,14 +478,13 @@ func TestHandlerTableFormatGroupByModelFiltersBlankModel(t *testing.T) {
 	if !strings.Contains(body, "  总请求   2\n") {
 		t.Errorf("overview must include blank-model events:\n%s", body)
 	}
-	for _, line := range strings.Split(body, "\n") {
-		fields := strings.Fields(line)
-		for i, f := range fields {
-			if f == "" && i > 0 {
-				t.Errorf("blank model row leaked into table:\n%s", body)
-				return
-			}
-		}
+	// Table body must filter blank model rows and keep real model "a".
+	rows := tableDataRows(body)
+	if len(rows) != 1 {
+		t.Fatalf("table data rows = %d, want 1; body:\n%s", len(rows), body)
+	}
+	if !strings.Contains(rows[0], "a") {
+		t.Errorf("table row must contain model a; got:\n%s", rows[0])
 	}
 }
 
@@ -472,6 +499,7 @@ func TestHandlerJSONGroupByModelFiltersBlankModel(t *testing.T) {
 	if err := s.InsertBatch(ctx, []Event{
 		{Ts: time.Now(), RequestID: "r1", Model: "a", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: c, CostStatus: CostStatusOK},
 		{Ts: time.Now(), RequestID: "r2", Model: "", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: c, CostStatus: CostStatusOK},
+		{Ts: time.Now(), RequestID: "r3", Model: "   ", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: c, CostStatus: CostStatusOK},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -480,14 +508,59 @@ func TestHandlerJSONGroupByModelFiltersBlankModel(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("json: got %d body %s", rec.Code, rec.Body.String())
 	}
-	var body struct {
+	var rows struct {
 		Rows []SummaryRow `json:"rows"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Rows) != 1 || body.Rows[0].Groups["model"] != "a" {
-		t.Fatalf("json rows = %+v, want only model a", body.Rows)
+	if len(rows.Rows) != 1 || rows.Rows[0].Groups["model"] != "a" {
+		t.Fatalf("json rows = %+v, want only model a", rows.Rows)
+	}
+}
+
+// TestHandlerOverviewIncludesAgyExtraBlankModel pins the contract that
+// AddOverview must use the unfiltered agy extra, so blank-model agy events
+// are counted in the overview header even though they are filtered from
+// the detail table. If AddOverview(ov, extra) were accidentally changed to
+// AddOverview(ov, filtered) this test would fail.
+func TestHandlerOverviewIncludesAgyExtraBlankModel(t *testing.T) {
+	t.Setenv("PRISM_ADMIN_TOKEN", "")
+	s := openTestStore(t)
+	ctx := context.Background()
+	price := &Price{Input: 1000, Output: 1000}
+	c, _ := costOf(100, 50, 0, 0, "", price)
+	// usage_events: 1 request for model "a".
+	if err := s.InsertBatch(ctx, []Event{
+		{Ts: time.Now(), RequestID: "r1", Model: "a", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: c, CostStatus: CostStatusOK},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewSummaryHandler(s)
+	// agy extra: 2 requests with blank model.
+	h.AgyQuery = func(ctx context.Context, q SummaryQuery) ([]SummaryRow, error) {
+		return []SummaryRow{
+			{Groups: map[string]any{"model": ""}, Requests: 2, PromptTokens: 200, CompletionTokens: 100, TotalTokens: 300},
+		}, nil
+	}
+
+	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?group_by=model&format=table", "127.0.0.1:1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("table: got %d body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// Overview must include both requests (1 usage_event + 2 blank-model agy).
+	if !strings.Contains(body, "  总请求   3\n") {
+		t.Errorf("overview must include blank-model agy events:\n%s", body)
+	}
+	// Table body must filter blank model rows and keep real model "a".
+	rows := tableDataRows(body)
+	if len(rows) != 1 {
+		t.Fatalf("table data rows = %d, want 1; body:\n%s", len(rows), body)
+	}
+	if !strings.Contains(rows[0], "a") {
+		t.Errorf("table row must contain model a; got:\n%s", rows[0])
 	}
 }
 

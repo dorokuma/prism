@@ -8,17 +8,36 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/pool"
 	"github.com/dorokuma/prism/internal/util"
 )
 
 // ---- Aggregate entry (provider_routing: auto) ----
+
+type fakeUsageRecorder struct {
+	mu  sync.Mutex
+	evs []middleware.UsageEvent
+}
+
+func (f *fakeUsageRecorder) Record(e middleware.UsageEvent) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.evs = append(f.evs, e)
+}
+
+func (f *fakeUsageRecorder) events() []middleware.UsageEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]middleware.UsageEvent(nil), f.evs...)
+}
 
 func writeProviderCacheFile(t *testing.T, dir, provider string, models []cache.ModelEntry) {
 	t.Helper()
@@ -367,6 +386,10 @@ func TestProxyChat_AggregateMissingModel(t *testing.T) {
 	})
 	pool := pool.NewPool(aggregateAccounts())
 
+	fake := &fakeUsageRecorder{}
+	middleware.SetUsageRecorder(fake)
+	defer middleware.SetUsageRecorder(nil)
+
 	body := []byte(`{"model":""}`)
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
@@ -382,6 +405,13 @@ func TestProxyChat_AggregateMissingModel(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "model is required") {
 		t.Fatalf("error message must contain 'model is required': %s", rec.Body.String())
+	}
+	evts := fake.events()
+	if len(evts) != 1 {
+		t.Fatalf("recorded events = %d, want 1", len(evts))
+	}
+	if evts[0].Model != "<unknown>" {
+		t.Fatalf("recorded model = %q, want <unknown>", evts[0].Model)
 	}
 }
 

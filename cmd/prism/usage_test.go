@@ -1097,11 +1097,20 @@ func TestRunUsageGroupByModelFiltersBlankModel(t *testing.T) {
 	if !strings.Contains(out, "  总请求   2\n") {
 		t.Errorf("default overview must include blank-model events:\n%s", out)
 	}
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 4 && fields[0] == "" {
-			t.Errorf("blank model row leaked into table:\n%s", out)
-			break
+	// JSON path: verify no blank model leaks into the detail rows.
+	var jsonBuf bytes.Buffer
+	if err := runUsageWith([]string{"--db", path, "--json"}, &jsonBuf, base); err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Rows []usage.SummaryRow `json:"rows"`
+	}
+	if err := json.Unmarshal(jsonBuf.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range doc.Rows {
+		if s, _ := row.Groups["model"].(string); s == "" {
+			t.Errorf("blank model row leaked into JSON output: %+v", row)
 		}
 	}
 

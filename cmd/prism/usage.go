@@ -120,7 +120,6 @@ func resolveUsageDBPath(explicit string) (dbPath, source string) {
 // is not running. The database is read directly through a read-only
 // connection (mode=ro, WAL), so it is safe to run while the service is
 // actively writing.
-
 func runUsage(args []string) error {
 	return runUsageWith(args, os.Stdout, time.Now())
 }

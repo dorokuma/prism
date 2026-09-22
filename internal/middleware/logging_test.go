@@ -707,6 +707,101 @@ func TestEmitAudit_RealKeyIDNotOverridden(t *testing.T) {
 	}
 }
 
+// TestEmitAudit_EmptyModelBecomesUnknown is the acceptance test for
+// the "no empty model anywhere" rule: an audit whose Model is empty or
+// whitespace-only must be recorded as "<unknown>" — a blank model would
+// appear as an empty group key in the model summary table and split
+// accounting for a real model. The choke point is EmitAudit, so every
+// path (rejectAudit, proxyChatWithBody defer, ...) is covered by a single
+// assertion. A real model name is never overwritten, and UpstreamModel is
+// left untouched.
+func TestEmitAudit_EmptyModelBecomesUnknown(t *testing.T) {
+	SetUsageDefaultKeyID("anonymous")
+	defer SetUsageDefaultKeyID("anonymous")
+
+	fake := &fakeUsageRecorder{}
+	SetUsageRecorder(fake)
+	defer SetUsageRecorder(nil)
+
+	t.Run("empty string becomes unknown", func(t *testing.T) {
+		h := &capturingHandler{}
+		restore := stashSlog(h)
+		defer restore()
+
+		aud := &RequestAudit{Req: "r1", Path: "/v1/chat/completions", Model: "", UpstreamModel: "orig-upstream"}
+		EmitAudit(aud)
+
+		if aud.Model != "<unknown>" {
+			t.Fatalf("audit model = %q, want <unknown>", aud.Model)
+		}
+		if aud.UpstreamModel != "orig-upstream" {
+			t.Fatalf("audit upstream_model = %q, want orig-upstream", aud.UpstreamModel)
+		}
+		if !strings.Contains(h.output(), `"model":"<unknown>"`) {
+			t.Errorf("audit log must carry <unknown> model; got:\n%s", h.output())
+		}
+		evs := fake.events()
+		if len(evs) != 1 {
+			t.Fatalf("events = %d, want 1", len(evs))
+		}
+		if evs[0].Model != "<unknown>" {
+			t.Fatalf("recorded model = %q, want <unknown>", evs[0].Model)
+		}
+	})
+
+	t.Run("whitespace-only becomes unknown", func(t *testing.T) {
+		h := &capturingHandler{}
+		restore := stashSlog(h)
+		defer restore()
+
+		aud := &RequestAudit{Req: "r2", Path: "/v1/chat/completions", Model: "   ", UpstreamModel: "orig-upstream"}
+		EmitAudit(aud)
+
+		if aud.Model != "<unknown>" {
+			t.Fatalf("audit model = %q, want <unknown>", aud.Model)
+		}
+		if aud.UpstreamModel != "orig-upstream" {
+			t.Fatalf("audit upstream_model = %q, want orig-upstream", aud.UpstreamModel)
+		}
+		if !strings.Contains(h.output(), `"model":"<unknown>"`) {
+			t.Errorf("audit log must carry <unknown> model; got:\n%s", h.output())
+		}
+		evs := fake.events()
+		if len(evs) != 2 {
+			t.Fatalf("events = %d, want 2", len(evs))
+		}
+		if evs[1].Model != "<unknown>" {
+			t.Fatalf("recorded model = %q, want <unknown>", evs[1].Model)
+		}
+	})
+
+	t.Run("real model is preserved", func(t *testing.T) {
+		h := &capturingHandler{}
+		restore := stashSlog(h)
+		defer restore()
+
+		aud := &RequestAudit{Req: "r3", Path: "/v1/chat/completions", Model: "gpt-4", UpstreamModel: "gpt-4-0613"}
+		EmitAudit(aud)
+
+		if aud.Model != "gpt-4" {
+			t.Fatalf("audit model = %q, want gpt-4", aud.Model)
+		}
+		if aud.UpstreamModel != "gpt-4-0613" {
+			t.Fatalf("audit upstream_model = %q, want gpt-4-0613", aud.UpstreamModel)
+		}
+		if !strings.Contains(h.output(), `"model":"gpt-4"`) {
+			t.Errorf("audit log must preserve real model; got:\n%s", h.output())
+		}
+		evs := fake.events()
+		if len(evs) != 3 {
+			t.Fatalf("events = %d, want 3", len(evs))
+		}
+		if evs[2].Model != "gpt-4" {
+			t.Fatalf("recorded model = %q, want gpt-4", evs[2].Model)
+		}
+	})
+}
+
 // TestSetUsageDefaultKeyID_ConcurrentSafe runs concurrent setters and
 // EmitAudit readers (via a recorder) to pin the atomic.Value conversion: the
 // SIGHUP reload path calls SetUsageDefaultKeyID while request goroutines
