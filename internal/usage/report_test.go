@@ -187,7 +187,7 @@ func TestRenderUsageReportStructure(t *testing.T) {
 	}
 	// Card structure: ╭─ title with the grouping description, ├─ rule,
 	// ╰─ bottom border.
-	if !strings.HasPrefix(got, "╭─ 用量 · 按模型分组 ") {
+	if !strings.HasPrefix(got, "╭─ 按模型分组 ") {
 		t.Errorf("title border/description wrong:\n%s", got)
 	}
 	if !strings.Contains(got, "├──────────────────────────────────────────────────────────┤\n") {
@@ -220,7 +220,7 @@ func TestRenderUsageReportStructure(t *testing.T) {
 }
 
 // TestRenderUsageReportExact pins the whole card byte for byte: borders,
-// summary row, header with its brand-bold titles (no color here), the dim
+// summary row, plain-text header (no color, no bold), the dim
 // sub-separator, the compact k/M numbers and the 10-cell capsule with its
 // right-aligned percentage.
 func TestRenderUsageReportExact(t *testing.T) {
@@ -231,7 +231,7 @@ func TestRenderUsageReportExact(t *testing.T) {
 	}
 	// The group column takes the layout budget (56 − 29 − 3 = 24 columns),
 	// 请求/缓存 are 6 wide each and 命中率 is 10 cells + 1 gap + 6 pct.
-	want := "╭─ 用量 · 按模型分组 ──────────────────────────────────────╮\n" +
+	want := "╭─ 按模型分组 ─────────────────────────────────────────────╮\n" +
 		"│ 请求 1,783 · 词元 2.23M · 开销 $0.836                    │\n" +
 		"├──────────────────────────────────────────────────────────┤\n" +
 		"│ 模型                       请求   缓存            命中率 │\n" +
@@ -256,16 +256,17 @@ func TestRenderUsageReportNoData(t *testing.T) {
 	if !strings.Contains(got, "请求 0 · 词元 0 · 开销 -") {
 		t.Errorf("summary must still render from Overview on an empty range:\n%s", got)
 	}
-	if !strings.HasPrefix(got, "╭─ 用量") || !strings.HasSuffix(got, "╯\n") {
+	if !strings.HasPrefix(got, "╭─ ") || !strings.HasSuffix(got, "╯\n") {
 		t.Errorf("the empty card must keep its borders:\n%s", got)
 	}
 	assertCardWidth(t, got)
 }
 
 // TestRenderUsageReportColor pins the palette contract: the piped render
-// carries no escape at all, the colored one uses the brand title and the
-// brand bold header, and the two are byte identical once the escapes are
-// stripped.
+// carries no escape at all, neither render carries color or bold on the card
+// TEXT (title and header included) — only the dim borders and the hit-rate
+// capsule keep their escapes — and the two are byte identical once the
+// escapes are stripped.
 func TestRenderUsageReportColor(t *testing.T) {
 	ov := &Overview{Requests: 1, TotalCost: ptr64(0.5)}
 	rows := []SummaryRow{{Groups: map[string]any{"model": "m"}, Requests: 1, PromptTokens: 10, CachedTokens: 5}}
@@ -274,17 +275,73 @@ func TestRenderUsageReportColor(t *testing.T) {
 	if strings.Contains(plain, "\x1b[") {
 		t.Errorf("plain output must not contain ANSI escapes:\n%q", plain)
 	}
-	if !strings.Contains(colored, "\x1b[1m\x1b[38;2;0;180;216m模型") {
-		t.Errorf("colored output must carry a brand bold header:\n%q", colored)
+	// Card text is plain in BOTH modes: no bold escape and no brand color
+	// around the title or the column titles.
+	for _, bad := range []string{"\x1b[1m", "\x1b[38;2;0;180;216m模型", "\x1b[38;2;0;180;216m按模型分组"} {
+		if strings.Contains(colored, bad) {
+			t.Errorf("colored output must keep %q unstyled:\n%q", bad, colored)
+		}
 	}
-	if !strings.Contains(colored, "\x1b[38;2;0;180;216m用量\x1b[0m") {
-		t.Errorf("colored output must carry the brand title:\n%q", colored)
+	// Colored output still colors what is not text: the dim borders.
+	if !strings.Contains(colored, "\x1b[38;2;102;102;102m│ ") {
+		t.Errorf("colored output must still dim the body border:\n%q", colored)
 	}
 	// Both render the same visible text once ANSI is stripped.
 	if render.StripANSI(colored) != plain {
 		t.Errorf("color must not change the visible text\nplain: %q\ncolored: %q", plain, colored)
 	}
 	// The width invariant holds in both modes.
+	assertCardWidth(t, plain)
+	assertCardWidth(t, colored)
+}
+
+// TestRenderUsageReportTitleTextIsPlainText locks the plain-text title
+// contract, the usage card's half of the planusage
+// TestRenderCardsTitleTextIsPlainText pin. In a COLORED render the title line
+// is EXACTLY Dim("╭─ ") + desc + Dim(" " + fill + "╮"): the 「用量」 head and
+// the 「 · 」 separator are gone, so the grouping description sits bare
+// between the two dim runs, and there is not a single escape between them.
+// The colored render is the no-color render plus those escapes, byte for
+// byte, and no bold (ESC [ 1 m) survives anywhere in the card.
+func TestRenderUsageReportTitleTextIsPlainText(t *testing.T) {
+	ov := &Overview{Requests: 2, TotalCost: ptr64(0.15)}
+	rows := []SummaryRow{{Groups: map[string]any{"model": "gpt-5"}, Requests: 2, PromptTokens: 300}}
+	colored := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{Color: true})
+	plain := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{})
+
+	const ansiDim, ansiReset = "\x1b[38;2;102;102;102m", "\x1b[0m"
+	// The description is the whole title: one space, then the dash fill that
+	// absorbs whatever width the description does not take (3 + 10 + 1 + 45
+	// + 1 = 60 for 按模型分组).
+	const desc = "按模型分组"
+	fill := reportWidth - 3 - 1 - render.DisplayWidth(desc) - 1
+	wantTitle := ansiDim + "╭─ " + ansiReset +
+		desc +
+		ansiDim + " " + strings.Repeat("─", fill) + "╮" + ansiReset
+	if rawTitle := strings.SplitN(colored, "\n", 2)[0]; rawTitle != wantTitle {
+		t.Fatalf("title line mismatch\n got: %q\nwant: %q", rawTitle, wantTitle)
+	}
+	// The plain render shows the same line with nothing in between: a
+	// scraper that used to key on the 「用量 ·」 head finds no such prefix.
+	if plainTitle := strings.SplitN(plain, "\n", 2)[0]; plainTitle != "╭─ "+desc+" "+strings.Repeat("─", fill)+"╮" {
+		t.Fatalf("plain title line mismatch: %q", plainTitle)
+	}
+	// Card text carries no color and no weight in EITHER mode: no bold, and
+	// no brand cyan anywhere (the ramp green/yellow/red and the dim borders
+	// are the only colors the card is allowed to paint).
+	for _, bad := range []string{"\x1b[1m", "\x1b[38;2;0;180;216m"} {
+		if strings.Contains(colored, bad) {
+			t.Errorf("colored output must keep the card text unstyled, found %q:\n%q", bad, colored)
+		}
+	}
+	// Color changes nothing but the escapes.
+	if render.StripANSI(colored) != plain {
+		t.Errorf("color must not change the visible text\nplain: %q\ncolored: %q",
+			plain, render.StripANSI(colored))
+	}
+	if strings.Contains(plain, "\x1b") {
+		t.Errorf("no-color render still carries escapes:\n%q", plain)
+	}
 	assertCardWidth(t, plain)
 	assertCardWidth(t, colored)
 }
@@ -633,13 +690,13 @@ func TestRenderUsageReportOverLongTitle(t *testing.T) {
 		{strings.Repeat("k", 80)}, // ASCII key: 80 columns
 		{strings.Repeat("键", 30)},
 		{"model", "provider", "account", "key_id", "stream", "success", "hour", "day", strings.Repeat("x", 40)},
-		{"模型", strings.Repeat("键", 20)}, // CJK key: truncation stops one column short
+		{"模型", strings.Repeat("键", 26)}, // CJK key: 59 columns, truncated to 53 — the double-width rune the ellipsis needs stops one column short
 	}
 	for _, groupBy := range cases {
 		got := RenderUsageReport(ov, rows, groupBy, ReportOptions{})
 		assertCardWidth(t, got)
 		title := reportLines(t, got)[0].plain
-		if !strings.HasPrefix(title, "╭─ 用量 · ") {
+		if !strings.HasPrefix(title, "╭─ ") {
 			t.Errorf("group_by %q: title head wrong: %q", groupBy, title)
 		}
 		if !strings.HasSuffix(title, "╮") {

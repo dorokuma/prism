@@ -104,10 +104,10 @@ func DescribePeriod(from, to, now int64) string {
 // ReportOptions controls the shared report renderer used by both the prism
 // usage CLI and the HTTP format=table output.
 type ReportOptions struct {
-	// Color enables ANSI coloring (brand title, brand bold headers, dim
-	// borders and the hit-rate capsule ramp). Alignment is computed on the
-	// de-colored text, so colored output stays aligned; with Color false,
-	// ANSI sequences are never emitted, so piped output is plain text.
+	// Color enables ANSI coloring (dim borders and the hit-rate capsule
+	// ramp). Alignment is computed on the de-colored text, so colored
+	// output stays aligned; with Color false, ANSI sequences are never
+	// emitted, so piped output is plain text.
 	Color bool
 }
 
@@ -120,7 +120,7 @@ type ReportOptions struct {
 // separators, header, detail rows, bottom border — is EXACTLY reportWidth
 // display columns wide, whatever the data looks like:
 //
-//	╭─ 用量 · 按模型分组 ──────────────────────────────────────╮
+//	╭─ 按模型分组 ─────────────────────────────────────────────╮
 //	│ 请求 1,783 · 词元 2.23M · 开销 $0.836                    │
 //	├──────────────────────────────────────────────────────────┤
 //	│ 模型                       请求   缓存            命中率 │
@@ -131,7 +131,7 @@ type ReportOptions struct {
 //
 // Geometry (display columns, ANSI counted as 0):
 //
-//	title     "╭─ " + Brand("用量") + Dim(" · ") + Dim(desc) + Dim(" " + fill + "╮")
+//	title     Dim("╭─ ") + desc + Dim(" " + fill + "╮")
 //	body      Dim("│ ") + content(56) + Dim(" │") = 60
 //	rules     "├" + "─"×58 + "┤" / "╰" + "─"×58 + "╯" = 60
 //	table     group columns + 请求 + 缓存 + 命中率 = 56
@@ -247,14 +247,15 @@ func reportColumns(groupBy []string) []reportColumn {
 }
 
 // RenderUsageReport renders the usage summary as the capsule card: the
-// title (grouping description), the summary row (taken from Overview —
-// never from summing the grouped rows, because a truncated LIMIT would
-// make the totals look small), a ├─ rule, the detail table with its brand
-// bold header and dim sub-separator, and the ╰─ bottom border. It is the
-// single implementation behind both the prism usage CLI and the HTTP
-// format=table output, so the two outputs can never drift apart. The
-// layout never depends on the terminal width, so --watch redraws are
-// stable and non-TTY output (e.g. a π panel capture) is identical.
+// title (grouping description only — no 「用量 ·」 prefix), the summary row
+// (taken from Overview — never from summing the grouped rows, because a
+// truncated LIMIT would make the totals look small), a ├─ rule, the detail
+// table with its plain-text header and dim sub-separator, and the ╰─ bottom
+// border. It is the single implementation behind both the prism usage CLI
+// and the HTTP format=table output, so the two outputs can never drift
+// apart. The layout never depends on the terminal width, so --watch
+// redraws are stable and non-TTY output (e.g. a π panel capture) is
+// identical.
 func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts ReportOptions) string {
 	pal := reportPalette{color: opts.Color}
 	cols := reportColumns(groupBy)
@@ -382,12 +383,14 @@ func (pal reportPalette) rowContent(r SummaryRow, cols []reportColumn) string {
 	return joinCells(cells)
 }
 
-// headerContent builds the header row's table content: brand bold column
-// titles at the same fixed widths as the data rows.
+// headerContent builds the header row's table content: plain-text column
+// titles (no color, no bold) at the same fixed widths as the data rows.
+// Every Chinese string in the card therefore renders as ordinary text, so
+// the header reads at the same size and weight as the rows below it.
 func (pal reportPalette) headerContent(cols []reportColumn) string {
 	cells := make([]string, len(cols))
 	for i, c := range cols {
-		cells[i] = pal.brandBold(c.cell(c.title))
+		cells[i] = c.cell(c.title)
 	}
 	return joinCells(cells)
 }
@@ -521,31 +524,20 @@ func formatGroupValue(g string, v any) string {
 
 // ── card palette (one color decision per render) ────────────────────────
 
-// reportPalette carries the color decision for one report render. Every
-// colored element goes through it, so Color=false strips ALL escapes while
-// the layout — cell widths, padding, glyphs, capsule length — is decided
-// before any wrapper runs. The palette therefore guarantees "colors off,
-// layout unchanged": the no-color render is the colored render minus its
-// escape sequences, byte for byte.
+// reportPalette carries the color decision for one report render. Colored
+// elements go through it (the dim borders and, via render.CapsuleBar, the
+// hit-rate ramp), so Color=false strips ALL escapes while the layout —
+// cell widths, padding, glyphs, capsule length — is decided before any
+// wrapper runs. The palette therefore guarantees "colors off, layout
+// unchanged": the no-color render is the colored render minus its escape
+// sequences, byte for byte. Text is deliberately NOT part of this: the
+// title, the header and every Chinese string render as plain text, so no
+// card text carries color or bold.
 type reportPalette struct{ color bool }
-
-func (pal reportPalette) brand(s string) string {
-	if pal.color {
-		return render.Brand(s)
-	}
-	return s
-}
 
 func (pal reportPalette) dim(s string) string {
 	if pal.color {
 		return render.Dim(s)
-	}
-	return s
-}
-
-func (pal reportPalette) brandBold(s string) string {
-	if pal.color {
-		return render.BrandBold(s)
 	}
 	return s
 }
@@ -567,7 +559,14 @@ func (pal reportPalette) rule(left, right string) string {
 
 // titleLine builds the top border with the embedded title:
 //
-//	╭─ ␣Brand(用量)␣Dim(·)␣Dim(desc)␣Dim(───…╮)
+//	╭─ ␣desc␣Dim(───…╮)
+//
+// The title is the grouping description alone: there is no 「用量」 head and
+// no 「·」 separator, because the surrounding card (the usage command that
+// renders it) already says what the numbers are, and the prefix only added
+// visual noise to the one line that already has a job. The description is
+// rendered as plain text — no color, no bold — so every Chinese string in
+// the card looks the same.
 //
 // The description (the grouping keys) is the only variable-length part: it
 // is capped at the width that leaves at least one dash fill, and the fill
@@ -580,23 +579,16 @@ func (pal reportPalette) rule(left, right string) string {
 // line — absorbs the difference.
 func (pal reportPalette) titleLine(desc string) string {
 	const prefixW, suffixW = 3, 1 // "╭─ " and "╮"
-	const head = "用量"
-	const sep = " · "
-	headW, sepW := render.DisplayWidth(head), render.DisplayWidth(sep)
-	// The line is "╭─ " + head + sep + desc + " " + fill + "╮", so the
-	// description may take at most reportWidth - prefixW - suffixW -
-	// headW - sepW - 2 columns (47 here) and still leave one space and one
-	// fill dash: total = 3 + headW + sepW + descW + 1 + fill + 1 = 60.
-	descMax := reportWidth - prefixW - suffixW - headW - sepW - 2
+	// The line is "╭─ " + desc + " " + fill + "╮", so the description may
+	// take at most reportWidth - prefixW - suffixW - 2 columns (54 here) and
+	// still leave one space and one fill dash: total = 3 + descW + 1 + fill
+	// + 1 = 60.
+	descMax := reportWidth - prefixW - suffixW - 2
 	desc = render.Truncate(desc, descMax)
 	descW := render.DisplayWidth(desc)
-	fill := reportWidth - prefixW - suffixW - headW - sepW - descW - 1
+	fill := reportWidth - prefixW - suffixW - descW - 1
 	if fill < 1 {
 		fill = 1
 	}
-	return pal.dim("╭─ ") +
-		pal.brand(head) +
-		pal.dim(sep) +
-		pal.dim(desc) +
-		pal.dim(" "+strings.Repeat("─", fill)+"╮")
+	return pal.dim("╭─ ") + desc + pal.dim(" "+strings.Repeat("─", fill)+"╮")
 }

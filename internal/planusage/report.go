@@ -239,19 +239,25 @@ func renderInfoCard(s Snapshot, accountTitle string, pal cardPalette) string {
 
 // cardTitleLine builds the top border with the embedded title:
 //
-//	╭─ ␣Brand(service)␣Dim(account)␣Dim(·)␣Brand(window)␣Dim(───…╮)
+//	╭─ ␣service␣account␣·␣window␣Dim(───…╮)
 //
 // One space separates each title element and the fill; the fill dashes
 // sit on the RIGHT of the title only; the total line is exactly cardWidth
 // display columns. An over-long title is shrunk IN THE VARIABLE SEGMENTS —
 // the account first (a long account is the common case), then the window
 // label (only an unknown upstream name is ever long: the known labels are
-// short and fixed), and the service brand only when there is nothing left
+// short and fixed), and the service name only when there is nothing left
 // to borrow room from. The whole line is never truncated: that old safety
 // net ate the right border ╮ and could leave the card at 59 columns, so
 // the fill — derived from the width the segments ACTUALLY occupy, since a
 // double-width rune that cannot fit the column the ellipsis needs stops a
 // truncation one column short — is what absorbs the difference.
+//
+// The title TEXT (service name, account and window label) is rendered as
+// plain text — no color, no bold — so every string in the card looks the
+// same, exactly like the usage report's card title; only the non-text
+// elements (the ╭─ border, the dash fill) stay dim. The separators are
+// ordinary spaces, so the segments read as one plain phrase.
 func cardTitleLine(service, account, window string, pal cardPalette) string {
 	const prefixW, suffixW, sep = 3, 1, " · "
 	sepW := render.DisplayWidth(sep)
@@ -262,8 +268,8 @@ func cardTitleLine(service, account, window string, pal cardPalette) string {
 	svc, acc, win := service, account, window
 	// De-duplicate the account segment: when the account name is exactly the
 	// provider display name ("Gemini Gemini"), it adds no information, so drop
-	// it and show the service brand only once. Account names that differ from
-	// the service keep the usual brand + dim account pair.
+	// it and show the service name only once. Account names that differ from
+	// the service keep the usual service + account pair.
 	if acc != "" && acc == svc {
 		acc = ""
 	}
@@ -288,7 +294,7 @@ shrink:
 			win = render.Truncate(win, bodyMax-titleWidth(svc, acc, "", sepW)-sepW)
 		case svc != "":
 			// Nothing left to borrow from (a long unknown provider key):
-			// shrink the service brand.
+			// shrink the service name.
 			if budget := bodyMax - titleWidth("", acc, win, sepW); budget >= 1 {
 				svc = render.Truncate(svc, budget)
 			} else {
@@ -301,14 +307,14 @@ shrink:
 
 	var b strings.Builder
 	b.WriteString(pal.dim("╭─ "))
-	b.WriteString(pal.brand(svc))
+	b.WriteString(svc)
 	if acc != "" {
 		b.WriteString(" ")
-		b.WriteString(pal.dim(acc))
+		b.WriteString(acc)
 	}
 	if win != "" {
-		b.WriteString(pal.dim(sep))
-		b.WriteString(pal.brand(win))
+		b.WriteString(sep)
+		b.WriteString(win)
 	}
 	// Fill from the MEASURED body width: 3 + body + 1 + fill + 1 = 60.
 	used := titleWidth(svc, acc, win, sepW)
@@ -599,15 +605,12 @@ func windowExhausted(w Window) bool {
 // cardPalette carries the color decision for one card render. Every
 // colored element goes through it, so NoColor strips ALL escapes while the
 // layout — cell counts, padding, glyphs — is decided before any wrapper
-// runs. The palette therefore guarantees "colors off, layout unchanged".
+// runs. The palette therefore guarantees "colors off, layout unchanged":
+// the no-color render is the colored render minus its escape sequences,
+// byte for byte. Text is deliberately NOT part of this: the title (service
+// name, account, window label) and every Chinese string render as plain
+// text, so no card text carries color or bold.
 type cardPalette struct{ color bool }
-
-func (pal cardPalette) brand(s string) string {
-	if pal.color {
-		return render.Brand(s)
-	}
-	return s
-}
 
 func (pal cardPalette) dim(s string) string {
 	if pal.color {

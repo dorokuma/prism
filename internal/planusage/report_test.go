@@ -421,10 +421,10 @@ func TestRenderTableEmpty(t *testing.T) {
 // (0, 1, 34, 59, 99, 100) and for the exhaustion paths (≥100 %, used up,
 // rate-limited); the capsule is ▰ (used) + ▱ (remaining) with a per-cell
 // green→yellow→red ramp and a solid red capsule for exhausted windows;
-// the title is Brand(service) + Dim(account) + Brand(window label) with a
-// right-only dash fill; the account never leaks into the bar or detail
-// rows; no-color output is the same layout minus the escapes; and no
-// cycle dots are invented.
+// the title is plain-text service + plain-text account + plain-text window
+// label (no color, no bold) with a right-only dash fill; the account never
+// leaks into the bar or detail rows; no-color output is the same layout
+// minus the escapes; and no cycle dots are invented.
 
 const (
 	ansiBrandCyan = "\x1b[38;2;0;180;216m"
@@ -517,17 +517,24 @@ func TestRenderCardsBasic(t *testing.T) {
 	}}, now)
 	lines := cardLines(t, got)
 
-	// Title: brand service + dim account + brand window label + right-only
-	// dash fill.
+	// Title: plain-text service + plain-text account + plain-text window
+	// label + right-only dash fill (no color and no bold on any of the
+	// title text, exactly like the usage report's card title).
 	assertCardTitle(t, lines[0], "Claude", "claude-main", "5小时限额")
-	if !strings.Contains(got, ansiBrandCyan+"Claude"+ansiReset) {
-		t.Fatalf("cyan service name missing:\n%q", got)
+	for _, bad := range []string{
+		"\x1b[1m",                            // bold
+		ansiBrandCyan + "Claude" + ansiReset, // colored service name
+		ansiBrandCyan + "5小时限额" + ansiReset,  // colored window label
+		ansiDim + "claude-main" + ansiReset,  // colored account
+		ansiDim + " · " + ansiReset,          // colored separator
+	} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("title text must stay unstyled, found %q:\n%q", bad, got)
+		}
 	}
-	if !strings.Contains(got, ansiDim+"claude-main"+ansiReset) {
-		t.Fatalf("dim account missing:\n%q", got)
-	}
-	if !strings.Contains(got, ansiBrandCyan+"5小时限额"+ansiReset) {
-		t.Fatalf("cyan window label missing:\n%q", got)
+	// The non-text parts of the title line keep their dim border.
+	if !strings.Contains(got, ansiDim+"╭─ ") {
+		t.Fatalf("dim title border missing:\n%q", got)
 	}
 	if strings.Contains(got, "╶") {
 		t.Fatalf("left-side title fill artifact (╶) present:\n%q", got)
@@ -583,6 +590,57 @@ func TestRenderCardsBasic(t *testing.T) {
 		strings.Count(bottom, "─") != cardLineWidth-2 {
 		t.Fatalf("bottom border malformed:\n%q", bottom)
 	}
+}
+
+// TestRenderCardsTitleTextIsPlainText locks the plain-text title
+// contract: in a COLORED render no title segment (service name, account,
+// " · " separator, window label) carries an escape, the only colored part
+// of the title line is the dim ╭─/─…╮ border, and the plain and colored
+// renders are byte identical once the escapes are stripped — so the
+// palette can never re-introduce color or bold into the card text.
+func TestRenderCardsTitleTextIsPlainText(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	h2 := now.Add(2 * time.Hour)
+	snaps := []Snapshot{{
+		Provider: "claude",
+		Accounts: []string{"claude-main"},
+		Windows:  []Window{{Name: "5h", Status: "ok", Percent: 59, ResetsAt: &h2}},
+	}}
+	colored := RenderCards(snaps, now)
+	plain := RenderCards(snaps, now, CardOptions{NoColor: true})
+
+	title := strings.SplitN(render.StripANSI(colored), "\n", 2)[0]
+	// Every title segment must appear in the colored render with no escape
+	// around it: the raw run sits directly in the escape-free text.
+	for _, seg := range []string{"Claude", "claude-main", " · ", "5小时限额"} {
+		if !strings.Contains(title, seg) {
+			t.Fatalf("title segment %q missing from %q", seg, title)
+		}
+	}
+	rawTitle := strings.SplitN(colored, "\n", 2)[0]
+	// The whole title line is pinned byte for byte: dim border, plain text,
+	// dim dash fill — and nothing else.
+	fill := cardLineWidth - 3 - 1 - render.DisplayWidth("Claude claude-main · 5小时限额") - 1
+	wantTitle := ansiDim + "╭─ " + ansiReset +
+		"Claude claude-main · 5小时限额" +
+		ansiDim + " " + strings.Repeat("─", fill) + "╮" + ansiReset
+	if rawTitle != wantTitle {
+		t.Fatalf("title line mismatch\n got: %q\nwant: %q", rawTitle, wantTitle)
+	}
+	// No bold anywhere in the card.
+	if strings.Contains(colored, "\x1b[1m") {
+		t.Fatalf("card must not carry bold:\n%q", colored)
+	}
+	// Color changes nothing but the escapes.
+	if render.StripANSI(colored) != plain {
+		t.Fatalf("color changed the visible text\nplain:\n%q\ncolored:\n%q",
+			plain, render.StripANSI(colored))
+	}
+	if strings.Contains(plain, "\x1b") {
+		t.Fatalf("no-color render still carries escapes:\n%q", plain)
+	}
+	cardLines(t, plain)
+	cardLines(t, colored)
 }
 
 // TestRenderCardsCapsuleGeometry walks every percentage the user can hit
@@ -991,7 +1049,8 @@ func TestRenderCardsZeroUsedWindow(t *testing.T) {
 // TestRenderCardsTitleDeduplicatesServiceAndAccount: when the account name
 // is exactly the provider display name, the title carries the name ONCE
 // ("Gemini · 5小时限额") instead of the redundant "Gemini Gemini". An account
-// that differs from the service keeps the usual brand + dim account pair.
+// that differs from the service keeps the usual service + account pair, both
+// plain text.
 func TestRenderCardsTitleDeduplicatesServiceAndAccount(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	got := RenderCards([]Snapshot{{

@@ -417,8 +417,8 @@ func TestHandlerTableFormat(t *testing.T) {
 	// widths: 模型 4 | 请求 4 | 缓存 4 | 命中率 6
 	// The same 60-column capsule card the CLI renders (see
 	// TestRenderUsageReportExact): title, summary row from Overview, ├─ rule,
-	// brand-bold header, dim sub-separator, one card row per group.
-	want := "╭─ 用量 · 按模型分组 ──────────────────────────────────────╮\n" +
+	// plain-text header, dim sub-separator, one card row per group.
+	want := "╭─ 按模型分组 ─────────────────────────────────────────────╮\n" +
 		"│ 请求 2 · 词元 300 · 开销 $0.150                          │\n" +
 		"├──────────────────────────────────────────────────────────┤\n" +
 		"│ 模型                       请求   缓存            命中率 │\n" +

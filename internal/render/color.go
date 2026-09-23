@@ -45,13 +45,18 @@ func Dim(s string) string {
 }
 
 // colorBold is the increased-intensity attribute (ESC [ 1 m). It is combined
-// with colorBrand for the usage report's table header.
+// with colorBrand for a bold brand-colored label; the usage report's table
+// header used to be exactly that, but since v0.31.2 the header is plain
+// text, so no caller is left.
 const colorBold = "\x1b[1m"
 
 // BrandBold wraps s in bold + brand cyan (ESC [ 1 m + ESC [ 38;2;0;180;216 m).
 // A single reset (ESC [ 0 m) returns to the terminal defaults for both
 // attributes, so the sequence costs zero display columns like the plain
-// wrappers.
+// wrappers. It is the generic "emphasise this label" primitive: the usage
+// card's column titles were its consumer until v0.31.2 made them plain
+// text, and it stays available (implementation untouched) for callers that
+// do want a bold brand label.
 func BrandBold(s string) string {
 	return colorBold + colorBrand + s + colorReset
 }
