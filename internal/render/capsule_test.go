@@ -104,7 +104,7 @@ func TestCapsuleUsedCells(t *testing.T) {
 	cases := []struct{ pct, cells, want int }{
 		{-10, 10, 0}, {0, 10, 0}, {1, 10, 1}, {5, 10, 1}, {6, 10, 1},
 		{50, 10, 5}, {51, 10, 6}, {94, 10, 10}, {100, 10, 10}, {140, 10, 10},
-		// The quota card's 51-cell geometry, pinned by its own tests too.
+		// An odd-cell example: the quota card's geometry before it narrowed to 56 columns (51 cells; the card's own tests now pin 47).
 		{0, 51, 0}, {34, 51, 18}, {59, 51, 31}, {99, 51, 51}, {100, 51, 51},
 	}
 	for _, tc := range cases {

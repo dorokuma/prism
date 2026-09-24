@@ -78,7 +78,7 @@ func lerpRGB(level, lo, hi int, from, to [3]uint8) [3]uint8 {
 
 // CapsuleLevel is the severity level (0..100) that capsule cell i of a
 // cells-long bar stands for: the leading cell is 100/cells (about 2 % for
-// a 51-cell quota capsule), the last is 100 %. Coloring a bar per cell by
+// a 47-cell quota capsule), the last is 100 %. Coloring a bar per cell by
 // that level makes it warm up as it grows instead of switching tiers in
 // one step.
 func CapsuleLevel(i, cells int) int {

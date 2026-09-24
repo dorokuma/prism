@@ -114,27 +114,27 @@ type ReportOptions struct {
 // ── capsule card layout (A1·命中率胶囊) ──────────────────────────────────
 //
 // The report is one fixed-width card that mirrors the quota capsule card
-// (internal/planusage.RenderCards): the same 60 display columns, the same
+// (internal/planusage.RenderCards): the same 56 display columns, the same
 // ╭─ / ├─ / ╰─ border vocabulary, the same palette and the same capsule
 // primitive (internal/render.CapsuleBar). Every line — title, summary,
 // separators, header, detail rows, bottom border — is EXACTLY reportWidth
 // display columns wide, whatever the data looks like:
 //
-//	╭─ 按模型分组 ─────────────────────────────────────────────╮
-//	│ 请求 1,783 · 词元 2.23M · 开销 $0.836                    │
-//	├──────────────────────────────────────────────────────────┤
-//	│ 模型                       请求   缓存            命中率 │
-//	│ ──────────────────────────────────────────────────────── │
-//	│ deepseek-v4-pro              1k     1M ▰▰▰▰▰▰▰▱▱▱  66.7% │
-//	│ glm-5.2                     283   100k ▰▰▱▱▱▱▱▱▱▱  20.0% │
-//	╰──────────────────────────────────────────────────────────╯
+//	╭─ 按模型分组 ─────────────────────────────────────────╮
+//	│ 请求 1,783 · 词元 2.23M · 开销 $0.836                │
+//	├──────────────────────────────────────────────────────┤
+//	│ 模型                   请求   缓存            命中率 │
+//	│ ──────────────────────────────────────────────────── │
+//	│ deepseek-v4-pro          1k     1M ▰▰▰▰▰▰▰▱▱▱  66.7% │
+//	│ glm-5.2                 283   100k ▰▰▱▱▱▱▱▱▱▱  20.0% │
+//	╰──────────────────────────────────────────────────────╯
 //
 // Geometry (display columns, ANSI counted as 0):
 //
 //	title     Dim("╭─ ") + desc + Dim(" " + fill + "╮")
-//	body      Dim("│ ") + content(56) + Dim(" │") = 60
-//	rules     "├" + "─"×58 + "┤" / "╰" + "─"×58 + "╯" = 60
-//	table     group columns + 请求 + 缓存 + 命中率 = 56
+//	body      Dim("│ ") + content(52) + Dim(" │") = 56
+//	rules     "├" + "─"×54 + "┤" / "╰" + "─"×54 + "╯" = 56
+//	table     group columns + 请求 + 缓存 + 命中率 = 52
 //
 // The body gutter is SYMMETRIC: one space either side of the content
 // ("│ " / " │") and nothing else — no extra indent inside the card — so
@@ -150,8 +150,8 @@ type ReportOptions struct {
 // safety net, truncate) the whole body to reportInner.
 const (
 	// reportWidth is the total display width of every report line.
-	reportWidth = 60
-	// reportInner is the width between "│ " and " │" (60 - 4).
+	reportWidth = 56
+	// reportInner is the width between "│ " and " │" (56 - 4).
 	reportInner = reportWidth - 4
 	// colGap separates two table columns.
 	colGap = " "
@@ -196,7 +196,7 @@ const (
 )
 
 // reportColumn is one detail column of the usage card. width is the fixed
-// display width the column occupies inside the 56-column table area, so a
+// display width the column occupies inside the 52-column table area, so a
 // row's columns always add up to tableWidth exactly; maxWidth caps the
 // VALUE before padding (0 = uncapped, the model column is capped at
 // modelMaxWidth).
@@ -580,9 +580,9 @@ func (pal reportPalette) rule(left, right string) string {
 func (pal reportPalette) titleLine(desc string) string {
 	const prefixW, suffixW = 3, 1 // "╭─ " and "╮"
 	// The line is "╭─ " + desc + " " + fill + "╮", so the description may
-	// take at most reportWidth - prefixW - suffixW - 2 columns (54 here) and
+	// take at most reportWidth - prefixW - suffixW - 2 columns (50 here) and
 	// still leave one space and one fill dash: total = 3 + descW + 1 + fill
-	// + 1 = 60.
+	// + 1 = 56.
 	descMax := reportWidth - prefixW - suffixW - 2
 	desc = render.Truncate(desc, descMax)
 	descW := render.DisplayWidth(desc)

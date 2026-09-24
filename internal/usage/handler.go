@@ -128,7 +128,7 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // from Overview (never from summing the LIMIT-truncated rows) and the detail
 // section shares RenderUsageReport with the CLI, so both outputs are
 // produced by the same code. Since v0.31.0 that shared layout is the fixed
-// 60-column capsule card (title, summary row, rules, detail rows, borders —
+// 56-column capsule card (title, summary row, rules, detail rows, borders —
 // every line exactly reportWidth columns, values ellipsis-truncated instead
 // of overflowing the card); there are no layout/width params and no
 // terminal-width dependency. format=json stays the default and is untouched.

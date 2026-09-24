@@ -473,13 +473,23 @@ func watchLoop(render func() error, out io.Writer, interval time.Duration, stop 
 	}
 }
 
-// wantColor decides whether the report gets ANSI colors: on by default only
-// when out is a terminal character device (os.Stdout on a TTY), off for
-// pipes/redirects, and --no-color forces it off. Detection uses
-// ModeCharDevice from os.Stdout.Stat() — no third-party dependency.
+// wantColor decides whether the report gets ANSI colors, in priority order:
+//
+//  1. --no-color forces colors off above everything else;
+//  2. CLICOLOR_FORCE / FORCE_COLOR force colors on when set to any
+//     non-empty value other than "0" (see envForcesColor), even when out is
+//     a pipe — the Pi extension spawns prism with stdio pipes and renders
+//     the captured text in its own TUI, so the TTY check alone would strip
+//     the card colors from /quota and /usage;
+//  3. otherwise colors are on only when out is a terminal character device
+//     (os.Stdout on a TTY), off for pipes/redirects. Detection uses
+//     ModeCharDevice from os.Stdout.Stat() — no third-party dependency.
 func wantColor(out io.Writer, noColor bool) bool {
 	if noColor {
 		return false
+	}
+	if envForcesColor() {
+		return true
 	}
 	f, ok := out.(*os.File)
 	if !ok {
@@ -490,6 +500,21 @@ func wantColor(out io.Writer, noColor bool) bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// envForcesColor reports whether the environment asks for colors regardless
+// of the output target. CLICOLOR_FORCE and FORCE_COLOR follow the common CLI
+// convention: any value except "" and "0" forces colors on, so the standard
+// CLICOLOR_FORCE=1 / FORCE_COLOR=1 forms work while an explicit "0" leaves
+// the decision to the normal TTY detection. The two are equivalent aliases:
+// either one is enough, neither takes precedence over the other.
+func envForcesColor() bool {
+	for _, name := range []string{"CLICOLOR_FORCE", "FORCE_COLOR"} {
+		if v := os.Getenv(name); v != "" && v != "0" {
+			return true
+		}
+	}
+	return false
 }
 
 // printUsageHelp writes the usage command help.

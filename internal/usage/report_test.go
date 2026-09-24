@@ -82,7 +82,7 @@ func ptr64(v float64) *float64 { return &v }
 
 // ── capsule card tests (A1·命中率胶囊) ───────────────────────────────────
 //
-// The invariants these tests guard: every report line is EXACTLY 60 display
+// The invariants these tests guard: every report line is EXACTLY 56 display
 // columns (ANSI counted as 0) at every shape the data can take — long names,
 // missing hit rates, an empty result, several group keys — in both color
 // modes; the card mirrors the quota capsule card (borders, palette,
@@ -190,10 +190,10 @@ func TestRenderUsageReportStructure(t *testing.T) {
 	if !strings.HasPrefix(got, "╭─ 按模型分组 ") {
 		t.Errorf("title border/description wrong:\n%s", got)
 	}
-	if !strings.Contains(got, "├──────────────────────────────────────────────────────────┤\n") {
+	if !strings.Contains(got, "├──────────────────────────────────────────────────────┤\n") {
 		t.Errorf("├─ separator missing:\n%s", got)
 	}
-	if !strings.HasSuffix(got, "╰──────────────────────────────────────────────────────────╯\n") {
+	if !strings.HasSuffix(got, "╰──────────────────────────────────────────────────────╯\n") {
 		t.Errorf("bottom border missing:\n%s", got)
 	}
 	// Compact detail headers: the model view uses the 模型 title, the Total
@@ -229,16 +229,16 @@ func TestRenderUsageReportExact(t *testing.T) {
 		{Groups: map[string]any{"model": "deepseek-v4-pro"}, Requests: 1500, PromptTokens: 1_500_000, CompletionTokens: 200_000, TotalTokens: 1_700_000, CachedTokens: 1_000_000, CostUSD: ptr64(0.65)},
 		{Groups: map[string]any{"model": "glm-5.2"}, Requests: 283, PromptTokens: 500_000, CompletionTokens: 30_000, TotalTokens: 530_000, CachedTokens: 100_000, CostUSD: nil},
 	}
-	// The group column takes the layout budget (56 − 29 − 3 = 24 columns),
+	// The group column takes the layout budget (52 − 29 − 3 = 20 columns),
 	// 请求/缓存 are 6 wide each and 命中率 is 10 cells + 1 gap + 6 pct.
-	want := "╭─ 按模型分组 ─────────────────────────────────────────────╮\n" +
-		"│ 请求 1,783 · 词元 2.23M · 开销 $0.836                    │\n" +
-		"├──────────────────────────────────────────────────────────┤\n" +
-		"│ 模型                       请求   缓存            命中率 │\n" +
-		"│ ──────────────────────────────────────────────────────── │\n" +
-		"│ deepseek-v4-pro              1k     1M ▰▰▰▰▰▰▰▱▱▱  66.7% │\n" +
-		"│ glm-5.2                     283   100k ▰▰▱▱▱▱▱▱▱▱  20.0% │\n" +
-		"╰──────────────────────────────────────────────────────────╯\n"
+	want := "╭─ 按模型分组 ─────────────────────────────────────────╮\n" +
+		"│ 请求 1,783 · 词元 2.23M · 开销 $0.836                │\n" +
+		"├──────────────────────────────────────────────────────┤\n" +
+		"│ 模型                   请求   缓存            命中率 │\n" +
+		"│ ──────────────────────────────────────────────────── │\n" +
+		"│ deepseek-v4-pro          1k     1M ▰▰▰▰▰▰▰▱▱▱  66.7% │\n" +
+		"│ glm-5.2                 283   100k ▰▰▱▱▱▱▱▱▱▱  20.0% │\n" +
+		"╰──────────────────────────────────────────────────────╯\n"
 	if got := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{}); got != want {
 		t.Fatalf("RenderUsageReport mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}
@@ -311,8 +311,8 @@ func TestRenderUsageReportTitleTextIsPlainText(t *testing.T) {
 
 	const ansiDim, ansiReset = "\x1b[38;2;102;102;102m", "\x1b[0m"
 	// The description is the whole title: one space, then the dash fill that
-	// absorbs whatever width the description does not take (3 + 10 + 1 + 45
-	// + 1 = 60 for 按模型分组).
+	// absorbs whatever width the description does not take (3 + 10 + 1 + 41
+	// + 1 = 56 for 按模型分组).
 	const desc = "按模型分组"
 	fill := reportWidth - 3 - 1 - render.DisplayWidth(desc) - 1
 	wantTitle := ansiDim + "╭─ " + ansiReset +
@@ -627,7 +627,7 @@ func TestRenderUsageReportMultiGroupKeys(t *testing.T) {
 	}
 	assertCardWidth(t, got)
 
-	// Column budget: 2 group keys → 24 columns split 12/12, so a group value
+	// Column budget: 2 group keys → 19 columns split 10/9, so a group value
 	// longer than its share is ellipsis-truncated instead of pushing the
 	// border out.
 	cols := reportColumns([]string{"model", "provider"})
@@ -690,7 +690,7 @@ func TestRenderUsageReportOverLongTitle(t *testing.T) {
 		{strings.Repeat("k", 80)}, // ASCII key: 80 columns
 		{strings.Repeat("键", 30)},
 		{"model", "provider", "account", "key_id", "stream", "success", "hour", "day", strings.Repeat("x", 40)},
-		{"模型", strings.Repeat("键", 26)}, // CJK key: 59 columns, truncated to 53 — the double-width rune the ellipsis needs stops one column short
+		{"模型", strings.Repeat("键", 26)}, // CJK key: 63 columns, truncated to 50
 	}
 	for _, groupBy := range cases {
 		got := RenderUsageReport(ov, rows, groupBy, ReportOptions{})
@@ -796,8 +796,8 @@ func TestRenderUsageReportGroupColumnBudget(t *testing.T) {
 		},
 	}
 	got := RenderUsageReport(&Overview{}, rows, []string{"provider"}, ReportOptions{})
-	// The provider column gets the whole single-group budget (24 columns),
-	// so a 53-character value is ellipsis-truncated rather than printed in
+	// The provider column gets the whole single-group budget (20 columns),
+	// so a 54-character value is ellipsis-truncated rather than printed in
 	// full: a fixed card cannot grow to fit it.
 	if !strings.Contains(got, "…") {
 		t.Errorf("over-long group value must be ellipsis-truncated:\n%s", got)
@@ -815,7 +815,7 @@ func TestRenderUsageReportGroupColumnBudget(t *testing.T) {
 	assertCardWidth(t, got)
 
 	// The model column keeps its historical 20-column cap, which is
-	// narrower than the 24-column single-group budget.
+	// exactly the single-group budget.
 	cols := reportColumns([]string{"model"})
 	if len(cols) != 4 || cols[0].maxWidth != modelMaxWidth {
 		t.Fatalf("model column cap = %d, want %d (cols %+v)", cols[0].maxWidth, modelMaxWidth, cols)
@@ -845,7 +845,7 @@ func TestRenderUsageReportNoCacheSegmentsInOverview(t *testing.T) {
 
 // TestReportColumnsFillTheTableArea is the arithmetic guard behind the card
 // width: the fixed columns plus the group columns plus the gaps must fill
-// the 56-column table area exactly, for any number of group keys.
+// the 52-column table area exactly, for any number of group keys.
 func TestReportColumnsFillTheTableArea(t *testing.T) {
 	for n := 0; n <= 5; n++ {
 		groupBy := []string{"model", "provider", "account", "key_id", "stream", "success", "hour", "day"}[:n]

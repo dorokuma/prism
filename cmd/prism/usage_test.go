@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dorokuma/prism/internal/render"
 	"github.com/dorokuma/prism/internal/usage"
 )
 
@@ -535,6 +536,11 @@ func TestRunUsageJSON(t *testing.T) {
 }
 
 func TestRunUsageTable(t *testing.T) {
+	// Pin the two override variables to "" so a host environment (a CI
+	// exporting FORCE_COLOR=1, a terminal exporting CLICOLOR_FORCE=1) cannot
+	// leak into the uncolored expectations below.
+	t.Setenv("CLICOLOR_FORCE", "")
+	t.Setenv("FORCE_COLOR", "")
 	base := time.Date(2026, 3, 10, 15, 4, 5, 0, time.Local)
 	path := seedUsageDB(t, base)
 	var buf bytes.Buffer
@@ -816,6 +822,12 @@ func TestRunUsageHelp(t *testing.T) {
 }
 
 func TestWantColor(t *testing.T) {
+	// Pin the two override variables to "" so a host environment (a CI
+	// exporting FORCE_COLOR=1, a terminal exporting CLICOLOR_FORCE=1) cannot
+	// leak into the plain expectations below.
+	t.Setenv("CLICOLOR_FORCE", "")
+	t.Setenv("FORCE_COLOR", "")
+
 	if wantColor(&bytes.Buffer{}, false) {
 		t.Error("a plain writer must not be colored")
 	}
@@ -834,6 +846,97 @@ func TestWantColor(t *testing.T) {
 	defer w.Close()
 	if wantColor(w, false) {
 		t.Error("a pipe must not be colored (ModeCharDevice check)")
+	}
+
+	// CLICOLOR_FORCE / FORCE_COLOR force colors on above the TTY check (the
+	// Pi extension captures prism through a pipe); --no-color still wins.
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"CLICOLOR_FORCE", "1"},
+		{"CLICOLOR_FORCE", "true"},
+		{"FORCE_COLOR", "1"},
+		{"FORCE_COLOR", "2"},
+	} {
+		t.Setenv(tc.name, tc.value)
+		if !wantColor(w, false) {
+			t.Errorf("%s=%s must force color on a pipe", tc.name, tc.value)
+		}
+		if wantColor(w, true) {
+			t.Errorf("%s=%s must not beat --no-color", tc.name, tc.value)
+		}
+		t.Setenv(tc.name, "")
+	}
+
+	// "" and "0" do not force: the pipe stays plain.
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"CLICOLOR_FORCE", "0"},
+		{"FORCE_COLOR", "0"},
+	} {
+		t.Setenv(tc.name, tc.value)
+		if wantColor(w, false) {
+			t.Errorf("%s=%s must not force color (pipe stays plain)", tc.name, tc.value)
+		}
+		t.Setenv(tc.name, "")
+	}
+
+	// The two variables are aliases, not a precedence pair: one forcing is
+	// enough even when the other explicitly says "0".
+	t.Setenv("CLICOLOR_FORCE", "0")
+	t.Setenv("FORCE_COLOR", "1")
+	if !wantColor(w, false) {
+		t.Error("FORCE_COLOR=1 must force color even with CLICOLOR_FORCE=0")
+	}
+}
+
+// TestRunUsageForceColorEnv drives the same contract through the CLI path
+// (runUsageWith writing into a bytes.Buffer, i.e. a pipe): CLICOLOR_FORCE=1
+// keeps the card's 24-bit ANSI colors in piped output, no variable keeps it
+// plain, --no-color beats the force variable, CLICOLOR_FORCE=0 does not
+// force, and FORCE_COLOR is an equivalent alias. The visible text must not
+// change in either mode.
+func TestRunUsageForceColorEnv(t *testing.T) {
+	base := time.Date(2026, 3, 10, 15, 4, 5, 0, time.Local)
+	path := seedUsageDB(t, base)
+	run := func(t *testing.T, env map[string]string, args ...string) string {
+		t.Helper()
+		t.Setenv("CLICOLOR_FORCE", "")
+		t.Setenv("FORCE_COLOR", "")
+		for k, v := range env {
+			t.Setenv(k, v)
+		}
+		var buf bytes.Buffer
+		if err := runUsageWith(append([]string{"--db", path, "--since", "1d"}, args...), &buf, base); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+
+	plain := run(t, nil)
+	if strings.Contains(plain, "\x1b[") {
+		t.Errorf("pipe without the env must stay plain:\n%q", plain)
+	}
+
+	forced := run(t, map[string]string{"CLICOLOR_FORCE": "1"})
+	if !strings.Contains(forced, "\x1b[38;2") {
+		t.Errorf("CLICOLOR_FORCE=1 must keep the 24-bit card colors on a pipe:\n%q", forced)
+	}
+	if visible := render.StripANSI(forced); visible != plain {
+		t.Errorf("forcing color must not change the visible text\n got: %q\nwant: %q", visible, plain)
+	}
+
+	if out := run(t, map[string]string{"CLICOLOR_FORCE": "1"}, "--no-color"); strings.Contains(out, "\x1b[") {
+		t.Errorf("--no-color must beat CLICOLOR_FORCE=1:\n%q", out)
+	}
+	if out := run(t, map[string]string{"CLICOLOR_FORCE": "0"}); strings.Contains(out, "\x1b[") {
+		t.Errorf("CLICOLOR_FORCE=0 must not force color:\n%q", out)
+	}
+	if out := run(t, map[string]string{"FORCE_COLOR": "1"}); !strings.Contains(out, "\x1b[38;2") {
+		t.Errorf("FORCE_COLOR=1 must keep the 24-bit card colors on a pipe:\n%q", out)
 	}
 }
 
@@ -928,6 +1031,11 @@ func usageTableHeader(s string) string {
 // (the env var is never consulted), every model appears exactly once on a
 // row carrying all its values, and the output is uncolored.
 func TestRunUsageDefaultCompactNonTTY(t *testing.T) {
+	// Pin the two override variables to "" so a host environment (a CI
+	// exporting FORCE_COLOR=1, a terminal exporting CLICOLOR_FORCE=1) cannot
+	// leak into the uncolored expectations below.
+	t.Setenv("CLICOLOR_FORCE", "")
+	t.Setenv("FORCE_COLOR", "")
 	base := time.Date(2026, 3, 10, 15, 4, 5, 0, time.Local)
 	path := seedUsageDB(t, base)
 	render := func(columns string) string {
@@ -972,7 +1080,7 @@ func TestRunUsageSortsByHitRateDescending(t *testing.T) {
 		// model-high: 1 request, 1000 prompt, 900 cached -> 90.0%
 		{Ts: base.Add(-3 * time.Hour), RequestID: "h1", Model: "model-high", PromptTokens: 1000, CachedTokens: 900, TotalTokens: 1000, Source: usage.SourceOpenAI},
 
-		// model-zero: 5 requests, 1000 prompt, 0 cached -> 0.0%
+		// model-zero: 1 request, 1000 prompt, 0 cached -> 0.0%
 		{Ts: base.Add(-4 * time.Hour), RequestID: "z1", Model: "model-zero", PromptTokens: 1000, CachedTokens: 0, TotalTokens: 1000, Source: usage.SourceOpenAI},
 	}
 	if err := s.InsertBatch(ctx, events); err != nil {

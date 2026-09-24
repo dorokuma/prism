@@ -415,17 +415,17 @@ func TestHandlerTableFormat(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
 	// widths: 模型 4 | 请求 4 | 缓存 4 | 命中率 6
-	// The same 60-column capsule card the CLI renders (see
+	// The same 56-column capsule card the CLI renders (see
 	// TestRenderUsageReportExact): title, summary row from Overview, ├─ rule,
 	// plain-text header, dim sub-separator, one card row per group.
-	want := "╭─ 按模型分组 ─────────────────────────────────────────────╮\n" +
-		"│ 请求 2 · 词元 300 · 开销 $0.150                          │\n" +
-		"├──────────────────────────────────────────────────────────┤\n" +
-		"│ 模型                       请求   缓存            命中率 │\n" +
-		"│ ──────────────────────────────────────────────────────── │\n" +
-		"│ a                             1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
-		"│ b                             1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
-		"╰──────────────────────────────────────────────────────────╯\n"
+	want := "╭─ 按模型分组 ─────────────────────────────────────────╮\n" +
+		"│ 请求 2 · 词元 300 · 开销 $0.150                      │\n" +
+		"├──────────────────────────────────────────────────────┤\n" +
+		"│ 模型                   请求   缓存            命中率 │\n" +
+		"│ ──────────────────────────────────────────────────── │\n" +
+		"│ a                         1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
+		"│ b                         1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
+		"╰──────────────────────────────────────────────────────╯\n"
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("table body mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}

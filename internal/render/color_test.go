@@ -17,7 +17,7 @@ func TestFg(t *testing.T) {
 
 func TestNamedColorsCostNoWidth(t *testing.T) {
 	for _, s := range []string{
-		Brand("svc"), Red("▰"), Yellow("! limit reached"), Dim("│ "), Fg(82, 183, 136, "▰"),
+		Brand("svc"), Red("▰"), Yellow("已达限额"), Dim("│ "), Fg(82, 183, 136, "▰"),
 	} {
 		if dw := DisplayWidth(s); dw != DisplayWidth(StripANSI(s)) {
 			t.Fatalf("color wrapper changed the display width of %q", s)

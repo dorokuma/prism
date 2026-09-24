@@ -416,7 +416,7 @@ func TestRenderTableEmpty(t *testing.T) {
 
 // ── card TUI tests (流光胶囊 / streaming capsule) ───────────────────────
 //
-// These tests guard the layout invariants: every card line is EXACTLY 60
+// These tests guard the layout invariants: every card line is EXACTLY 56
 // display columns (ANSI stripped) at every percentage the user can hit
 // (0, 1, 34, 59, 99, 100) and for the exhaustion paths (≥100 %, used up,
 // rate-limited); the capsule is ▰ (used) + ▱ (remaining) with a per-cell
@@ -432,8 +432,8 @@ const (
 	ansiYellow    = "\x1b[38;2;244;162;97m" // #F4A261: ramp stop + footer
 	ansiRed       = "\x1b[38;2;230;57;70m"
 	ansiDim       = "\x1b[38;2;102;102;102m"
-	cardLineWidth = 60
-	cardBarCells  = 51 // capsule = cardInner(56) − indent(0) − pct(4) − gap(1)
+	cardLineWidth = 56
+	cardBarCells  = 47 // capsule = cardInner(52) − indent(0) − pct(4) − gap(1)
 	ansiReset     = "\x1b[0m"
 )
 
@@ -548,19 +548,19 @@ func TestRenderCardsBasic(t *testing.T) {
 	if !strings.HasSuffix(row, " 59% │") {
 		t.Fatalf("bar row must end with the right-aligned pct:\n%q", row)
 	}
-	// The capsule's FILLED LENGTH is the used share: 59 % → 31 ▰ + 20 ▱.
+	// The capsule's FILLED LENGTH is the used share: 59 % → 28 ▰ + 19 ▱.
 	bar := barArea(t, row)
-	if n := strings.Count(bar, capUsed); n != 31 {
-		t.Fatalf("used cells = %d, want 31: %q", n, bar)
+	if n := strings.Count(bar, capUsed); n != 28 {
+		t.Fatalf("used cells = %d, want 28: %q", n, bar)
 	}
-	if n := strings.Count(bar, capEmpty); n != cardBarCells-31 {
-		t.Fatalf("remaining cells = %d, want %d: %q", n, cardBarCells-31, bar)
+	if n := strings.Count(bar, capEmpty); n != cardBarCells-28 {
+		t.Fatalf("remaining cells = %d, want %d: %q", n, cardBarCells-28, bar)
 	}
 	// The used run keeps the healthy band flat green; the rest is dim gray.
-	if !strings.Contains(got, ansiGreen+strings.Repeat(capUsed, 20)+ansiReset) {
+	if !strings.Contains(got, ansiGreen+strings.Repeat(capUsed, 19)+ansiReset) {
 		t.Fatalf("flat green used run missing:\n%q", got)
 	}
-	if !strings.Contains(got, ansiDim+strings.Repeat(capEmpty, 20)+ansiReset) {
+	if !strings.Contains(got, ansiDim+strings.Repeat(capEmpty, 19)+ansiReset) {
 		t.Fatalf("dim remaining run missing:\n%q", got)
 	}
 	if strings.Contains(got, ansiRed) {
@@ -572,7 +572,7 @@ func TestRenderCardsBasic(t *testing.T) {
 	if !strings.HasPrefix(detail, "│ 已用 59%") {
 		t.Fatalf("detail left text wrong:\n%q", detail)
 	}
-	if !strings.HasSuffix(detail, "resets in 2h 01m │") {
+	if !strings.HasSuffix(detail, "2h 01m 后重置 │") {
 		t.Fatalf("detail right text wrong:\n%q", detail)
 	}
 
@@ -580,11 +580,11 @@ func TestRenderCardsBasic(t *testing.T) {
 	if strings.ContainsAny(got, "○●◆") {
 		t.Fatalf("cycle dots must not be fabricated:\n%q", got)
 	}
-	if strings.Contains(got, "limit reached") {
+	if strings.Contains(got, "已达限额") {
 		t.Fatalf("exhausted footer must not appear:\n%q", got)
 	}
 
-	// Bottom border: ╰ + 58 dashes + ╯.
+	// Bottom border: ╰ + 54 dashes + ╯.
 	bottom := lines[len(lines)-1]
 	if !strings.HasPrefix(bottom, "╰") || !strings.HasSuffix(bottom, "╯") ||
 		strings.Count(bottom, "─") != cardLineWidth-2 {
@@ -646,7 +646,7 @@ func TestRenderCardsTitleTextIsPlainText(t *testing.T) {
 // TestRenderCardsCapsuleGeometry walks every percentage the user can hit
 // — including the exhausted paths and a sub-percent window refined through
 // UsedFraction — and checks the capsule length, the percentage label, the
-// detail text and the 60-column invariant in one go.
+// detail text and the 56-column invariant in one go.
 func TestRenderCardsCapsuleGeometry(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h := now.Add(3*time.Hour + 12*time.Minute)
@@ -665,31 +665,31 @@ func TestRenderCardsCapsuleGeometry(t *testing.T) {
 		wantUsed: 1, wantPct: "  1%", wantDetail: "已用 1%",
 	}, {
 		name: "thirty-four", win: Window{Percent: 34},
-		wantUsed: 18, wantPct: " 34%", wantDetail: "已用 34%",
+		wantUsed: 16, wantPct: " 34%", wantDetail: "已用 34%",
 	}, {
 		name: "fifty-nine", win: Window{Percent: 59},
-		wantUsed: 31, wantPct: " 59%", wantDetail: "已用 59%",
+		wantUsed: 28, wantPct: " 59%", wantDetail: "已用 59%",
 	}, {
 		name: "ninety-nine", win: Window{Percent: 99},
-		wantUsed: 51, wantPct: " 99%", wantDetail: "已用 99%",
+		wantUsed: 47, wantPct: " 99%", wantDetail: "已用 99%",
 	}, {
 		name: "hundred", win: Window{Percent: 100},
-		wantUsed: 51, wantPct: "100%", wantDetail: "已用 100%", wantExhaust: true,
+		wantUsed: 47, wantPct: "100%", wantDetail: "已用 100%", wantExhaust: true,
 	}, {
 		name: "used up", win: Window{Status: "used up", Percent: 100},
-		wantUsed: 51, wantPct: "100%", wantDetail: "已耗尽 100%", wantExhaust: true,
+		wantUsed: 47, wantPct: "100%", wantDetail: "已耗尽 100%", wantExhaust: true,
 	}, {
 		name: "rate limited", win: Window{Status: "rate-limited", Percent: 40},
-		wantUsed: 51, wantPct: " 40%", wantDetail: "限流 40%", wantExhaust: true,
+		wantUsed: 47, wantPct: " 40%", wantDetail: "限流 40%", wantExhaust: true,
 	}, {
 		name: "sub-percent fraction", win: Window{Percent: 0, UsedFraction: 0.004},
 		wantUsed: 1, wantPct: "  1%", wantDetail: "已用 1%",
 	}, {
 		name: "token pool", win: Window{Percent: 34, LimitTokensEstimate: 3_500_000},
-		wantUsed: 18, wantPct: " 34%", wantDetail: "已用 34% / 总额 3.5M tok",
+		wantUsed: 16, wantPct: " 34%", wantDetail: "已用 34% / 总额 3.5M 词元",
 	}, {
 		name: "dollar estimate", win: Window{Percent: 12, LimitUSDEstimate: 60, USDStatus: "estimated"},
-		wantUsed: 7, wantPct: " 12%", wantDetail: "额度 12% / $60.00",
+		wantUsed: 6, wantPct: " 12%", wantDetail: "额度 12% / $60.00",
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -701,11 +701,11 @@ func TestRenderCardsCapsuleGeometry(t *testing.T) {
 				Accounts: []string{"claude-main"},
 				Windows:  []Window{w},
 			}}, now)
-			// Every line — colored or not — is exactly 60 columns.
+			// Every line — colored or not — is exactly 56 columns.
 			lines := cardLines(t, got)
 			wantLines := 4 // title, bar, detail, bottom
 			if tc.wantExhaust {
-				wantLines++ // the "! limit reached" footer
+				wantLines++ // the 已达限额 footer
 			}
 			if len(lines) != wantLines {
 				t.Fatalf("want %d lines, got %d:\n%q", wantLines, len(lines), lines)
@@ -723,10 +723,10 @@ func TestRenderCardsCapsuleGeometry(t *testing.T) {
 			if !strings.HasPrefix(strings.TrimPrefix(lines[2], "│ "), tc.wantDetail) {
 				t.Fatalf("detail = %q, want %q", lines[2], tc.wantDetail)
 			}
-			if !strings.HasSuffix(lines[2], "resets in 3h 12m │") {
+			if !strings.HasSuffix(lines[2], "3h 12m 后重置 │") {
 				t.Fatalf("reset countdown missing: %q", lines[2])
 			}
-			if tc.wantExhaust && !strings.Contains(lines[3], "! limit reached") {
+			if tc.wantExhaust && !strings.Contains(lines[3], "已达限额") {
 				t.Fatalf("exhausted window needs the footer: %q", lines[3])
 			}
 			// The colors off render must be the same layout, escapes stripped.
@@ -837,11 +837,11 @@ func TestRenderCardsExhausted(t *testing.T) {
 		t.Fatalf("detail '已耗尽 100%%' missing:\n%q", lines[2])
 	}
 
-	// Footer: #F4A261 "! limit reached".
-	if !strings.Contains(got, ansiYellow+"! limit reached"+ansiReset) {
+	// Footer: #F4A261 已达限额.
+	if !strings.Contains(got, ansiYellow+"已达限额"+ansiReset) {
 		t.Fatalf("#F4A261 footer missing:\n%q", got)
 	}
-	if lines[3] == "" || !strings.HasPrefix(lines[3], "│ ! limit reached") {
+	if lines[3] == "" || !strings.HasPrefix(lines[3], "│ 已达限额") {
 		t.Fatalf("footer row malformed:\n%q", lines[3])
 	}
 }
@@ -869,14 +869,14 @@ func TestRenderCardsRateLimited(t *testing.T) {
 	if !strings.Contains(got, ansiRed+strings.Repeat(capUsed, cardBarCells)+ansiReset) {
 		t.Fatalf("rate-limited capsule must be solid red:\n%q", got)
 	}
-	if !strings.HasSuffix(detail, "resets in 2h 01m │") {
+	if !strings.HasSuffix(detail, "2h 01m 后重置 │") {
 		t.Fatalf("rate-limited pct missing:\n%q", detail)
 	}
 	// Reset countdown still shown (ResetsAt exists).
-	if !strings.HasSuffix(lines[2], "resets in 2h 01m │") {
+	if !strings.HasSuffix(lines[2], "2h 01m 后重置 │") {
 		t.Fatalf("countdown missing for rate-limited:\n%q", lines[2])
 	}
-	if !strings.Contains(got, "! limit reached") {
+	if !strings.Contains(got, "已达限额") {
 		t.Fatalf("rate-limited must trigger the exhausted footer:\n%q", got)
 	}
 }
@@ -887,7 +887,7 @@ func TestRenderCardsRateLimited(t *testing.T) {
 // TestCapsuleUsedCells, TestCapsuleLevel). The tests below pin what the
 // QUOTA cards do with the shared primitive: the direction of the gradient
 // (a consumed share warms toward red), the level arithmetic bound to the
-// 49-cell card geometry, and the exhausted paths.
+// 47-cell card geometry, and the exhausted paths.
 
 // TestCapsuleGradientInBar checks that the ramp really reaches the
 // rendered capsule: a healthy bar is flat green, a nearly-full bar warms
@@ -897,7 +897,7 @@ func TestCapsuleGradientInBar(t *testing.T) {
 	low := RenderCards([]Snapshot{
 		{Provider: "gemini", Accounts: []string{"a"}, Windows: []Window{{Name: "5h", Percent: 34}}},
 	}, now)
-	if !strings.Contains(low, ansiGreen+strings.Repeat(capUsed, 18)+ansiReset) {
+	if !strings.Contains(low, ansiGreen+strings.Repeat(capUsed, 16)+ansiReset) {
 		t.Fatalf("34%% must be one flat green run:\n%q", low)
 	}
 	if strings.Contains(low, ansiRed) || strings.Contains(low, ansiYellow) {
@@ -907,7 +907,7 @@ func TestCapsuleGradientInBar(t *testing.T) {
 	high := RenderCards([]Snapshot{
 		{Provider: "gemini", Accounts: []string{"a"}, Windows: []Window{{Name: "5h", Percent: 99}}},
 	}, now)
-	if !strings.Contains(high, ansiGreen+strings.Repeat(capUsed, 20)+ansiReset) {
+	if !strings.Contains(high, ansiGreen+strings.Repeat(capUsed, 19)+ansiReset) {
 		t.Fatalf("99%% must start flat green:\n%q", high)
 	}
 	if !strings.Contains(high, ansiRed+capUsed+ansiReset) {
@@ -938,8 +938,8 @@ func TestCapsuleGlyphWidth(t *testing.T) {
 // TestCapsuleUsedCells locks ceil(pct/100 * barCells) with clamping.
 func TestCapsuleUsedCells(t *testing.T) {
 	cases := []struct{ pct, want int }{
-		{-10, 0}, {0, 0}, {1, 1}, {2, 2}, {3, 2},
-		{34, 18}, {50, 26}, {59, 31}, {98, 50}, {99, 51}, {100, 51}, {140, 51},
+		{-10, 0}, {0, 0}, {1, 1}, {2, 1}, {3, 2},
+		{34, 16}, {50, 24}, {59, 28}, {98, 47}, {99, 47}, {100, 47}, {140, 47},
 	}
 	for _, tc := range cases {
 		if got := capsuleUsedCells(tc.pct); got != tc.want {
@@ -950,8 +950,8 @@ func TestCapsuleUsedCells(t *testing.T) {
 
 // TestCapsuleLevel covers the per-cell level the ramp is evaluated at.
 func TestCapsuleLevel(t *testing.T) {
-	if got := capsuleLevel(0); got != 1 {
-		t.Errorf("capsuleLevel(0) = %d, want 1 (100/51)", got)
+	if got := capsuleLevel(0); got != 2 {
+		t.Errorf("capsuleLevel(0) = %d, want 2 (100/47)", got)
 	}
 	if got := capsuleLevel(cardBarCells - 1); got != 100 {
 		t.Errorf("capsuleLevel(last) = %d, want 100", got)
@@ -981,8 +981,8 @@ func TestRenderCardsWindowCards(t *testing.T) {
 	assertCardTitle(t, lines[5], "Gemini", "gemini-acct-1", "周限额")
 
 	five := lines[1]
-	if n := strings.Count(barArea(t, five), capUsed); n != 18 {
-		t.Fatalf("5h used cells = %d, want 18:\n%q", n, five)
+	if n := strings.Count(barArea(t, five), capUsed); n != 16 {
+		t.Fatalf("5h used cells = %d, want 16:\n%q", n, five)
 	}
 	if !strings.HasSuffix(five, " 34% │") {
 		t.Fatalf("5h pct wrong:\n%q", five)
@@ -992,16 +992,16 @@ func TestRenderCardsWindowCards(t *testing.T) {
 	}
 
 	weekly := lines[6]
-	if n := strings.Count(barArea(t, weekly), capUsed); n != 48 {
-		t.Fatalf("weekly used cells = %d, want 48:\n%q", n, weekly)
+	if n := strings.Count(barArea(t, weekly), capUsed); n != 45 {
+		t.Fatalf("weekly used cells = %d, want 45:\n%q", n, weekly)
 	}
 	if !strings.HasSuffix(weekly, " 94% │") {
 		t.Fatalf("weekly pct wrong:\n%q", weekly)
 	}
-	if !strings.HasPrefix(strings.TrimPrefix(lines[7], "│ "), "已用 94% / 总额 3.5M tok") {
+	if !strings.HasPrefix(strings.TrimPrefix(lines[7], "│ "), "已用 94% / 总额 3.5M 词元") {
 		t.Fatalf("weekly detail wrong:\n%q", lines[7])
 	}
-	if !strings.HasSuffix(lines[7], "resets in 2d 1h │") {
+	if !strings.HasSuffix(lines[7], "2d 1h 后重置 │") {
 		t.Fatalf("weekly reset wrong:\n%q", lines[7])
 	}
 
@@ -1013,7 +1013,7 @@ func TestRenderCardsWindowCards(t *testing.T) {
 		}
 	}
 	// 94 % is NOT exhausted: no red capsule, no footer, no cycle dots.
-	if strings.Contains(got, ansiRed) || strings.Contains(got, "limit reached") {
+	if strings.Contains(got, ansiRed) || strings.Contains(got, "已达限额") {
 		t.Fatalf("94%% must not look exhausted:\n%q", got)
 	}
 	if strings.ContainsAny(got, "○●◆") {
@@ -1088,7 +1088,7 @@ func TestRenderCardsErrorAndEmpty(t *testing.T) {
 	}}, now)
 	lines := cardLines(t, got)
 	assertCardTitle(t, lines[0], "Opus", "a1", "")
-	if !strings.Contains(lines[1], "⚠ unauthorized") {
+	if !strings.Contains(lines[1], "⚠ 未授权") {
 		t.Fatalf("error note missing:\n%q", lines[1])
 	}
 	if len(lines) != 3 {
@@ -1125,10 +1125,10 @@ func TestRenderCardsErrorAndEmpty(t *testing.T) {
 	if n := strings.Count(got, "a1 旧"); n != 1 {
 		t.Fatalf("stale marker occurs %d times, want 1 (title only):\n%q", n, got)
 	}
-	if !strings.Contains(lines[3], "⚠ fetch_failed") {
+	if !strings.Contains(lines[3], "⚠ 拉取失败") {
 		t.Fatalf("error note missing from the window card:\n%q", lines[3])
 	}
-	if !strings.Contains(lines[1], " 3%") || !strings.HasSuffix(lines[2], "resets in 45m │") {
+	if !strings.Contains(lines[1], " 3%") || !strings.HasSuffix(lines[2], "45m 后重置 │") {
 		t.Fatalf("window card missing data:\n%q", lines)
 	}
 	if strings.Contains(lines[1], "a1") || strings.Contains(lines[2], "a1") {
@@ -1181,7 +1181,7 @@ func TestRenderCardsOverLongWindowNameTitle(t *testing.T) {
 	h2 := now.Add(2 * time.Hour)
 	names := []string{
 		strings.Repeat("w", 70),  // ASCII, 70 columns
-		strings.Repeat("窗口", 35), // CJK, 70 columns
+		strings.Repeat("窗口", 35), // CJK, 140 columns
 		"mixed-窗口-" + strings.Repeat("x", 60),
 		strings.Repeat("🔥", 40),
 	}
@@ -1191,7 +1191,7 @@ func TestRenderCardsOverLongWindowNameTitle(t *testing.T) {
 			Accounts: []string{"a1"},
 			Windows:  []Window{{Name: name, Status: "ok", Percent: 7, ResetsAt: &h2}},
 		}}, now, CardOptions{NoColor: true})
-		// cardLines asserts EVERY line — title included — is 60 columns.
+		// cardLines asserts EVERY line — title included — is 56 columns.
 		lines := cardLines(t, got)
 		title := lines[0]
 		if !strings.HasPrefix(title, "╭─ Opus · ") {
@@ -1221,7 +1221,7 @@ func TestRenderCardsOverLongWindowNameTitle(t *testing.T) {
 // TestRenderCardsCJKAccountTitleFill pins the OTHER half: the account is
 // the first segment to shrink, and a CJK account whose truncation budget
 // ends on an odd column stops one column short of it. The dash fill is
-// derived from the MEASURED width, so the card stays at exactly 60
+// derived from the MEASURED width, so the card stays at exactly 56
 // columns — assuming the budget was consumed in full would push the right
 // border out.
 func TestRenderCardsCJKAccountTitleFill(t *testing.T) {
@@ -1232,7 +1232,7 @@ func TestRenderCardsCJKAccountTitleFill(t *testing.T) {
 		Accounts: []string{strings.Repeat("账", 40)}, // 80 columns
 		Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 7, ResetsAt: &h2}},
 	}}, now, CardOptions{NoColor: true})
-	lines := cardLines(t, got) // title is 60 columns, ╮ intact
+	lines := cardLines(t, got) // title is 56 columns, ╮ intact
 	title := lines[0]
 	if !strings.HasPrefix(title, "╭─ Opus ") {
 		t.Fatalf("title head wrong: %q", title)
@@ -1314,10 +1314,10 @@ func TestResetText(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h := now.Add(3*time.Hour + 12*time.Minute)
 	future := now.Add(12 * time.Hour)
-	if got := resetText(Window{ResetsAt: &h}, now); got != "resets in 3h 12m" {
+	if got := resetText(Window{ResetsAt: &h}, now); got != "3h 12m 后重置" {
 		t.Errorf("future reset = %q", got)
 	}
-	if got := resetText(Window{ResetsAt: &now}, now); got != "resets now" {
+	if got := resetText(Window{ResetsAt: &now}, now); got != "已重置" {
 		t.Errorf("elapsed reset = %q", got)
 	}
 	if got := resetText(Window{ResetsAt: nil}, now); got != "-" {
@@ -1327,8 +1327,63 @@ func TestResetText(t *testing.T) {
 	if got := resetText(Window{ResetsAt: &zero}, now); got != "-" {
 		t.Errorf("zero reset = %q", got)
 	}
-	if got := resetText(Window{ResetsAt: &future}, now); got != "resets in 12h" {
+	if got := resetText(Window{ResetsAt: &future}, now); got != "12h 后重置" {
 		t.Errorf("whole-hour reset = %q", got)
+	}
+}
+
+// TestRenderCardsLocalizedCardText pins the Chinese wording of the three
+// card texts that used to be English: the exhausted footer, the reset
+// countdown and the fetch-failure note. The data layer keeps the English
+// code; the RENDER layer maps it, so the card shows Chinese for every
+// mapped code and passes an unmapped one through behind the ⚠ prefix. No
+// old English string may survive anywhere in a rendered card.
+func TestRenderCardsLocalizedCardText(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	h := now.Add(3*time.Hour + 12*time.Minute)
+	past := now.Add(-time.Minute)
+	got := RenderCards([]Snapshot{{
+		Provider: "opencode-go",
+		Accounts: []string{"a1"},
+		Err:      "unauthorized",
+		Windows:  []Window{{Name: "rolling", Status: "used up", Percent: 100, ResetsAt: &h}},
+	}, {
+		Provider: "xai",
+		Accounts: []string{"b2"},
+		Err:      "no_subscription",
+		Windows:  []Window{{Name: "weekly", Percent: 12, ResetsAt: &past}},
+	}}, now)
+	cardLines(t, got) // every row still exactly cardLineWidth columns
+	for _, want := range []string{"3h 12m 后重置", "已达限额", "⚠ 未授权", "⚠ 无订阅", "已重置"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("localized card text %q missing:\n%q", want, got)
+		}
+	}
+	for _, bad := range []string{
+		"limit reached", "resets in", "resets now", "unauthorized",
+		"no_subscription", "unexpected_status", "fetch_failed",
+	} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("English card text %q survived:\n%q", bad, got)
+		}
+	}
+
+	// The remaining mapped codes, and an unmapped code that must pass
+	// through unchanged behind the ⚠ prefix.
+	for _, tc := range []struct{ code, want string }{
+		{"unexpected_status", "⚠ 上游状态异常"},
+		{"fetch_failed", "⚠ 拉取失败"},
+		{"timeout", "⚠ timeout"},
+	} {
+		plain := RenderCards([]Snapshot{{
+			Provider: "gemini",
+			Accounts: []string{"c3"},
+			Err:      tc.code,
+		}}, now, CardOptions{NoColor: true})
+		if !strings.Contains(plain, tc.want) {
+			t.Fatalf("code %q: want %q in card:\n%q", tc.code, tc.want, plain)
+		}
+		cardLines(t, plain)
 	}
 }
 

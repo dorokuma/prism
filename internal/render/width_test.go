@@ -139,7 +139,7 @@ func TestPadWideTruncationFillsToWidth(t *testing.T) {
 	// so a truncation budget that ends on an odd column cannot take the
 	// next double-width rune and the result lands at w-1 columns. Every
 	// padded slot must still measure exactly w columns, whatever the
-	// content — that is the invariant the 60-column cards rely on.
+	// content — that is the invariant the capsule cards rely on.
 	// Truncation semantics are NOT changed by the pad: an over-wide string
 	// is still "kept prefix + …" and never longer than w.
 	inputs := map[string]string{

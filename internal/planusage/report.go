@@ -115,16 +115,16 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 // per (account, window): the window label rides in the title, the capsule
 // bar takes row 2, and row 3 carries used/total + reset. Every line of
 // every card — title, bar, detail, note, footer, borders — is exactly
-// cardWidth (60) columns wide:
+// cardWidth (56) columns wide:
 //
-//	╭─ Gemini acct-1 · 5小时限额 ───────────────────────╮
-//	│ ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  34% │
-//	│ 已用 34% / 总额 3.5M tok                resets in 3h 12m │
-//	╰──────────────────────────────────────────────────╯
+//	╭─ Gemini acct-1 · 5小时限额 ──────────────────────────╮
+//	│ ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  34% │
+//	│ 已用 34% / 总额 3.5M 词元              3h 12m 后重置 │
+//	╰──────────────────────────────────────────────────────╯
 //
-// Bar row:    "│ " + capsule(51) + gap(1) + pct(4) + " │"
-// Detail row: "│ " + detail(38) + reset(18) + " │"
-// Both add up to 2 + 56 + 2 = 60 columns. The body gutter is SYMMETRIC:
+// Bar row:    "│ " + capsule(47) + gap(1) + pct(4) + " │"
+// Detail row: "│ " + detail(34) + reset(18) + " │"
+// Both add up to 2 + 52 + 2 = 56 columns. The body gutter is SYMMETRIC:
 // one space either side of the content and nothing else — the bar and the
 // detail rows carry no indent of their own, so left and right breathing
 // room stay 1:1 at every line. The capsule replaced the old 18-cell mini
@@ -132,14 +132,14 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 // makes it read as a capsule, and it is also why the label column is
 // reserved first (see barCells).
 const (
-	cardWidth   = 60
+	cardWidth   = 56
 	cardInner   = cardWidth - 4                             // width between "│ " and " │"
 	barIndent   = 0                                         // no indent: the gutter is the border's single space
 	pctWidth    = 4                                         // right-aligned " 34%" / "100%"
 	barGap      = 1                                         // one space between capsule and pct
-	barCells    = cardInner - barIndent - pctWidth - barGap // 51 capsule cells
-	resetWidth  = 18                                        // right-aligned "resets in 3h 12m"
-	detailWidth = cardInner - barIndent - resetWidth        // 38
+	barCells    = cardInner - barIndent - pctWidth - barGap // 47 capsule cells
+	resetWidth  = 18                                        // right-aligned "3h 12m 后重置"
+	detailWidth = cardInner - barIndent - resetWidth        // 34
 )
 
 // Capsule glyphs, the per-cell ramp and the equal-color run merging live in
@@ -226,7 +226,7 @@ func renderWindowCard(s Snapshot, accountTitle string, w Window, now time.Time, 
 		lines = append(lines, cardFooter(pal))
 	}
 	if s.Err != "" {
-		lines = append(lines, cardNote("⚠ "+s.Err, pal))
+		lines = append(lines, cardNote(cardErrorNote(s.Err), pal))
 	}
 	return joinCard(lines, pal)
 }
@@ -237,7 +237,7 @@ func renderWindowCard(s Snapshot, accountTitle string, w Window, now time.Time, 
 func renderInfoCard(s Snapshot, accountTitle string, pal cardPalette) string {
 	lines := []string{cardTitleLine(providerDisplayName(s.Provider), accountCell(s, accountTitle), "", pal)}
 	if s.Err != "" {
-		lines = append(lines, cardNote("⚠ "+s.Err, pal))
+		lines = append(lines, cardNote(cardErrorNote(s.Err), pal))
 	}
 	return joinCard(lines, pal)
 }
@@ -267,9 +267,9 @@ func cardTitleLine(service, account, window string, pal cardPalette) string {
 	const prefixW, suffixW, sep = 3, 1, " · "
 	sepW := render.DisplayWidth(sep)
 	// The line is "╭─ " + body + " " + fill + "╮" = 3 + body + 1 + fill
-	// + 1, so the body may take at most 54 columns and still leave one
+	// + 1, so the body may take at most 50 columns and still leave one
 	// fill dash.
-	bodyMax := cardWidth - prefixW - suffixW - 2 // 54
+	bodyMax := cardWidth - prefixW - suffixW - 2 // 50
 	svc, acc, win := service, account, window
 	// De-duplicate the account segment: when the account name is exactly the
 	// provider display name ("Gemini Gemini"), it adds no information, so drop
@@ -321,7 +321,7 @@ shrink:
 		b.WriteString(sep)
 		b.WriteString(win)
 	}
-	// Fill from the MEASURED body width: 3 + body + 1 + fill + 1 = 60.
+	// Fill from the MEASURED body width: 3 + body + 1 + fill + 1 = 56.
 	used := titleWidth(svc, acc, win, sepW)
 	fill := cardWidth - prefixW - suffixW - used - 1
 	if fill < 1 {
@@ -375,15 +375,39 @@ func cardBody(text string, pal cardPalette) string {
 	return pal.dim("│ ") + render.PadRight(text, cardInner) + pal.dim(" │")
 }
 
-// cardFooter renders the exhausted-window warning row: yellow (#F4A261)
-// "! limit reached".
+// cardFooter renders the exhausted-window warning row: the yellow
+// (#F4A261) 已达限额. Only the text, the color and the position on the
+// card belong to this row — its structure is cardBody's, like every
+// other middle row.
 func cardFooter(pal cardPalette) string {
-	return cardBody(pal.yellow("! limit reached"), pal)
+	return cardBody(pal.yellow("已达限额"), pal)
 }
 
 // cardNote renders a note row (fetch errors etc).
 func cardNote(text string, pal cardPalette) string {
 	return cardBody(text, pal)
+}
+
+// cardErrorNote is the card's note for a fetch failure: the ⚠ prefix plus
+// the LOCALIZED error code. Snapshot.Err itself keeps the English code —
+// ErrorCode sets it, logs and the HTTP JSON carry it, and
+// Cache.StoreFailed decides window retention on it — so the translation
+// lives in this render layer only. The mapped set is exactly what a card
+// can carry (unauthorized, no_subscription, unexpected_status,
+// fetch_failed); a code the table does not know passes through unchanged,
+// still behind the ⚠ prefix.
+func cardErrorNote(code string) string {
+	switch code {
+	case "unauthorized":
+		code = "未授权"
+	case "no_subscription":
+		code = "无订阅"
+	case "unexpected_status":
+		code = "上游状态异常"
+	case "fetch_failed":
+		code = "拉取失败"
+	}
+	return "⚠ " + code
 }
 
 // joinCard appends the bottom border to the card lines.
@@ -447,7 +471,7 @@ func col2Label(w Window) string {
 // total, never a consumed token or dollar count), so the numerator stays
 // the percentage rather than an invented "1.2M":
 //
-//	已用 34% / 总额 3.5M tok     (weekly token pool inferred)
+//	已用 34% / 总额 3.5M 词元     (weekly token pool inferred)
 //	额度 12% / $60.00           (dollar estimate)
 //	已用 7%                      (no estimate concept at all)
 func windowDetail(w Window) string {
@@ -464,27 +488,29 @@ func windowDetail(w Window) string {
 // concept, e.g. the Gemini 5h window).
 func totalPart(w Window) string {
 	if w.LimitTokensEstimate > 0 {
-		return " / 总额 " + render.FormatTokens(w.LimitTokensEstimate) + " tok"
+		return " / 总额 " + render.FormatTokens(w.LimitTokensEstimate) + " 词元"
 	}
 	return ""
 }
 
-// resetText is the detail row's right-aligned text: "resets in 3h 12m"
-// when the upstream reported ResetsAt, "resets now" once the window has
-// rolled over, and "-" when there is no reset time at all.
+// resetText is the detail row's right-aligned text: "3h 12m 后重置"
+// when the upstream reported ResetsAt, "已重置" once the window has
+// rolled over, and "-" when there is no reset time at all. The countdown
+// itself comes from cardCountdown, so the resetWidth column keeps its
+// fixed 18 columns whatever the wording.
 func resetText(w Window, now time.Time) string {
 	if w.ResetsAt == nil || w.ResetsAt.IsZero() {
 		return "-"
 	}
 	if !w.ResetsAt.After(now) {
-		return "resets now"
+		return "已重置"
 	}
-	return "resets in " + cardCountdown(now, *w.ResetsAt)
+	return cardCountdown(now, *w.ResetsAt) + " 后重置"
 }
 
 // cardCountdown formats the remaining time for the detail row's reset
 // column. Minutes are zero-padded and the components are separated by one
-// space (2h 01m, 4h 51m, 3d 4h) so the column reads "resets in 3h 12m";
+// space (2h 01m, 4h 51m, 3d 4h) so the column reads "3h 12m 后重置";
 // the day/hour cases mirror formatRemain. formatRemain itself is
 // untouched: the legacy table's output must not change.
 func cardCountdown(now, at time.Time) string {
@@ -569,7 +595,7 @@ func capsuleUsedCells(pct int) int {
 }
 
 // capsuleLevel is the consumed share (0..100) that capsule cell i of a
-// full bar stands for: the leading cell is ~2 % (100/51), the last is
+// full bar stands for: the leading cell is ~2 % (100/47), the last is
 // 100 %. The capsule is colored per cell by that level, so the fill
 // warms up as it grows instead of switching tiers in one step. The
 // arithmetic is render.CapsuleLevel, shared with the usage report (which
@@ -583,7 +609,7 @@ func capsuleLevel(i int) int {
 //     capsule is a solid red ▰ row. A hollow ▱ row was rejected: hollow
 //     reads as "nothing used", which is the opposite of an exhausted
 //     window — a drained pill is shown solid red, and the
-//     "! limit reached" footer spells the state out.
+//     已达限额 footer spells the state out.
 //   - otherwise the used share is solid ▰, colored per cell along the
 //     green→yellow→red ramp, and the remaining share is hollow ▱ in dim
 //     gray (#666666).
@@ -602,7 +628,7 @@ func capsuleBar(w Window, pal cardPalette) string {
 
 // windowExhausted reports whether one window counts as exhausted: at or
 // above 100 %, used up, or rate-limited. The same determination drives
-// the solid red capsule and the "! limit reached" footer.
+// the solid red capsule and the 已达限额 footer.
 func windowExhausted(w Window) bool {
 	return w.Percent >= 100 || w.Status == "used up" || w.Status == "rate-limited"
 }

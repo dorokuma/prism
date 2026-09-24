@@ -264,7 +264,7 @@ model_remap:
 #   default_key_id: anonymous
 
 # ---------------------------------------------------------------------------
-# 可选：quota —— 上游套餐用量快照（SuperGrok 周限 + Gemini 5小时/周限）。
+# 可选：quota —— 上游套餐用量快照（SuperGrok 周限 + Gemini 5小时/周限 + ClinePass 5小时/周/月限）。
 # 和上面的 usage 不是一层：usage 是本地词元账本，quota 是官方限额百分比。
 # 关掉 usage.enabled 不影响 quota。
 #

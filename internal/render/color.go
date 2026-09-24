@@ -13,7 +13,7 @@ const colorBrand = "\x1b[38;2;0;180;216m"
 // colorRed is used exhausted / used-up quota.
 const colorRed = "\x1b[38;2;230;57;70m"
 
-// colorYellow is the warning color (#F4A261): the "! limit reached"
+// colorYellow is the warning color (#F4A261): the 已达限额
 // footer and other exhausted/warning accents. The spec palette has no
 // separate orange tier, so no ≥80 % orange exists.
 const colorYellow = "\x1b[38;2;244;162;97m"
