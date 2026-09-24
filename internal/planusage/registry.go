@@ -6,10 +6,11 @@ import (
 )
 
 // DefaultFetchers is the built-in registry: SuperGrok weekly pool
-// (cli-chat-proxy billing) and Gemini 5h/weekly (retrieveUserQuotaSummary).
+// (cli-chat-proxy billing), Gemini 5h/weekly (retrieveUserQuotaSummary)
+// and ClinePass 5h/weekly/monthly (users/me/plan/usage-limits).
 // OpenCode Go windows are not polled.
 func DefaultFetchers() []Fetcher {
-	return []Fetcher{XAIFetcher{}, GeminiFetcher{}}
+	return []Fetcher{XAIFetcher{}, GeminiFetcher{}, ClinePassFetcher{}}
 }
 
 // MatchFetcher returns the first fetcher that owns this account, or nil.

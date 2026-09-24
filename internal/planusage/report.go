@@ -30,7 +30,9 @@ func RenderTable(snaps []Snapshot) string {
 // RenderTableAt is RenderTable with an injectable clock (tests). Each
 // account is one MODULE: its windows are consecutive rows, the account
 // name sits on the module's first window row, later rows leave the
-// account cell empty. Modules are sorted by account name so they never
+// account cell empty. Modules are sorted by provider display order
+// first (see providerDisplayOrder: gemini < clinepass < xai, unlisted
+// providers after them), then by account name, so they never
 // interleave (a bare row can not look like it belongs to the previous
 // module). Load-balanced plans are never merged. Snapshots without
 // windows keep the account line and the error line, if any. Error lines
@@ -49,8 +51,9 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 		{Title: "限额估算", Align: render.AlignLeft},
 	}
 
-	// Stable sort by the first account name so modules stay contiguous
-	// and in a readable order (Cache.List is map-ordered).
+	// Stable sort by accountSortKey — provider display order first, then
+	// the first account name — so modules stay contiguous and in a
+	// readable order (Cache.List is map-ordered).
 	sorted := append([]Snapshot(nil), snaps...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return accountSortKey(sorted[i]) < accountSortKey(sorted[j])
@@ -159,8 +162,10 @@ type CardOptions struct {
 }
 
 // RenderCards renders each (account, window) as one fixed-width
-// (60-column) capsule card; cards are sorted by account name and
-// separated by one blank line. ANSI true-color escapes are emitted by
+// (56-column) capsule card; cards are sorted by provider display order
+// (gemini < clinepass < xai; unlisted providers fall back to
+// lexicographic) and then by account name, separated by one blank
+// line. ANSI true-color escapes are emitted by
 // default — pass CardOptions{NoColor: true} for pipes, redirects and
 // --no-color, which strips the escapes and nothing else. (The
 // pipe-friendly table is RenderTable's job.)
@@ -408,6 +413,8 @@ func providerDisplayName(p string) string {
 		return "Opus"
 	case "gemini", "google":
 		return "Gemini"
+	case "clinepass":
+		return "ClinePass"
 	case "xai", "grok":
 		return "SuperGrok"
 	default:
@@ -639,13 +646,17 @@ func (pal cardPalette) yellow(s string) string {
 
 // ── legacy helpers (kept) ─────────────────────────────────────────────────
 
-// accountSortKey orders snapshots by their first account name (provider
-// as fallback), so modules never interleave in the table.
+// accountSortKey orders snapshots by provider display order first (see
+// providerDisplayOrder: gemini < clinepass < xai), then by their first
+// account name (provider as fallback), so modules never interleave in
+// the table or the cards.
 func accountSortKey(s Snapshot) string {
+	name := s.Provider
 	if len(s.Accounts) > 0 {
-		return s.Accounts[0]
+		name = s.Accounts[0]
 	}
-	return s.Provider
+	rank, _ := providerDisplayRank(s.Provider)
+	return fmt.Sprintf("%03d%s", rank, name)
 }
 
 // accountCell is the first-column value for one account. The provider

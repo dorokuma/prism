@@ -125,7 +125,7 @@ func runQuotaWith(args []string, out io.Writer) error {
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), `用法: prism quota [flags]
 
-查询 SuperGrok 周池与 Gemini 5小时/周限占用。
+查询 SuperGrok 周池、Gemini 5小时/周限与 ClinePass 5小时/周/月限占用。
 不依赖 prism 服务进程。这不是 prism usage 的本地词元账本。
 
 flags:
