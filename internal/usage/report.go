@@ -157,7 +157,10 @@ const (
 	colGap = " "
 
 	// reqWidth / cacheWidth are the fixed request and cache columns.
-	// FormatTokens renders up to 6 columns ("938.6M", "50.91M"), so 6
+	// FormatTokens keeps every render at 6 columns or fewer across its
+	// whole carry chain, M -> B -> T -> P -> E: two-decimal M below 100M
+	// ("50.91M"), one decimal from 100M up ("938.6M"), and the same
+	// single-decimal shape after each carry ("4.6B", "999.9T"), so 6
 	// keeps realistic counts intact.
 	reqWidth   = 6
 	cacheWidth = 6

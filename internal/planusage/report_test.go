@@ -688,6 +688,11 @@ func TestRenderCardsCapsuleGeometry(t *testing.T) {
 		name: "token pool", win: Window{Percent: 34, LimitTokensEstimate: 3_500_000},
 		wantUsed: 16, wantPct: " 34%", wantDetail: "已用 34% / 总额 3.5M 词元",
 	}, {
+		// A billion-plus pool carries past M: the card shows 4.6B instead
+		// of the wide "4557.8M" the M-only formatter produced.
+		name: "large token pool", win: Window{Percent: 34, LimitTokensEstimate: 4_557_800_000},
+		wantUsed: 16, wantPct: " 34%", wantDetail: "已用 34% / 总额 4.6B 词元",
+	}, {
 		name: "dollar estimate", win: Window{Percent: 12, LimitUSDEstimate: 60, USDStatus: "estimated"},
 		wantUsed: 6, wantPct: " 12%", wantDetail: "额度 12% / $60.00",
 	}}

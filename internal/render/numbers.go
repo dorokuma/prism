@@ -22,7 +22,15 @@ func FormatInt(n int64) string {
 //   - 1000..999999: "k" suffix, no decimals, truncated ("340k", "999k")
 //   - 1,000,000..100,000,000: "M" suffix, up to two decimals, trailing
 //     zeros removed ("1M", "1.5M", "1.54M")
-//   - > 100,000,000: "M" suffix, one decimal, trailing zeros removed ("123.5M")
+//   - > 100,000,000: "M" suffix, one decimal, trailing zeros removed
+//     ("123.5M", "938.6M")
+//
+// The chain carries past M: the value is scaled into the largest unit that
+// keeps it at 1 or more, and a render that rounds up to a full 1000 of its
+// unit moves one unit up ("999.96M" -> "1B", "4557.8M" -> "4.6B"),
+// repeating until the scaled value is below 1000 (M -> B -> T -> P -> E, so
+// 1,234,567M reads "1.2T"). The units above M keep the single decimal the
+// formatter already uses for its largest values.
 //
 // Integers never show a decimal point: 1000000 is "1M", not "1.00M", and
 // 100000001 is "100M", not "100.0M".
@@ -40,10 +48,61 @@ func FormatTokens(n int64) string {
 		// k segment is truncated to whole thousands; there are no decimals
 		// to trim, but the rule is identical: no trailing zeros.
 		return sign + strconv.FormatUint(u/1000, 10) + "k"
-	case u <= 100_000_000:
-		return sign + trimTrailingZeros(strconv.FormatFloat(float64(u)/1_000_000, 'f', 2, 64)) + "M"
-	default:
-		return sign + trimTrailingZeros(strconv.FormatFloat(float64(u)/1_000_000, 'f', 1, 64)) + "M"
+	}
+	return sign + formatMagnitude(u)
+}
+
+// tokenMagnitude is one step of the compact notation's carry chain: the
+// divisor that scales a count into the unit and the suffix it renders with.
+type tokenMagnitude struct {
+	div    uint64
+	suffix string
+	// twoDecimalsUpTo keeps the formatter's original precision split for
+	// the M segment: up to two decimals below 100M ("1.54M", "50.91M"),
+	// one decimal above ("123.5M"). Zero means the unit always renders
+	// with a single decimal, the style the formatter already uses for its
+	// largest values.
+	twoDecimalsUpTo uint64
+}
+
+// tokenMagnitudes lists the carry chain from the largest unit down to the
+// smallest one above the truncated k segment. Each step is 1000x the next,
+// so scaling into the first unit that fits always leaves a value below 1000
+// once the carry rule below has been applied.
+var tokenMagnitudes = []tokenMagnitude{
+	{div: 1_000_000_000_000_000_000, suffix: "E"},
+	{div: 1_000_000_000_000_000, suffix: "P"},
+	{div: 1_000_000_000_000, suffix: "T"},
+	{div: 1_000_000_000, suffix: "B"},
+	{div: 1_000_000, suffix: "M", twoDecimalsUpTo: 100_000_000},
+}
+
+// formatMagnitude renders u (>= 1,000,000) with the compact suffix chain:
+// the largest unit that keeps the value at 1 or more, carrying one unit up
+// whenever the decimal render rounds up to 1000 of that unit (999.96M ->
+// 1B) until the scaled value is below 1000.
+func formatMagnitude(u uint64) string {
+	i := len(tokenMagnitudes) - 1
+	for j, m := range tokenMagnitudes {
+		if u >= m.div {
+			i = j
+			break
+		}
+	}
+	for {
+		m := tokenMagnitudes[i]
+		prec := 1
+		if u <= m.twoDecimalsUpTo {
+			prec = 2
+		}
+		text := trimTrailingZeros(strconv.FormatFloat(float64(u)/float64(m.div), 'f', prec, 64))
+		// Rounding can fill the unit: 999.96M renders as 1000.0M, so it
+		// carries and renders again one unit up as "1B".
+		if v, err := strconv.ParseFloat(text, 64); err == nil && v >= 1000 && i > 0 {
+			i--
+			continue
+		}
+		return text + m.suffix
 	}
 }
 

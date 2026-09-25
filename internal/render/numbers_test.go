@@ -30,6 +30,7 @@ func TestFormatTokens(t *testing.T) {
 		in   int64
 		want string
 	}{
+		// plain and k segments: small values are unchanged.
 		{0, "0"},
 		{340, "340"},
 		{999, "999"},
@@ -38,6 +39,7 @@ func TestFormatTokens(t *testing.T) {
 		{1999, "1k"},
 		{340000, "340k"},
 		{999999, "999k"},
+		// M segment: the original two-decimal window and one-decimal style.
 		{1000000, "1M"},
 		{1500000, "1.5M"},
 		{1540000, "1.54M"},
@@ -46,9 +48,33 @@ func TestFormatTokens(t *testing.T) {
 		{100000000, "100M"},
 		{100000001, "100M"},
 		{123456789, "123.5M"},
+		// No carry: an M value that still scales below 1000 stays in M.
+		{166500000, "166.5M"},
+		{839200000, "839.2M"},
+		{999900000, "999.9M"},
+		// Carry: a render that round-trips to 1000 of its unit moves one
+		// unit up, including the rounding boundary 999.96M -> 1B.
+		{999960000, "1B"},
+		{999999999, "1B"},
+		{1000000000, "1B"},
+		{2235900000, "2.2B"},
+		{4557800000, "4.6B"},
+		{999900000000, "999.9B"},
+		// Carry across two unit steps: B fills up and overflows into T, and
+		// the chain keeps carrying (T -> P -> E) so the scaled value stays
+		// below 1000 across the whole int64 range.
+		{999960000000, "1T"},
+		{1234567000000, "1.2T"},
+		{999960000000000, "1P"},
+		{1999000000000000, "2P"},
+		{9223372036854775807, "9.2E"},
+		// negated values carry the same way.
 		{-1500, "-1k"},
 		{-1000000, "-1M"},
 		{-1500000, "-1.5M"},
+		{-999960000, "-1B"},
+		{-4557800000, "-4.6B"},
+		{-9223372036854775808, "-9.2E"},
 	}
 	for _, c := range cases {
 		if got := FormatTokens(c.in); got != c.want {
