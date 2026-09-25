@@ -187,6 +187,9 @@ flags:
 			if snap.Provider == "gemini" {
 				snap = applyQuotaGeminiEstimate(ctx, cfg, snap)
 			}
+			if snap.Provider == "clinepass" {
+				snap = applyQuotaClinePassEstimate(ctx, snap)
+			}
 		}
 		snaps = append(snaps, snap)
 	}

@@ -175,6 +175,42 @@ func clinepassWindowName(typ string) string {
 	}
 }
 
+// clinepassPeriodStart derives a window's period start from its reset
+// instant, mirroring the Gemini weekly precedent (ResetsAt-7d). The
+// upstream reports only the reset; the start is the inverse used to bound
+// the consumed-token sum for the 总额 estimate:
+//
+//	5h      → ResetsAt − 5h
+//	weekly  → ResetsAt − 7d
+//	monthly → ResetsAt minus one calendar month
+//
+// The monthly case uses time.Time.AddDate, which NORMALIZES an out-of-range
+// day instead of clamping it: 2026-05-31 minus one month underflows April
+// and lands on 2026-05-01, and 2026-03-31 lands on 2026-03-03 — not on the
+// last day of the previous month. The upstream reset stays authoritative
+// for the boundary; this is only the inverse estimate, and the same
+// normalization applies whatever the reset's day-of-month is. A window
+// without a reset instant has no period start (and therefore no estimate).
+// Unknown window names get nil.
+func clinepassPeriodStart(name string, resetsAt *time.Time) *time.Time {
+	if resetsAt == nil || resetsAt.IsZero() {
+		return nil
+	}
+	switch name {
+	case "5h":
+		start := resetsAt.Add(-5 * time.Hour)
+		return &start
+	case "weekly":
+		start := resetsAt.Add(-7 * 24 * time.Hour)
+		return &start
+	case "monthly":
+		start := resetsAt.AddDate(0, -1, 0)
+		return &start
+	default:
+		return nil
+	}
+}
+
 // clinepassLimitWindow maps one upstream limit entry onto a Window.
 // percentUsed is clamped to 0..100 and carried as the floored int.
 // Fractional upstream values additionally keep their unfloored share in
@@ -183,7 +219,8 @@ func clinepassWindowName(typ string) string {
 // UsedFraction: n/100 in float64 does not always multiply back to
 // exactly n (0.07*100 = 7.000000000000001), so the ceil in displayPercent
 // would turn an exact 7 % into 8 %. ResetsAt is the upstream reset
-// instant, when reported.
+// instant, when reported; PeriodStart is derived from it (see
+// clinepassPeriodStart) so the quota reversal can bound its token sum.
 func clinepassLimitWindow(name string, l clinepassLimit) Window {
 	pct := l.PercentUsed
 	if pct < 0 {
@@ -205,5 +242,6 @@ func clinepassLimitWindow(name string, l clinepassLimit) Window {
 		w.Status = "rate-limited"
 	}
 	w.ResetsAt = parseXAITime(l.ResetsAt)
+	w.PeriodStart = clinepassPeriodStart(name, w.ResetsAt)
 	return w
 }

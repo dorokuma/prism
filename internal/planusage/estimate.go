@@ -264,6 +264,47 @@ func ApplyGrokWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum,
 	return ApplyWeekEstimate(ctx, snap, sum, path, now)
 }
 
+// ApplyClinePassEstimates fills LimitTokensEstimate on every ClinePass
+// window (5h / weekly / monthly) with the LIVE reversal: consumed tokens in
+// the current period ÷ used fraction (percentUsed/100, or the unfloored
+// UsedFraction when the upstream sent a fractional percent). Each window's
+// PeriodStart is derived from its ResetsAt by the fetcher
+// (clinepassPeriodStart), so a window without a reset instant is skipped.
+//
+// The estimate is only produced for a strictly partial window:
+// 0 < used fraction < 1 and a positive token sum. At 100 % the upstream
+// percent is clamped, so reversing it would systematically understate the
+// pool — an exhausted window simply shows no 总额. Sum errors (metapi
+// database missing/unreadable, proxy_logs absent) are logged and leave the
+// estimate empty: they never fail the snapshot or mark the fetch failed.
+func ApplyClinePassEstimates(ctx context.Context, snap Snapshot, sum GrokTokenSum, now time.Time) Snapshot {
+	if sum == nil {
+		return snap
+	}
+	for i := range snap.Windows {
+		w := snap.Windows[i]
+		if w.PeriodStart == nil || w.PeriodStart.IsZero() {
+			continue
+		}
+		from := w.PeriodStart.Unix()
+		to := now.Unix()
+		if w.ResetsAt != nil && !w.ResetsAt.After(now) {
+			to = w.ResetsAt.Unix()
+		}
+		tokens, err := sum(ctx, from, to)
+		if err != nil {
+			slog.Warn("clinepass quota token sum failed", "window", w.Name, "error", err)
+			continue
+		}
+		frac := windowUsedFraction(w)
+		if tokens <= 0 || frac <= 0 || frac >= 1 {
+			continue
+		}
+		snap.Windows[i].LimitTokensEstimate = reversePool(tokens, frac)
+	}
+	return snap
+}
+
 func loadGrokWeekEstimate(path string) (grokWeekEstimate, error) {
 	var st grokWeekEstimate
 	data, err := os.ReadFile(path)

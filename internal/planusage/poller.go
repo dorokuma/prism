@@ -33,6 +33,8 @@ type Poller struct {
 
 	geminiSum          GrokTokenSum
 	geminiEstimatePath string
+
+	clinepassSum GrokTokenSum
 }
 
 func NewPoller(fetchers []Fetcher, cache *Cache, interval, timeout time.Duration) *Poller {
@@ -93,6 +95,16 @@ func (p *Poller) SetGeminiEstimate(sum GrokTokenSum, path string) {
 	p.mu.Lock()
 	p.geminiSum = sum
 	p.geminiEstimatePath = path
+	p.mu.Unlock()
+}
+
+// SetClinePassEstimate wires ClinePass 限额估算 (metapi cline-pass token
+// consumption ÷ each window's used percent, applied to all three windows).
+// There is no estimate file: every window's period start is derived from
+// its live ResetsAt, so there is nothing to freeze for a fresh window.
+func (p *Poller) SetClinePassEstimate(sum GrokTokenSum) {
+	p.mu.Lock()
+	p.clinepassSum = sum
 	p.mu.Unlock()
 }
 
@@ -197,17 +209,24 @@ func (p *Poller) fetchOne(parent context.Context, g KeyGroup, timeout time.Durat
 	}
 	var sum GrokTokenSum
 	var estPath string
+	clinepass := false
 	p.mu.Lock()
 	switch snap.Provider {
 	case "xai":
 		sum, estPath = p.grokSum, p.estimatePath
 	case "gemini":
 		sum, estPath = p.geminiSum, p.geminiEstimatePath
+	case "clinepass":
+		sum, clinepass = p.clinepassSum, true
 	}
 	p.mu.Unlock()
 	if sum != nil {
 		ctx, cancel := context.WithTimeout(parent, timeout)
-		snap = ApplyWeekEstimate(ctx, snap, sum, estPath, time.Now())
+		if clinepass {
+			snap = ApplyClinePassEstimates(ctx, snap, sum, time.Now())
+		} else {
+			snap = ApplyWeekEstimate(ctx, snap, sum, estPath, time.Now())
+		}
 		cancel()
 	}
 	p.cache.Store(g.Fingerprint, snap)

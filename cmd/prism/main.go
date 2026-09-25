@@ -18,6 +18,7 @@ import (
 	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
 	"github.com/dorokuma/prism/internal/mcp"
+	"github.com/dorokuma/prism/internal/metapiusage"
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/newapi"
 	"github.com/dorokuma/prism/internal/oauth"
@@ -552,6 +553,17 @@ func main() {
 	if gem := planusage.CombineTokenSums(usageGemini, agySumFunc(agyIdx)); gem != nil {
 		quotaPoller.SetGeminiEstimate(gem, planusage.DefaultGeminiEstimatePath)
 	}
+	// ClinePass 总额估算：ClinePass 流量全经 metapi 转发，prism 侧没有
+	// 消耗量，故从 metapi 生产库只读求 cline-pass/* 各窗口词元和。求和源
+	// 每次求和按条短连接（open→created_at 形状自检→SUM→close），不持有
+	// 常驻句柄：metapi 换库/文件替换/数据面回滚后下一轮刷新即读到新数据，
+	// 启动时库不可用（开机顺序/权限窗口）也会在后续轮次自动恢复，不会被
+	// 永久禁用。库缺失/不可读/表缺失/created_at 格式漂移 ⇒ 该窗口无总额
+	// （降级跳过），不影响快照获取与展示，也不标记 fetch 失败；不可用/降级
+	// 按状态转换各记一次 WARN、恢复记 Info，并计入 expvar
+	// clinepass_usage_source_errors / clinepass_usage_source_status（/metrics）。
+	metapiSource := metapiusage.NewSource(metapiUsageDBPath)
+	quotaPoller.SetClinePassEstimate(metapiSource.SumClinePassTokens)
 	quotaPoller.Start()
 	quotaHandler := planusage.NewHandler(quotaCache, quotaPoller.Enabled)
 	summaryHandler.DefaultFrom = func() int64 {

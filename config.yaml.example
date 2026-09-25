@@ -275,6 +275,25 @@ model_remap:
 #   查询：prism quota    或    GET /admin/quota
 #   鉴权与 /admin/usage/summary 相同（PRISM_ADMIN_TOKEN）。
 #   响应里的 ~usd 是按文档额度（$12 / $30 / $60）用整数 percent 估算，不是账单。
+#
+#   总额估算（卡片/表格的「总额 X 词元」）：SuperGrok 与 Gemini 用本地
+#   词元账本（usage.db + agy 索引）反推；ClinePass 流量全经 metapi 转发，
+#   prism 侧没有消耗量，消耗取自 metapi 生产库
+#   /var/lib/metapi/data/hub.db 的 proxy_logs（只读 mode=ro 打开、带
+#   busy_timeout；按 model_requested LIKE 'cline-pass/%' 与各窗口起点
+#   [PeriodStart, now] 求和，再除以已用占比；占比 >= 100% 或为 0 的窗口
+#   不产出总额）。该库不存在、不可读或 proxy_logs 缺失时，ClinePass
+#   窗口只显示占用百分比（无总额），不影响快照获取与展示，也不报错。
+#   该库每次求和按条只读短连接打开（open→created_at 形状自检→SUM→
+#   close），不做常驻句柄：metapi 换库/文件替换/数据面回滚后下一轮刷新
+#   即读到新数据，prism 启动时库不可用（开机顺序/权限窗口）也会在后续
+#   轮次自动恢复，无需重启。求和前校验 created_at 形状（metapi 若把
+#   UTC 'YYYY-MM-DD HH:MM:SS' 文本改成其他格式，该轮降级不出总额，而
+#   不是静默按错窗口少算）。不可用/降级计入 /metrics 的
+#   clinepass_usage_source_errors 与 clinepass_usage_source_status，
+#   状态转换各记一次 WARN、恢复记 Info（不逐轮刷屏）。
+#   路径是代码内默认值（与 agy 用量索引 agyusage.DefaultIndexPath 的
+#   既有模式一致），不是配置键，无需在 config.yaml 中声明。
 # ---------------------------------------------------------------------------
 # quota:
 #   enabled: true
