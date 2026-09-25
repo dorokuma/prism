@@ -335,11 +335,11 @@ func groupDesc(groupBy []string) string {
 	return "按" + strings.Join(labels, "/") + "分组"
 }
 
-// formatRequests renders a request count with the same compact k/M
-// notation render.FormatTokens uses. The shared formatter is token-named,
-// but its algorithm is a generic count formatter; this wrapper gives the
-// request column a semantically honest name without duplicating the
-// algorithm.
+// formatRequests renders a request count with the same compact notation
+// render.FormatTokens uses, carry chain included: k below one million, then
+// M / B / T / P / E. The shared formatter is token-named, but its algorithm
+// is a generic count formatter; this wrapper gives the request column a
+// semantically honest name without duplicating the algorithm.
 func formatRequests(n int64) string {
 	return render.FormatTokens(n)
 }
