@@ -24,6 +24,11 @@ type Window struct {
 	// from consumed tokens ÷ used fraction. Zero means not yet
 	// available (no usage, or used fraction unknown).
 	LimitTokensEstimate int64 `json:"limit_tokens_estimate,omitempty"`
+	// MeasuredTokens is the actually measured token consumption for
+	// this window from the upstream/metapi. It is used as the total
+	// when LimitTokensEstimate is unavailable (e.g. a 100 % exhausted
+	// window) so the card can show X/X instead of "-".
+	MeasuredTokens int64 `json:"measured_tokens,omitempty"`
 }
 
 // Snapshot is one upstream plan fetch for a unique API key.
@@ -34,6 +39,55 @@ type Snapshot struct {
 	Windows   []Window  `json:"windows"`
 	Err       string    `json:"error,omitempty"`
 	Stale     bool      `json:"stale"`
+	// accountFPs holds the per-account key fingerprints (SHA-256 first 8
+	// bytes hex) for color assignment. It is NOT serialized to JSON.
+	accountFPs []string
+}
+
+// AccountFPs returns the per-account fingerprints, aligned with Accounts.
+// When nil or shorter than Accounts, missing entries are "".
+func (s Snapshot) AccountFPs() []string {
+	if s.accountFPs == nil {
+		return make([]string, len(s.Accounts))
+	}
+	out := make([]string, len(s.Accounts))
+	copy(out, s.accountFPs)
+	return out
+}
+
+// SetAccountFPs sets the per-account fingerprints. The slice must have
+// the same length as Accounts, or be shorter (missing entries become "").
+// Callers that have the accounts at hand should prefer AssignAccountViews,
+// which fills Accounts and the fingerprints in ONE step.
+func (s *Snapshot) SetAccountFPs(fps []string) {
+	if s == nil {
+		return
+	}
+	s.accountFPs = fps
+}
+
+// AssignAccountViews stamps s with the names of accounts and their
+// per-account key fingerprints, in one step so the two slices can never
+// drift out of alignment: AccountFPs()[i] belongs to Accounts[i].
+//
+// The fingerprint is KeyFingerprint(AccountView.Key()) — the same 口径 the
+// service poller uses — and it is what a merged ClinePass row's identity
+// (clineRowID) and colour (accountColor) are made of. A snapshot that
+// carries the names but no fingerprints renders the degraded bare ·, an
+// uncoloured name and position-keyed rows, so every snapshot built from a
+// key group must go through here: the service poller and the CLI both do.
+func AssignAccountViews(s *Snapshot, accounts []AccountView) {
+	if s == nil {
+		return
+	}
+	names := make([]string, 0, len(accounts))
+	fps := make([]string, 0, len(accounts))
+	for _, a := range accounts {
+		names = append(names, a.Name())
+		fps = append(fps, KeyFingerprint(a.Key()))
+	}
+	s.Accounts = names
+	s.SetAccountFPs(fps)
 }
 
 // AccountView is the read-only account surface the fetchers need.

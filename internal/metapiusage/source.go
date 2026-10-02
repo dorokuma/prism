@@ -20,8 +20,8 @@ func init() { sourceStatus.Set("ok") }
 
 // Source is the long-lived ClinePass consumption source the service poller
 // wires into planusage. Unlike a persistent sql.DB handle it keeps NO
-// connection: every SumClinePassTokens call opens a fresh short-lived
-// read-only Store (open → shape-check + sum → close), so
+// connection: every call opens a fresh short-lived read-only Store (open
+// → shape-check + sum/account-list → close), so
 //
 //   - a metapi database swap / file replacement / data-plane rollback is
 //     read on the next refresh round. A persistent handle would keep
@@ -31,12 +31,12 @@ func init() { sourceStatus.Set("ok") }
 //     ordering, a permission window) recovers by itself on a later round
 //     instead of being disabled for the process lifetime.
 //
-// The cost is one open (+ ping under a 5 s busy_timeout) per window sum —
-// milliseconds, dominated by the sum query itself — against a refresh
+// The cost is one open (+ ping under a 5 s busy_timeout) per operation
+// — milliseconds, dominated by the query itself — against a refresh
 // interval of two minutes by default.
 //
-// Failures degrade this round's estimates only: SumClinePassTokens reports
-// them to the caller (planusage leaves the windows without a total, never
+// Failures degrade this round's estimates only: errors are reported to
+// the caller (planusage leaves the windows without a total, never
 // touching Snapshot.Err). The degraded state is logged once per transition
 // into and out of it (never once per round) and mirrored in expvar.
 type Source struct {
@@ -59,7 +59,9 @@ func NewSource(path string) *Source { return &Source{path: path} }
 // failure logs the recovery. Callers degrade to "no estimate" and must
 // never fail the quota fetch.
 func (s *Source) SumClinePassTokens(ctx context.Context, fromUnix, toUnix int64) (int64, error) {
-	n, err := s.sumOnce(ctx, fromUnix, toUnix)
+	n, err := s.sumOnce(ctx, func(st *Store) (int64, error) {
+		return st.SumClinePassTokens(ctx, fromUnix, toUnix)
+	})
 	s.observe(err)
 	if err != nil {
 		return 0, err
@@ -67,13 +69,52 @@ func (s *Source) SumClinePassTokens(ctx context.Context, fromUnix, toUnix int64)
 	return n, nil
 }
 
-func (s *Source) sumOnce(ctx context.Context, fromUnix, toUnix int64) (int64, error) {
+// SumClinePassTokensByAccount opens path read-only, sums the ClinePass
+// rows for one account_id in [fromUnix, toUnix] and closes the
+// connection. Errors and degradation are the same as SumClinePassTokens.
+func (s *Source) SumClinePassTokensByAccount(ctx context.Context, accountID int64, fromUnix, toUnix int64) (int64, error) {
+	n, err := s.sumOnce(ctx, func(st *Store) (int64, error) {
+		return st.SumClinePassTokensByAccount(ctx, accountID, fromUnix, toUnix)
+	})
+	s.observe(err)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ListClinePassAccounts opens path read-only, lists the ACTIVE ClinePass
+// accounts (site_id=49) and closes the connection. The returned api_token is
+// what cmd/prism authenticates against cline.bot with: it goes only to the
+// immediate caller, is never logged and is never rendered (the display colour
+// comes from planusage.KeyFingerprint of the key). Errors and degradation are
+// the same as SumClinePassTokens.
+//
+// This is the ONE account-discovery implementation: the service roster
+// (cmd/prism refreshQuotaAccounts, at startup and on SIGHUP) and the CLI
+// (prism quota) both call it, so the two paths cannot drift on which accounts
+// exist. A disabled account is filtered out in SQL (see Store).
+func (s *Source) ListClinePassAccounts(ctx context.Context) ([]clinePassAccountWithToken, error) {
+	var out []clinePassAccountWithToken
+	_, err := s.sumOnce(ctx, func(st *Store) (int64, error) {
+		var err error
+		out, err = st.ListClinePassAccountsWithToken(ctx)
+		return 0, err
+	})
+	s.observe(err)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Source) sumOnce(ctx context.Context, fn func(*Store) (int64, error)) (int64, error) {
 	st, err := Open(s.path)
 	if err != nil {
 		return 0, err
 	}
 	defer st.Close()
-	return st.SumClinePassTokens(ctx, fromUnix, toUnix)
+	return fn(st)
 }
 
 // observe moves the degradation state machine: the first failure after a

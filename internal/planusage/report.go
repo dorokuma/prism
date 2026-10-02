@@ -112,10 +112,12 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 // ── card-style TUI dashboard ─────────────────────────────────────────────
 
 // Card geometry, in display columns measured with ANSI stripped. One card
-// per (account, window): the window label rides in the title, the capsule
-// bar takes row 2, and row 3 carries used/total + reset. Every line of
-// every card — title, bar, detail, note, footer, borders — is exactly
-// cardWidth (56) columns wide:
+// per (account, window) for every provider EXCEPT ClinePass (whose cards
+// are merged: one card per profile + window, one row per account — see the
+// merged-card section below): the window label rides in the title, the
+// capsule bar takes row 2, and row 3 carries used/total + reset. Every
+// line of every card — title, bar, detail, note, footer, borders — is
+// exactly cardWidth (56) columns wide:
 //
 //	╭─ Gemini acct-1 · 5小时限额 ──────────────────────────╮
 //	│ ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  34% │
@@ -161,14 +163,26 @@ type CardOptions struct {
 	NoColor bool
 }
 
-// RenderCards renders each (account, window) as one fixed-width
-// (56-column) capsule card; cards are sorted by provider display order
-// (gemini < clinepass < xai; unlisted providers fall back to
-// lexicographic) and then by account name, separated by one blank
-// line. ANSI true-color escapes are emitted by
-// default — pass CardOptions{NoColor: true} for pipes, redirects and
-// --no-color, which strips the escapes and nothing else. (The
-// pipe-friendly table is RenderTable's job.)
+// RenderCards renders the quota cards; cards are sorted by provider
+// display order (gemini < clinepass < xai; unlisted providers fall back
+// to lexicographic) and then by account name, separated by one blank
+// line. ANSI true-color escapes are emitted by default — pass
+// CardOptions{NoColor: true} for pipes, redirects and --no-color, which
+// strips the escapes and nothing else. (The pipe-friendly table is
+// RenderTable's job.)
+//
+// Two layouts share this entry point:
+//
+//   - every provider but ClinePass keeps the one-card-per-(account,
+//     window) capsule layout: title = service + account + window, row 2 =
+//     the capsule, row 3 = detail text + used/total + reset countdown, and
+//     a 已达限额 footer when the window is exhausted. Nothing below
+//     touches it.
+//   - ClinePass is merged (see clineBar/README in the merged-card section):
+//     one card per (profile, window) with one ROW per account. ClinePass
+//     accounts are polled one key each, so their snapshots are collected
+//     into groups BEFORE any card is emitted — a single snapshot never
+//     carries two ClinePass accounts.
 func RenderCards(snaps []Snapshot, now time.Time, opts ...CardOptions) string {
 	if len(snaps) == 0 {
 		return "  没有套餐数据\n"
@@ -185,8 +199,24 @@ func RenderCards(snaps []Snapshot, now time.Time, opts ...CardOptions) string {
 		return accountSortKey(sorted[i]) < accountSortKey(sorted[j])
 	})
 
+	groups := clinePassGroups(sorted)
+	emitted := make(map[clineKey]bool)
+
 	var cards []string
 	for _, s := range sorted {
+		if isClinePass(s.Provider) {
+			// The merged card is emitted at the position of the first
+			// snapshot that contributes to it, so Gemini and SuperGrok keep
+			// their relative order around the ClinePass block.
+			for _, key := range clinePassKeys(s) {
+				if emitted[key] {
+					continue
+				}
+				emitted[key] = true
+				cards = append(cards, renderClineCard(groups[key], pal))
+			}
+			continue
+		}
 		for _, acc := range cardTitles(s) {
 			if len(s.Windows) == 0 {
 				cards = append(cards, renderInfoCard(s, acc, pal))
@@ -242,12 +272,340 @@ func renderInfoCard(s Snapshot, accountTitle string, pal cardPalette) string {
 	return joinCard(lines, pal)
 }
 
-// cardTitleLine builds the top border with the embedded title:
+// ── ClinePass merged cards: one card per (profile, window) ──────────────
+//
+// ClinePass is the one provider whose cards are MERGED. Every ClinePass
+// account belongs to the same plan, and the accounts are polled one key
+// each, so the useful grouping is the plan (套餐/profile) plus the window —
+// not the (account, window) pair the other providers keep. One card per
+// (profile, window) holds one ROW per account:
+//
+//	╭─ ClinePass · 5小时限额 ─────────────────────────────────╮
+//	│ · cline-user ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  34%    3.4M/10.0M │
+//	│ · cline-user ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰ 100%     4.2M/4.2M │
+//	╰─────────────────────────────────────────────────────────╯
+//
+// Row format, left to right (every element separated by one space):
+//
+//	color dot(1) account name(n) capsule(23) pct(4) number(13)
+//
+// so a row is clineRowFixed+n display columns and the CARD is 4 columns
+// wider than its widest row. n is the LONGEST account DISPLAY name in the
+// card (see clineDisplayName): the displayed name is never truncated, a
+// long name widens the whole card instead, and every row of one card
+// shares that width, so the capsules, the percentages and the number
+// fields stay in one column each. The account name and its dot carry the
+// same accountColor(fp) (see accountNameText/accountDot), so rows of one
+// card are told apart by color AND by name even when two accounts share a
+// name.
+//
+// The name a row DISPLAYS drops its trailing pure-digit suffix (Cline1 →
+// Cline, stripNumericSuffix via clineDisplayName). The row's IDENTITY is
+// untouched by that: clineRowID keys on the FULL name plus the fingerprint,
+// so Cline1 and Cline2 stay TWO rows (with or without a fingerprint) and
+// are told apart by the dot and the name color instead.
+//
+// A merged row carries ONLY those elements. It has no detail text line
+// (no 已用 x% / 总额 …, that wording belongs to the other providers), no
+// reset countdown, no 已达限额 footer, no status suffix and nothing
+// appended to the account name (its trailing digit suffix is DROPPED, see
+// clineDisplayName): the ONE exhausted signal is the capsule
+// going solid red plus the X/X number field (see clineNumberField).
+const (
+	clineCapCells    = 23 // capsule columns
+	clinePctWidth    = 4  // right-aligned pct: "100%" / " 34%"
+	clineNumberWidth = 13 // right-aligned used/total
+	// clineRowFixed is a merged row's display columns WITHOUT the account
+	// name: dot(1) + 4 one-column gaps + capsule + pct + number.
+	clineRowFixed = 1 + 4 + clineCapCells + clinePctWidth + clineNumberWidth // 45
+)
+
+// clineKey identifies one merged card: the profile (normalized provider
+// key) plus the window NAME. Snapshots of one profile describe the same
+// plan, so their windows merge; different providers or windows never do.
+// A windowless snapshot (a failed fetch) keys on the empty window, so the
+// failing accounts of one plan still share one card.
+type clineKey struct{ provider, window string }
+
+// clineRow is one account's row inside a merged card. win is nil for a
+// windowless snapshot: the row then shows the account (dot + name) and
+// leaves the metric columns blank.
+type clineRow struct {
+	name string
+	fp   string
+	win  *Window
+}
+
+// clineGroup is one merged card under construction.
+type clineGroup struct {
+	profile string // provider display name, e.g. ClinePass
+	window  string // window display title; "" for a windowless snapshot
+	rows    []clineRow
+	notes   []string
+	seen    map[string]bool
+}
+
+// isClinePass reports whether a provider key is the ClinePass family. It
+// mirrors ClinePassFetcher.Match's provider test (case-insensitive,
+// whitespace-trimmed) so the cards and the fetcher agree on what
+// "clinepass" is.
+func isClinePass(provider string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), clinepassProviderName)
+}
+
+// clinePassKeys lists the merged-card keys one snapshot contributes to, in
+// card order: one per window, or the single empty (windowless) key when
+// the snapshot carries no window at all.
+func clinePassKeys(s Snapshot) []clineKey {
+	provider := strings.ToLower(strings.TrimSpace(s.Provider))
+	if len(s.Windows) == 0 {
+		return []clineKey{{provider: provider}}
+	}
+	keys := make([]clineKey, 0, len(s.Windows))
+	for _, w := range s.Windows {
+		keys = append(keys, clineKey{provider: provider, window: w.Name})
+	}
+	return keys
+}
+
+// clinePassGroups collects the merged cards of a snapshot list. The
+// snapshots must already be sorted (accountSortKey); rows are appended in
+// that order, so accounts keep the ordering the rest of the report uses.
+//
+// Row IDENTITY is (window, name, fingerprint): the fingerprint is what
+// makes TWO DIFFERENT accounts that share a name two rows (real case: two
+// metapi ClinePass rows with the same username but different api_tokens),
+// and it is also what keeps one account from being listed twice when it
+// shows up in more than one snapshot of the group (accounts that share a
+// key are ONE snapshot with several names, and a failed/retried round can
+// repeat a roster). Without a fingerprint there is no way to tell "the
+// same account twice" from "two accounts, same name" apart, and the
+// same-name case is the one that must stay visible: such a row is keyed by
+// its position (snapshot ordinal, account index) instead.
+func clinePassGroups(sorted []Snapshot) map[clineKey]*clineGroup {
+	groups := map[clineKey]*clineGroup{}
+	for si, s := range sorted {
+		if !isClinePass(s.Provider) {
+			continue
+		}
+		names := s.Accounts
+		if len(names) == 0 {
+			names = []string{providerDisplayName(s.Provider)}
+		}
+		fps := s.AccountFPs()
+		for _, key := range clinePassKeys(s) {
+			g := groups[key]
+			if g == nil {
+				g = &clineGroup{
+					profile: providerDisplayName(s.Provider),
+					window:  windowTitle(key.window),
+					seen:    map[string]bool{},
+				}
+				groups[key] = g
+			}
+			var win *Window
+			if key.window != "" {
+				for i := range s.Windows {
+					if s.Windows[i].Name == key.window {
+						win = &s.Windows[i]
+						break
+					}
+				}
+			}
+			for ai, name := range names {
+				fp := ""
+				if ai < len(fps) {
+					fp = fps[ai]
+				}
+				id := clineRowID(name, fp, si, ai)
+				if g.seen[id] {
+					continue
+				}
+				g.seen[id] = true
+				g.rows = append(g.rows, clineRow{name: name, fp: fp, win: win})
+			}
+			if s.Err != "" {
+				if note := clineNote(names[0], s.Err); !containsString(g.notes, note) {
+					g.notes = append(g.notes, note)
+				}
+			}
+		}
+	}
+	return groups
+}
+
+// clineRowID is the dedupe key of one merged row (see clinePassGroups).
+func clineRowID(name, fp string, snapshot, account int) string {
+	if fp != "" {
+		return "fp\x00" + name + "\x00" + fp
+	}
+	return "at\x00" + name + "\x00" + strconv.Itoa(snapshot) + ":" + strconv.Itoa(account)
+}
+
+// clineNote attributes a fetch failure on a merged card: the account the
+// failure came from plus the localized code. The account name is what the
+// title no longer carries, so the note is where it has to appear.
+func clineNote(name, code string) string {
+	if name == "" {
+		return cardErrorNote(code)
+	}
+	return "⚠ " + name + ": " + localizedCode(code)
+}
+
+// containsString reports whether list already holds s. The merged card
+// keeps its failure notes unique, so a repeated snapshot cannot duplicate
+// a note line.
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// clineCardWidth is the merged card's width in display columns: the row's
+// fixed columns plus the LONGEST account DISPLAY name in the card (the name
+// the row actually shows, clineDisplayName), so a long name widens the card
+// instead of being truncated. The width comes from the DISPLAY name, not
+// the identity's full name, so a stripped digit suffix never reserves an
+// invisible blank column. The title's own needs are a floor, so a short
+// account name can never squeeze the plan + window name into an ellipsis.
+func clineCardWidth(g *clineGroup) int {
+	name := 0
+	for _, r := range g.rows {
+		if w := render.DisplayWidth(clineDisplayName(r)); w > name {
+			name = w
+		}
+	}
+	width := 4 + clineRowFixed + name
+	if need := titleWidth(g.profile, "", g.window, render.DisplayWidth(" · ")) + 6; need > width {
+		width = need
+	}
+	return width
+}
+
+// renderClineCard renders one merged (profile, window) card: the title
+// (plan display name + window name, never an account), one row per
+// account, the failure notes, and the bottom border.
+func renderClineCard(g *clineGroup, pal cardPalette) string {
+	width := clineCardWidth(g)
+	lines := []string{cardTitleLineAt(width, g.profile, "", g.window, pal)}
+	for _, r := range g.rows {
+		lines = append(lines, clineRowLine(r, width, pal))
+	}
+	for _, note := range g.notes {
+		lines = append(lines, cardBodyAt(width, note, pal))
+	}
+	return joinCardAt(lines, width, pal)
+}
+
+// clineDisplayName is the account name a merged row SHOWS: the trailing
+// pure-digit suffix is dropped (Cline1 → Cline, Cline2 → Cline), so two
+// accounts whose names differ only by that suffix read as one name. It is a
+// DISPLAY-ONLY transform — the row's identity stays clineRowID(name, fp,
+// …), which keys on the FULL name plus the fingerprint, so Cline1 and
+// Cline2 remain TWO rows (also when no fingerprint is available, where the
+// key falls back to the row's position). Same-name accounts are told apart
+// by the dot and the name color (accountColor(fp)), not by the text.
+func clineDisplayName(r clineRow) string {
+	return stripNumericSuffix(r.name)
+}
+
+// clineRowLine renders one merged row. The account name is padded to the
+// card's name column, so the capsule, the percentage and the number field
+// of every row start at the same column. The dot and the name share one
+// color (accountColor of the account's fingerprint); with no usable
+// fingerprint the dot degrades to the plain · and the name stays plain.
+// The row shows the account's DISPLAY name (clineDisplayName, trailing
+// digits dropped); only the row identity (clineRowID) keeps the full name.
+func clineRowLine(r clineRow, width int, pal cardPalette) string {
+	name := clineDisplayName(r)
+	pad := width - 4 - clineRowFixed - render.DisplayWidth(name)
+	if pad < 0 {
+		pad = 0
+	}
+	capsule := strings.Repeat(" ", clineCapCells)
+	pct := strings.Repeat(" ", clinePctWidth)
+	number := strings.Repeat(" ", clineNumberWidth)
+	if r.win != nil {
+		capsule = clineBar(*r.win, pal)
+		pct = render.PadLeft(pctLabel(*r.win), clinePctWidth)
+		number = render.PadLeft(clineNumberField(*r.win), clineNumberWidth)
+	}
+	return pal.dim("│ ") +
+		accountDot(r.fp, pal) + " " +
+		accountNameText(name, r.fp, pal) + strings.Repeat(" ", pad+1) +
+		capsule + " " + pct + " " + number +
+		pal.dim(" │")
+}
+
+// clineBar is a merged row's capsule: the used share solid ▰, the rest
+// hollow ▱, colored per cell along the shared severity ramp — and the
+// WHOLE capsule solid red once the window is exhausted. "Went red" is the
+// only exhausted signal a merged row carries (there is no footer and no
+// countdown any more), so the drained pill is drawn solid, exactly like
+// the legacy exhausted capsule.
+func clineBar(w Window, pal cardPalette) string {
+	if windowExhausted(w) {
+		return pal.red(strings.Repeat(capUsed, clineCapCells))
+	}
+	pct := displayPercent(w)
+	return render.CapsuleBar(clineCapCells, render.CapsuleUsedCells(pct, clineCapCells), nil, pal.color)
+}
+
+// clineNumberField is a merged row's number field: used/total, where the
+// total is the window's MEASURED total (LimitTokensEstimate, or
+// MeasuredTokens when the pool is unknown) and used is the window's share
+// of it — the same 已用 percentage the pct column shows.
+//
+// A 100 % (exhausted) row is forced to the FULL pair, so a drained row
+// always reads X/X — never "-" and never a fraction of a measured total.
+// "-" survives for the one case the data cannot answer: no estimate AND
+// no measured consumption at all (metapi unreadable).
+func clineNumberField(w Window) string {
+	total := w.LimitTokensEstimate
+	if total <= 0 {
+		total = w.MeasuredTokens
+	}
+	if total <= 0 {
+		return "-"
+	}
+	if windowExhausted(w) {
+		return formatTokenPair(total, total)
+	}
+	used := int64(float64(total) * float64(displayPercent(w)) / 100)
+	return formatTokenPair(used, total)
+}
+
+// accountNameText renders an account name in the same palette color as its
+// dot. It shares accountColor with accountDot, so the two can never
+// disagree; without a usable fingerprint (empty or shorter than 8 hex
+// characters) both degrade to the plain · and plain text.
+func accountNameText(name, fp string, pal cardPalette) string {
+	if !pal.color {
+		return name
+	}
+	color := accountColor(fp)
+	if color == "" {
+		return name
+	}
+	return render.FgFromHex(color, name)
+}
+
+// cardTitleLine builds the top border with the embedded title at the
+// legacy card width. The merged ClinePass cards call cardTitleLineAt with
+// their own (name-driven) width; everything else goes through here.
+func cardTitleLine(service, account, window string, pal cardPalette) string {
+	return cardTitleLineAt(cardWidth, service, account, window, pal)
+}
+
+// cardTitleLineAt is cardTitleLine for an explicit card width:
 //
 //	╭─ ␣service␣account␣·␣window␣Dim(───…╮)
 //
 // One space separates each title element and the fill; the fill dashes
-// sit on the RIGHT of the title only; the total line is exactly cardWidth
+// sit on the RIGHT of the title only; the total line is exactly width
 // display columns. An over-long title is shrunk IN THE VARIABLE SEGMENTS —
 // the account first (a long account is the common case), then the window
 // label (only an unknown upstream name is ever long: the known labels are
@@ -263,13 +621,13 @@ func renderInfoCard(s Snapshot, accountTitle string, pal cardPalette) string {
 // same, exactly like the usage report's card title; only the non-text
 // elements (the ╭─ border, the dash fill) stay dim. The separators are
 // ordinary spaces, so the segments read as one plain phrase.
-func cardTitleLine(service, account, window string, pal cardPalette) string {
+func cardTitleLineAt(width int, service, account, window string, pal cardPalette) string {
 	const prefixW, suffixW, sep = 3, 1, " · "
 	sepW := render.DisplayWidth(sep)
 	// The line is "╭─ " + body + " " + fill + "╮" = 3 + body + 1 + fill
-	// + 1, so the body may take at most 50 columns and still leave one
-	// fill dash.
-	bodyMax := cardWidth - prefixW - suffixW - 2 // 50
+	// + 1, so the body may take at most width-6 columns and still leave
+	// one fill dash (50 at the legacy width).
+	bodyMax := width - prefixW - suffixW - 2
 	svc, acc, win := service, account, window
 	// De-duplicate the account segment: when the account name is exactly the
 	// provider display name ("Gemini Gemini"), it adds no information, so drop
@@ -321,9 +679,9 @@ shrink:
 		b.WriteString(sep)
 		b.WriteString(win)
 	}
-	// Fill from the MEASURED body width: 3 + body + 1 + fill + 1 = 56.
+	// Fill from the MEASURED body width: 3 + body + 1 + fill + 1 = width.
 	used := titleWidth(svc, acc, win, sepW)
-	fill := cardWidth - prefixW - suffixW - used - 1
+	fill := width - prefixW - suffixW - used - 1
 	if fill < 1 {
 		fill = 1
 	}
@@ -372,7 +730,12 @@ func cardDetailRow(w Window, now time.Time, pal cardPalette) string {
 // cardBody renders one mostly-empty middle line: the content
 // left-aligned at the card body and padded to cardInner.
 func cardBody(text string, pal cardPalette) string {
-	return pal.dim("│ ") + render.PadRight(text, cardInner) + pal.dim(" │")
+	return cardBodyAt(cardWidth, text, pal)
+}
+
+// cardBodyAt is cardBody for an explicit card width.
+func cardBodyAt(width int, text string, pal cardPalette) string {
+	return pal.dim("│ ") + render.PadRight(text, width-4) + pal.dim(" │")
 }
 
 // cardFooter renders the exhausted-window warning row: the yellow
@@ -397,27 +760,38 @@ func cardNote(text string, pal cardPalette) string {
 // fetch_failed); a code the table does not know passes through unchanged,
 // still behind the ⚠ prefix.
 func cardErrorNote(code string) string {
+	return "⚠ " + localizedCode(code)
+}
+
+// localizedCode is the Chinese wording of one fetch-failure code; an
+// unmapped code passes through unchanged.
+func localizedCode(code string) string {
 	switch code {
 	case "unauthorized":
-		code = "未授权"
+		return "未授权"
 	case "no_subscription":
-		code = "无订阅"
+		return "无订阅"
 	case "unexpected_status":
-		code = "上游状态异常"
+		return "上游状态异常"
 	case "fetch_failed":
-		code = "拉取失败"
+		return "拉取失败"
 	}
-	return "⚠ " + code
+	return code
 }
 
 // joinCard appends the bottom border to the card lines.
 func joinCard(lines []string, pal cardPalette) string {
+	return joinCardAt(lines, cardWidth, pal)
+}
+
+// joinCardAt is joinCard for an explicit card width.
+func joinCardAt(lines []string, width int, pal cardPalette) string {
 	var sb strings.Builder
 	for _, l := range lines {
 		sb.WriteString(l)
 		sb.WriteByte('\n')
 	}
-	sb.WriteString(pal.dim("╰" + strings.Repeat("─", cardWidth-2) + "╯"))
+	sb.WriteString(pal.dim("╰" + strings.Repeat("─", width-2) + "╯"))
 	return sb.String()
 }
 
@@ -443,6 +817,25 @@ func providerDisplayName(p string) string {
 		return "SuperGrok"
 	default:
 		return p
+	}
+}
+
+// windowTitle is the capsule card's window label. The spec wording
+// ("5小时限额") replaces the legacy table's 短期/中期/长期 — the window
+// name is now part of the card title, so it says what the window IS.
+// Unknown names pass through unchanged, an empty name renders "--".
+func windowTitle(name string) string {
+	switch name {
+	case "rolling", "5h":
+		return "5小时限额"
+	case "weekly":
+		return "周限额"
+	case "monthly":
+		return "月限额"
+	case "":
+		return "--"
+	default:
+		return name
 	}
 }
 
@@ -497,7 +890,7 @@ func totalPart(w Window) string {
 // when the upstream reported ResetsAt, "已重置" once the window has
 // rolled over, and "-" when there is no reset time at all. The countdown
 // itself comes from cardCountdown, so the resetWidth column keeps its
-// fixed 18 columns whatever the wording.
+// width at every value.
 func resetText(w Window, now time.Time) string {
 	if w.ResetsAt == nil || w.ResetsAt.IsZero() {
 		return "-"
@@ -506,58 +899,6 @@ func resetText(w Window, now time.Time) string {
 		return "已重置"
 	}
 	return cardCountdown(now, *w.ResetsAt) + " 后重置"
-}
-
-// cardCountdown formats the remaining time for the detail row's reset
-// column. Minutes are zero-padded and the components are separated by one
-// space (2h 01m, 4h 51m, 3d 4h) so the column reads "3h 12m 后重置";
-// the day/hour cases mirror formatRemain. formatRemain itself is
-// untouched: the legacy table's output must not change.
-func cardCountdown(now, at time.Time) string {
-	d := at.Sub(now)
-	if d <= 0 {
-		return "已到"
-	}
-	if d < time.Minute {
-		return "<1m"
-	}
-	mins := int(d.Minutes())
-	if mins < 60 {
-		return fmt.Sprintf("%dm", mins)
-	}
-	hours := mins / 60
-	mins %= 60
-	if hours < 24 {
-		if mins == 0 {
-			return fmt.Sprintf("%dh", hours)
-		}
-		return fmt.Sprintf("%dh %02dm", hours, mins)
-	}
-	days := hours / 24
-	hours %= 24
-	if hours == 0 {
-		return fmt.Sprintf("%dd", days)
-	}
-	return fmt.Sprintf("%dd %dh", days, hours)
-}
-
-// windowTitle is the capsule card's window label. The spec wording
-// ("5小时限额") replaces the legacy table's 短期/中期/长期 — the window
-// name is now part of the card title, so it says what the window IS.
-// Unknown names pass through unchanged, an empty name renders "--".
-func windowTitle(name string) string {
-	switch name {
-	case "rolling", "5h":
-		return "5小时限额"
-	case "weekly":
-		return "周限额"
-	case "monthly":
-		return "月限额"
-	case "":
-		return "--"
-	default:
-		return name
-	}
 }
 
 // pctLabel is the bar row's percentage: the consumed share, right-aligned
@@ -773,4 +1114,113 @@ func formatRemain(now time.Time, at *time.Time) string {
 		return fmt.Sprintf("%dd", days)
 	}
 	return fmt.Sprintf("%dd%dh", days, hours)
+}
+
+// ── multi-account helpers (new) ────────────────────────────────────────
+
+// stripNumericSuffix removes the trailing run of digits from an account name,
+// leaving everything before it. "Cline1" → "Cline", "account123" → "account",
+// "Cline-1" → "Cline-" (a hyphen is not a digit and stays).
+//
+// A name that is ENTIRELY digits ("12345") keeps its name: stripping down to
+// the empty string would leave the row with nothing but the colour dot, which
+// is worse than showing the account's actual name — the row identity
+// (clineRowID) and the colour already tell such accounts apart.
+//
+// It is wired into the merged card through clineDisplayName: a merged row
+// SHOWS the stripped name (Cline1/Cline2 both read "Cline"), while the row
+// IDENTITY (clineRowID) keeps the full name plus the fingerprint — so a
+// suffixed pair is still exactly two rows, and two same-name accounts are
+// told apart by their dot and name color (accountColor(fp)). No other
+// renderer calls it.
+func stripNumericSuffix(s string) string {
+	i := len(s)
+	for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
+		i--
+	}
+	if i == 0 {
+		return s
+	}
+	return s[:i]
+}
+
+// accountColor picks a high-contrast bright color for the account from
+// a fixed palette, indexed by the key fingerprint modulo palette length.
+// The color is stable across renders for the same key.
+func accountColor(fp string) string {
+	if fp == "" || len(fp) < 8 {
+		return ""
+	}
+	palette := []string{
+		"00FFFF", // 青
+		"FF00FF", // 洋红
+		"FFFF00", // 黄
+		"00FF00", // 绿
+		"FF8800", // 橙
+		"8800FF", // 紫
+	}
+	var h uint64
+	for i := 0; i < 8; i++ {
+		h = h*16 + uint64(hexValue(string(fp[i])))
+	}
+	return palette[h%uint64(len(palette))]
+}
+
+// accountDot returns a 1-display-column color dot for the account. The
+// color is derived from a fixed bright palette indexed by the key
+// fingerprint. In no-color mode the bare middle dot is returned.
+func accountDot(fp string, pal cardPalette) string {
+	if fp == "" || !pal.color {
+		return "·"
+	}
+	color := accountColor(fp)
+	if color == "" {
+		return "·"
+	}
+	return render.FgFromHex(color, "·")
+}
+
+func hexValue(s string) int {
+	v, _ := strconv.ParseUint(s, 16, 8)
+	return int(v)
+}
+
+// formatTokenPair formats a used/total token pair with one decimal per
+// side: "3.4M/10.0M". Joined without spaces, because the pair shares ONE
+// right-aligned column (the merged ClinePass card's number field).
+func formatTokenPair(used, total int64) string {
+	u := render.FormatTokensOneDecimal(used)
+	t := render.FormatTokensOneDecimal(total)
+	return u + "/" + t
+}
+
+// ── card title & body helpers ─────────────────────────────────────────
+
+// cardCountdown formats a duration as a human-friendly countdown.
+func cardCountdown(now, at time.Time) string {
+	d := at.Sub(now)
+	if d <= 0 {
+		return "已到"
+	}
+	if d < time.Minute {
+		return "<1m"
+	}
+	mins := int(d.Minutes())
+	if mins < 60 {
+		return fmt.Sprintf("%dm", mins)
+	}
+	hours := mins / 60
+	mins %= 60
+	if hours < 24 {
+		if mins == 0 {
+			return fmt.Sprintf("%dh", hours)
+		}
+		return fmt.Sprintf("%dh %02dm", hours, mins)
+	}
+	days := hours / 24
+	hours %= 24
+	if hours == 0 {
+		return fmt.Sprintf("%dd", days)
+	}
+	return fmt.Sprintf("%dd %dh", days, hours)
 }

@@ -159,6 +159,64 @@ func FormatCostCompact(v *float64) string {
 	return sign + "$" + groupDigits(intPart) + "." + frac
 }
 
+// FormatTokensOneDecimal formats a token count compactly with exactly one
+// decimal for K/M/B/B/T/P/E units and plain digits below 1000:
+//   - < 1000: plain digits ("340")
+//   - >= 1000: "K" suffix with one decimal ("850.0K", "5.2M", "322.8M",
+//     "2.3B")
+//
+// The carry chain is the same as FormatTokens (M -> B -> T -> P -> E),
+// but the precision is fixed at 1 decimal instead of trimming trailing
+// zeros. A value that rounds up to 1000 of its unit carries one unit up,
+// repeating until the scaled value is below 1000.
+func FormatTokensOneDecimal(n int64) string {
+	sign := ""
+	u := uint64(n)
+	if n < 0 {
+		sign = "-"
+		u = uint64(-(n + 1)) + 1
+	}
+	if u < 1000 {
+		return sign + strconv.FormatUint(u, 10)
+	}
+	return sign + formatMagnitudeOneDecimal(u)
+}
+
+// tokenMagnitudeOneDecimal is one step of the fixed-one-decimal notation's
+// carry chain.
+type tokenMagnitudeOneDecimal struct {
+	div    uint64
+	suffix string
+}
+
+var tokenMagnitudesOneDecimal = []tokenMagnitudeOneDecimal{
+	{div: 1_000_000_000_000_000_000, suffix: "E"},
+	{div: 1_000_000_000_000_000, suffix: "P"},
+	{div: 1_000_000_000_000, suffix: "T"},
+	{div: 1_000_000_000, suffix: "B"},
+	{div: 1_000_000, suffix: "M"},
+	{div: 1_000, suffix: "K"},
+}
+
+func formatMagnitudeOneDecimal(u uint64) string {
+	i := len(tokenMagnitudesOneDecimal) - 1
+	for j, m := range tokenMagnitudesOneDecimal {
+		if u >= m.div {
+			i = j
+			break
+		}
+	}
+	for {
+		m := tokenMagnitudesOneDecimal[i]
+		text := strconv.FormatFloat(float64(u)/float64(m.div), 'f', 1, 64)
+		if v, err := strconv.ParseFloat(text, 64); err == nil && v >= 1000 && i > 0 {
+			i--
+			continue
+		}
+		return text + m.suffix
+	}
+}
+
 // FormatPercent formats part/total*100 with one decimal and a "%" suffix
 // ("0.7%"). A zero total renders as "-" instead of dividing by zero.
 func FormatPercent(part, total float64) string {

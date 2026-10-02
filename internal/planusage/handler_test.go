@@ -63,10 +63,47 @@ func TestCacheStoreFailedKeepsWindows(t *testing.T) {
 		Provider: "opencode-go",
 		Windows:  []Window{{Name: "rolling", Percent: 10, Status: "ok"}},
 	})
-	c.StoreFailed("fp", "opencode-go", []string{"a"}, "fetch_failed")
+	c.StoreFailed("fp", Snapshot{Provider: "opencode-go", Accounts: []string{"a"}}, "fetch_failed")
 	got := c.List()
 	if len(got) != 1 || !got[0].Stale || got[0].Windows[0].Percent != 10 {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+// TestCacheStoreFailedKeepsFingerprints pins O7 at the cache boundary: the
+// stored failed snapshot must keep the per-account fingerprints the caller
+// assembled (Accounts[i] ↔ AccountFPs()[i]), i.e. StoreFailed must not rebuild
+// the snapshot without them. Order matters: moving an account moves its
+// fingerprint with it.
+func TestCacheStoreFailedKeepsFingerprints(t *testing.T) {
+	c := NewCache()
+	assembled := Snapshot{Provider: "clinepass"}
+	AssignAccountViews(&assembled, []AccountView{
+		fakeAcc{name: "Cline", key: "tok-a"},
+		fakeAcc{name: "Cline", key: "tok-b"},
+	})
+	c.StoreFailed("fp", assembled, "fetch_failed")
+	got := c.List()
+	if len(got) != 1 {
+		t.Fatalf("list = %d, want 1", len(got))
+	}
+	fps := got[0].AccountFPs()
+	if len(fps) != 2 || len(got[0].Accounts) != 2 {
+		t.Fatalf("failed round must keep both names and both fingerprints: %+v (fps=%v)", got[0], fps)
+	}
+	if fps[0] != KeyFingerprint("tok-a") || fps[1] != KeyFingerprint("tok-b") {
+		t.Fatalf("failed round fingerprints = %v, want the assembled key fingerprints", fps)
+	}
+
+	reordered := Snapshot{Provider: "clinepass"}
+	AssignAccountViews(&reordered, []AccountView{
+		fakeAcc{name: "Cline", key: "tok-b"},
+		fakeAcc{name: "Cline", key: "tok-a"},
+	})
+	c.StoreFailed("fp", reordered, "fetch_failed")
+	fps = c.List()[0].AccountFPs()
+	if fps[0] != KeyFingerprint("tok-b") || fps[1] != KeyFingerprint("tok-a") {
+		t.Fatalf("fingerprint %v did not follow the account it belongs to", fps)
 	}
 }
 
@@ -77,7 +114,7 @@ func TestCacheStoreFailedAuthClearsWindows(t *testing.T) {
 			Provider: "opencode-go",
 			Windows:  []Window{{Name: "rolling", Percent: 10, Status: "ok"}},
 		})
-		c.StoreFailed("fp", "opencode-go", []string{"a"}, code)
+		c.StoreFailed("fp", Snapshot{Provider: "opencode-go", Accounts: []string{"a"}}, code)
 		got := c.List()
 		if len(got) != 1 {
 			t.Fatalf("%s: list = %d", code, len(got))

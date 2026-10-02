@@ -1,7 +1,7 @@
 ---
 status: active
 superseded_by: ""
-supersedes: 20250923-quota-tui-card-format.md
+supersedes: 20260923-quota-tui-card-format.md
 模块: planusage, render, cmd/prism
 ---
 

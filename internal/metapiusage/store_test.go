@@ -11,8 +11,11 @@ import (
 )
 
 // metapiFixtureRow is one proxy_logs row for the test fixture; nil
-// pointers map to SQL NULL.
+// pointers map to SQL NULL. accountID is the metapi account the row belongs
+// to (NULL for rows metapi recorded without one), which is what the
+// per-account sum isolates on.
 type metapiFixtureRow struct {
+	accountID  *int64
 	model      string
 	createdAt  time.Time
 	prompt     *int64
@@ -21,6 +24,18 @@ type metapiFixtureRow struct {
 }
 
 func i64(v int64) *int64 { return &v }
+
+// metapiAccountFixture is one accounts row: site 49 is ClinePass, status is
+// metapi's own enum ('active' / 'disabled', default 'active').
+type metapiAccountFixture struct {
+	id       int64
+	siteID   int64
+	username string
+	status   string
+	apiToken *string // nil = SQL NULL (an account without a usable token)
+}
+
+func sptr(v string) *string { return &v }
 
 // createdAtFixtureLayout is the fixture-side copy of metapi's created_at
 // shape, written as a literal on purpose: fixtures must not certify the
@@ -33,6 +48,7 @@ func createProxyLogsTable(t *testing.T, db *sql.DB) {
 	t.Helper()
 	if _, err := db.Exec(`CREATE TABLE proxy_logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		account_id INTEGER,
 		model_requested TEXT,
 		prompt_tokens INTEGER,
 		completion_tokens INTEGER,
@@ -40,6 +56,40 @@ func createProxyLogsTable(t *testing.T, db *sql.DB) {
 		created_at TEXT DEFAULT (datetime('now'))
 	)`); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// createAccountsTable creates the accounts subset this package reads: id,
+// site_id, username, status and api_token. The production table's other
+// columns (tokens, quota, oauth linkage, …) are deliberately absent — prism
+// never reads them.
+func createAccountsTable(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(`CREATE TABLE accounts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		site_id INTEGER NOT NULL,
+		username TEXT,
+		status TEXT DEFAULT 'active',
+		api_token TEXT
+	)`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// insertProxyLogs writes the fixture rows into proxy_logs. The column list is
+// explicit (account_id included) so a fixture row with a NULL account_id is
+// the same as metapi's own NULL.
+func insertProxyLogs(t *testing.T, db *sql.DB, rows []metapiFixtureRow) {
+	t.Helper()
+	for _, r := range rows {
+		if _, err := db.Exec(
+			`INSERT INTO proxy_logs (account_id, model_requested, prompt_tokens, completion_tokens, total_tokens, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			r.accountID, r.model, r.prompt, r.completion, r.total,
+			r.createdAt.UTC().Format(createdAtFixtureLayout),
+		); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -53,17 +103,39 @@ func writeFixtureAt(t *testing.T, path string, rows []metapiFixtureRow) string {
 	}
 	defer db.Close()
 	createProxyLogsTable(t, db)
-	for _, r := range rows {
+	insertProxyLogs(t, db, rows)
+	return path
+}
+
+// writeHubFixtureAt creates BOTH tables this package reads (accounts and
+// proxy_logs) at path and returns the path. It is the fixture of the
+// account-aware paths: the roster (ListClinePassAccounts) and the per-account
+// token sum.
+func writeHubFixtureAt(t *testing.T, path string, accounts []metapiAccountFixture, rows []metapiFixtureRow) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createProxyLogsTable(t, db)
+	createAccountsTable(t, db)
+	for _, a := range accounts {
 		if _, err := db.Exec(
-			`INSERT INTO proxy_logs (model_requested, prompt_tokens, completion_tokens, total_tokens, created_at)
-			 VALUES (?, ?, ?, ?, ?)`,
-			r.model, r.prompt, r.completion, r.total,
-			r.createdAt.UTC().Format(createdAtFixtureLayout),
+			`INSERT INTO accounts (id, site_id, username, status, api_token) VALUES (?, ?, ?, ?, ?)`,
+			a.id, a.siteID, a.username, a.status, a.apiToken,
 		); err != nil {
 			t.Fatal(err)
 		}
 	}
+	insertProxyLogs(t, db, rows)
 	return path
+}
+
+// writeHubFixture is writeHubFixtureAt in its own temp dir.
+func writeHubFixture(t *testing.T, accounts []metapiAccountFixture, rows []metapiFixtureRow) string {
+	t.Helper()
+	return writeHubFixtureAt(t, filepath.Join(t.TempDir(), "hub.db"), accounts, rows)
 }
 
 // writeFixture creates a proxy_logs fixture in its own temp dir. Returns
@@ -122,6 +194,105 @@ func TestSumClinePassTokens(t *testing.T) {
 	// An empty window sums to 0, not an error.
 	if got, err = st.SumClinePassTokens(context.Background(), to+10, to+20); err != nil || got != 0 {
 		t.Fatalf("empty window: got (%d, %v), want (0, nil)", got, err)
+	}
+}
+
+// TestSumClinePassTokensByAccount pins the per-account isolation: only the
+// rows of the requested metapi account count. Another account's ClinePass
+// traffic in the SAME window must not leak in — that is the whole point of the
+// per-account estimate, each subscription's pool is its own — and neither must
+// a row of the same account whose model is not cline-pass/*.
+func TestSumClinePassTokensByAccount(t *testing.T) {
+	base := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	from := base.Unix()
+	to := base.Add(time.Hour).Unix()
+	acctA, acctB := int64(34), int64(38)
+
+	path := writeHubFixture(t, nil, []metapiFixtureRow{
+		// account 34: counted (stored total), plus one NULL total falling
+		// back to prompt+completion.
+		{accountID: &acctA, model: "cline-pass/x", createdAt: base.Add(10 * time.Minute), total: i64(100)},
+		{accountID: &acctA, model: "cline-pass/y", createdAt: base.Add(20 * time.Minute), prompt: i64(7), completion: i64(3), total: nil},
+		// account 38 in the same window: excluded from account 34's sum.
+		{accountID: &acctB, model: "cline-pass/x", createdAt: base.Add(15 * time.Minute), total: i64(9_999)},
+		// NULL account_id (a row metapi recorded without an account): never
+		// attributed to a specific account.
+		{model: "cline-pass/x", createdAt: base.Add(16 * time.Minute), total: i64(5_000)},
+		// account 34 outside the window / with another model: excluded.
+		{accountID: &acctA, model: "cline-pass/x", createdAt: base.Add(-time.Second), total: i64(1_000)},
+		{accountID: &acctA, model: "gpt-5", createdAt: base.Add(5 * time.Minute), total: i64(2_000)},
+	})
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	if got, err := st.SumClinePassTokensByAccount(ctx, acctA, from, to); err != nil || got != 110 {
+		t.Fatalf("account 34 sum = (%d, %v), want (110, nil)", got, err)
+	}
+	if got, err := st.SumClinePassTokensByAccount(ctx, acctB, from, to); err != nil || got != 9_999 {
+		t.Fatalf("account 38 sum = (%d, %v), want (9999, nil) — the other account must not leak", got, err)
+	}
+	// An account with no traffic in the window sums to 0, not an error.
+	if got, err := st.SumClinePassTokensByAccount(ctx, 41, from, to); err != nil || got != 0 {
+		t.Fatalf("unknown account sum = (%d, %v), want (0, nil)", got, err)
+	}
+	// A non-positive lower bound is a no-op, like the subscription-wide sum.
+	if got, err := st.SumClinePassTokensByAccount(ctx, acctA, 0, to); err != nil || got != 0 {
+		t.Fatalf("from<=0: got (%d, %v), want (0, nil)", got, err)
+	}
+
+	// The subscription-wide sum still sees all accounts: 110 + 9999 + 5000.
+	if got, err := st.SumClinePassTokens(ctx, from, to); err != nil || got != 15_109 {
+		t.Fatalf("subscription-wide sum = (%d, %v), want (15109, nil)", got, err)
+	}
+}
+
+// TestListClinePassAccountsFiltersDisabled pins the SQL-side roster filter:
+// site 49 AND status 'active'. The production site 49 holds one active and one
+// disabled account, and a disabled account must not be polled (it has no live
+// subscription) nor rendered. Rows without an api_token and rows of another
+// site are excluded too. The Source variant (the one cmd/prism calls) must
+// return the same roster.
+func TestListClinePassAccountsFiltersDisabled(t *testing.T) {
+	path := writeHubFixture(t, []metapiAccountFixture{
+		{id: 34, siteID: 49, username: "Cline", status: "disabled", apiToken: sptr("tok-disabled")},
+		{id: 38, siteID: 49, username: "Cline2", status: "active", apiToken: sptr("tok-active-2")},
+		{id: 39, siteID: 49, username: "no-token", status: "active", apiToken: nil},
+		{id: 40, siteID: 9, username: "other-site", status: "active", apiToken: sptr("tok-other-site")},
+		{id: 41, siteID: 49, username: "Cline3", status: "disabled", apiToken: sptr("tok-disabled-3")},
+	}, nil)
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	got, err := st.ListClinePassAccountsWithToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("roster = %+v, want exactly the one active site-49 account", got)
+	}
+	if got[0].AccountID != 38 || got[0].Username != "Cline2" || got[0].APIToken != "tok-active-2" {
+		t.Fatalf("roster entry = %+v, want account 38 Cline2", got[0])
+	}
+
+	// The service-side listing (Source) must agree: ONE implementation decides
+	// which accounts exist, so CLI and service cannot drift.
+	src := NewSource(path)
+	fromSrc, err := src.ListClinePassAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fromSrc) != 1 || fromSrc[0].AccountID != 38 || fromSrc[0].APIToken != "tok-active-2" {
+		t.Fatalf("source roster = %+v, want the same single active account", fromSrc)
 	}
 }
 

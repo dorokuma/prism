@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/metapiusage"
 	"github.com/dorokuma/prism/internal/oauth"
 	"github.com/dorokuma/prism/internal/oauth/google"
 	"github.com/dorokuma/prism/internal/oauth/xai"
@@ -115,6 +117,37 @@ func quotaCredential(cfg *config.Config, a config.AccountConfig) string {
 	return tok
 }
 
+// buildQuotaSnapshot completes one CLI snapshot for a key group. It is the
+// CLI counterpart of the service poller's fetchOne:
+//
+//   - planusage.AssignAccountViews stamps the group's account names AND their
+//     per-account key fingerprints in one aligned step, exactly like the
+//     service path. Without it a production `prism quota` snapshot carried no
+//     fingerprint at all, so a ClinePass row degraded to the bare ·, an
+//     uncoloured account name and a position-keyed row — the "same-name
+//     accounts are told apart by their dot" behaviour was unreachable in the
+//     CLI while it worked on /admin/quota;
+//   - the provider's 总额 estimate is applied on success only. A failed fetch
+//     keeps the snapshot's error code and gets no estimate, like before.
+//
+// The HTTP fetch itself stays in the caller: this function is pure assembly.
+func buildQuotaSnapshot(ctx context.Context, cfg *config.Config, g planusage.KeyGroup, snap planusage.Snapshot, ferr error) planusage.Snapshot {
+	planusage.AssignAccountViews(&snap, g.Accounts)
+	if ferr != nil {
+		snap.Err = planusage.ErrorCode(ferr)
+		return snap
+	}
+	switch snap.Provider {
+	case "xai":
+		snap = applyQuotaGrokEstimate(ctx, cfg, snap)
+	case "gemini":
+		snap = applyQuotaGeminiEstimate(ctx, cfg, snap)
+	case "clinepass":
+		snap = applyQuotaClinePassEstimate(ctx, snap, planusage.AccountIDFrom(g.Accounts[0]))
+	}
+	return snap
+}
+
 func runQuotaWith(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("quota", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -149,7 +182,22 @@ flags:
 
 	var accs []planusage.AccountView
 	for _, a := range cfg.Accounts {
+		if strings.EqualFold(a.Provider, "clinepass") {
+			// clinepass accounts are discovered from metapi, not config.
+			continue
+		}
 		accs = append(accs, cliAccount{name: a.Name, provider: a.Provider, base: a.BaseURL, key: quotaCredential(cfg, a), authHeader: a.AuthHeader})
+	}
+	// Discover the ClinePass accounts from metapi (site_id=49, active only)
+	// for CLI quota. The CLI has no long-lived source to borrow, and it does
+	// not need one: metapiusage.Source keeps no connection, so a one-shot
+	// Source is exactly the "open per operation" behaviour this invocation
+	// wants (a replaced or newly created database is read as it is).
+	metapiSource := metapiusage.NewSource(metapiUsageDBPath)
+	if metapiAccs, err := readClinePassAccounts(context.Background(), metapiSource); err != nil {
+		slog.Warn("read clinepass accounts from metapi failed", "error", err)
+	} else if len(metapiAccs) > 0 {
+		accs = append(accs, metapiAccs...)
 	}
 	if *provider != "" {
 		var filtered []planusage.AccountView
@@ -170,28 +218,12 @@ flags:
 	var snaps []planusage.Snapshot
 	failed := 0
 	for _, g := range groups {
-		names := make([]string, 0, len(g.Accounts))
-		for _, a := range g.Accounts {
-			names = append(names, a.Name())
-		}
 		ctx := context.Background()
 		snap, ferr := planusage.FetchWithRetry(ctx, g.Fetcher, g.Accounts[0], timeout)
-		snap.Accounts = names
 		if ferr != nil {
 			failed++
-			snap.Err = planusage.ErrorCode(ferr)
-		} else {
-			if snap.Provider == "xai" {
-				snap = applyQuotaGrokEstimate(ctx, cfg, snap)
-			}
-			if snap.Provider == "gemini" {
-				snap = applyQuotaGeminiEstimate(ctx, cfg, snap)
-			}
-			if snap.Provider == "clinepass" {
-				snap = applyQuotaClinePassEstimate(ctx, snap)
-			}
 		}
-		snaps = append(snaps, snap)
+		snaps = append(snaps, buildQuotaSnapshot(ctx, cfg, g, snap, ferr))
 	}
 
 	if *jsonOut {

@@ -274,9 +274,10 @@ func ApplyGrokWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum,
 // The estimate is only produced for a strictly partial window:
 // 0 < used fraction < 1 and a positive token sum. At 100 % the upstream
 // percent is clamped, so reversing it would systematically understate the
-// pool — an exhausted window simply shows no 总额. Sum errors (metapi
-// database missing/unreadable, proxy_logs absent) are logged and leave the
-// estimate empty: they never fail the snapshot or mark the fetch failed.
+// pool — an exhausted window uses the measured consumption itself as the
+// total so the card shows X/X. Sum errors (metapi database missing/unreadable,
+// proxy_logs absent) are logged and leave the estimate empty: they never
+// fail the snapshot or mark the fetch failed.
 func ApplyClinePassEstimates(ctx context.Context, snap Snapshot, sum GrokTokenSum, now time.Time) Snapshot {
 	if sum == nil {
 		return snap
@@ -296,11 +297,17 @@ func ApplyClinePassEstimates(ctx context.Context, snap Snapshot, sum GrokTokenSu
 			slog.Warn("clinepass quota token sum failed", "window", w.Name, "error", err)
 			continue
 		}
-		frac := windowUsedFraction(w)
-		if tokens <= 0 || frac <= 0 || frac >= 1 {
+		if tokens <= 0 {
 			continue
 		}
-		snap.Windows[i].LimitTokensEstimate = reversePool(tokens, frac)
+		frac := windowUsedFraction(w)
+		if frac >= 1 {
+			// Exhausted window: measured consumption IS the total.
+			snap.Windows[i].LimitTokensEstimate = tokens
+			snap.Windows[i].MeasuredTokens = tokens
+		} else if frac > 0 {
+			snap.Windows[i].LimitTokensEstimate = reversePool(tokens, frac)
+		}
 	}
 	return snap
 }

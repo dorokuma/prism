@@ -34,7 +34,7 @@ type Poller struct {
 	geminiSum          GrokTokenSum
 	geminiEstimatePath string
 
-	clinepassSum GrokTokenSum
+	clinepassSumFactory func(accountID int64) GrokTokenSum
 }
 
 func NewPoller(fetchers []Fetcher, cache *Cache, interval, timeout time.Duration) *Poller {
@@ -62,6 +62,15 @@ func (p *Poller) SetAccounts(accounts []AccountView) {
 	p.mu.Lock()
 	p.accounts = append([]AccountView(nil), accounts...)
 	p.mu.Unlock()
+}
+
+// Accounts returns a copy of the roster the poller currently polls. The
+// copy keeps the poller's own slice private; callers (the SIGHUP roster
+// refresh) use it as the previous roster to fall back on.
+func (p *Poller) Accounts() []AccountView {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]AccountView(nil), p.accounts...)
 }
 
 func (p *Poller) SetOptions(enabled bool, interval, timeout time.Duration) {
@@ -100,11 +109,14 @@ func (p *Poller) SetGeminiEstimate(sum GrokTokenSum, path string) {
 
 // SetClinePassEstimate wires ClinePass 限额估算 (metapi cline-pass token
 // consumption ÷ each window's used percent, applied to all three windows).
-// There is no estimate file: every window's period start is derived from
-// its live ResetsAt, so there is nothing to freeze for a fresh window.
-func (p *Poller) SetClinePassEstimate(sum GrokTokenSum) {
+// The factory receives the metapi account_id and returns a sum function
+// scoped to that account, so each account's estimate uses only its own
+// traffic. There is no estimate file: every window's period start is
+// derived from its live ResetsAt, so there is nothing to freeze for a
+// fresh window.
+func (p *Poller) SetClinePassEstimate(sumFactory func(accountID int64) GrokTokenSum) {
 	p.mu.Lock()
-	p.clinepassSum = sum
+	p.clinepassSumFactory = sumFactory
 	p.mu.Unlock()
 }
 
@@ -199,12 +211,20 @@ func (p *Poller) fetchOne(parent context.Context, g KeyGroup, timeout time.Durat
 	}
 	acc := g.Accounts[0]
 	snap, err := FetchWithRetry(parent, g.Fetcher, acc, timeout)
-	snap.Accounts = names
+	// Names + per-account fingerprints in ONE step (AssignAccountViews), so
+	// Accounts[i] and AccountFPs()[i] can never drift: the merged ClinePass
+	// row's identity and its dot/name colour are both built from them. The
+	// CLI path assembles its snapshots the same way (see the CLI counterpart
+	// in cmd/prism/quota.go).
+	AssignAccountViews(&snap, g.Accounts)
 	if err != nil {
 		fetchErrors.Add(1)
 		code := ErrorCode(err)
 		slog.Warn("quota fetch failed", "provider", snap.Provider, "accounts", names, "error", code)
-		p.cache.StoreFailed(g.Fingerprint, snap.Provider, names, code)
+		// Hand over the WHOLE snapshot: it already carries the account names and
+		// their aligned fingerprints (AssignAccountViews above), so the failed
+		// round keeps the same row identity and colour as a successful one.
+		p.cache.StoreFailed(g.Fingerprint, snap, code)
 		return
 	}
 	var sum GrokTokenSum
@@ -217,7 +237,11 @@ func (p *Poller) fetchOne(parent context.Context, g KeyGroup, timeout time.Durat
 	case "gemini":
 		sum, estPath = p.geminiSum, p.geminiEstimatePath
 	case "clinepass":
-		sum, clinepass = p.clinepassSum, true
+		clinepass = true
+		if p.clinepassSumFactory != nil {
+			accID := AccountIDFrom(g.Accounts[0])
+			sum = p.clinepassSumFactory(accID)
+		}
 	}
 	p.mu.Unlock()
 	if sum != nil {

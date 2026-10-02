@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -529,11 +530,17 @@ func main() {
 
 	quotaCache := planusage.NewCache()
 	quotaPoller := planusage.NewPoller(planusage.DefaultFetchers(), quotaCache, cfg.Quota.RefreshInterval, cfg.Quota.RequestTimeout)
-	var quotaViews []planusage.AccountView
-	for _, a := range p.AllAccounts() {
-		quotaViews = append(quotaViews, a)
-	}
-	quotaPoller.SetAccounts(quotaViews)
+	// metapiSource is the service-side metapi gateway: the ClinePass 总额 sums
+	// (SetClinePassEstimate below) and the account discovery (refreshQuotaAccounts)
+	// both go through it, one short-lived read-only connection per operation
+	// (see internal/metapiusage/source.go).
+	metapiSource := metapiusage.NewSource(metapiUsageDBPath)
+	// Discover ClinePass accounts from metapi (site_id=49, active only) and use
+	// them for quota polling. Each account is polled with its own api_token and
+	// its consumption is summed separately. The same call runs on SIGHUP
+	// (see the signal loop), so a metapi that was unavailable at boot — or an
+	// account added/disabled while prism runs — is picked up without a restart.
+	refreshQuotaAccounts(p, quotaPoller, metapiSource)
 	quotaPoller.SetOptions(cfg.Quota.Enabled, cfg.Quota.RefreshInterval, cfg.Quota.RequestTimeout)
 
 	var agyIdx *agyusage.Index
@@ -554,16 +561,22 @@ func main() {
 		quotaPoller.SetGeminiEstimate(gem, planusage.DefaultGeminiEstimatePath)
 	}
 	// ClinePass 总额估算：ClinePass 流量全经 metapi 转发，prism 侧没有
-	// 消耗量，故从 metapi 生产库只读求 cline-pass/* 各窗口词元和。求和源
-	// 每次求和按条短连接（open→created_at 形状自检→SUM→close），不持有
-	// 常驻句柄：metapi 换库/文件替换/数据面回滚后下一轮刷新即读到新数据，
-	// 启动时库不可用（开机顺序/权限窗口）也会在后续轮次自动恢复，不会被
-	// 永久禁用。库缺失/不可读/表缺失/created_at 格式漂移 ⇒ 该窗口无总额
-	// （降级跳过），不影响快照获取与展示，也不标记 fetch 失败；不可用/降级
-	// 按状态转换各记一次 WARN、恢复记 Info，并计入 expvar
-	// clinepass_usage_source_errors / clinepass_usage_source_status（/metrics）。
-	metapiSource := metapiusage.NewSource(metapiUsageDBPath)
-	quotaPoller.SetClinePassEstimate(metapiSource.SumClinePassTokens)
+	// 消耗量，故从 metapi 生产库只读求 cline-pass/* 各窗口词元和。账号与密钥
+	// 直读 metapi accounts(site_id=49)，每个账号用自己的 api_token 轮询
+	// cline.bot，消耗按 account_id 隔离求和。求和源每次求和按条短连接
+	// （open→created_at 形状自检→SUM→close），不持有常驻句柄：metapi 换库/
+	// 文件替换/数据面回滚后下一轮刷新即读到新数据，启动时库不可用（开机顺序/
+	// 权限窗口）也会在后续轮次自动恢复，不会被永久禁用。库缺失/不可读/表缺失/
+	// created_at 格式漂移 ⇒ 该窗口无总额（降级跳过），不影响快照获取与展示，
+	// 也不标记 fetch 失败；不可用/降级按状态转换各记一次 WARN、恢复记 Info，
+	// 并计入 expvar clinepass_usage_source_errors /
+	// clinepass_usage_source_status（/metrics）。
+	// metapiSource 已在上面账号发现处创建，服务侧求和与账号发现共用一个对象。
+	quotaPoller.SetClinePassEstimate(func(accountID int64) planusage.GrokTokenSum {
+		return func(ctx context.Context, from, to int64) (int64, error) {
+			return metapiSource.SumClinePassTokensByAccount(ctx, accountID, from, to)
+		}
+	})
 	quotaPoller.Start()
 	quotaHandler := planusage.NewHandler(quotaCache, quotaPoller.Enabled)
 	summaryHandler.DefaultFrom = func() int64 {
@@ -683,6 +696,13 @@ func main() {
 					middleware.SetUsageDefaultKeyID(newCfg.Usage.DefaultKeyID)
 					quotaPoller.SetOptions(newCfg.Quota.Enabled, newCfg.Quota.RefreshInterval, newCfg.Quota.RequestTimeout)
 				}
+				// Re-discover the ClinePass roster on every SIGHUP, independent of
+				// whether the config reload succeeded: the roster lives in metapi
+				// (site 49), so this is the recovery path for a metapi that was
+				// unavailable when prism booted and for accounts added or
+				// disabled while prism runs. A failed discovery keeps the
+				// previous ClinePass views (see refreshQuotaAccounts).
+				refreshQuotaAccounts(p, quotaPoller, metapiSource)
 				// Always reload MCP tools from current config (new or old).
 				curCfg := holder.Load()
 				mcp.ClearMCPCache()
@@ -732,6 +752,56 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+// refreshQuotaAccounts rebuilds the poller's quota roster — the pool's config
+// accounts plus a fresh metapi ClinePass discovery — and installs it on the
+// poller. It runs at startup and on every SIGHUP, so the ClinePass block
+// survives the two cases startup-only discovery could not: metapi being
+// unavailable while prism boots, and accounts added or disabled while prism
+// runs.
+//
+// Failure policy (see nextQuotaViews): a discovery ERROR keeps the previous
+// metapi-backed views — a transient metapi read failure must never make the
+// ClinePass cards silently disappear — while a successful discovery always
+// wins, including an empty one (that is how a disabled account leaves the
+// roster). A host without a metapi database reports no accounts and no error,
+// so it warns about nothing.
+//
+// The roster is NOT re-discovered periodically: SIGHUP (or a restart) is the
+// recovery point, recorded in .agents/notes.
+//
+// A round that leaves an empty ClinePass roster although the previous round had
+// accounts is counted in clinepass_quota_roster_drops_total and logged once as
+// a WARN carrying the reason (metapi database file absent / no clinepass
+// accounts discovered / discovery failed) — see clinePassRosterDelta. The
+// current size is mirrored in clinepass_quota_accounts, so the silent-shrink
+// paths (database file gone during a SIGHUP, every account disabled, a
+// NULL/empty api_token row, a site_id rebuild) are observable instead of only
+// showing up as a missing card.
+func refreshQuotaAccounts(p *pool.Pool, poller *planusage.Poller, src *metapiusage.Source) {
+	configViews := make([]planusage.AccountView, 0, len(p.AllAccounts()))
+	for _, a := range p.AllAccounts() {
+		if strings.EqualFold(a.Provider(), "clinepass") {
+			// clinepass accounts are discovered from metapi, not config.
+			continue
+		}
+		configViews = append(configViews, a)
+	}
+	prev := poller.Accounts()
+	discovered, err := readClinePassAccounts(context.Background(), src)
+	if err != nil {
+		slog.Warn("read clinepass accounts from metapi failed, keeping the previous roster", "error", err)
+	}
+	views := nextQuotaViews(configViews, discovered, prev, err)
+	count, dropped := clinePassRosterDelta(prev, views, metapiUsageDBPathIfPresent() != "", err)
+	clinepassQuotaAccounts.Set(int64(count))
+	if dropped != "" {
+		clinepassQuotaRosterDrops.Add(1)
+		slog.Warn("clinepass quota accounts dropped to zero",
+			"previous", clinePassViewCount(prev), "reason", dropped)
+	}
+	poller.SetAccounts(views)
 }
 
 // attachOAuth wires file-backed token sources onto oauth accounts.

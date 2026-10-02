@@ -31,6 +31,19 @@ func KeyFingerprint(key string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// AccountIDFrom extracts the metapi account_id from an AccountView when
+// the view carries it (the metapi-backed clinepass accounts do). Non-
+// metapi accounts return 0.
+func AccountIDFrom(acc AccountView) int64 {
+	type accountIDER interface {
+		AccountID() int64
+	}
+	if a, ok := acc.(accountIDER); ok {
+		return a.AccountID()
+	}
+	return 0
+}
+
 // GroupByKey collapses accounts that share a key. Order of first appearance
 // is preserved. Accounts with no matching fetcher are skipped.
 func GroupByKey(accounts []AccountView, fetchers []Fetcher) []KeyGroup {

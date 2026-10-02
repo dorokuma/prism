@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -142,9 +144,14 @@ func TestPollerClinePassEstimateApplied(t *testing.T) {
 	p := NewPoller([]Fetcher{ClinePassFetcher{QuotaURL: srv.URL, Timeout: time.Second}}, c, 30*time.Second, time.Second)
 	p.SetAccounts([]AccountView{fakeAcc{
 		name: "ClinePass", provider: "clinepass", base: "https://api.cline.bot/api/v1",
-		key: "k", client: srv.Client(),
+		key: "k", client: srv.Client(), accountID: 7,
 	}})
-	p.SetClinePassEstimate(func(context.Context, int64, int64) (int64, error) { return 1000, nil })
+	p.SetClinePassEstimate(func(accountID int64) GrokTokenSum {
+		if accountID != 7 {
+			t.Errorf("clinepass sum factory got account id %d, want the account's own 7", accountID)
+		}
+		return func(context.Context, int64, int64) (int64, error) { return 1000, nil }
+	})
 	p.Refresh()
 	snaps := c.List()
 	if len(snaps) != 1 || len(snaps[0].Windows) != 3 {
@@ -194,7 +201,9 @@ func TestPollerEstimateDispatchPerProvider(t *testing.T) {
 	// Only the clinepass sum is wired.
 	p := NewPoller(fetchers, NewCache(), 30*time.Second, time.Second)
 	p.SetAccounts(accounts)
-	p.SetClinePassEstimate(func(context.Context, int64, int64) (int64, error) { return 1000, nil })
+	p.SetClinePassEstimate(func(accountID int64) GrokTokenSum {
+		return func(context.Context, int64, int64) (int64, error) { return 1000, nil }
+	})
 	got := collect(t, p)
 	if len(got["clinepass"]) != 3 || got["clinepass"][0].LimitTokensEstimate == 0 {
 		t.Fatalf("clinepass windows must be estimated: %+v", got["clinepass"])
@@ -262,5 +271,129 @@ func TestPollerGeminiEstimateApplied(t *testing.T) {
 	want := reversePool(1000, 1-0.0558405)
 	if weekly.LimitTokensEstimate != want {
 		t.Fatalf("gemini weekly estimate = %d, want %d", weekly.LimitTokensEstimate, want)
+	}
+}
+
+// TestPollerClinePassPerAccountEstimate pins O10-1, the service-side
+// per-account wiring: the poller must hand EACH account's own metapi
+// account_id to the sum factory (AccountIDFrom(g.Accounts[0])) and write that
+// account's consumption into that account's snapshot. Before this case the
+// factory in every poller test ignored its accountID and fakeAcc.accountID was
+// never assigned, so passing 0 — or picking the wrong account of a group —
+// kept the whole suite green.
+func TestPollerClinePassPerAccountEstimate(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, clinepassUsageBody)
+	}))
+	defer srv.Close()
+
+	const tokA, tokB = "cline-token-alpha", "cline-token-bravo"
+	c := NewCache()
+	p := NewPoller([]Fetcher{ClinePassFetcher{QuotaURL: srv.URL, Timeout: time.Second}}, c, 30*time.Second, time.Second)
+	p.SetAccounts([]AccountView{
+		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokA, client: srv.Client(), accountID: 7},
+		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokB, client: srv.Client(), accountID: 9},
+	})
+
+	// Each account has its own distinct consumption, keyed by its own id.
+	consumed := map[int64]int64{7: 1000, 9: 3000}
+	var mu sync.Mutex
+	var asked []int64
+	p.SetClinePassEstimate(func(accountID int64) GrokTokenSum {
+		mu.Lock()
+		asked = append(asked, accountID)
+		mu.Unlock()
+		n, ok := consumed[accountID]
+		if !ok {
+			t.Errorf("sum factory got account id %d, want one of the accounts' own ids (7, 9)", accountID)
+		}
+		return func(context.Context, int64, int64) (int64, error) { return n, nil }
+	})
+
+	p.Refresh()
+
+	mu.Lock()
+	got := append([]int64(nil), asked...)
+	mu.Unlock()
+	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+	if len(got) != 2 || got[0] != 7 || got[1] != 9 {
+		t.Fatalf("factory account ids = %v, want [7 9] (one per account, its own id)", got)
+	}
+
+	// Each snapshot counts only its own account's consumption: clinepassUsageBody
+	// is 7 % / 8 % / 4 %, so 1000 → 14286 and 3000 → 42857 on the 5h window.
+	snaps := c.List()
+	byFP := map[string]int64{}
+	for _, s := range snaps {
+		fps := s.AccountFPs()
+		if len(fps) != 1 || len(s.Accounts) != 1 {
+			t.Fatalf("one snapshot per account key expected: %+v", s)
+		}
+		var five int64 = -1
+		for _, w := range s.Windows {
+			if w.Name == "5h" {
+				five = w.LimitTokensEstimate
+			}
+		}
+		if five < 0 {
+			t.Fatalf("5h window missing: %+v", s)
+		}
+		byFP[fps[0]] = five
+	}
+	if len(byFP) != 2 {
+		t.Fatalf("snapshots = %d, want 2 (one per account)", len(byFP))
+	}
+	if got := byFP[KeyFingerprint(tokA)]; got != 14286 {
+		t.Fatalf("account 7 (1000 tokens ÷ 7%%) 5h estimate = %d, want 14286", got)
+	}
+	if got := byFP[KeyFingerprint(tokB)]; got != 42857 {
+		t.Fatalf("account 9 (3000 tokens ÷ 7%%) 5h estimate = %d, want 42857", got)
+	}
+}
+
+// TestPollerFailedRoundKeepsAccountFingerprints pins O7 end to end: after a
+// FAILED fetch round the cached snapshot must still carry the account names
+// and their aligned, non-empty fingerprints, exactly like a successful round.
+// The failure branch used to call StoreFailed with the names only, which
+// rebuilt the snapshot without accountFPs: a merged ClinePass row then degraded
+// to the bare ·, an uncoloured account name and a position-keyed row.
+func TestPollerFailedRoundKeepsAccountFingerprints(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	const tokA, tokB = "cline-token-alpha", "cline-token-bravo"
+	c := NewCache()
+	p := NewPoller([]Fetcher{ClinePassFetcher{QuotaURL: srv.URL, Timeout: time.Second}}, c, 30*time.Second, time.Second)
+	p.SetAccounts([]AccountView{
+		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokA, client: srv.Client(), accountID: 7},
+		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokB, client: srv.Client(), accountID: 9},
+	})
+	p.Refresh()
+
+	snaps := c.List()
+	if len(snaps) != 2 {
+		t.Fatalf("failed round snapshots = %d, want 2 (one per account key)", len(snaps))
+	}
+	seen := map[string]bool{}
+	for _, s := range snaps {
+		if s.Err != "unexpected_status" {
+			t.Fatalf("failed round error = %q, want unexpected_status: %+v", s.Err, s)
+		}
+		fps := s.AccountFPs()
+		if len(s.Accounts) != 1 || len(fps) != 1 {
+			t.Fatalf("failed round must keep names AND fingerprints aligned: %+v (fps=%v)", s, fps)
+		}
+		if fps[0] == "" {
+			t.Fatalf("failed round dropped the account fingerprint: %+v", s)
+		}
+		if fps[0] != KeyFingerprint(tokA) && fps[0] != KeyFingerprint(tokB) {
+			t.Fatalf("failed round fingerprint %q is not an account key fingerprint", fps[0])
+		}
+		seen[fps[0]] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("failed round fingerprints = %v, want 2 distinct (one per account)", seen)
 	}
 }

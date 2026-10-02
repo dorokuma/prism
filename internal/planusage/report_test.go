@@ -1407,3 +1407,456 @@ func TestWindowTitle(t *testing.T) {
 		}
 	}
 }
+
+func TestAccountColor(t *testing.T) {
+	palette := []string{"00FFFF", "FF00FF", "FFFF00", "00FF00", "FF8800", "8800FF"}
+	cases := []struct {
+		fp   string
+		want string
+	}{
+		{"", ""},
+		{"short", ""}, // < 8 chars must not panic
+	}
+	for _, tc := range cases {
+		if got := accountColor(tc.fp); got != tc.want {
+			t.Errorf("accountColor(%q) = %q, want %q", tc.fp, got, tc.want)
+		}
+	}
+	// Non-empty 8+ hex fingerprints must return a palette color.
+	for _, fp := range []string{"1234567890ABCDEF", "FFFFFFFFFFFFFFFF", "0000000000000000"} {
+		c := accountColor(fp)
+		found := false
+		for _, p := range palette {
+			if c == p {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("accountColor(%q) = %q not in palette", fp, c)
+		}
+	}
+}
+
+// ── ClinePass merged cards (one card per profile + window) ──────────────
+//
+// ClinePass is the only provider whose cards merge: every account of the
+// plan is polled with its own key (its own snapshot), so the plan's accounts
+// only become ROWS of one card once the snapshots are grouped by (profile,
+// window). Everything below pins that layout: one row per account, the title
+// free of account names, the row's exact columns, X/X on a drained row and
+// the fixed bright palette.
+
+// clinePassSnap is one ClinePass account's snapshot: one account and its
+// own key fingerprint (the shape the poller produces — one snapshot per
+// account key).
+func clinePassSnap(fp, account string, windows ...Window) Snapshot {
+	s := Snapshot{Provider: "clinepass", Accounts: []string{account}, Windows: windows}
+	s.SetAccountFPs([]string{fp})
+	return s
+}
+
+// mergedCardLines splits a merged-card render into ANSI-stripped lines and
+// asserts that every line of one card shares that card's width. The merged
+// card is exactly as wide as its longest account name needs (names are never
+// truncated), so the width invariant is PER CARD: cards are separated by a
+// blank line, which resets the expectation.
+func mergedCardLines(t *testing.T, got string) []string {
+	t.Helper()
+	raw := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
+	out := make([]string, 0, len(raw))
+	width := -1
+	for i, l := range raw {
+		if l == "" {
+			out = append(out, "")
+			width = -1
+			continue
+		}
+		plain := render.StripANSI(l)
+		w := render.DisplayWidth(plain)
+		if width == -1 {
+			width = w
+		} else if w != width {
+			t.Fatalf("line %d: width %d, want the card's %d:\n%q", i, w, width, plain)
+		}
+		out = append(out, plain)
+	}
+	return out
+}
+
+// mergedRowNumber is a merged row's 13-column number field (all ASCII, so a
+// byte slice is a column slice).
+func mergedRowNumber(t *testing.T, row string) string {
+	t.Helper()
+	body := strings.TrimSuffix(strings.TrimPrefix(row, "│ "), " │")
+	if w := render.DisplayWidth(body); w < clineNumberWidth {
+		t.Fatalf("row too short for a number field: %q", row)
+	}
+	return body[len(body)-clineNumberWidth:]
+}
+
+// TestRenderCardsClinePassMergesSameWindowAccounts is the headline contract:
+// two accounts of one plan are two snapshots, and they must land in ONE card
+// with exactly TWO rows (never four, never a duplicated name) when they share
+// a window. The title carries the plan and the window only, the row carries
+// the account, and no row carries the other providers' detail text, reset
+// countdown or 已达限额 footer.
+func TestRenderCardsClinePassMergesSameWindowAccounts(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	full := Window{Name: "5h", Status: "used up", Percent: 100, LimitTokensEstimate: 4_200_000, MeasuredTokens: 4_200_000}
+	part := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	got := RenderCards([]Snapshot{
+		clinePassSnap("aaaa1111bbbb2222", "cline-user", full),
+		clinePassSnap("cccc3333dddd4444", "cline-user", part),
+	}, now)
+
+	if n := strings.Count(got, "╭─ "); n != 1 {
+		t.Fatalf("want ONE merged card, got %d:\n%s", n, render.StripANSI(got))
+	}
+	lines := mergedCardLines(t, got)
+	if len(lines) != 4 { // title + 2 rows + bottom border
+		t.Fatalf("want 4 lines (title + 2 rows + border), got %d:\n%s", len(lines), got)
+	}
+	if !strings.HasPrefix(lines[0], "╭─ ClinePass · 5小时限额") {
+		t.Fatalf("title must be plan + window: %q", lines[0])
+	}
+	if strings.Contains(lines[0], "cline-user") {
+		t.Fatalf("the account must not appear in a merged title: %q", lines[0])
+	}
+
+	rows := lines[1:3]
+	for i, r := range rows {
+		if !strings.HasPrefix(r, "│ · cline-user ") {
+			t.Fatalf("row %d must be dot + account name: %q", i, r)
+		}
+	}
+	if !strings.Contains(rows[0], "100%") || !strings.Contains(rows[0], "4.2M/4.2M") {
+		t.Fatalf("drained row wrong: %q", rows[0])
+	}
+	if !strings.Contains(rows[1], " 34%") || !strings.Contains(rows[1], "3.4M/10.0M") {
+		t.Fatalf("34%% row wrong: %q", rows[1])
+	}
+
+	// The merged row has no detail text, no countdown, no footer and no
+	// suffix after the account name.
+	for _, bad := range []string{"已用", "总额", "词元", "后重置", "已重置", "已达限额"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("merged card must not carry %q:\n%s", bad, render.StripANSI(got))
+		}
+	}
+	if strings.Count(got, "cline-user") != 2 {
+		t.Fatalf("the account name must appear exactly once per row:\n%s", render.StripANSI(got))
+	}
+
+	// Colour: the dot and the name share the account's palette colour.
+	for _, fp := range []string{"aaaa1111bbbb2222", "cccc3333dddd4444"} {
+		color := accountColor(fp)
+		if color == "" {
+			t.Fatalf("fingerprint %q must map to a palette colour", fp)
+		}
+		if !strings.Contains(got, render.FgFromHex(color, "·")) ||
+			!strings.Contains(got, render.FgFromHex(color, "cline-user")) {
+			t.Fatalf("dot and name must both carry %s:\n%q", color, got)
+		}
+	}
+
+	// No-colour output is the same layout minus the escapes.
+	plain := RenderCards([]Snapshot{
+		clinePassSnap("aaaa1111bbbb2222", "cline-user", full),
+		clinePassSnap("cccc3333dddd4444", "cline-user", part),
+	}, now, CardOptions{NoColor: true})
+	if plain != render.StripANSI(got) {
+		t.Fatalf("no-colour render differs from the coloured one\ngot:\n%q\nwant:\n%q", plain, render.StripANSI(got))
+	}
+}
+
+// TestRenderCardsClinePassExhaustedShowsXOverX pins the exhausted wording:
+// a 100 % row ALWAYS shows X/X — the measured consumption as both sides when
+// the pool is unknown — and never "-".
+func TestRenderCardsClinePassExhaustedShowsXOverX(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		w    Window
+		want string
+	}{
+		{
+			// The estimate pipeline sets LimitTokensEstimate = MeasuredTokens
+			// on a drained window.
+			name: "measured pair",
+			w:    Window{Name: "5h", Status: "used up", Percent: 100, LimitTokensEstimate: 3_800, MeasuredTokens: 3_800},
+			want: "    3.8K/3.8K",
+		},
+		{
+			// Unknown pool: the measured consumption IS the total.
+			name: "measured only",
+			w:    Window{Name: "5h", Status: "ok", Percent: 100, MeasuredTokens: 4_200_000},
+			want: "    4.2M/4.2M",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RenderCards([]Snapshot{clinePassSnap("aaaa1111bbbb2222", "cline-user", tc.w)}, now)
+			rows := mergedCardLines(t, got)
+			if len(rows) != 3 {
+				t.Fatalf("want 3 lines, got %d:\n%s", len(rows), got)
+			}
+			if num := mergedRowNumber(t, rows[1]); num != tc.want {
+				t.Fatalf("number field = %q, want %q", num, tc.want)
+			}
+			if strings.Contains(rows[1], "      -") || strings.HasSuffix(rows[1], "- │") {
+				t.Fatalf("a drained row must not fall back to \"-\": %q", rows[1])
+			}
+			// The one exhausted signal: the capsule went solid red.
+			if !strings.Contains(got, ansiRed+strings.Repeat(capUsed, clineCapCells)+ansiReset) {
+				t.Fatalf("drained capsule must be solid red:\n%q", got)
+			}
+		})
+	}
+}
+
+// TestRenderCardsClinePassRowIdentity pins the row identity rules: the row is
+// keyed by (window, account name, fingerprint), so an account whose name list
+// is repeated across snapshots is still ONE row (the duplicated roster is what
+// used to double a 2-account card into 4 rows), while two DIFFERENT accounts
+// that happen to share a name stay two rows.
+func TestRenderCardsClinePassRowIdentity(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+
+	rowsOf := func(t *testing.T, snaps []Snapshot) int {
+		t.Helper()
+		lines := mergedCardLines(t, RenderCards(snaps, now))
+		if len(lines) < 3 {
+			t.Fatalf("no merged rows:\n%v", lines)
+		}
+		return len(lines) - 2 // title + bottom border
+	}
+
+	// Two accounts with the same name and different fingerprints: 2 rows.
+	if n := rowsOf(t, []Snapshot{
+		clinePassSnap("aaaa1111bbbb2222", "cline-user", w),
+		clinePassSnap("cccc3333dddd4444", "cline-user", w),
+	}); n != 2 {
+		t.Fatalf("same-name accounts = %d rows, want 2", n)
+	}
+
+	// The SAME account listed by two snapshots (a roster repeated across
+	// snapshots): still 2 rows, not 4 — the old doubling regression.
+	if n := rowsOf(t, []Snapshot{
+		clinePassSnap("aaaa1111bbbb2222", "cline-user", w),
+		clinePassSnap("cccc3333dddd4444", "other-user", w),
+		clinePassSnap("aaaa1111bbbb2222", "cline-user", w),
+		clinePassSnap("cccc3333dddd4444", "other-user", w),
+	}); n != 2 {
+		t.Fatalf("repeated roster = %d rows, want 2", n)
+	}
+
+	// No fingerprints at all: two same-name accounts are indistinguishable, so
+	// the row is keyed by position and both stay visible.
+	if n := rowsOf(t, []Snapshot{
+		{Provider: "clinepass", Accounts: []string{"cline-user"}, Windows: []Window{w}},
+		{Provider: "clinepass", Accounts: []string{"cline-user"}, Windows: []Window{w}},
+	}); n != 2 {
+		t.Fatalf("fingerprint-less same-name accounts = %d rows, want 2", n)
+	}
+
+	// One snapshot with two accounts sharing one key: two rows.
+	if n := rowsOf(t, []Snapshot{
+		{Provider: "clinepass", Accounts: []string{"cline-user", "other-user"}, Windows: []Window{w}},
+	}); n != 2 {
+		t.Fatalf("two accounts of one snapshot = %d rows, want 2", n)
+	}
+}
+
+// TestRenderCardsClinePassDisplayNameDropsNumericSuffix pins the display
+// name of a merged row: the trailing pure-digit suffix is dropped (Cline1
+// and Cline2 both read "Cline"), so the two accounts of one plan read as one
+// name. Stripping is DISPLAY-ONLY: the row identity (clineRowID) keeps the
+// full name plus the fingerprint, so the pair stays exactly TWO rows (also
+// without a fingerprint, where the key falls back to the position), and the
+// dot plus the name colour are what tells the same-reading rows apart.
+func TestRenderCardsClinePassDisplayNameDropsNumericSuffix(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	fps := []string{"aaaa1111bbbb2222", "cccc3333dddd4444"}
+
+	got := RenderCards([]Snapshot{
+		clinePassSnap(fps[0], "Cline1", w),
+		clinePassSnap(fps[1], "Cline2", w),
+	}, now)
+
+	if n := strings.Count(got, "╭─ "); n != 1 {
+		t.Fatalf("want ONE merged card, got %d:\n%s", n, render.StripANSI(got))
+	}
+	lines := mergedCardLines(t, got)
+	if len(lines) != 4 { // title + 2 rows + bottom border
+		t.Fatalf("want 4 lines (title + 2 rows + border), got %d:\n%s", len(lines), render.StripANSI(got))
+	}
+	rows := lines[1:3]
+	for i, r := range rows {
+		if !strings.HasPrefix(r, "│ · Cline ") {
+			t.Fatalf("row %d must show the stripped name: %q", i, r)
+		}
+	}
+	// The digits never reach the card, and the two rows keep their own text:
+	// the stripped name appears once per row (the title's "ClinePass" is not
+	// part of the neighbourhood-counted text).
+	if strings.Contains(got, "Cline1") || strings.Contains(got, "Cline2") {
+		t.Fatalf("the digit suffix must not reach the card:\n%s", render.StripANSI(got))
+	}
+	if n := strings.Count(rows[0]+rows[1], "Cline"); n != 2 {
+		t.Fatalf("the stripped name must appear once per row, got %d:\n%s", n, render.StripANSI(got))
+	}
+	// Same text, different colour: each account keeps its own palette colour
+	// on BOTH the dot and the name, which is what tells the pair apart.
+	for _, fp := range fps {
+		color := accountColor(fp)
+		if color == "" {
+			t.Fatalf("fingerprint %q must map to a palette colour", fp)
+		}
+		if !strings.Contains(got, render.FgFromHex(color, "·")) ||
+			!strings.Contains(got, render.FgFromHex(color, "Cline")) {
+			t.Fatalf("dot and name must both carry %s:\n%q", color, got)
+		}
+	}
+	// The card is as wide as its longest DISPLAY name, not the full one: the
+	// dropped suffix must not reserve an invisible blank column.
+	if want := 4 + clineRowFixed + render.DisplayWidth("Cline"); render.DisplayWidth(lines[0]) != want {
+		t.Fatalf("card width = %d, want %d (no column for the dropped suffix):\n%s",
+			render.DisplayWidth(lines[0]), want, render.StripANSI(got))
+	}
+
+	// No fingerprint at all: the position-keyed rows still stay TWO, and both
+	// read "Cline" (plain · and an uncoloured name).
+	plain := RenderCards([]Snapshot{
+		{Provider: "clinepass", Accounts: []string{"Cline1"}, Windows: []Window{w}},
+		{Provider: "clinepass", Accounts: []string{"Cline2"}, Windows: []Window{w}},
+	}, now, CardOptions{NoColor: true})
+	plainLines := mergedCardLines(t, plain)
+	if len(plainLines) != 4 {
+		t.Fatalf("fingerprint-less pair: want 4 lines (2 rows), got %d:\n%s", len(plainLines), plain)
+	}
+	for i, r := range plainLines[1:3] {
+		if !strings.HasPrefix(r, "│ · Cline ") {
+			t.Fatalf("fingerprint-less row %d must show the stripped name: %q", i, r)
+		}
+	}
+}
+
+// TestStripNumericSuffix pins the display-name transform and its all-digit
+// fallback: a trailing pure-digit suffix is dropped, but a name that is ONLY
+// digits keeps its name. Returning "" there would blank the account column of
+// the row (nothing but the colour dot left), so the fallback is part of the
+// contract, not an accident of the loop.
+func TestStripNumericSuffix(t *testing.T) {
+	cases := map[string]string{
+		"Cline1":     "Cline",
+		"Cline2":     "Cline",
+		"account123": "account",
+		"Cline-1":    "Cline-", // only the trailing digits go; the hyphen stays
+		"Cline":      "Cline",
+		"":           "",
+		"12345":      "12345", // all digits: keep the name, never strip to ""
+		"0":          "0",
+	}
+	for in, want := range cases {
+		if got := stripNumericSuffix(in); got != want {
+			t.Errorf("stripNumericSuffix(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// End to end: an all-digit account name must still render its name on the
+	// merged row (dot + name), not a dot followed by blanks.
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	got := RenderCards([]Snapshot{clinePassSnap("aaaa1111bbbb2222", "12345", w)}, now)
+	lines := mergedCardLines(t, got)
+	if !strings.HasPrefix(lines[1], "│ · 12345 ") {
+		t.Fatalf("an all-digit account name must stay visible: %q", lines[1])
+	}
+}
+
+// TestRenderCardsClinePassLongNameWidensCard: the account name is never
+// truncated — a long name widens the whole card, and every row of that card
+// stays aligned. A long name must not leak into the title either.
+func TestRenderCardsClinePassLongNameWidensCard(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	long := strings.Repeat("账", 20) // 40 display columns
+	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	got := RenderCards([]Snapshot{
+		clinePassSnap("aaaa1111bbbb2222", "ab", w),
+		clinePassSnap("cccc3333dddd4444", long, w),
+	}, now)
+
+	lines := mergedCardLines(t, got) // every line of the card shares one width
+	if len(lines) != 4 {
+		t.Fatalf("want 4 lines, got %d:\n%s", len(lines), render.StripANSI(got))
+	}
+	wantWidth := 4 + clineRowFixed + render.DisplayWidth(long)
+	if w := render.DisplayWidth(lines[0]); w != wantWidth {
+		t.Fatalf("card width = %d, want %d:\n%s", w, wantWidth, render.StripANSI(got))
+	}
+	if !strings.Contains(lines[2], long) {
+		t.Fatalf("the long account name must render in full on its row: %q", lines[2])
+	}
+	if strings.Contains(got, "…") {
+		t.Fatalf("merged rows must never be truncated:\n%s", render.StripANSI(got))
+	}
+	if strings.Contains(lines[0], long) {
+		t.Fatalf("the account name must stay out of the title: %q", lines[0])
+	}
+}
+
+// TestRenderCardsClinePassDegradesWithoutFingerprint pins the palette's
+// fallback: an empty or short fingerprint renders the plain · and an
+// uncoloured name instead of reading past the fingerprint (the old
+// out-of-range read), so it must not panic and must not carry colour.
+func TestRenderCardsClinePassDegradesWithoutFingerprint(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	for _, tc := range []struct{ name, fp string }{{"empty", ""}, {"short", "abc123"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RenderCards([]Snapshot{clinePassSnap(tc.fp, "cline-user", w)}, now)
+			lines := mergedCardLines(t, got)
+			if !strings.HasPrefix(lines[1], "│ · cline-user ") {
+				t.Fatalf("want a plain · and an uncoloured name: %q", lines[1])
+			}
+			if !strings.Contains(got, "│ ") {
+				t.Fatalf("border missing:\n%q", got)
+			}
+			for _, color := range []string{"00FFFF", "FF00FF", "FFFF00", "00FF00", "FF8800", "8800FF"} {
+				if strings.Contains(got, render.FgFromHex(color, "·")) ||
+					strings.Contains(got, render.FgFromHex(color, "cline-user")) {
+					t.Fatalf("fingerprint %q must not be coloured:\n%q", tc.fp, got)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderCardsClinePassKeepsOtherProvidersLegacy: the merge is ClinePass
+// only. The same (account, window) shape under a ClinePass key and under any
+// other key must come out as a merged card and as the one-card-per-(account,
+// window) legacy card respectively — the legacy card keeps its title account,
+// its detail text, its countdown and its 已达限额 footer.
+func TestRenderCardsClinePassKeepsOtherProvidersLegacy(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	h := now.Add(3*time.Hour + 12*time.Minute)
+	w := Window{Name: "5h", Status: "used up", Percent: 100, LimitTokensEstimate: 3_800, MeasuredTokens: 3_800, ResetsAt: &h}
+	for _, provider := range []string{"gemini", "xai", "opencode-go"} {
+		t.Run(provider, func(t *testing.T) {
+			s := Snapshot{Provider: provider, Accounts: []string{"acct-1"}, Windows: []Window{w}}
+			got := RenderCards([]Snapshot{s}, now, CardOptions{NoColor: true})
+			title := strings.SplitN(got, "\n", 2)[0]
+			if !strings.Contains(title, "acct-1") {
+				t.Fatalf("%s title must keep the account: %q", provider, title)
+			}
+			for _, want := range []string{"已耗尽 100%", "总额 3k 词元", "3h 12m 后重置", "已达限额"} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("%s card lost %q:\n%s", provider, want, got)
+				}
+			}
+		})
+	}
+}

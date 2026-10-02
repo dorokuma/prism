@@ -71,6 +71,18 @@ func Fg(r, g, b uint8, s string) string {
 	return colorStart(r, g, b) + s + colorReset
 }
 
+// FgFromHex wraps s in a 24-bit true-color sequence for a hex RGB string
+// ("RRGGBB"). Invalid hex falls back to plain s.
+func FgFromHex(hex string, s string) string {
+	if len(hex) != 6 {
+		return s
+	}
+	r, _ := strconv.ParseUint(hex[0:2], 16, 8)
+	g, _ := strconv.ParseUint(hex[2:4], 16, 8)
+	b, _ := strconv.ParseUint(hex[4:6], 16, 8)
+	return Fg(uint8(r), uint8(g), uint8(b), s)
+}
+
 // colorStart is the bare foreground sequence (no reset), so callers that
 // emit many cells can share it across runs.
 func colorStart(r, g, b uint8) string {

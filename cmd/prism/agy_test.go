@@ -14,7 +14,7 @@ import (
 )
 
 func TestRunUsageMergesAgyGemini(t *testing.T) {
-	base := time.Date(2026, 9, 12, 15, 0, 0, 0, time.Local)
+	base := time.Now()
 	dbPath := seedUsageDB(t, base)
 
 	convDir := t.TempDir()

@@ -1,8 +1,9 @@
-// Package metapiusage reads ClinePass token consumption from the metapi
-// hub database. ClinePass traffic is routed through metapi (a separate
-// gateway deployment), so prism's own usage ledger never records it; the
-// ClinePass quota reversal (internal/planusage) therefore takes its
-// consumed-token sum from metapi's proxy_logs.
+// Package metapiusage reads ClinePass token consumption and account
+// metadata from the metapi hub database. ClinePass traffic is routed
+// through metapi (a separate gateway deployment), so prism's own usage
+// ledger never records it; the ClinePass quota reversal
+// (internal/planusage) therefore takes its consumed-token sum from
+// metapi's proxy_logs.
 //
 // The database is opened STRICTLY read-only (mode=ro) with a busy timeout:
 // metapi owns and writes the file, and this package must never take a
@@ -11,17 +12,17 @@
 // degraded by the caller to "no 总额 for this window": it must never
 // affect quota fetching, snapshot state or display.
 //
-// The sum is subscription-wide: it totals every cline-pass/% row in the
-// window. With a single ClinePass subscription that is exactly the
-// account's traffic; a second subscription (another prism account with
-// its own metapi upstream) would mix both and needs a per-account scope
-// review.
-//
-// A Store is one read-only connection: open, sum, close. The service
-// poller uses Source, which opens a fresh Store per sum, so a replaced
-// database FILE (a restore / swap / data-plane rollback) or a database
-// that was unavailable at startup is picked up on the next refresh round
-// instead of being served stale from a frozen inode.
+// Accounts are read from the metapi accounts table (site_id=49 for
+// ClinePass). Only ACTIVE accounts are listed: metapi keeps disabled rows in
+// the table (the production site 49 holds one active and one disabled
+// account), and a disabled account must neither be polled nor rendered —
+// there is no live subscription behind it. Each account's api_token is used
+// to poll cline.bot, and its consumption is summed from proxy_logs by
+// account_id. A persistent Store holds NO connection: the service Source
+// opens a fresh Store per operation, so a replaced database FILE (a restore /
+// swap / data-plane rollback) or a database that was unavailable at startup
+// is picked up on the next refresh round instead of being served stale from a
+// frozen inode.
 package metapiusage
 
 import (
@@ -123,6 +124,100 @@ func (s *Store) SumClinePassTokens(ctx context.Context, fromUnix, toUnix int64) 
 	var n int64
 	if err := s.db.QueryRowContext(ctx, q,
 		clinePassModelLike, formatCreatedAt(fromUnix), formatCreatedAt(toUnix)).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// clinePassAccountWithToken is one ClinePass subscription account from the
+// metapi accounts table (site_id=49), including the raw api_token for callers
+// that need to authenticate with the upstream. It is deliberately
+// unexported: only callers within this module can request it, and they must
+// never log, render or persist the token (the display colour is derived from
+// planusage.KeyFingerprint of the key — the SHA-256 first 8 bytes hex — never
+// from the token itself).
+//
+// The account's status is NOT carried: the roster is already restricted to
+// status = 'active' in SQL (see ListClinePassAccountsWithToken), so a status
+// field here would be a value nobody could act on — and a caller-side filter
+// would be a second place to get the rule wrong.
+type clinePassAccountWithToken struct {
+	AccountID int64
+	Username  string
+	APIToken  string
+}
+
+// ListClinePassAccountsWithToken returns every ACTIVE account in the metapi
+// accounts table whose site_id is 49 (ClinePass), together with its raw
+// api_token. The token is what the upstream poll authenticates with; it must
+// never leave the immediate caller (cmd/prism) and must never be logged. A
+// missing accounts table or an unreadable database is returned as an error
+// for the caller to degrade to "no clinepass accounts".
+//
+// A disabled account is EXCLUDED in SQL rather than filtered by the caller:
+// metapi's own status enum is the single truth ('active' / 'disabled',
+// default 'active', never NULL in the production table), and a status the
+// caller could not read would silently become a polled account again.
+func (s *Store) ListClinePassAccountsWithToken(ctx context.Context) ([]clinePassAccountWithToken, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("metapiusage: store not open")
+	}
+	const q = `SELECT id, username, api_token FROM accounts WHERE site_id = 49 AND status = 'active'`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []clinePassAccountWithToken
+	for rows.Next() {
+		var id sql.NullInt64
+		var username, apiToken sql.NullString
+		if err := rows.Scan(&id, &username, &apiToken); err != nil {
+			return nil, err
+		}
+		if !id.Valid || !username.Valid || !apiToken.Valid {
+			continue
+		}
+		out = append(out, clinePassAccountWithToken{
+			AccountID: id.Int64,
+			Username:  username.String,
+			APIToken:  apiToken.String,
+		})
+	}
+	return out, rows.Err()
+}
+
+// SumClinePassTokensByAccount sums 词元 of ClinePass rows in
+// [fromUnix, toUnix] (unix seconds, inclusive) for ONE metapi account.
+// The per-row total is total_tokens with prompt+completion as the
+// fallback for NULL rows, mirroring the usage-db ledger expression
+// (internal/usage SumTokensLike). A non-positive lower bound returns 0
+// without querying. A missing proxy_logs table is returned as an error
+// for the caller to degrade to "no estimate"; it is never fatal.
+//
+// Before summing, the created_at sample is shape-checked (see
+// ErrCreatedAtShape): with a drifted layout the TEXT range comparison
+// would silently mis-bound the window, so drift is returned as an error
+// and the caller degrades this round to "no estimate" — the same
+// contract as a missing table.
+func (s *Store) SumClinePassTokensByAccount(ctx context.Context, accountID int64, fromUnix, toUnix int64) (int64, error) {
+	if s == nil || s.db == nil {
+		return 0, errors.New("metapiusage: store not open")
+	}
+	if fromUnix <= 0 {
+		return 0, nil
+	}
+	if err := s.checkCreatedAtShape(ctx); err != nil {
+		return 0, err
+	}
+	const q = `SELECT COALESCE(SUM(CASE WHEN total_tokens IS NULL
+			THEN COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)
+			ELSE total_tokens END), 0)
+		FROM proxy_logs
+		WHERE account_id = ? AND model_requested LIKE ? AND created_at >= ? AND created_at <= ?`
+	var n int64
+	if err := s.db.QueryRowContext(ctx, q,
+		accountID, clinePassModelLike, formatCreatedAt(fromUnix), formatCreatedAt(toUnix)).Scan(&n); err != nil {
 		return 0, err
 	}
 	return n, nil

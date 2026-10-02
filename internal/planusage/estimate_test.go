@@ -341,9 +341,9 @@ func TestApplyClinePassEstimates(t *testing.T) {
 
 	cards := RenderCards([]Snapshot{got}, now, CardOptions{NoColor: true})
 	for _, want := range []string{
-		"已用 5% / 总额 5M 词元",
-		"已用 8% / 总额 1.25M 词元",
-		"已用 4% / 总额 1M 词元",
+		"250.0K/5.0M",
+		"100.0K/1.2M",
+		"40.0K/1.0M",
 	} {
 		if !strings.Contains(cards, want) {
 			t.Fatalf("cards missing %q:\n%s", want, cards)
@@ -433,8 +433,8 @@ func TestApplyClinePassEstimatesGuards(t *testing.T) {
 	full := Snapshot{Provider: "clinepass", Windows: []Window{{
 		Name: "monthly", Status: "rate-limited", Percent: 100, PeriodStart: &start, ResetsAt: &end,
 	}}}
-	if got := ApplyClinePassEstimates(context.Background(), full, liveSum, now); got.Windows[0].LimitTokensEstimate != 0 {
-		t.Fatalf("exhausted window must not estimate: %+v", got.Windows[0])
+	if got := ApplyClinePassEstimates(context.Background(), full, liveSum, now); got.Windows[0].LimitTokensEstimate != 1000 {
+		t.Fatalf("exhausted window must estimate measured tokens: %+v", got.Windows[0])
 	}
 
 	// A window without a period start is skipped without a sum call.
@@ -467,6 +467,32 @@ func TestApplyClinePassEstimatesPastResetCapsSum(t *testing.T) {
 	ApplyClinePassEstimates(context.Background(), snap, sum, now)
 	if gotTo != end.Unix() {
 		t.Fatalf("sum to = %d, want reset %d", gotTo, end.Unix())
+	}
+}
+
+// TestApplyClinePassEstimatesExhaustedUsesMeasured pins the new exhausted
+// behavior: when frac >= 1 the window's total is the measured consumption
+// itself (LimitTokensEstimate = MeasuredTokens = tokens), so the card
+// renders X/X instead of "-".
+func TestApplyClinePassEstimatesExhaustedUsesMeasured(t *testing.T) {
+	start := time.Date(2026, 9, 20, 8, 0, 0, 0, time.UTC)
+	end := start.Add(5 * time.Hour)
+	now := start.Add(time.Hour)
+	snap := Snapshot{Provider: "clinepass", Windows: []Window{{
+		Name: "5h", Status: "used up", Percent: 100, PeriodStart: &start, ResetsAt: &end,
+	}}}
+	sum := func(context.Context, int64, int64) (int64, error) { return 3800, nil }
+	got := ApplyClinePassEstimates(context.Background(), snap, sum, now)
+	w := got.Windows[0]
+	if w.LimitTokensEstimate != 3800 {
+		t.Fatalf("exhausted limit = %d, want 3800", w.LimitTokensEstimate)
+	}
+	if w.MeasuredTokens != 3800 {
+		t.Fatalf("exhausted measured = %d, want 3800", w.MeasuredTokens)
+	}
+	cards := RenderCards([]Snapshot{got}, now, CardOptions{NoColor: true})
+	if !strings.Contains(cards, "3.8K/3.8K") {
+		t.Fatalf("exhausted card must show 3.8K/3.8K:\n%s", cards)
 	}
 }
 
