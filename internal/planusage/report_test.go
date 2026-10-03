@@ -1484,8 +1484,10 @@ func mergedCardLines(t *testing.T, got string) []string {
 	return out
 }
 
-// mergedRowNumber is a merged row's 13-column number field (all ASCII, so a
-// byte slice is a column slice).
+// mergedRowNumber is a merged row's 13-column number field. The field is
+// ASCII whenever it holds a token pair; the 5-hour countdown rows carry CJK
+// (后重置), so callers checking those must compare the row's suffix instead of
+// slicing bytes.
 func mergedRowNumber(t *testing.T, row string) string {
 	t.Helper()
 	body := strings.TrimSuffix(strings.TrimPrefix(row, "│ "), " │")
@@ -1537,8 +1539,9 @@ func TestRenderCardsClinePassMergesSameWindowAccounts(t *testing.T) {
 		t.Fatalf("34%% row wrong: %q", rows[1])
 	}
 
-	// The merged row has no detail text, no countdown, no footer and no
-	// suffix after the account name.
+	// The merged row has no detail text, no 已达限额 footer and no suffix
+	// after the account name. A countdown appears ONLY on a 5-hour row that
+	// has no number at all; here both rows carry a pair, so none appears.
 	for _, bad := range []string{"已用", "总额", "词元", "后重置", "已重置", "已达限额"} {
 		if strings.Contains(got, bad) {
 			t.Fatalf("merged card must not carry %q:\n%s", bad, render.StripANSI(got))
@@ -1669,14 +1672,13 @@ func TestRenderCardsClinePassRowIdentity(t *testing.T) {
 	}
 }
 
-// TestRenderCardsClinePassDisplayNameDropsNumericSuffix pins the display
-// name of a merged row: the trailing pure-digit suffix is dropped (Cline1
-// and Cline2 both read "Cline"), so the two accounts of one plan read as one
-// name. Stripping is DISPLAY-ONLY: the row identity (clineRowID) keeps the
-// full name plus the fingerprint, so the pair stays exactly TWO rows (also
-// without a fingerprint, where the key falls back to the position), and the
-// dot plus the name colour are what tells the same-reading rows apart.
-func TestRenderCardsClinePassDisplayNameDropsNumericSuffix(t *testing.T) {
+// TestRenderCardsClinePassKeepsAccountName pins the display name of a merged
+// row: the account's FULL name, trailing digit run included. Two metapi
+// site-49 accounts are TWO independent pools with different api_tokens, so
+// showing Cline2 as "Cline" would read two quotas as one. The row identity
+// (clineRowID) keys on the same full name plus the fingerprint, so the text
+// and the colour agree, and the card is as wide as the longest FULL name.
+func TestRenderCardsClinePassKeepsAccountName(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
 	fps := []string{"aaaa1111bbbb2222", "cccc3333dddd4444"}
@@ -1694,41 +1696,30 @@ func TestRenderCardsClinePassDisplayNameDropsNumericSuffix(t *testing.T) {
 		t.Fatalf("want 4 lines (title + 2 rows + border), got %d:\n%s", len(lines), render.StripANSI(got))
 	}
 	rows := lines[1:3]
-	for i, r := range rows {
-		if !strings.HasPrefix(r, "│ · Cline ") {
-			t.Fatalf("row %d must show the stripped name: %q", i, r)
-		}
+	if !strings.HasPrefix(rows[0], "│ · Cline1 ") || !strings.HasPrefix(rows[1], "│ · Cline2 ") {
+		t.Fatalf("each row must show its own FULL name: %q / %q", rows[0], rows[1])
 	}
-	// The digits never reach the card, and the two rows keep their own text:
-	// the stripped name appears once per row (the title's "ClinePass" is not
-	// part of the neighbourhood-counted text).
-	if strings.Contains(got, "Cline1") || strings.Contains(got, "Cline2") {
-		t.Fatalf("the digit suffix must not reach the card:\n%s", render.StripANSI(got))
-	}
-	if n := strings.Count(rows[0]+rows[1], "Cline"); n != 2 {
-		t.Fatalf("the stripped name must appear once per row, got %d:\n%s", n, render.StripANSI(got))
-	}
-	// Same text, different colour: each account keeps its own palette colour
-	// on BOTH the dot and the name, which is what tells the pair apart.
-	for _, fp := range fps {
-		color := accountColor(fp)
+	// Same prefix, different rows: each account keeps its own palette colour
+	// on BOTH the dot and the name.
+	for _, tc := range []struct{ fp, name string }{{fps[0], "Cline1"}, {fps[1], "Cline2"}} {
+		color := accountColor(tc.fp)
 		if color == "" {
-			t.Fatalf("fingerprint %q must map to a palette colour", fp)
+			t.Fatalf("fingerprint %q must map to a palette colour", tc.fp)
 		}
 		if !strings.Contains(got, render.FgFromHex(color, "·")) ||
-			!strings.Contains(got, render.FgFromHex(color, "Cline")) {
+			!strings.Contains(got, render.FgFromHex(color, tc.name)) {
 			t.Fatalf("dot and name must both carry %s:\n%q", color, got)
 		}
 	}
-	// The card is as wide as its longest DISPLAY name, not the full one: the
-	// dropped suffix must not reserve an invisible blank column.
-	if want := 4 + clineRowFixed + render.DisplayWidth("Cline"); render.DisplayWidth(lines[0]) != want {
-		t.Fatalf("card width = %d, want %d (no column for the dropped suffix):\n%s",
+	// The card is as wide as its longest FULL name: the digits occupy a
+	// column like any other character.
+	if want := 4 + clineRowFixed + render.DisplayWidth("Cline2"); render.DisplayWidth(lines[0]) != want {
+		t.Fatalf("card width = %d, want %d:\n%s",
 			render.DisplayWidth(lines[0]), want, render.StripANSI(got))
 	}
 
-	// No fingerprint at all: the position-keyed rows still stay TWO, and both
-	// read "Cline" (plain · and an uncoloured name).
+	// No fingerprint at all: the position-keyed rows still stay TWO and keep
+	// their full names (plain · and an uncoloured name).
 	plain := RenderCards([]Snapshot{
 		{Provider: "clinepass", Accounts: []string{"Cline1"}, Windows: []Window{w}},
 		{Provider: "clinepass", Accounts: []string{"Cline2"}, Windows: []Window{w}},
@@ -1737,43 +1728,54 @@ func TestRenderCardsClinePassDisplayNameDropsNumericSuffix(t *testing.T) {
 	if len(plainLines) != 4 {
 		t.Fatalf("fingerprint-less pair: want 4 lines (2 rows), got %d:\n%s", len(plainLines), plain)
 	}
-	for i, r := range plainLines[1:3] {
-		if !strings.HasPrefix(r, "│ · Cline ") {
-			t.Fatalf("fingerprint-less row %d must show the stripped name: %q", i, r)
-		}
+	if !strings.HasPrefix(plainLines[1], "│ · Cline1 ") || !strings.HasPrefix(plainLines[2], "│ · Cline2 ") {
+		t.Fatalf("fingerprint-less rows must keep the full names: %q / %q", plainLines[1], plainLines[2])
 	}
 }
 
-// TestStripNumericSuffix pins the display-name transform and its all-digit
-// fallback: a trailing pure-digit suffix is dropped, but a name that is ONLY
-// digits keeps its name. Returning "" there would blank the account column of
-// the row (nothing but the colour dot left), so the fallback is part of the
-// contract, not an accident of the loop.
-func TestStripNumericSuffix(t *testing.T) {
-	cases := map[string]string{
-		"Cline1":     "Cline",
-		"Cline2":     "Cline",
-		"account123": "account",
-		"Cline-1":    "Cline-", // only the trailing digits go; the hyphen stays
-		"Cline":      "Cline",
-		"":           "",
-		"12345":      "12345", // all digits: keep the name, never strip to ""
-		"0":          "0",
+// TestRenderCardsClinePassEstimateMarkerAndFiveHourCountdown pins the two
+// display rules of the estimated pools and of the window that has none:
+//
+//   - a weekly/monthly card SAYS it is an estimate — the title carries 估算池
+//     and every row prefixes its total with "~", because the upstream never
+//     reports an absolute pool (see ApplyClinePassEstimates);
+//   - the 5-hour row (no pool at all) shows the reset COUNTDOWN in its number
+//     field instead of "-": what that window has is a reset instant.
+func TestRenderCardsClinePassEstimateMarkerAndFiveHourCountdown(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(2*time.Hour + 15*time.Minute)
+
+	weekly := Window{Name: "weekly", Status: "ok", Percent: 20, LimitTokensEstimate: 2_000_000, ResetsAt: &reset}
+	monthly := Window{Name: "monthly", Status: "ok", Percent: 60, LimitTokensEstimate: 4_000_000, ResetsAt: &reset}
+	got := RenderCards([]Snapshot{clinePassSnap("aaaa1111bbbb2222", "Cline", weekly, monthly)}, now, CardOptions{NoColor: true})
+
+	for _, want := range []string{
+		"╭─ ClinePass · 周限额 · 估算池 ",
+		"╭─ ClinePass · 月限额 · 估算池 ",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("pool card title missing %q:\n%s", want, got)
+		}
 	}
-	for in, want := range cases {
-		if got := stripNumericSuffix(in); got != want {
-			t.Errorf("stripNumericSuffix(%q) = %q, want %q", in, got, want)
+	for _, want := range []string{"400.0K/~2.0M", "2.4M/~4.0M"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("estimated total missing the ~ marker %q:\n%s", want, got)
 		}
 	}
 
-	// End to end: an all-digit account name must still render its name on the
-	// merged row (dot + name), not a dot followed by blanks.
-	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
-	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
-	got := RenderCards([]Snapshot{clinePassSnap("aaaa1111bbbb2222", "12345", w)}, now)
+	// The 5-hour window carries no pool, so it is neither marked nor given a
+	// token pair: its field is the countdown, in the same 13 columns.
+	fiveHour := Window{Name: "5h", Status: "ok", Percent: 12, ResetsAt: &reset}
+	got = RenderCards([]Snapshot{clinePassSnap("aaaa1111bbbb2222", "Cline", fiveHour)}, now, CardOptions{NoColor: true})
 	lines := mergedCardLines(t, got)
-	if !strings.HasPrefix(lines[1], "│ · 12345 ") {
-		t.Fatalf("an all-digit account name must stay visible: %q", lines[1])
+	if !strings.HasPrefix(lines[0], "╭─ ClinePass · 5小时限额 ") || strings.Contains(lines[0], clineEstimatePoolLabel) {
+		t.Fatalf("the 5-hour card has no pool and must not be marked: %q", lines[0])
+	}
+	if !strings.HasSuffix(lines[1], "2h 15m 后重置 │") {
+		t.Fatalf("the 5h number field must be the reset countdown: %q", lines[1])
+	}
+	if strings.Contains(lines[1], "-") {
+		t.Fatalf("the 5h row must not fall back to \"-\": %q", lines[1])
 	}
 }
 

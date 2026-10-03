@@ -264,26 +264,70 @@ func ApplyGrokWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum,
 	return ApplyWeekEstimate(ctx, snap, sum, path, now)
 }
 
-// ApplyClinePassEstimates fills LimitTokensEstimate on every ClinePass
-// window (5h / weekly / monthly) with the LIVE reversal: consumed tokens in
-// the current period ÷ used fraction (percentUsed/100, or the unfloored
-// UsedFraction when the upstream sent a fractional percent). Each window's
-// PeriodStart is derived from its ResetsAt by the fetcher
-// (clinepassPeriodStart), so a window without a reset instant is skipped.
+// ApplyClinePassEstimates fills LimitTokensEstimate on the ClinePass
+// POOL windows (weekly / monthly) from the LIVE reversal, anchored on the
+// WEEKLY window so the plan's hard constraint — 月限额 = 2 × 周限额 — holds
+// by construction instead of by luck.
 //
-// The estimate is only produced for a strictly partial window:
-// 0 < used fraction < 1 and a positive token sum. At 100 % the upstream
-// percent is clamped, so reversing it would systematically understate the
-// pool — an exhausted window uses the measured consumption itself as the
-// total so the card shows X/X. Sum errors (metapi database missing/unreadable,
-// proxy_logs absent) are logged and leave the estimate empty: they never
-// fail the snapshot or mark the fetch failed.
+// Why weekly-anchored: the upstream only ever reports a used PERCENT per
+// window (percentUsed), never an absolute pool, and each percent is
+// computed against that window's own token count. Reversing every window
+// on its own therefore produced three mutually contradictory pools in
+// production (5h 1.6G / weekly 4.0G / monthly 5.2G). The one relation the
+// plan DOES guarantee is monthly = 2 × weekly, so exactly ONE pool size L
+// is derived and the monthly window is written as 2*L: the monthly figure
+// can never drift away from twice the weekly one, whatever the two
+// percents say.
+//
+// L comes from the weekly window when it is usable — 0 < used fraction < 1
+// and a positive token sum — as L = tokens_w / frac_w. When the weekly
+// window is NOT usable (a fresh week carrying no traffic yet, or one that
+// is already exhausted) the monthly window backs it up with
+// L = tokens_m / (2 * frac_m): half the monthly reversal, because the
+// monthly pool is twice the weekly one.
+//
+// The 5-hour window is deliberately NOT estimated: it is a rolling rate
+// limit with its own percent, so reversing it would produce yet another
+// unrelated pool. Its card shows the reset countdown in place of the
+// token pair (see clineNumberField).
+//
+// An exhausted window (frac >= 1) keeps the X/X wording from the derived
+// L (L/L, or 2L/2L for the monthly window). Only when there is no L at
+// all — the very first round is already drained and neither window is
+// partial — does a drained window fall back to its own measured
+// consumption (T/T), the best the data can answer. When neither window is
+// usable no estimate is written at all (the field stays empty).
+//
+// Sum errors (metapi database missing/unreadable, proxy_logs absent) are
+// logged and leave the estimate empty: they never fail the snapshot or
+// mark the fetch failed.
 func ApplyClinePassEstimates(ctx context.Context, snap Snapshot, sum GrokTokenSum, now time.Time) Snapshot {
 	if sum == nil {
 		return snap
 	}
+	// One window observation: its index in the snapshot, the tokens summed
+	// over its own [period start, min(now, reset)] range, and its used
+	// fraction.
+	type observed struct {
+		set    bool
+		idx    int
+		tokens int64
+		frac   float64
+	}
+	var weekly, monthly observed
 	for i := range snap.Windows {
 		w := snap.Windows[i]
+		// Only the pool windows are estimated; the 5-hour window is
+		// skipped without a sum call (nothing to reverse it against).
+		var slot *observed
+		switch w.Name {
+		case "weekly":
+			slot = &weekly
+		case "monthly":
+			slot = &monthly
+		default:
+			continue
+		}
 		if w.PeriodStart == nil || w.PeriodStart.IsZero() {
 			continue
 		}
@@ -297,17 +341,37 @@ func ApplyClinePassEstimates(ctx context.Context, snap Snapshot, sum GrokTokenSu
 			slog.Warn("clinepass quota token sum failed", "window", w.Name, "error", err)
 			continue
 		}
-		if tokens <= 0 {
+		*slot = observed{set: true, idx: i, tokens: tokens, frac: windowUsedFraction(w)}
+	}
+
+	// One pool size for the whole plan: the weekly reversal when the week
+	// is usable, otherwise half the monthly reversal. monthly = 2 × weekly
+	// is then structural.
+	pool := int64(0)
+	switch {
+	case weekly.set && weekly.tokens > 0 && weekly.frac > 0 && weekly.frac < 1:
+		pool = reversePool(weekly.tokens, weekly.frac)
+	case monthly.set && monthly.tokens > 0 && monthly.frac > 0 && monthly.frac < 1:
+		pool = reversePool(monthly.tokens, 2*monthly.frac)
+	}
+	if pool > 0 {
+		if weekly.set {
+			snap.Windows[weekly.idx].LimitTokensEstimate = pool
+		}
+		if monthly.set {
+			snap.Windows[monthly.idx].LimitTokensEstimate = 2 * pool
+		}
+		return snap
+	}
+
+	// No pool anywhere: a drained window still shows X/X from its own
+	// measured consumption rather than an empty field.
+	for _, o := range []observed{weekly, monthly} {
+		if !o.set || o.tokens <= 0 || o.frac < 1 {
 			continue
 		}
-		frac := windowUsedFraction(w)
-		if frac >= 1 {
-			// Exhausted window: measured consumption IS the total.
-			snap.Windows[i].LimitTokensEstimate = tokens
-			snap.Windows[i].MeasuredTokens = tokens
-		} else if frac > 0 {
-			snap.Windows[i].LimitTokensEstimate = reversePool(tokens, frac)
-		}
+		snap.Windows[o.idx].LimitTokensEstimate = o.tokens
+		snap.Windows[o.idx].MeasuredTokens = o.tokens
 	}
 	return snap
 }

@@ -21,6 +21,10 @@ type metapiFixtureRow struct {
 	prompt     *int64
 	completion *int64
 	total      *int64
+	// cacheRead is metapi's cache_read_tokens, the part of total_tokens the
+	// per-account sum must NOT count (the upstream percent it is reversed
+	// against is a prompt+completion 口径).
+	cacheRead *int64
 }
 
 func i64(v int64) *int64 { return &v }
@@ -53,6 +57,7 @@ func createProxyLogsTable(t *testing.T, db *sql.DB) {
 		prompt_tokens INTEGER,
 		completion_tokens INTEGER,
 		total_tokens INTEGER,
+		cache_read_tokens INTEGER,
 		created_at TEXT DEFAULT (datetime('now'))
 	)`); err != nil {
 		t.Fatal(err)
@@ -83,9 +88,9 @@ func insertProxyLogs(t *testing.T, db *sql.DB, rows []metapiFixtureRow) {
 	t.Helper()
 	for _, r := range rows {
 		if _, err := db.Exec(
-			`INSERT INTO proxy_logs (account_id, model_requested, prompt_tokens, completion_tokens, total_tokens, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			r.accountID, r.model, r.prompt, r.completion, r.total,
+			`INSERT INTO proxy_logs (account_id, model_requested, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			r.accountID, r.model, r.prompt, r.completion, r.total, r.cacheRead,
 			r.createdAt.UTC().Format(createdAtFixtureLayout),
 		); err != nil {
 			t.Fatal(err)
@@ -197,11 +202,12 @@ func TestSumClinePassTokens(t *testing.T) {
 	}
 }
 
-// TestSumClinePassTokensByAccount pins the per-account isolation: only the
-// rows of the requested metapi account count. Another account's ClinePass
-// traffic in the SAME window must not leak in — that is the whole point of the
-// per-account estimate, each subscription's pool is its own — and neither must
-// a row of the same account whose model is not cline-pass/*.
+// TestSumClinePassTokensByAccount pins two properties at once: per-account
+// isolation — only the rows of the requested metapi account count, another
+// account's ClinePass traffic in the SAME window must not leak in (each
+// subscription's pool is its own) — and the molecule, prompt_tokens +
+// completion_tokens with metapi's cache_read_tokens EXCLUDED (total_tokens
+// WOULD count the cache, which the upstream percent does not).
 func TestSumClinePassTokensByAccount(t *testing.T) {
 	base := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
 	from := base.Unix()
@@ -209,18 +215,21 @@ func TestSumClinePassTokensByAccount(t *testing.T) {
 	acctA, acctB := int64(34), int64(38)
 
 	path := writeHubFixture(t, nil, []metapiFixtureRow{
-		// account 34: counted (stored total), plus one NULL total falling
-		// back to prompt+completion.
-		{accountID: &acctA, model: "cline-pass/x", createdAt: base.Add(10 * time.Minute), total: i64(100)},
+		// account 34: counted (prompt+completion), no cache on the row.
+		{accountID: &acctA, model: "cline-pass/x", createdAt: base.Add(10 * time.Minute), prompt: i64(60), completion: i64(40), total: i64(100)},
+		// account 34 with a NULL total: prompt+completion still count.
 		{accountID: &acctA, model: "cline-pass/y", createdAt: base.Add(20 * time.Minute), prompt: i64(7), completion: i64(3), total: nil},
+		// account 34, cache-heavy: metapi's total (9820) includes 9800
+		// cache-read tokens, which the sum MUST drop (20 + 0 counts).
+		{accountID: &acctA, model: "cline-pass/z", createdAt: base.Add(25 * time.Minute), prompt: i64(20), total: i64(9_820), cacheRead: i64(9_800)},
 		// account 38 in the same window: excluded from account 34's sum.
-		{accountID: &acctB, model: "cline-pass/x", createdAt: base.Add(15 * time.Minute), total: i64(9_999)},
+		{accountID: &acctB, model: "cline-pass/x", createdAt: base.Add(15 * time.Minute), prompt: i64(5_000), total: i64(9_999), cacheRead: i64(4_999)},
 		// NULL account_id (a row metapi recorded without an account): never
 		// attributed to a specific account.
-		{model: "cline-pass/x", createdAt: base.Add(16 * time.Minute), total: i64(5_000)},
+		{model: "cline-pass/x", createdAt: base.Add(16 * time.Minute), prompt: i64(5_000), total: i64(5_000)},
 		// account 34 outside the window / with another model: excluded.
-		{accountID: &acctA, model: "cline-pass/x", createdAt: base.Add(-time.Second), total: i64(1_000)},
-		{accountID: &acctA, model: "gpt-5", createdAt: base.Add(5 * time.Minute), total: i64(2_000)},
+		{accountID: &acctA, model: "cline-pass/x", createdAt: base.Add(-time.Second), prompt: i64(1_000), total: i64(1_000)},
+		{accountID: &acctA, model: "gpt-5", createdAt: base.Add(5 * time.Minute), prompt: i64(2_000), total: i64(2_000)},
 	})
 
 	st, err := Open(path)
@@ -230,11 +239,15 @@ func TestSumClinePassTokensByAccount(t *testing.T) {
 	defer st.Close()
 	ctx := context.Background()
 
-	if got, err := st.SumClinePassTokensByAccount(ctx, acctA, from, to); err != nil || got != 110 {
-		t.Fatalf("account 34 sum = (%d, %v), want (110, nil)", got, err)
+	// 60+40 + 7+3 + 20+0 = 130: the two cache-heavy rows contribute nothing
+	// of their cache to this account.
+	if got, err := st.SumClinePassTokensByAccount(ctx, acctA, from, to); err != nil || got != 130 {
+		t.Fatalf("account 34 sum = (%d, %v), want (130, nil) — prompt+completion only", got, err)
 	}
-	if got, err := st.SumClinePassTokensByAccount(ctx, acctB, from, to); err != nil || got != 9_999 {
-		t.Fatalf("account 38 sum = (%d, %v), want (9999, nil) — the other account must not leak", got, err)
+	// 5000 + 0: the other account's own cache is dropped too, and 4200/7000
+	// of the first account never leak here.
+	if got, err := st.SumClinePassTokensByAccount(ctx, acctB, from, to); err != nil || got != 5_000 {
+		t.Fatalf("account 38 sum = (%d, %v), want (5000, nil) — the other account must not leak", got, err)
 	}
 	// An account with no traffic in the window sums to 0, not an error.
 	if got, err := st.SumClinePassTokensByAccount(ctx, 41, from, to); err != nil || got != 0 {
@@ -245,9 +258,10 @@ func TestSumClinePassTokensByAccount(t *testing.T) {
 		t.Fatalf("from<=0: got (%d, %v), want (0, nil)", got, err)
 	}
 
-	// The subscription-wide sum still sees all accounts: 110 + 9999 + 5000.
-	if got, err := st.SumClinePassTokens(ctx, from, to); err != nil || got != 15_109 {
-		t.Fatalf("subscription-wide sum = (%d, %v), want (15109, nil)", got, err)
+	// The subscription-wide sum still sees all accounts — and still counts
+	// total_tokens (cache included): 100 + 10 + 9820 + 9999 + 5000.
+	if got, err := st.SumClinePassTokens(ctx, from, to); err != nil || got != 24_929 {
+		t.Fatalf("subscription-wide sum = (%d, %v), want (24929, nil)", got, err)
 	}
 }
 

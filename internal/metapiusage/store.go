@@ -101,6 +101,21 @@ func (s *Store) Close() error {
 // proxy_logs table is returned as an error for the caller to degrade to
 // "no estimate"; it is never fatal.
 //
+// Deprecated: it is the SUBSCRIPTION-WIDE 口径 (no account_id filter,
+// see the SQL below) and its molecule still sums total_tokens, which in
+// metapi INCLUDES cache_read_tokens. SumClinePassTokensByAccount is the
+// per-account replacement the production estimate uses, and it sums
+// prompt+completion only (剔除 cache, the 口径 the upstream plan percent
+// counts). The two therefore disagree on BOTH axes — account scope and
+// cache — and a subscription-wide numerator would also add one metapi
+// account's traffic to another account's percent (串账). It currently has
+// NO production caller: the service (Source.SumClinePassTokensByAccount)
+// and the CLI (`prism quota`) both go through the per-account form, and
+// metapiusage.Source.SumClinePassTokens is a wrapper with no non-test
+// caller either. Kept only for the legacy/full-subscription shape until
+// the callers are settled; align its 口径 with the per-account sum or
+// delete it (tracked in the 2026-10-03 derivation note).
+//
 // Before summing, the created_at sample is shape-checked (see
 // ErrCreatedAtShape): with a drifted layout the TEXT range comparison
 // would silently mis-bound the window, so drift is returned as an error
@@ -116,6 +131,10 @@ func (s *Store) SumClinePassTokens(ctx context.Context, fromUnix, toUnix int64) 
 	if err := s.checkCreatedAtShape(ctx); err != nil {
 		return 0, err
 	}
+	// NOTE: this molecule (total_tokens, with the prompt+completion
+	// fallback) plus the account-wide WHERE is exactly the 口径
+	// SumClinePassTokensByAccount replaced; see the Deprecated note
+	// above before reusing it.
 	const q = `SELECT COALESCE(SUM(CASE WHEN total_tokens IS NULL
 			THEN COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)
 			ELSE total_tokens END), 0)
@@ -189,11 +208,21 @@ func (s *Store) ListClinePassAccountsWithToken(ctx context.Context) ([]clinePass
 
 // SumClinePassTokensByAccount sums 词元 of ClinePass rows in
 // [fromUnix, toUnix] (unix seconds, inclusive) for ONE metapi account.
-// The per-row total is total_tokens with prompt+completion as the
-// fallback for NULL rows, mirroring the usage-db ledger expression
-// (internal/usage SumTokensLike). A non-positive lower bound returns 0
-// without querying. A missing proxy_logs table is returned as an error
-// for the caller to degrade to "no estimate"; it is never fatal.
+//
+// The per-row amount is prompt_tokens + completion_tokens (NULL = 0),
+// deliberately NOT total_tokens: metapi's total_tokens INCLUDES
+// cache_read_tokens (the production log writes total = prompt +
+// completion + cache_read), while the upstream plan percent this sum is
+// reversed against counts prompt and completion 词元 only — that is the
+// 口径 this sum exists to match (剔除 cache). Summing total_tokens put
+// the cache reads on the numerator; because cache is a far larger share
+// of a week than of a month (49 % vs 13 % measured on the production
+// database), it skewed the reversed pool badly (monthly/weekly came out
+// 1.29 instead of 2).
+//
+// A non-positive lower bound returns 0 without querying. A missing
+// proxy_logs table is returned as an error for the caller to degrade to
+// "no estimate"; it is never fatal.
 //
 // Before summing, the created_at sample is shape-checked (see
 // ErrCreatedAtShape): with a drifted layout the TEXT range comparison
@@ -210,9 +239,7 @@ func (s *Store) SumClinePassTokensByAccount(ctx context.Context, accountID int64
 	if err := s.checkCreatedAtShape(ctx); err != nil {
 		return 0, err
 	}
-	const q = `SELECT COALESCE(SUM(CASE WHEN total_tokens IS NULL
-			THEN COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)
-			ELSE total_tokens END), 0)
+	const q = `SELECT COALESCE(SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)), 0)
 		FROM proxy_logs
 		WHERE account_id = ? AND model_requested LIKE ? AND created_at >= ? AND created_at <= ?`
 	var n int64

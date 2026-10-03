@@ -134,7 +134,9 @@ func TestErrorCode(t *testing.T) {
 }
 
 // TestPollerClinePassEstimateApplied pins the clinepass poller path: the
-// three windows each get their own live reversal from their own percent.
+// weekly window anchors the pool (1000 tokens ÷ 8 % = 12500), the monthly
+// window is exactly twice it, and the 5-hour window carries no estimate at
+// all.
 func TestPollerClinePassEstimateApplied(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, clinepassUsageBody)
@@ -158,7 +160,8 @@ func TestPollerClinePassEstimateApplied(t *testing.T) {
 		t.Fatalf("snapshots = %+v, want 1 snapshot with 3 windows", snaps)
 	}
 	// clinepassUsageBody percentUsed 7 / 8 / 4 (integral → Percent/100).
-	want := map[string]int64{"5h": 14286, "weekly": 12500, "monthly": 25000}
+	// The weekly percent anchors the pool; monthly = 2 × weekly; 5h none.
+	want := map[string]int64{"5h": 0, "weekly": 12500, "monthly": 25000}
 	for _, w := range snaps[0].Windows {
 		if w.LimitTokensEstimate != want[w.Name] {
 			t.Fatalf("%s estimate = %d, want %d", w.Name, w.LimitTokensEstimate, want[w.Name])
@@ -205,8 +208,16 @@ func TestPollerEstimateDispatchPerProvider(t *testing.T) {
 		return func(context.Context, int64, int64) (int64, error) { return 1000, nil }
 	})
 	got := collect(t, p)
-	if len(got["clinepass"]) != 3 || got["clinepass"][0].LimitTokensEstimate == 0 {
-		t.Fatalf("clinepass windows must be estimated: %+v", got["clinepass"])
+	// The POOL windows are estimated (weekly anchors the pool, monthly is
+	// 2 × weekly); the 5-hour window never is.
+	pool := map[string]int64{"weekly": 12500, "monthly": 25000}
+	if len(got["clinepass"]) != 3 {
+		t.Fatalf("clinepass windows = %+v, want 3", got["clinepass"])
+	}
+	for _, w := range got["clinepass"] {
+		if w.LimitTokensEstimate != pool[w.Name] {
+			t.Fatalf("clinepass %s estimate = %d, want %d", w.Name, w.LimitTokensEstimate, pool[w.Name])
+		}
 	}
 	for _, w := range got["gemini"] {
 		if w.LimitTokensEstimate != 0 {
@@ -320,8 +331,9 @@ func TestPollerClinePassPerAccountEstimate(t *testing.T) {
 		t.Fatalf("factory account ids = %v, want [7 9] (one per account, its own id)", got)
 	}
 
-	// Each snapshot counts only its own account's consumption: clinepassUsageBody
-	// is 7 % / 8 % / 4 %, so 1000 → 14286 and 3000 → 42857 on the 5h window.
+	// Each snapshot counts only its own account's consumption:
+	// clinepassUsageBody is 7 % / 8 % / 4 %, so the WEEKLY window (the pool
+	// anchor) takes 1000 → 12500 and 3000 → 37500.
 	snaps := c.List()
 	byFP := map[string]int64{}
 	for _, s := range snaps {
@@ -329,25 +341,28 @@ func TestPollerClinePassPerAccountEstimate(t *testing.T) {
 		if len(fps) != 1 || len(s.Accounts) != 1 {
 			t.Fatalf("one snapshot per account key expected: %+v", s)
 		}
-		var five int64 = -1
+		var weekly int64 = -1
 		for _, w := range s.Windows {
-			if w.Name == "5h" {
-				five = w.LimitTokensEstimate
+			if w.Name == "weekly" {
+				weekly = w.LimitTokensEstimate
+			}
+			if w.Name == "5h" && w.LimitTokensEstimate != 0 {
+				t.Errorf("the 5h window must stay unestimated: %+v", w)
 			}
 		}
-		if five < 0 {
-			t.Fatalf("5h window missing: %+v", s)
+		if weekly < 0 {
+			t.Fatalf("weekly window missing: %+v", s)
 		}
-		byFP[fps[0]] = five
+		byFP[fps[0]] = weekly
 	}
 	if len(byFP) != 2 {
 		t.Fatalf("snapshots = %d, want 2 (one per account)", len(byFP))
 	}
-	if got := byFP[KeyFingerprint(tokA)]; got != 14286 {
-		t.Fatalf("account 7 (1000 tokens ÷ 7%%) 5h estimate = %d, want 14286", got)
+	if got := byFP[KeyFingerprint(tokA)]; got != 12500 {
+		t.Fatalf("account 7 (1000 tokens ÷ 8%%) weekly estimate = %d, want 12500", got)
 	}
-	if got := byFP[KeyFingerprint(tokB)]; got != 42857 {
-		t.Fatalf("account 9 (3000 tokens ÷ 7%%) 5h estimate = %d, want 42857", got)
+	if got := byFP[KeyFingerprint(tokB)]; got != 37500 {
+		t.Fatalf("account 9 (3000 tokens ÷ 8%%) weekly estimate = %d, want 37500", got)
 	}
 }
 

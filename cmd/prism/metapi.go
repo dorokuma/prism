@@ -199,29 +199,42 @@ func clinePassRosterDelta(prev, next []planusage.AccountView, dbPresent bool, di
 	}
 }
 
-// applyQuotaClinePassEstimate fills the three ClinePass windows' 总额 in
-// the CLI path (`prism quota`) from metapi's cline-pass consumption. When
-// accountID > 0 the sum is scoped to that single metapi account; otherwise
-// it falls back to the legacy subscription-wide sum. It shares
-// planusage.ApplyClinePassEstimates with the service poller, so the CLI
-// and /admin/quota produce the same numbers — including the created_at
-// shape guard inside Store.SumClinePassTokens, which degrades a drifted
-// database to "no 总额" instead of mis-bounding the window. A
-// missing/unreadable metapi database leaves the estimates empty and the
-// snapshot untouched.
+// clinepassEstimateSkipped counts the ClinePass estimates dropped because
+// the account carried no metapi account_id (see
+// applyQuotaClinePassEstimate). Published on /metrics next to
+// clinepass_quota_accounts, so an account that silently stopped producing a
+// 总额 becomes visible instead of only missing from a card.
+var clinepassEstimateSkipped = expvar.NewInt("clinepass_quota_estimate_skipped_total")
+
+// applyQuotaClinePassEstimate fills the ClinePass windows' 总额 in the CLI
+// path (`prism quota`) from metapi's cline-pass consumption for ONE metapi
+// account. It shares planusage.ApplyClinePassEstimates with the service
+// poller, so the CLI and /admin/quota produce the same numbers — including
+// the created_at shape guard inside Store.SumClinePassTokensByAccount, which
+// degrades a drifted database to "no 总额" instead of mis-bounding the
+// window. A missing/unreadable metapi database leaves the estimates empty
+// and the snapshot untouched.
+//
+// accountID <= 0 does NOT fall back to a subscription-wide sum. Two metapi
+// site-49 accounts are TWO INDEPENDENT pools with their own api_token, so a
+// subscription-wide numerator would add one subscription's traffic to the
+// other's percent and print a 总额 belonging to neither (串账). The estimate
+// is dropped instead: one WARN naming the account, counted in
+// clinepass_quota_estimate_skipped_total.
 func applyQuotaClinePassEstimate(ctx context.Context, snap planusage.Snapshot, accountID int64) planusage.Snapshot {
+	if accountID <= 0 {
+		clinepassEstimateSkipped.Add(1)
+		slog.Warn("clinepass estimate skipped: no metapi account id",
+			"provider", snap.Provider, "accounts", snap.Accounts)
+		return snap
+	}
 	st := openMetapiUsage()
 	if st == nil {
 		return snap
 	}
 	defer st.Close()
-	var sum planusage.GrokTokenSum
-	if accountID > 0 {
-		sum = func(ctx context.Context, from, to int64) (int64, error) {
-			return st.SumClinePassTokensByAccount(ctx, accountID, from, to)
-		}
-	} else {
-		sum = st.SumClinePassTokens
+	sum := func(ctx context.Context, from, to int64) (int64, error) {
+		return st.SumClinePassTokensByAccount(ctx, accountID, from, to)
 	}
 	return planusage.ApplyClinePassEstimates(ctx, snap, sum, time.Now())
 }

@@ -297,9 +297,12 @@ func TestClinePassPeriodStartDerivation(t *testing.T) {
 	}
 }
 
-// TestApplyClinePassEstimates pins the three-window live reversal: each
-// window's consumed sum is divided by its own used fraction, and the result
-// renders as 总额 in both the cards and the legacy table.
+// TestApplyClinePassEstimates pins the weekly-anchored derivation: ONE pool
+// size L comes from the WEEKLY window's own reversal, the monthly window is
+// written as exactly 2*L — the plan's 月限额 = 2 × 周限额 then holds by
+// construction instead of by arithmetic luck — and the 5-hour window is
+// left WITHOUT an estimate (it is a rate limit whose card shows a countdown,
+// so it must not even be summed).
 func TestApplyClinePassEstimates(t *testing.T) {
 	start5h := time.Date(2026, 9, 20, 8, 0, 0, 0, time.UTC)
 	end5h := start5h.Add(5 * time.Hour)
@@ -318,11 +321,12 @@ func TestApplyClinePassEstimates(t *testing.T) {
 	sum := func(_ context.Context, from, to int64) (int64, error) {
 		switch from {
 		case start5h.Unix():
-			if to != now.Unix() {
-				t.Errorf("5h sum window [%d,%d], want to=now", from, to)
-			}
+			t.Errorf("the 5-hour window must not be summed at all")
 			return 250_000, nil
 		case startW.Unix():
+			if to != now.Unix() {
+				t.Errorf("weekly sum window [%d,%d], want to=now", from, to)
+			}
 			return 100_000, nil
 		case startM.Unix():
 			return 40_000, nil
@@ -332,27 +336,130 @@ func TestApplyClinePassEstimates(t *testing.T) {
 		}
 	}
 	got := ApplyClinePassEstimates(context.Background(), snap, sum, now)
-	wantEst := []int64{5_000_000, 1_250_000, 1_000_000}
-	for i, want := range wantEst {
-		if got.Windows[i].LimitTokensEstimate != want {
-			t.Fatalf("%s estimate = %d, want %d", got.Windows[i].Name, got.Windows[i].LimitTokensEstimate, want)
-		}
+
+	if got.Windows[0].LimitTokensEstimate != 0 {
+		t.Fatalf("5h must not carry an estimate: %+v", got.Windows[0])
+	}
+	// L = 100000 / 0.08 = 1_250_000; the monthly window is 2L, whatever its
+	// own percent (4 %) would have reversed to on its own.
+	if got.Windows[1].LimitTokensEstimate != 1_250_000 {
+		t.Fatalf("weekly estimate = %d, want 1250000", got.Windows[1].LimitTokensEstimate)
+	}
+	if got.Windows[2].LimitTokensEstimate != 2_500_000 {
+		t.Fatalf("monthly estimate = %d, want exactly 2 × weekly = 2500000", got.Windows[2].LimitTokensEstimate)
 	}
 
 	cards := RenderCards([]Snapshot{got}, now, CardOptions{NoColor: true})
 	for _, want := range []string{
-		"250.0K/5.0M",
-		"100.0K/1.2M",
-		"40.0K/1.0M",
+		"100.0K/~1.2M",
+		"100.0K/~2.5M",
 	} {
 		if !strings.Contains(cards, want) {
 			t.Fatalf("cards missing %q:\n%s", want, cards)
 		}
 	}
 	table := RenderTableAt([]Snapshot{got}, now)
-	for _, want := range []string{"5M", "1.25M", "1M"} {
+	for _, want := range []string{"1.25M", "2.5M"} {
 		if !strings.Contains(table, want) {
 			t.Fatalf("table missing %q:\n%s", want, table)
+		}
+	}
+}
+
+// TestApplyClinePassEstimatesWeeklyResetFallsBackToMonthly pins the fallback
+// for the moment the WEEK window resets: the fresh week carries no traffic
+// yet, so it cannot anchor the pool, and the still-partial monthly window
+// takes over with HALF its own reversal — L = tokens_m / (2*frac_m) — so the
+// monthly card keeps reading 2L and the fresh week is not left blank.
+func TestApplyClinePassEstimatesWeeklyResetFallsBackToMonthly(t *testing.T) {
+	now := time.Date(2026, 9, 20, 9, 0, 0, 0, time.UTC)
+	startW := time.Date(2026, 9, 20, 8, 0, 0, 0, time.UTC) // the week just rolled
+	endW := startW.Add(7 * 24 * time.Hour)
+	startM := time.Date(2026, 8, 24, 4, 0, 0, 0, time.UTC)
+	endM := startM.AddDate(0, 1, 0)
+
+	snap := Snapshot{Provider: "clinepass", Windows: []Window{
+		{Name: "weekly", Status: "ok", Percent: 0, PeriodStart: &startW, ResetsAt: &endW},
+		{Name: "monthly", Status: "ok", Percent: 25, PeriodStart: &startM, ResetsAt: &endM},
+	}}
+	sum := func(_ context.Context, from, _ int64) (int64, error) {
+		if from == startW.Unix() {
+			return 0, nil // the week has just reset: nothing in it yet
+		}
+		return 400_000, nil
+	}
+	got := ApplyClinePassEstimates(context.Background(), snap, sum, now)
+	if got.Windows[0].LimitTokensEstimate != 800_000 {
+		t.Fatalf("fresh week estimate = %d, want 800000 (half the monthly reversal)",
+			got.Windows[0].LimitTokensEstimate)
+	}
+	if got.Windows[1].LimitTokensEstimate != 1_600_000 {
+		t.Fatalf("monthly estimate = %d, want 2 × the weekly pool = 1600000",
+			got.Windows[1].LimitTokensEstimate)
+	}
+}
+
+// TestApplyClinePassEstimatesDrainedWeekAnchorsMonthly pins the production
+// Cline2 shape: the WEEKLY window is already 100 % drained — the upstream
+// clamps percentUsed there, so it cannot anchor a pool — while the MONTHLY
+// window is still PARTIAL (0.999 used, carried UNFLOORED in UsedFraction).
+// The one pool L therefore comes from the monthly fallback,
+// L = tokens_m / (2 × frac_m), and BOTH rows are written from it.
+//
+// The point of the case is the drained week: because a pool IS derivable
+// (from the monthly), the drained weekly row must render that pool (X/~X),
+// NOT the last-resort measured pair (T/T) that applies only when no pool can
+// be derived anywhere. The monthly row reads 2L/~2L: its displayPercent still
+// ceils 99.9 % to 100 %, so its used side equals its total — both sides carry
+// the "~" because the total is an inference.
+func TestApplyClinePassEstimatesDrainedWeekAnchorsMonthly(t *testing.T) {
+	now := time.Date(2026, 10, 3, 7, 0, 0, 0, time.UTC)
+	startW := time.Date(2026, 10, 2, 6, 39, 0, 0, time.UTC)
+	endW := startW.Add(7 * 24 * time.Hour)
+	startM := time.Date(2026, 9, 24, 4, 5, 0, 0, time.UTC)
+	endM := startM.AddDate(0, 1, 0)
+
+	// Weekly: drained (Percent 100) ⇒ unusable as the anchor; its own measured
+	// 5M happens to equal L, which is what a drained week means.
+	// Monthly: 99.9 % used (UsedFraction set, Percent floored to 99) ⇒ partial,
+	// hence the only usable anchor: 9990000 / (2 × 0.999) = 5000000 = L. The
+	// pool is sized so BOTH sides fit the 13-column number field
+	// ("5.0M/~5.0M" = 10, "10.0M/~10.0M" = 12) instead of being truncated.
+	snap := Snapshot{Provider: "clinepass", Windows: []Window{
+		{Name: "weekly", Status: "rate-limited", Percent: 100, PeriodStart: &startW, ResetsAt: &endW},
+		{Name: "monthly", Status: "ok", Percent: 99, UsedFraction: 0.999, PeriodStart: &startM, ResetsAt: &endM},
+	}}
+	sum := func(_ context.Context, from, _ int64) (int64, error) {
+		switch from {
+		case startW.Unix():
+			return 5_000_000, nil
+		case startM.Unix():
+			return 9_990_000, nil
+		default:
+			t.Errorf("unexpected sum window from=%d", from)
+			return 0, nil
+		}
+	}
+	got := ApplyClinePassEstimates(context.Background(), snap, sum, now)
+
+	if got.Windows[0].LimitTokensEstimate != 5_000_000 {
+		t.Fatalf("drained weekly estimate = %d, want L = 5000000 (the monthly-derived pool)",
+			got.Windows[0].LimitTokensEstimate)
+	}
+	if got.Windows[0].MeasuredTokens != 0 {
+		t.Fatalf("a drained window WITH a pool must not fall back to its measured pair: %+v", got.Windows[0])
+	}
+	if got.Windows[1].LimitTokensEstimate != 10_000_000 {
+		t.Fatalf("monthly estimate = %d, want exactly 2L = 10000000", got.Windows[1].LimitTokensEstimate)
+	}
+
+	cards := RenderCards([]Snapshot{got}, now, CardOptions{NoColor: true})
+	for _, want := range []string{
+		"5.0M/~5.0M",   // weekly: the derived pool, not the measured 5.0M/5.0M pair
+		"10.0M/~10.0M", // monthly: 2L, its used side ceiled to 100 %
+	} {
+		if !strings.Contains(cards, want) {
+			t.Fatalf("cards missing %q:\n%s", want, cards)
 		}
 	}
 }
@@ -362,9 +469,9 @@ func TestApplyClinePassEstimates(t *testing.T) {
 // floored integer: 7.4 % of 7400 tokens is a 100000 pool, not 7400/0.07.
 func TestApplyClinePassEstimatesUsesUnflooredFraction(t *testing.T) {
 	start := time.Date(2026, 9, 20, 8, 0, 0, 0, time.UTC)
-	end := start.Add(5 * time.Hour)
+	end := start.Add(7 * 24 * time.Hour)
 	snap := Snapshot{Provider: "clinepass", Windows: []Window{{
-		Name: "5h", Status: "ok", Percent: 7, UsedFraction: 0.074,
+		Name: "weekly", Status: "ok", Percent: 7, UsedFraction: 0.074,
 		PeriodStart: &start, ResetsAt: &end,
 	}}}
 	sum := func(context.Context, int64, int64) (int64, error) { return 7400, nil }
@@ -375,7 +482,10 @@ func TestApplyClinePassEstimatesUsesUnflooredFraction(t *testing.T) {
 }
 
 // TestApplyClinePassEstimatesSubPercentStillInverts pins the sub-percent
-// case: Percent floors to 0 but the upstream fraction still inverts.
+// case: Percent floors to 0 but the upstream fraction still inverts. It is a
+// monthly-ONLY snapshot, so the pool comes from the monthly fallback — half
+// the monthly reversal, L = 4000 / (2 * 0.004) — and the monthly window then
+// shows 2L = 1000000.
 func TestApplyClinePassEstimatesSubPercentStillInverts(t *testing.T) {
 	start := time.Date(2026, 9, 20, 8, 0, 0, 0, time.UTC)
 	end := start.AddDate(0, 1, 0)
@@ -396,7 +506,7 @@ func TestApplyClinePassEstimatesSubPercentStillInverts(t *testing.T) {
 // start. In every case the snapshot itself stays untouched.
 func TestApplyClinePassEstimatesGuards(t *testing.T) {
 	start := time.Date(2026, 9, 20, 8, 0, 0, 0, time.UTC)
-	end := start.Add(5 * time.Hour)
+	end := start.Add(7 * 24 * time.Hour)
 	now := start.Add(time.Hour)
 	calls := 0
 	sum := func(context.Context, int64, int64) (int64, error) {
@@ -406,7 +516,7 @@ func TestApplyClinePassEstimatesGuards(t *testing.T) {
 
 	// Sum error → every estimate stays empty, no fetch error appears.
 	snap := Snapshot{Provider: "clinepass", Windows: []Window{
-		{Name: "5h", Status: "ok", Percent: 7, PeriodStart: &start, ResetsAt: &end},
+		{Name: "weekly", Status: "ok", Percent: 7, PeriodStart: &start, ResetsAt: &end},
 	}}
 	got := ApplyClinePassEstimates(context.Background(), snap, sum, now)
 	if got.Windows[0].LimitTokensEstimate != 0 || got.Err != "" {
@@ -454,7 +564,7 @@ func TestApplyClinePassEstimatesGuards(t *testing.T) {
 // spilling into the next period.
 func TestApplyClinePassEstimatesPastResetCapsSum(t *testing.T) {
 	start := time.Date(2026, 9, 20, 8, 0, 0, 0, time.UTC)
-	end := start.Add(5 * time.Hour)
+	end := start.Add(7 * 24 * time.Hour)
 	now := end.Add(time.Hour)
 	var gotTo int64
 	sum := func(_ context.Context, _, to int64) (int64, error) {
@@ -462,7 +572,7 @@ func TestApplyClinePassEstimatesPastResetCapsSum(t *testing.T) {
 		return 1000, nil
 	}
 	snap := Snapshot{Provider: "clinepass", Windows: []Window{{
-		Name: "5h", Status: "ok", Percent: 10, PeriodStart: &start, ResetsAt: &end,
+		Name: "weekly", Status: "ok", Percent: 10, PeriodStart: &start, ResetsAt: &end,
 	}}}
 	ApplyClinePassEstimates(context.Background(), snap, sum, now)
 	if gotTo != end.Unix() {
@@ -470,16 +580,16 @@ func TestApplyClinePassEstimatesPastResetCapsSum(t *testing.T) {
 	}
 }
 
-// TestApplyClinePassEstimatesExhaustedUsesMeasured pins the new exhausted
-// behavior: when frac >= 1 the window's total is the measured consumption
-// itself (LimitTokensEstimate = MeasuredTokens = tokens), so the card
-// renders X/X instead of "-".
+// TestApplyClinePassEstimatesExhaustedUsesMeasured pins the last-resort
+// wording: with NO pool derivable anywhere (the very first round is already
+// drained, so neither window is partial), a drained window still shows X/X
+// from its own measured consumption instead of an empty field.
 func TestApplyClinePassEstimatesExhaustedUsesMeasured(t *testing.T) {
 	start := time.Date(2026, 9, 20, 8, 0, 0, 0, time.UTC)
-	end := start.Add(5 * time.Hour)
+	end := start.Add(7 * 24 * time.Hour)
 	now := start.Add(time.Hour)
 	snap := Snapshot{Provider: "clinepass", Windows: []Window{{
-		Name: "5h", Status: "used up", Percent: 100, PeriodStart: &start, ResetsAt: &end,
+		Name: "weekly", Status: "used up", Percent: 100, PeriodStart: &start, ResetsAt: &end,
 	}}}
 	sum := func(context.Context, int64, int64) (int64, error) { return 3800, nil }
 	got := ApplyClinePassEstimates(context.Background(), snap, sum, now)
@@ -491,6 +601,7 @@ func TestApplyClinePassEstimatesExhaustedUsesMeasured(t *testing.T) {
 		t.Fatalf("exhausted measured = %d, want 3800", w.MeasuredTokens)
 	}
 	cards := RenderCards([]Snapshot{got}, now, CardOptions{NoColor: true})
+	// A MEASURED total carries no "~": the tilde marks an inferred pool.
 	if !strings.Contains(cards, "3.8K/3.8K") {
 		t.Fatalf("exhausted card must show 3.8K/3.8K:\n%s", cards)
 	}

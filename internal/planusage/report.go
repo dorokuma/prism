@@ -213,7 +213,7 @@ func RenderCards(snaps []Snapshot, now time.Time, opts ...CardOptions) string {
 					continue
 				}
 				emitted[key] = true
-				cards = append(cards, renderClineCard(groups[key], pal))
+				cards = append(cards, renderClineCard(groups[key], now, pal))
 			}
 			continue
 		}
@@ -299,18 +299,27 @@ func renderInfoCard(s Snapshot, accountTitle string, pal cardPalette) string {
 // card are told apart by color AND by name even when two accounts share a
 // name.
 //
-// The name a row DISPLAYS drops its trailing pure-digit suffix (Cline1 →
-// Cline, stripNumericSuffix via clineDisplayName). The row's IDENTITY is
-// untouched by that: clineRowID keys on the FULL name plus the fingerprint,
-// so Cline1 and Cline2 stay TWO rows (with or without a fingerprint) and
-// are told apart by the dot and the name color instead.
+// The name a row DISPLAYS is the account's FULL name — including a
+// trailing digit run: the two metapi subscriptions of one plan are two
+// INDEPENDENT pools (real case: Cline / Cline2, different api_tokens),
+// so showing them as one name would misread two quotas as one. The row's
+// IDENTITY is clineRowID (the full name plus the fingerprint), so the
+// names and the per-account colours agree.
 //
 // A merged row carries ONLY those elements. It has no detail text line
 // (no 已用 x% / 总额 …, that wording belongs to the other providers), no
-// reset countdown, no 已达限额 footer, no status suffix and nothing
-// appended to the account name (its trailing digit suffix is DROPPED, see
-// clineDisplayName): the ONE exhausted signal is the capsule
-// going solid red plus the X/X number field (see clineNumberField).
+// 已达限额 footer, no status suffix and nothing appended to the account
+// name: the ONE exhausted signal is the capsule going solid red plus the
+// X/X number field (see clineNumberField). The number field itself is:
+//
+//   - weekly / monthly: used/~total, where the total is the ESTIMATED pool
+//     (ApplyClinePassEstimates derives it from the live percent, the
+//     upstream never reports one), hence the "~"; the card title carries
+//     the 估算池 marker for the same reason;
+//   - 5h: the window has no pool at all, so the field shows the reset
+//     countdown (see clineCountdownField) instead of a token pair — and
+//     instead of "-", which said nothing about a window the upstream does
+//     report.
 const (
 	clineCapCells    = 23 // capsule columns
 	clinePctWidth    = 4  // right-aligned pct: "100%" / " 34%"
@@ -319,6 +328,14 @@ const (
 	// name: dot(1) + 4 one-column gaps + capsule + pct + number.
 	clineRowFixed = 1 + 4 + clineCapCells + clinePctWidth + clineNumberWidth // 45
 )
+
+// clineEstimatePoolLabel marks the merged cards whose 总额 is an ESTIMATE:
+// weekly and monthly carry a pool size DERIVED from the live percent (see
+// ApplyClinePassEstimates), never an absolute the upstream reported. The
+// 5-hour card carries no pool, so it is not marked. The label rides in the
+// card title (its own title segment) and each pool row prefixes its total
+// with "~".
+const clineEstimatePoolLabel = "估算池"
 
 // clineKey identifies one merged card: the profile (normalized provider
 // key) plus the window NAME. Snapshots of one profile describe the same
@@ -338,11 +355,12 @@ type clineRow struct {
 
 // clineGroup is one merged card under construction.
 type clineGroup struct {
-	profile string // provider display name, e.g. ClinePass
-	window  string // window display title; "" for a windowless snapshot
-	rows    []clineRow
-	notes   []string
-	seen    map[string]bool
+	profile    string // provider display name, e.g. ClinePass
+	window     string // window display title; "" for a windowless snapshot
+	windowName string // raw window name ("weekly" / "5h"); "" when windowless
+	rows       []clineRow
+	notes      []string
+	seen       map[string]bool
 }
 
 // isClinePass reports whether a provider key is the ClinePass family. It
@@ -397,9 +415,10 @@ func clinePassGroups(sorted []Snapshot) map[clineKey]*clineGroup {
 			g := groups[key]
 			if g == nil {
 				g = &clineGroup{
-					profile: providerDisplayName(s.Provider),
-					window:  windowTitle(key.window),
-					seen:    map[string]bool{},
+					profile:    providerDisplayName(s.Provider),
+					window:     windowTitle(key.window),
+					windowName: key.window,
+					seen:       map[string]bool{},
 				}
 				groups[key] = g
 			}
@@ -467,10 +486,9 @@ func containsString(list []string, s string) bool {
 // clineCardWidth is the merged card's width in display columns: the row's
 // fixed columns plus the LONGEST account DISPLAY name in the card (the name
 // the row actually shows, clineDisplayName), so a long name widens the card
-// instead of being truncated. The width comes from the DISPLAY name, not
-// the identity's full name, so a stripped digit suffix never reserves an
-// invisible blank column. The title's own needs are a floor, so a short
-// account name can never squeeze the plan + window name into an ellipsis.
+// instead of being truncated. The title's own needs are a floor, so a short
+// account name can never squeeze the plan + window name (or the 估算池
+// marker) into an ellipsis.
 func clineCardWidth(g *clineGroup) int {
 	name := 0
 	for _, r := range g.rows {
@@ -479,20 +497,39 @@ func clineCardWidth(g *clineGroup) int {
 		}
 	}
 	width := 4 + clineRowFixed + name
-	if need := titleWidth(g.profile, "", g.window, render.DisplayWidth(" · ")) + 6; need > width {
+	if need := titleWidth(g.profile, "", clineCardTitle(g), render.DisplayWidth(" · ")) + 6; need > width {
 		width = need
 	}
 	return width
 }
 
+// clineCardTitle is the merged card's window segment: the window label,
+// plus the 估算池 marker on the windows whose total is an ESTIMATE (weekly /
+// monthly). The 5-hour window has no pool — its row shows a countdown — so
+// marking it would claim an estimate that does not exist.
+func clineCardTitle(g *clineGroup) string {
+	if !clinePoolWindow(g.windowName) {
+		return g.window
+	}
+	return g.window + " · " + clineEstimatePoolLabel
+}
+
+// clinePoolWindow reports whether a ClinePass window carries an ESTIMATED
+// token pool (weekly / monthly, see ApplyClinePassEstimates). The 5-hour
+// window is a rolling rate limit, never a pool.
+func clinePoolWindow(name string) bool {
+	return name == "weekly" || name == "monthly"
+}
+
 // renderClineCard renders one merged (profile, window) card: the title
 // (plan display name + window name, never an account), one row per
-// account, the failure notes, and the bottom border.
-func renderClineCard(g *clineGroup, pal cardPalette) string {
+// account, the failure notes, and the bottom border. now is only needed
+// by the rows' countdown field (see clineCountdownField).
+func renderClineCard(g *clineGroup, now time.Time, pal cardPalette) string {
 	width := clineCardWidth(g)
-	lines := []string{cardTitleLineAt(width, g.profile, "", g.window, pal)}
+	lines := []string{cardTitleLineAt(width, g.profile, "", clineCardTitle(g), pal)}
 	for _, r := range g.rows {
-		lines = append(lines, clineRowLine(r, width, pal))
+		lines = append(lines, clineRowLine(r, width, now, pal))
 	}
 	for _, note := range g.notes {
 		lines = append(lines, cardBodyAt(width, note, pal))
@@ -500,16 +537,15 @@ func renderClineCard(g *clineGroup, pal cardPalette) string {
 	return joinCardAt(lines, width, pal)
 }
 
-// clineDisplayName is the account name a merged row SHOWS: the trailing
-// pure-digit suffix is dropped (Cline1 → Cline, Cline2 → Cline), so two
-// accounts whose names differ only by that suffix read as one name. It is a
-// DISPLAY-ONLY transform — the row's identity stays clineRowID(name, fp,
-// …), which keys on the FULL name plus the fingerprint, so Cline1 and
-// Cline2 remain TWO rows (also when no fingerprint is available, where the
-// key falls back to the row's position). Same-name accounts are told apart
-// by the dot and the name color (accountColor(fp)), not by the text.
+// clineDisplayName is the account name a merged row SHOWS: the account's
+// FULL name. The trailing pure-digit suffix is deliberately KEPT (Cline1
+// stays "Cline1"): the metapi site-49 accounts are SEPARATE subscriptions
+// with separate pools and separate api_tokens, so hiding the digits behind
+// one shared reading would tell the user one quota where there are two.
+// The row identity (clineRowID) keys on the full name plus the fingerprint
+// as before, so the display and the identity agree.
 func clineDisplayName(r clineRow) string {
-	return stripNumericSuffix(r.name)
+	return r.name
 }
 
 // clineRowLine renders one merged row. The account name is padded to the
@@ -517,9 +553,9 @@ func clineDisplayName(r clineRow) string {
 // of every row start at the same column. The dot and the name share one
 // color (accountColor of the account's fingerprint); with no usable
 // fingerprint the dot degrades to the plain · and the name stays plain.
-// The row shows the account's DISPLAY name (clineDisplayName, trailing
-// digits dropped); only the row identity (clineRowID) keeps the full name.
-func clineRowLine(r clineRow, width int, pal cardPalette) string {
+// The row shows the account's full name (clineDisplayName); the row
+// identity (clineRowID) keeps the full name too.
+func clineRowLine(r clineRow, width int, now time.Time, pal cardPalette) string {
 	name := clineDisplayName(r)
 	pad := width - 4 - clineRowFixed - render.DisplayWidth(name)
 	if pad < 0 {
@@ -531,7 +567,7 @@ func clineRowLine(r clineRow, width int, pal cardPalette) string {
 	if r.win != nil {
 		capsule = clineBar(*r.win, pal)
 		pct = render.PadLeft(pctLabel(*r.win), clinePctWidth)
-		number = render.PadLeft(clineNumberField(*r.win), clineNumberWidth)
+		number = render.PadLeft(clineNumberField(*r.win, now), clineNumberWidth)
 	}
 	return pal.dim("│ ") +
 		accountDot(r.fp, pal) + " " +
@@ -555,27 +591,69 @@ func clineBar(w Window, pal cardPalette) string {
 }
 
 // clineNumberField is a merged row's number field: used/total, where the
-// total is the window's MEASURED total (LimitTokensEstimate, or
-// MeasuredTokens when the pool is unknown) and used is the window's share
-// of it — the same 已用 percentage the pct column shows.
+// total is the window's ESTIMATED pool (LimitTokensEstimate) or, when the
+// pool is unknown, the MEASURED consumption (MeasuredTokens); used is the
+// window's share of it — the same 已用 percentage the pct column shows.
+//
+// A weekly/monthly total is prefixed with "~": the upstream NEVER reports
+// an absolute pool, so that number is an inference (see
+// ApplyClinePassEstimates) and must not read as a reported fact. The
+// 5-hour window has no pool and therefore no "~".
 //
 // A 100 % (exhausted) row is forced to the FULL pair, so a drained row
 // always reads X/X — never "-" and never a fraction of a measured total.
-// "-" survives for the one case the data cannot answer: no estimate AND
-// no measured consumption at all (metapi unreadable).
-func clineNumberField(w Window) string {
-	total := w.LimitTokensEstimate
+// "-" survives for the case the data cannot answer: no estimate AND no
+// measured consumption at all (metapi unreadable). On the 5-hour window
+// the field then carries the reset COUNTDOWN instead, which is the only
+// number that window actually has.
+func clineNumberField(w Window, now time.Time) string {
+	est := w.LimitTokensEstimate
+	total := est
 	if total <= 0 {
 		total = w.MeasuredTokens
 	}
 	if total <= 0 {
+		if s := clineCountdownField(w, now); s != "" {
+			return s
+		}
 		return "-"
 	}
+	marker := ""
+	if est > 0 && w.MeasuredTokens == 0 && clinePoolWindow(w.Name) {
+		// The total is an INFERENCE: ApplyClinePassEstimates derived it from
+		// the used percent. A window whose total is its own measurement —
+		// MeasuredTokens is set — is not marked, a measurement is not an
+		// estimate.
+		marker = "~"
+	}
 	if windowExhausted(w) {
-		return formatTokenPair(total, total)
+		return formatTokenPair(total, total, marker)
 	}
 	used := int64(float64(total) * float64(displayPercent(w)) / 100)
-	return formatTokenPair(used, total)
+	return formatTokenPair(used, total, marker)
+}
+
+// clineCountdownField is the 5-hour row's number field: the reset
+// countdown ("2h 15m 后重置"), in the column the token pair would occupy.
+// The 5-hour window is a rolling rate limit whose percent never carried a
+// pool, so WHAT it rolls over is the useful number there — "-" told the
+// reader nothing about a window the upstream does report. Any other window
+// returns "" (the caller falls back to "-"): a weekly/monthly row always
+// has an estimate or a measured pair, and "-" there is the honest
+// "metapi gave us nothing" signal.
+//
+// The text fits the 13-column number field for every real 5-hour window
+// (the countdown cannot exceed 5h, so at most "4h 59m 后重置" =
+// 13 columns); a window with no reset instant has no countdown at all,
+// and the caller's PadLeft caps anything longer without widening the row.
+func clineCountdownField(w Window, now time.Time) string {
+	if w.Name != "5h" || w.ResetsAt == nil || w.ResetsAt.IsZero() {
+		return ""
+	}
+	if !w.ResetsAt.After(now) {
+		return "已重置"
+	}
+	return cardCountdown(now, *w.ResetsAt) + " 后重置"
 }
 
 // accountNameText renders an account name in the same palette color as its
@@ -1118,32 +1196,6 @@ func formatRemain(now time.Time, at *time.Time) string {
 
 // ── multi-account helpers (new) ────────────────────────────────────────
 
-// stripNumericSuffix removes the trailing run of digits from an account name,
-// leaving everything before it. "Cline1" → "Cline", "account123" → "account",
-// "Cline-1" → "Cline-" (a hyphen is not a digit and stays).
-//
-// A name that is ENTIRELY digits ("12345") keeps its name: stripping down to
-// the empty string would leave the row with nothing but the colour dot, which
-// is worse than showing the account's actual name — the row identity
-// (clineRowID) and the colour already tell such accounts apart.
-//
-// It is wired into the merged card through clineDisplayName: a merged row
-// SHOWS the stripped name (Cline1/Cline2 both read "Cline"), while the row
-// IDENTITY (clineRowID) keeps the full name plus the fingerprint — so a
-// suffixed pair is still exactly two rows, and two same-name accounts are
-// told apart by their dot and name color (accountColor(fp)). No other
-// renderer calls it.
-func stripNumericSuffix(s string) string {
-	i := len(s)
-	for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
-		i--
-	}
-	if i == 0 {
-		return s
-	}
-	return s[:i]
-}
-
 // accountColor picks a high-contrast bright color for the account from
 // a fixed palette, indexed by the key fingerprint modulo palette length.
 // The color is stable across renders for the same key.
@@ -1186,11 +1238,13 @@ func hexValue(s string) int {
 }
 
 // formatTokenPair formats a used/total token pair with one decimal per
-// side: "3.4M/10.0M". Joined without spaces, because the pair shares ONE
+// side: "3.4M/~10.0M". Joined without spaces, because the pair shares ONE
 // right-aligned column (the merged ClinePass card's number field).
-func formatTokenPair(used, total int64) string {
+// totalMarker is prefixed to the TOTAL side and is "" unless that side is
+// an estimate rather than a measured value (see clineNumberField).
+func formatTokenPair(used, total int64, totalMarker string) string {
 	u := render.FormatTokensOneDecimal(used)
-	t := render.FormatTokensOneDecimal(total)
+	t := totalMarker + render.FormatTokensOneDecimal(total)
 	return u + "/" + t
 }
 
