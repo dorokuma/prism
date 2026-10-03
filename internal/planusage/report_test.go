@@ -477,7 +477,7 @@ func cardLines(t *testing.T, got string) []string {
 
 // wantCardWidth is the width a card render must come out at for a given set of
 // name cells: the widest cell's row width, floored by the name column's
-// minimum (4 + clineRowFixed + clineNameColMin, 58 while the longest account
+// minimum (4 + clineRowFixed + clineNameColMin, 61 while the longest account
 // name in the current production roster is 9 columns wide — that is a
 // deployment fact, not a property of this package — and a longer name widens
 // every card of the render instead of being truncated). Spelled out here
@@ -505,11 +505,12 @@ func cardTitleLines(lines []string) []string {
 }
 
 // rowTail is the fixed right-hand end of a row: one space, the 4-column
-// right-aligned percentage, one space, the 13-column right-aligned metric,
-// one space and the right border. EVERY row ends with exactly this whatever
-// the account name is, which is what keeps the columns lined up down the card.
+// right-aligned percentage, clineMetricGap (4) spaces, the 13-column
+// right-aligned metric, one space and the right border. EVERY row ends with
+// exactly this whatever the account name is, which is what keeps the columns
+// lined up down the card.
 func rowTail(pct, metric string) string {
-	return render.PadLeft(pct, clinePctWidth) + " " +
+	return render.PadLeft(pct, clinePctWidth) + strings.Repeat(" ", clineMetricGap) +
 		render.PadLeft(metric, clineNumberWidth) + " │"
 }
 
@@ -2145,9 +2146,10 @@ func TestRenderCardsStaleMarkerRidesInTheRow(t *testing.T) {
 // TestRenderCardsUniformWidthAcrossProviders is the headline contract of the
 // shared width: a render holding THREE providers — short account names next to
 // a 9-column one ("SuperGrok", the longest name this package knows) — gives
-// every card ONE width, and that width is the name column's floor (58
-// columns), not each card's own longest name. Before the change the three
-// cards came out 54 / 55 / 58 columns wide, so the right border and the
+// every card ONE width, and that width is the name column's floor (61
+// columns), not each card's own longest name. Under the old per-card layout the
+// three cards came out at their own widths instead — 54 / 55 / 58 columns at the
+// time — so the right border and the
 // capsule start of each card sat at a different column.
 func TestRenderCardsUniformWidthAcrossProviders(t *testing.T) {
 	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
@@ -2170,38 +2172,38 @@ func TestRenderCardsUniformWidthAcrossProviders(t *testing.T) {
 		t.Fatalf("want 3 cards, got %d:\n%s", len(titles), got)
 	}
 
-	// Every card's border line — and every other line of it — is exactly 58
+	// Every card's border line — and every other line of it — is exactly 61
 	// display columns wide.
 	for i, title := range titles {
-		if w := render.DisplayWidth(title); w != 58 {
-			t.Fatalf("card %d title: width %d, want 58:\n%q", i, w, title)
+		if w := render.DisplayWidth(title); w != 61 {
+			t.Fatalf("card %d title: width %d, want 61:\n%q", i, w, title)
 		}
 	}
 	for i, l := range lines {
 		if l == "" {
 			continue
 		}
-		if w := render.DisplayWidth(l); w != 58 {
-			t.Fatalf("line %d: width %d, want the shared 58:\n%q", i, w, l)
+		if w := render.DisplayWidth(l); w != 61 {
+			t.Fatalf("line %d: width %d, want the shared 61:\n%q", i, w, l)
 		}
 	}
 	// The width is the floor the common case is pinned at, and it is NOT the
 	// numeric coincidence of one card's own name.
-	if want := wantCardWidth("cline-", "gemini-x", "SuperGrok"); want != 58 {
-		t.Fatalf("the three name cells must ask for the 58-column floor, got %d", want)
+	if want := wantCardWidth("cline-", "gemini-x", "SuperGrok"); want != 61 {
+		t.Fatalf("the three name cells must ask for the 61-column floor, got %d", want)
 	}
 
 	// The floor decides the width on its own as soon as the roster holds only
 	// SHORT names: the same render minus the 9-column account still comes out
-	// 58 columns wide — the width does not follow the longest name down, so
+	// 61 columns wide — the width does not follow the longest name down, so
 	// the same command cannot jump between widths from run to run.
 	shortOnly := RenderCards(snaps[:2], now, CardOptions{NoColor: true})
 	for i, l := range cardLines(t, shortOnly) {
 		if l == "" {
 			continue
 		}
-		if w := render.DisplayWidth(l); w != 58 {
-			t.Fatalf("short-name-only render, line %d: width %d, want the 58-column floor:\n%q", i, w, l)
+		if w := render.DisplayWidth(l); w != 61 {
+			t.Fatalf("short-name-only render, line %d: width %d, want the 61-column floor:\n%q", i, w, l)
 		}
 	}
 
@@ -2227,7 +2229,7 @@ func TestRenderCardsUniformWidthAcrossProviders(t *testing.T) {
 	}
 	// "│ " + dot + " " + the 9-column name cell + " " is 14 columns, i.e.
 	// width - clineRowFixed + 1.
-	if wantStart := 58 - clineRowFixed + 1; start != wantStart {
+	if wantStart := 61 - clineRowFixed + 1; start != wantStart {
 		t.Fatalf("capsule starts at column %d, want %d", start, wantStart)
 	}
 

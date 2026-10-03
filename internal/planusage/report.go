@@ -117,13 +117,13 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 // section below). A card is a title line, N data rows, the fetch-failure
 // notes (if any) and the bottom border:
 //
-//	╭─ Gemini · 周限额 ───────────────────────────────────────╮
-//	│ · gemini-acct  ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  34%   3.4M/10.0M │
-//	╰─────────────────────────────────────────────────────────╯
+//	╭─ Gemini · 周限额 ───────────────────────────────────────────╮
+//	│ · gemini-acct ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  34%       3.4M/10.0M │
+//	╰─────────────────────────────────────────────────────────────╯
 //
 // Row: "│ " + dot(1) + " " + name(n) + " " + capsule(23) + " " +
-// pct(4) + " " + metric(13) + " │" = clineRowFixed + n + 4 columns. The
-// card is max(row width, the width the title needs) columns wide, so the
+// pct(4) + clineMetricGap + metric(13) + " │" = clineRowFixed + n + 4 columns.
+// The card is max(row width, the width the title needs) columns wide, so the
 // LONGEST account display name and the title both fit and no line ever
 // overflows its own border. There is no fixed card width any more: the old
 // 56-column two-row layout (title account + 47-cell capsule + detail row +
@@ -241,15 +241,16 @@ func cardProfileName(provider string) string {
 // cline* identifier names below are historical. One card per (provider,
 // window) holds one ROW per account of that group:
 //
-//	╭─ ClinePass · 5小时限额 ─────────────────────────────────╮
-//	│ · cline-user ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  34%    3.4M/10.0M │
-//	│ · cline-user ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰ 100%     4.2M/4.2M │
-//	╰─────────────────────────────────────────────────────────╯
+//	╭─ ClinePass · 5小时限额 ────────────────────────────────────╮
+//	│ · cline-user ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  34%       3.4M/10.0M │
+//	│ · cline-user ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰ 100%        4.2M/4.2M │
+//	╰────────────────────────────────────────────────────────────╯
 //
 // The title NEVER carries an account name (it is the provider plus the
 // window label), so a long account name can never collide with the metrics;
 // the account is the row's first element instead. Row format, left to right
-// (every element separated by one space):
+// (one space between the elements — except the percentage→metric break,
+// which is clineMetricGap = 4 columns):
 //
 //	color dot(1) account name(n) capsule(23) pct(4) metric(13)
 //
@@ -292,9 +293,17 @@ const (
 	clineCapCells    = 23 // capsule columns
 	clinePctWidth    = 4  // right-aligned pct: "100%" / " 34%"
 	clineNumberWidth = 13 // right-aligned used/total, or the countdown
+	// clineMetricGap is the display columns between the pct field and the
+	// metric field. It is 4, not 1: the break between the percentage and
+	// the value it belongs to has to read as a break, so the user asked
+	// for a wider gap — every row (and with it every card) gains 3
+	// columns. The capsule stays 23 cells: the gap is the only thing that
+	// grew.
+	clineMetricGap = 4
 	// clineRowFixed is a row's display columns WITHOUT the account name:
-	// dot(1) + 4 one-column gaps + capsule + pct + metric.
-	clineRowFixed = 1 + 4 + clineCapCells + clinePctWidth + clineNumberWidth // 45
+	// dot(1) + 3 one-column gaps + the pct/metric gap + capsule + pct +
+	// metric.
+	clineRowFixed = 1 + 3 + clineMetricGap + clineCapCells + clinePctWidth + clineNumberWidth // 48
 	// clineNameColMin is the FLOOR of the name column in display columns: the
 	// longest account name in the current production roster — the accounts the
 	// user's config and the metapi account table feed in — i.e. "SuperGrok",
@@ -303,7 +312,7 @@ const (
 	// so without a floor the same command would come out narrower when only
 	// short-named providers answer than when SuperGrok is in the roster — the
 	// width would jump between runs. The floor pins the common case at
-	// max(...) >= 4 + clineRowFixed + 9 = 58 columns; a name LONGER than the
+	// max(...) >= 4 + clineRowFixed + 9 = 61 columns; a name LONGER than the
 	// floor still widens every card of the render together (it is never
 	// truncated).
 	clineNameColMin = 9
@@ -554,13 +563,15 @@ func clineRowNameCell(r clineRow) string {
 // is padded to that width's name column — the render-wide one (cardWidth),
 // NOT this card's own longest name — so the capsule, the percentage and the
 // metric field of every row start at the same column, on this card and on
-// every other card of the render. The dot and the name share one color
-// (accountColor of the account's fingerprint); with no usable fingerprint
-// the dot degrades to the plain · and the name stays plain. The row shows
-// the account's DISPLAY name (clineDisplayName) plus the 旧 marker of a
-// stale snapshot; the row identity (clineRowID) keeps the full name plus
-// the fingerprint. A windowless snapshot (a failed fetch) leaves the three
-// metric columns blank, so its account still stays visible.
+// every other card of the render. The percentage and the metric field are
+// separated by clineMetricGap = 4 columns — the wider break between the
+// share and the value it belongs to (it used to be one space). The dot and
+// the name share one color (accountColor of the account's fingerprint); with
+// no usable fingerprint the dot degrades to the plain · and the name stays
+// plain. The row shows the account's DISPLAY name (clineDisplayName) plus the
+// 旧 marker of a stale snapshot; the row identity (clineRowID) keeps the full
+// name plus the fingerprint. A windowless snapshot (a failed fetch) leaves
+// the three metric columns blank, so its account still stays visible.
 func clineRowLine(r clineRow, width int, now time.Time, pal cardPalette) string {
 	display := clineDisplayName(r)
 	cell := clineRowNameCell(r)
@@ -587,7 +598,7 @@ func clineRowLine(r clineRow, width int, now time.Time, pal cardPalette) string 
 		accountDot(r.fp, pal) + " " +
 		accountNameText(display, r.fp, pal) + strings.TrimPrefix(cell, display) +
 		strings.Repeat(" ", pad+1) +
-		capsule + " " + pct + " " + metric +
+		capsule + " " + pct + strings.Repeat(" ", clineMetricGap) + metric +
 		pal.dim(" │")
 }
 
