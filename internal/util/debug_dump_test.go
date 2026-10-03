@@ -16,6 +16,12 @@ import (
 // disk when an upstream echoes the credential it received.
 func TestDumpDebugUpstreamResponseScrubsAccountKey(t *testing.T) {
 	const key = "raw-key-98765"
+	// Isolate the shared fixed dump dir (os.TempDir()/prism-debug): the
+	// production path re-reads the env on every call (debugDumpDir), so this
+	// scopes the dump dir to this test's own TMPDIR. Other packages' test
+	// binaries run concurrently and would otherwise RemoveAll/write the same
+	// /tmp/prism-debug directory under each other.
+	t.Setenv("TMPDIR", t.TempDir())
 	prev := DebugMode.Load()
 	DebugMode.Store(true)
 	defer func() { DebugMode.Store(prev) }()
@@ -53,6 +59,9 @@ func TestDumpDebugUpstreamResponseScrubsAccountKey(t *testing.T) {
 // keys) but omits business text content (prompt/completion text — including
 // a credential that was embedded inside it) and never leaks it to disk.
 func TestDebugDumpOmitsBusinessContentKeepsStructure(t *testing.T) {
+	// Isolate the shared fixed dump dir (os.TempDir()/prism-debug): see
+	// TestDumpDebugUpstreamResponseScrubsAccountKey for the reason.
+	t.Setenv("TMPDIR", t.TempDir())
 	prev := DebugMode.Load()
 	DebugMode.Store(true)
 	defer func() { DebugMode.Store(prev) }()
@@ -303,6 +312,9 @@ func TestDebugDumpSanitizeOmitsResponsesAPIFields(t *testing.T) {
 // the structure (id, role, function name, arguments key) and never contain
 // the raw business text.
 func TestDumpDebugUpstreamResponseOmitsBusinessKeys(t *testing.T) {
+	// Isolate the shared fixed dump dir (os.TempDir()/prism-debug): see
+	// TestDumpDebugUpstreamResponseScrubsAccountKey for the reason.
+	t.Setenv("TMPDIR", t.TempDir())
 	prev := DebugMode.Load()
 	DebugMode.Store(true)
 	defer func() { DebugMode.Store(prev) }()
@@ -341,6 +353,10 @@ func TestDumpDebugUpstreamResponseOmitsBusinessKeys(t *testing.T) {
 // -race` proves the access is race-free. It also pins the behavior: each
 // dump observes exactly the last stored value (atomic snapshot semantics).
 func TestDebugModeConcurrentReadWrite(t *testing.T) {
+	// Isolate the shared fixed dump dir (os.TempDir()/prism-debug): this
+	// test's RemoveAll (and the dumps the hammering goroutines write) would
+	// otherwise stomp concurrently running test binaries' dumps.
+	t.Setenv("TMPDIR", t.TempDir())
 	prev := DebugMode.Load()
 	defer func() { DebugMode.Store(prev) }()
 
@@ -379,6 +395,10 @@ func TestDebugModeConcurrentReadWrite(t *testing.T) {
 }
 
 func TestDumpDebugRefusesSymlinkFile(t *testing.T) {
+	// Isolate the shared fixed dump dir (os.TempDir()/prism-debug): the
+	// assertions still derive the path from os.TempDir() (the production
+	// path re-reads the env), so the coincidence-only failure is gone.
+	t.Setenv("TMPDIR", t.TempDir())
 	prev := DebugMode.Load()
 	DebugMode.Store(true)
 	defer func() { DebugMode.Store(prev) }()
@@ -413,6 +433,10 @@ func TestDumpDebugRefusesSymlinkFile(t *testing.T) {
 }
 
 func TestDumpDebugRefusesSymlinkDir(t *testing.T) {
+	// Isolate the shared fixed dump dir (os.TempDir()/prism-debug): the
+	// assertions still derive the path from os.TempDir() (the production
+	// path re-reads the env), so the coincidence-only failure is gone.
+	t.Setenv("TMPDIR", t.TempDir())
 	prev := DebugMode.Load()
 	DebugMode.Store(true)
 	defer func() { DebugMode.Store(prev) }()
