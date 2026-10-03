@@ -1672,19 +1672,20 @@ func TestRenderCardsClinePassRowIdentity(t *testing.T) {
 	}
 }
 
-// TestRenderCardsClinePassKeepsAccountName pins the display name of a merged
-// row: the account's FULL name, trailing digit run included. Two metapi
-// site-49 accounts are TWO independent pools with different api_tokens, so
-// showing Cline2 as "Cline" would read two quotas as one. The row identity
-// (clineRowID) keys on the same full name plus the fingerprint, so the text
-// and the colour agree, and the card is as wide as the longest FULL name.
-func TestRenderCardsClinePassKeepsAccountName(t *testing.T) {
+// TestRenderCardsClinePassDisplayNameDropsNumericSuffix pins the DISPLAY name
+// of a merged row: the trailing pure-digit suffix is dropped, so the two
+// accounts of one plan read as ONE name (Cline and Cline2 both show "Cline").
+// Stripping is display-only: the row identity (clineRowID) still keys on the
+// FULL name plus the fingerprint, so the pair stays exactly TWO rows (also
+// without a fingerprint, where the key falls back to the position), and the
+// dot plus the name colour are what tells the two same-reading rows apart.
+func TestRenderCardsClinePassDisplayNameDropsNumericSuffix(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
 	fps := []string{"aaaa1111bbbb2222", "cccc3333dddd4444"}
 
 	got := RenderCards([]Snapshot{
-		clinePassSnap(fps[0], "Cline1", w),
+		clinePassSnap(fps[0], "Cline", w),
 		clinePassSnap(fps[1], "Cline2", w),
 	}, now)
 
@@ -1696,30 +1697,50 @@ func TestRenderCardsClinePassKeepsAccountName(t *testing.T) {
 		t.Fatalf("want 4 lines (title + 2 rows + border), got %d:\n%s", len(lines), render.StripANSI(got))
 	}
 	rows := lines[1:3]
-	if !strings.HasPrefix(rows[0], "│ · Cline1 ") || !strings.HasPrefix(rows[1], "│ · Cline2 ") {
-		t.Fatalf("each row must show its own FULL name: %q / %q", rows[0], rows[1])
+	for i, r := range rows {
+		// The prefix ends with a SPACE, so no digit can sit right after the
+		// name: the suffix is gone, not merely moved.
+		if !strings.HasPrefix(r, "│ · Cline ") {
+			t.Fatalf("row %d must read the suffix-free name Cline: %q", i, r)
+		}
 	}
-	// Same prefix, different rows: each account keeps its own palette colour
-	// on BOTH the dot and the name.
-	for _, tc := range []struct{ fp, name string }{{fps[0], "Cline1"}, {fps[1], "Cline2"}} {
-		color := accountColor(tc.fp)
+	// Two rows, one visible text: after the strip there is nothing but the
+	// colour left to tell them apart (the row count is unchanged because the
+	// identity still keys on the full name + fingerprint).
+	if rows[0] != rows[1] {
+		t.Fatalf("the two rows must share one visible text:\n%q\n%q", rows[0], rows[1])
+	}
+	for _, gone := range []string{"Cline2", "Cline1"} {
+		if strings.Contains(got, gone) {
+			t.Fatalf("the digit suffix must not reach the card (%q found):\n%s", gone, render.StripANSI(got))
+		}
+	}
+	// Same text, different colour: each account keeps its own palette colour
+	// on BOTH the dot and the name, which is what tells the pair apart.
+	colors := map[string]bool{}
+	for _, fp := range fps {
+		color := accountColor(fp)
 		if color == "" {
-			t.Fatalf("fingerprint %q must map to a palette colour", tc.fp)
+			t.Fatalf("fingerprint %q must map to a palette colour", fp)
 		}
 		if !strings.Contains(got, render.FgFromHex(color, "·")) ||
-			!strings.Contains(got, render.FgFromHex(color, tc.name)) {
+			!strings.Contains(got, render.FgFromHex(color, "Cline")) {
 			t.Fatalf("dot and name must both carry %s:\n%q", color, got)
 		}
+		colors[color] = true
 	}
-	// The card is as wide as its longest FULL name: the digits occupy a
-	// column like any other character.
-	if want := 4 + clineRowFixed + render.DisplayWidth("Cline2"); render.DisplayWidth(lines[0]) != want {
-		t.Fatalf("card width = %d, want %d:\n%s",
+	if len(colors) != 2 {
+		t.Fatalf("the two same-reading rows must carry different colours: %v", colors)
+	}
+	// The card is as wide as its longest DISPLAY name, not the full one: the
+	// dropped suffix must not reserve an invisible blank column.
+	if want := 4 + clineRowFixed + render.DisplayWidth("Cline"); render.DisplayWidth(lines[0]) != want {
+		t.Fatalf("card width = %d, want %d (no column for the dropped suffix):\n%s",
 			render.DisplayWidth(lines[0]), want, render.StripANSI(got))
 	}
 
-	// No fingerprint at all: the position-keyed rows still stay TWO and keep
-	// their full names (plain · and an uncoloured name).
+	// No fingerprint at all: the position-keyed rows still stay TWO, and both
+	// read the same stripped name (plain · and an uncoloured name).
 	plain := RenderCards([]Snapshot{
 		{Provider: "clinepass", Accounts: []string{"Cline1"}, Windows: []Window{w}},
 		{Provider: "clinepass", Accounts: []string{"Cline2"}, Windows: []Window{w}},
@@ -1728,8 +1749,50 @@ func TestRenderCardsClinePassKeepsAccountName(t *testing.T) {
 	if len(plainLines) != 4 {
 		t.Fatalf("fingerprint-less pair: want 4 lines (2 rows), got %d:\n%s", len(plainLines), plain)
 	}
-	if !strings.HasPrefix(plainLines[1], "│ · Cline1 ") || !strings.HasPrefix(plainLines[2], "│ · Cline2 ") {
-		t.Fatalf("fingerprint-less rows must keep the full names: %q / %q", plainLines[1], plainLines[2])
+	for i, r := range plainLines[1:3] {
+		if !strings.HasPrefix(r, "│ · Cline ") {
+			t.Fatalf("fingerprint-less row %d must read the stripped name: %q", i, r)
+		}
+	}
+	if plainLines[1] != plainLines[2] {
+		t.Fatalf("fingerprint-less rows must share one visible text:\n%q\n%q", plainLines[1], plainLines[2])
+	}
+}
+
+// TestStripNumericSuffix pins the display-name transform and its all-digit
+// fallback: a trailing pure-digit suffix is dropped, a digit run in the MIDDLE
+// of a name is not touched, and a name that is ONLY digits keeps its name.
+// Returning "" there would blank the account column of the row (nothing but
+// the colour dot left), so the fallback is part of the contract, not an
+// accident of the loop.
+func TestStripNumericSuffix(t *testing.T) {
+	cases := map[string]string{
+		"Cline":       "Cline",
+		"Cline1":      "Cline",
+		"Cline2":      "Cline",
+		"account123":  "account",
+		"Cline-1":     "Cline-", // only the trailing digits go; the hyphen stays
+		"cline-user2": "cline-user",
+		"Cline1x":     "Cline1x", // the digit run is not trailing
+		"deepseek-v2": "deepseek-v",
+		"":            "",
+		"12345":       "12345", // all digits: keep the name, never strip to ""
+		"0":           "0",
+	}
+	for in, want := range cases {
+		if got := stripNumericSuffix(in); got != want {
+			t.Errorf("stripNumericSuffix(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// End to end: an all-digit account name must still render its name on the
+	// merged row (dot + name), not a dot followed by blanks.
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	got := RenderCards([]Snapshot{clinePassSnap("aaaa1111bbbb2222", "12345", w)}, now)
+	lines := mergedCardLines(t, got)
+	if !strings.HasPrefix(lines[1], "│ · 12345 ") {
+		t.Fatalf("an all-digit account name must stay visible: %q", lines[1])
 	}
 }
 

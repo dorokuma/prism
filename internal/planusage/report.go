@@ -299,12 +299,11 @@ func renderInfoCard(s Snapshot, accountTitle string, pal cardPalette) string {
 // card are told apart by color AND by name even when two accounts share a
 // name.
 //
-// The name a row DISPLAYS is the account's FULL name — including a
-// trailing digit run: the two metapi subscriptions of one plan are two
-// INDEPENDENT pools (real case: Cline / Cline2, different api_tokens),
-// so showing them as one name would misread two quotas as one. The row's
-// IDENTITY is clineRowID (the full name plus the fingerprint), so the
-// names and the per-account colours agree.
+// The name a row DISPLAYS drops its trailing pure-digit suffix (Cline1 and
+// Cline2 both read "Cline", stripNumericSuffix via clineDisplayName). The
+// row's IDENTITY is untouched by that: clineRowID keys on the FULL name plus
+// the fingerprint, so Cline1 and Cline2 stay TWO rows (with or without a
+// fingerprint) and are told apart by the dot and the name color instead.
 //
 // A merged row carries ONLY those elements. It has no detail text line
 // (no 已用 x% / 总额 …, that wording belongs to the other providers), no
@@ -538,14 +537,14 @@ func renderClineCard(g *clineGroup, now time.Time, pal cardPalette) string {
 }
 
 // clineDisplayName is the account name a merged row SHOWS: the account's
-// FULL name. The trailing pure-digit suffix is deliberately KEPT (Cline1
-// stays "Cline1"): the metapi site-49 accounts are SEPARATE subscriptions
-// with separate pools and separate api_tokens, so hiding the digits behind
-// one shared reading would tell the user one quota where there are two.
-// The row identity (clineRowID) keys on the full name plus the fingerprint
-// as before, so the display and the identity agree.
+// full name with its trailing pure-digit suffix dropped (Cline1 and Cline2
+// both read "Cline"; see stripNumericSuffix). Stripping is DISPLAY-ONLY:
+// the row identity (clineRowID) keeps the full name plus the fingerprint, so
+// a suffixed pair is still exactly two rows — and with the digits gone, the
+// dot and the name color (accountColor(fp)) are what tell the two
+// same-reading rows apart.
 func clineDisplayName(r clineRow) string {
-	return r.name
+	return stripNumericSuffix(r.name)
 }
 
 // clineRowLine renders one merged row. The account name is padded to the
@@ -553,8 +552,9 @@ func clineDisplayName(r clineRow) string {
 // of every row start at the same column. The dot and the name share one
 // color (accountColor of the account's fingerprint); with no usable
 // fingerprint the dot degrades to the plain · and the name stays plain.
-// The row shows the account's full name (clineDisplayName); the row
-// identity (clineRowID) keeps the full name too.
+// The row shows the account's DISPLAY name (clineDisplayName, the trailing
+// pure-digit suffix dropped); the row identity (clineRowID) keeps the full
+// name plus the fingerprint.
 func clineRowLine(r clineRow, width int, now time.Time, pal cardPalette) string {
 	name := clineDisplayName(r)
 	pad := width - 4 - clineRowFixed - render.DisplayWidth(name)
@@ -1195,6 +1195,33 @@ func formatRemain(now time.Time, at *time.Time) string {
 }
 
 // ── multi-account helpers (new) ────────────────────────────────────────
+
+// stripNumericSuffix removes the trailing run of digits from an account name,
+// leaving everything before it. "Cline1" → "Cline", "account123" → "account",
+// "Cline-1" → "Cline-" (a hyphen is not a digit and stays). Digits in the
+// MIDDLE of a name are never touched.
+//
+// A name that is ENTIRELY digits ("12345") keeps its name: stripping down to
+// the empty string would leave the row with nothing but the colour dot, which
+// is worse than showing the account's actual name — the row identity
+// (clineRowID) and the colour already tell such accounts apart.
+//
+// It is wired into the merged card through clineDisplayName: a merged row
+// SHOWS the stripped name (Cline/Cline2 both read "Cline"), while the row
+// IDENTITY (clineRowID) keeps the full name plus the fingerprint — so a
+// suffixed pair is still exactly two rows, and two same-reading accounts are
+// told apart by their dot and name color (accountColor(fp)). No other
+// renderer calls it.
+func stripNumericSuffix(s string) string {
+	i := len(s)
+	for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
+		i--
+	}
+	if i == 0 {
+		return s
+	}
+	return s[:i]
+}
 
 // accountColor picks a high-contrast bright color for the account from
 // a fixed palette, indexed by the key fingerprint modulo palette length.

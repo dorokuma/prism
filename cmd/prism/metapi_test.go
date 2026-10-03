@@ -190,10 +190,10 @@ func TestApplyQuotaClinePassEstimatePerAccount(t *testing.T) {
 // and then run through the CLI assembly.
 func TestCLIAssemblyCarriesAccountFingerprints(t *testing.T) {
 	now := time.Now()
-	// Two accounts with distinct names (Cline / Cline2 — both are shown in
-	// full now that the digit suffix is kept) and tokens that map to
-	// different palette colours — the fixture token choice is deliberate, the
-	// palette itself is only 6 wide (see the leftover list).
+	// Two accounts whose DISPLAY name is the same (Cline2 drops its digit
+	// suffix) and whose tokens map to different palette colours — the fixture
+	// token choice is deliberate, the palette itself is only 6 wide (see the
+	// leftover list).
 	const tokA, tokB = "cline-token-alpha", "cline-token-bravo"
 	dbPath := seedMetapiAccountsDB(t,
 		[]metapiAccountRow{
@@ -268,28 +268,26 @@ func TestCLIAssemblyCarriesAccountFingerprints(t *testing.T) {
 	}
 	var rows []string
 	for _, line := range strings.Split(strings.TrimSuffix(colored, "\n"), "\n") {
-		plain := render.StripANSI(line)
-		if strings.Contains(plain, "│ · Cline ") || strings.Contains(plain, "│ · Cline2 ") {
+		if strings.Contains(render.StripANSI(line), "│ · Cline ") {
 			rows = append(rows, line)
 		}
 	}
 	if len(rows) != 2 {
-		t.Fatalf("want two rows showing the FULL account names (Cline / Cline2):\n%s", render.StripANSI(colored))
+		t.Fatalf("want two same-name rows (Cline / Cline2 both display \"Cline\"):\n%s", render.StripANSI(colored))
 	}
 	colors := map[string]bool{}
-	for i, r := range rows {
-		name := []string{"Cline", "Cline2"}[i]
-		dot, nm := sgrBefore(t, r, "·"), sgrBefore(t, r, name)
+	for _, r := range rows {
+		dot, name := sgrBefore(t, r, "·"), sgrBefore(t, r, "Cline")
 		if dot == "" {
 			t.Fatalf("the dot must be coloured, not the bare ·: %q", r)
 		}
-		if dot != nm {
-			t.Fatalf("the dot and the account name must share one colour: dot=%q name=%q\n%q", dot, nm, r)
+		if dot != name {
+			t.Fatalf("the dot and the account name must share one colour: dot=%q name=%q\n%q", dot, name, r)
 		}
 		colors[dot] = true
 	}
 	if len(colors) != 2 {
-		t.Fatalf("the two account rows must carry different colours:\n%s", render.StripANSI(colored))
+		t.Fatalf("the two same-name rows must carry different colours:\n%s", render.StripANSI(colored))
 	}
 	if plain != render.StripANSI(colored) {
 		t.Fatalf("the no-colour render must be the coloured one minus the escapes")

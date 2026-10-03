@@ -108,3 +108,12 @@ supersedes: ""
 - 本轮任务 `[MARK-PRISM-EST-27]`（reviewer 复审要求：补决策笔记 + expvar 增量断言 + `SumClinePassTokens` 标 Deprecated + 打满用例）。
 - 相关实现：`internal/planusage/estimate.go`（`ApplyClinePassEstimates`）、`internal/planusage/report.go`（`clineNumberField`/`clineCountdownField`/`clineCardTitle`/`clineDisplayName`）、`internal/metapiusage/store.go`（`SumClinePassTokensByAccount` 口径、`SumClinePassTokens` Deprecated）、`cmd/prism/metapi.go`（`applyQuotaClinePassEstimate` + `clinepassEstimateSkipped`）。
 - 实测数值来自本机 metapi 生产库只读核对（acct 34 / acct 38）；上游百分比的整数化与窗口起点反推均为结构性质，见「已知残差」。
+
+## 修订（supersede）：账号显示名恢复「去尾部数字后缀」（显示回归修复，`[MARK-PRISM-NAME-39]`）
+- **本笔反转 D5 的「账号名保留数字后缀」**：`clineDisplayName` 重新接上 `stripNumericSuffix`，显示名只剥**尾部连续数字**，`Cline` 与 `Cline2` 两行**都显示 `Cline`**；名字**中间**的数字不动，剥完为空则保留原名（`12345` → `12345`）。
+- **不变的部分**：行身份仍键在**全名 + 指纹**（`clineRowID` 未动），**行数不变**（`Cline` / `Cline2` 仍是 2 行）；账号靠**颜色**区分——行首色点与同色名（紫 `8800FF` / 绿 `00FF00`）；卡宽量宽以**显示名**为基准，被去掉的后缀不占列。
+- **为什么反转**：v0.35.0 把显示名改成全名属**显示回归**；`.agents/notes/20260929-clinepass-multi-account-metapi.md` 记录的「显示名去后缀 + 行数/身份不变」是用户反复强调的既定契约，两个独立订阅的信息由**颜色 + 行身份**承载，不依赖名字里的数字。
+- **本次未动 v0.35.0 的其它行为**：分子剔 cache、周锚定单向派生（月 = 2×周）、`~` 标记、标题「估算池」、5h 重置倒计时、`account_id <= 0` 的 WARN + expvar、`SumClinePassTokens` 的 Deprecated——全部保持原样。
+- **回归用例**：`internal/planusage/report_test.go` 的 `TestRenderCardsClinePassDisplayNameDropsNumericSuffix`（同一 provider、`Cline` + `Cline2` 两账号合并渲染 ⇒ 卡内无数字后缀、两行行首同为 `│ · Cline `、仍 2 行、两色不同、卡宽按显示名）；反向变异（`clineDisplayName` 返回全名）时该用例按预期 FAIL。同时恢复 `TestStripNumericSuffix`（尾部数字 / 中间数字 / 纯数字兜底）。
+- **连带改动（超出「只改 internal/planusage」边界的说明）**：`cmd/prism/metapi_test.go` 的 `TestCLIAssemblyCarriesAccountFingerprints` 在 v0.35.0 同车把断言改成了「两行显示全名」（`sgrBefore(t, r, "Cline2")`），显示名回退后该断言必然红，故把这三处断言（注释 / 行筛选 / 颜色循环）还原为 v0.34.0 的「两行同名、靠色点 + 同色名区分」形态；**仅测试断言，无生产代码改动**。
+- **同时消解「遗留清单」中的悬置项**：原「旧笔记未标 superseded」的前提（显示名保留全名）已被本修订反转 —— 20260929 与现行行为重新一致，**无需**再给它加 superseded 标注，该悬置项就此关闭。
