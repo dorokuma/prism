@@ -21,7 +21,7 @@ supersedes: ""
 ## 决策
 - **`resetText` 去掉后缀**（`report.go:869`）：未来重置态返回裸倒计时 `cardCountdown(now, *w.ResetsAt)`，例如 `3h 45m` / `42m` / `12h`。`cardCountdown` 的时间格式（`2h 01m` / `3d 4h`）不动，`已重置` / `-` 两态不动。
 - **去掉后缀而非加宽列**：13 列对裸倒计时绰绰有余（5 小时窗口上界 `4h 59m` = 6 列），`PadLeft` 的裁剪保护也随之从「理论上不可能触发」变得更宽松，行宽不变量与测试的 `cardLines` 断言均无需放宽。
-- **`resetText` 是三条路径的公共文案源**：① 5 小时窗口的指标段；② 周/月「无 token 总额」的回落倒计时（`clineTokenPairWindow` 为真但 `total <= 0` 且无 `MeasuredTokens` 时，`clineMetricField` 走倒计时兜底）；③ 无窗口失败快照。因此**同时**给三处去后缀——本次不按窗口分叉，回落路径的倒计时一并变形（Gemini 周限额卡在无总额时肉眼可见）。这与 v0.36.0 定下的「三家 provider 一套模板、版式不按 provider/窗口分叉」一致（见 `2026-10-03-unified-quota-cards-spec.md`）。
+- **`resetText` 是两条路径的公共文案源**：① 5 小时窗口的指标段；② 周/月「无 token 总额」的回落倒计时（`clineTokenPairWindow` 为真但 `total <= 0` 且无 `MeasuredTokens` 时，`clineMetricField` 走倒计时兜底）。因此**同时**给两处去后缀——本次不按窗口分叉，回落路径的倒计时一并变形（Gemini 周限额卡在无总额时肉眼可见）；无窗口失败快照（`clineRowLine` 的 `r.win == nil` 分支）的指标段仍为空，不受影响。这与 v0.36.0 定下的「三家 provider 一套模板、版式不按 provider/窗口分叉」一致（见 `2026-10-03-unified-quota-cards-spec.md`）。
 - **`providerDisplayOrder` 改为 `{"gemini","xai","clinepass"}`**（`order.go:18`）：Gemini 保持首位，SuperGrok 升至第二，ClinePass 落到末位。**未列出的 provider 仍共享尾 rank 回退字典序**（`providerDisplayRank` 的既有语义，rank = `len(providerDisplayOrder)` = 3），同一 provider 内仍按首账号名 tie-break，模块不交错——即「未列出 provider 不得插到精选 provider 之前」这条 v0.32.0 定下的展示契约不变。
 - **该顺序被两个渲染入口共用**：`accountSortKey` 是排序键的唯一实现，`RenderCards`（CLI 卡片与 `GET /admin/quota` 的卡片视图）与 legacy `?format=table`（`RenderTableAt`）都消费它。因此**表格的行序也随本次改变**；表格的**列文本与列格式逐字未动**（`formatRemain` 等 legacy 格式未触碰）。
 - **程序化接口不变**：`Snapshot`/`Window` 模型、`/admin/quota` JSON 的字段与数组顺序来源、`/metrics`、CLI flag 全部未动；本次只改渲染层的拼接与排序常量。
