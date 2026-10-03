@@ -63,7 +63,7 @@ go test -c -race -o /tmp/prism-cache-race.test ./internal/cache/
 | 退回原启发式（变异） | **113/9600 ≈ 1.2% 失败** | **293/40000 ≈ 0.73% 失败**（279 × `SharedResultAcrossCallers` + 14 × `ConcurrentSameProviderSingleUpstream`） | — |
 
 ## 遗留（未决 / 需后续处理）
-- **残余风险 ≈ 0（本笔加固的正确性边界）**：栅栏触发点与 park 在同一代码路径上——在捕获 leader 的 `f` 指针之后、`<-f.done` 之前——因此 hook 一旦投递即**结构性地**保证该 caller 会 park 到 leader 的 `done`（它已持有该 `*inflightFetch`，不可能再另开一轮）。唯一残余形态是**极端调度饥饿**下 5s watchdog 超时，其失败签名是 `follower never joined…`（超时）而**非** `hits == 2`——两者可区分，不会把加固后的同步问题误诊为「合并契约被破坏」。
+- **残余风险 ≈ 0（本笔加固的正确性边界）**：栅栏触发点与 park 在同一代码路径上——在捕获 leader 的 `f` 指针之后、`<-f.done` 之前——因此 hook 一旦投递即**结构性地**保证该 caller 会 park 到 leader 的 `done`（它已持有该 `*inflightFetch`，不可能再另开一轮）。唯一残余形态是**极端调度饥饿**下 5s watchdog 超时，其失败签名是 `follower never joined…`（超时；另一用例的同义签名见同一份 grep：`internal/cache/models_test.go` 的 watchdog 超时签名 `only %d/%d callers joined the in-flight fetch`，以及该用例里的另一条 `leader never reached the upstream`）而**非** `hits == 2`——两者可区分，不会把加固后的同步问题误诊为「合并契约被破坏」。
 - **`internal/util` 的 `TestDebugDumpOmitsBusinessContentKeepsStructure` 用固定路径 `/tmp/prism-debug/...`**：多进程并发跑套件时会互相踩（多个测试二进制同时写同一目录），**单套运行不复现**。本笔**未修**——它不在本笔允许改动范围内（`internal/util` 属禁改），且与本次 cache 合并用例失败是两码事。后续如需并发跑套件，要么让该用例用 `t.TempDir()`/带 PID 的唯一路径（改测试），要么在 CI/压测里对 `internal/util` 串行化。待用户决策。
 - **`models_test.go` 的用例在变异配置下用 `-test.count>` 复现率低于 `fetchctx_test.go`**（饱和配方 14 vs 279）：窗口更窄，属正常；加固后两者均 0 失败。
 
