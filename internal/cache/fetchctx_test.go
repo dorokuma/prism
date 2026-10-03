@@ -143,12 +143,18 @@ func TestFetchWithContext_LeaderWorkNotCancelledByRequestContext(t *testing.T) {
 // TestFetchWithContext_SharedResultAcrossCallers pins the merge across the
 // two entry points: a Fetch (background fill) and a FetchWithContext
 // (request) for the same provider collapse into ONE leader upstream round —
-// the follower is PROVABLY parked on the leader's done channel before the
-// leader is released (the inflight map is polled under fetchMu, like the
-// leader's own registration) — and both callers observe the same result.
+// the follower's join is proven by the fetchJoinHook firing (the follower
+// has captured the leader's in-flight entry and will park on its done
+// channel; polling the fetches map cannot prove this, since that entry is
+// the leader's own registration) — and both callers observe the same result.
 func TestFetchWithContext_SharedResultAcrossCallers(t *testing.T) {
 	srv, entered, release, hits := blockingModelsUpstream(t)
 	mc := fetchCtxMC(t, srv.URL)
+
+	// Deterministic join fence: the hook fires from inside the follower, after
+	// it resolved the leader's entry and before it parks on f.done.
+	joined := make(chan string, 1)
+	mc.fetchJoinHook = func(provider string) { joined <- provider }
 
 	// The request-triggered call becomes the leader (work on the shared
 	// context); the background Fetch joins it.
@@ -161,21 +167,16 @@ func TestFetchWithContext_SharedResultAcrossCallers(t *testing.T) {
 	}
 	fillDone := make(chan error, 1)
 	go func() { fillDone <- mc.Fetch("p") }()
-	// Provably wait until the follower is registered on the leader's entry
-	// (the leader is still blocked at the upstream, so the entry cannot be
-	// cleaned up yet), then release the leader.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		mc.fetchMu.Lock()
-		_, ok := mc.fetches["p"]
-		mc.fetchMu.Unlock()
-		if ok {
-			break
+	// Wait for the REAL join event (the follower has captured the leader's
+	// entry), then release the leader. The leader is still blocked at the
+	// upstream when the hook fires, so the entry cannot have been cleaned up.
+	select {
+	case p := <-joined:
+		if p != "p" {
+			t.Fatalf("join hook provider = %q, want %q", p, "p")
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("in-flight fetch entry never registered")
-		}
-		time.Sleep(2 * time.Millisecond)
+	case <-time.After(5 * time.Second):
+		t.Fatal("follower never joined the leader's in-flight fetch")
 	}
 	close(release)
 

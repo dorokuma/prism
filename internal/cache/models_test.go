@@ -3423,9 +3423,10 @@ func TestFetch_FailoverNoHealthyAccount(t *testing.T) {
 
 // TestFetch_ConcurrentSameProviderSingleUpstream is the item-2 core: 20
 // concurrent Fetch calls for the SAME provider collapse into exactly ONE
-// upstream request. The leader blocks in the upstream handler while all 20
-// goroutines are provably launched, so every one of them either leads or
-// joins the in-flight fetch — the hit count proves the merge.
+// upstream request. The leader blocks in the upstream handler while the
+// other 19 callers are provably joined to the leader's in-flight entry
+// (each join is signalled by fetchJoinHook), so every one of them either
+// leads or joins the in-flight fetch — the hit count proves the merge.
 func TestFetch_ConcurrentSameProviderSingleUpstream(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -3443,6 +3444,9 @@ func TestFetch_ConcurrentSameProviderSingleUpstream(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	const n = 20
+	joined := make(chan string, n)
+
 	cfg := &config.Config{
 		MaxConcurrentPerAccount: map[string]int{"*": 1},
 	}
@@ -3454,35 +3458,41 @@ func TestFetch_ConcurrentSameProviderSingleUpstream(t *testing.T) {
 			{Name: "a1", Provider: "p", BaseURL: srv.URL, Key: "k"},
 		}),
 		stop: make(chan struct{}),
+		// Deterministic join fence: one signal per follower that resolves the
+		// leader's in-flight entry (the leader itself emits none).
+		fetchJoinHook: func(provider string) { joined <- provider },
 	}
 
-	const n = 20
-	var started int32
 	var wg sync.WaitGroup
 	errs := make([]error, n)
 	wg.Add(n)
 	for i := 0; i < n; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			atomic.AddInt32(&started, 1)
 			errs[idx] = mc.Fetch("p")
 		}(i)
 	}
 
-	// The leader is provably blocked at the upstream; wait until all 20
-	// goroutines are launched (they can only lead or join — the leader
-	// cannot finish before release), then release the upstream.
+	// The leader is provably blocked at the upstream; wait until the other
+	// 19 callers have PROVABLY joined the leader's in-flight entry (each join
+	// is signalled by fetchJoinHook), then release the upstream. Waiting on
+	// "goroutines launched" would not prove the join: a caller can be
+	// preempted after launching but before its fetches lookup, and then start
+	// a second round once the released leader cleans up (the flaky window).
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("leader never reached the upstream")
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for atomic.LoadInt32(&started) < n {
-		if time.Now().After(deadline) {
-			t.Fatalf("only %d/%d goroutines launched", atomic.LoadInt32(&started), n)
+	for i := 0; i < n-1; i++ {
+		select {
+		case p := <-joined:
+			if p != "p" {
+				t.Fatalf("join hook provider = %q, want %q", p, "p")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d/%d callers joined the in-flight fetch", i, n-1)
 		}
-		time.Sleep(2 * time.Millisecond)
 	}
 	close(release)
 

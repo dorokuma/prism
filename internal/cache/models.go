@@ -154,6 +154,18 @@ type ModelCache struct {
 	// (production).
 	fetchLeaderHook func()
 
+	// fetchJoinHook is a test-only injection point called by a follower in
+	// fetchWait once it has resolved the leader's in-flight entry and is
+	// about to park on the leader's done channel (after fetchMu is released,
+	// before the wait). Calling convention: it runs on the follower's
+	// goroutine between the join decision and the park on f.done, with
+	// fetchMu released — so the hook must not block and must not take
+	// fetchMu. Tests use it as a deterministic join fence: a value on this
+	// hook PROVES the caller joined the leader instead of starting its own
+	// round, which polling the fetches map cannot (that entry is the
+	// leader's own registration). nil means no hook (production).
+	fetchJoinHook func(provider string)
+
 	// fetchBudget overrides the ONE total failover timeout applied to a
 	// whole provider fetch round (see fetchLeader). 0 means the production
 	// default of 30s. Tests inject a short budget to pin the shared-budget
@@ -607,6 +619,15 @@ func (mc *ModelCache) fetchWait(waitCtx, workCtx context.Context, provider strin
 	mc.fetchMu.Lock()
 	if f, ok := mc.fetches[provider]; ok {
 		mc.fetchMu.Unlock()
+		// The caller has already captured the leader's entry, so it is a
+		// follower regardless of what happens next (even if the leader
+		// finishes and removes the map entry, this caller still parks on
+		// f.done and returns the leader's result). The test-only hook fires
+		// exactly here — after the join decision, before the wait — so a
+		// test can synchronize on a REAL join event. nil is a no-op.
+		if h := mc.fetchJoinHook; h != nil {
+			h(provider)
+		}
 		select {
 		case <-f.done:
 			return f.err
