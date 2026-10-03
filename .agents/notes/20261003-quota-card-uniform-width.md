@@ -1,7 +1,7 @@
 ---
 status: active # active | superseded
 superseded_by: ""
-supersedes: "20260924-card-width-60-to-56.md"
+supersedes: ""
 模块: planusage
 ---
 
@@ -41,6 +41,7 @@ supersedes: "20260924-card-width-60-to-56.md"
 
 ## 遗留清单（未决 / 需后续处理）
 - **`internal/usage` 的 `reportWidth = 56` 未跟进 quota 侧的 58**：本次只动 quota 卡片（`internal/planusage`），usage 报告仍是定宽 56 列，与 quota 的常规 58 列**不再相等**（`20260924-card-width-60-to-56.md` 的「两卡同宽」已被本笔取代）。两者是否统一（把 usage 也改成「按内容 + 名字列下限」的动态宽度，或把 quota 压回固定 56）**待用户决策**，本次不动。
+- **「部分取代」在笔记维护规矩里没有规范写法**：`.agents/notes/README.md` 的维护规矩只给了 `active` / `superseded` 二元状态（方案更新时旧笔记标 `superseded` + `superseded_by`、新笔记填 `supersedes`），**没有**「旧笔记结论仍部分有效、只有一部分被新笔记取代」时的写法。本次按仓库既有先例处理：旧笔记保持 `status: active`、`superseded_by: ""`，由新笔记正文说明取代了哪一部分（quota 侧宽度算法）、哪一部分仍成立（`internal/usage` 的 `reportWidth = 56`）。是否把「部分取代」写法正式补进笔记维护规矩 = **待用户决策**，本次不动。
 
 ## 来源
 - 任务说明（worker 派发，[MARK-PRISM-WIDTH-49]）：quota 卡片三家宽度不一致（54/55/58），要求全局统一 + 9 列下限 + 名字完整不截断。

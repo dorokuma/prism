@@ -477,9 +477,12 @@ func cardLines(t *testing.T, got string) []string {
 
 // wantCardWidth is the width a card render must come out at for a given set of
 // name cells: the widest cell's row width, floored by the name column's
-// minimum (4 + clineRowFixed + clineNameColMin, 58 for the names this package
-// knows today). Spelled out here rather than calling the production cardWidth,
-// so the assertion states the contract instead of restating the code.
+// minimum (4 + clineRowFixed + clineNameColMin, 58 while the longest account
+// name in the current production roster is 9 columns wide — that is a
+// deployment fact, not a property of this package — and a longer name widens
+// every card of the render instead of being truncated). Spelled out here
+// rather than calling the production cardWidth, so the assertion states the
+// contract instead of restating the code.
 func wantCardWidth(nameCells ...string) int {
 	width := 4 + clineRowFixed + clineNameColMin
 	for _, c := range nameCells {
