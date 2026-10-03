@@ -157,13 +157,15 @@ type ModelCache struct {
 	// fetchJoinHook is a test-only injection point called by a follower in
 	// fetchWait once it has resolved the leader's in-flight entry and is
 	// about to park on the leader's done channel (after fetchMu is released,
-	// before the wait). Calling convention: it runs on the follower's
-	// goroutine between the join decision and the park on f.done, with
-	// fetchMu released — so the hook must not block and must not take
-	// fetchMu. Tests use it as a deterministic join fence: a value on this
-	// hook PROVES the caller joined the leader instead of starting its own
-	// round, which polling the fetches map cannot (that entry is the
-	// leader's own registration). nil means no hook (production).
+	// before the wait). Calling convention: it holds NO lock at this call
+	// site — it runs synchronously on the follower's own goroutine, after
+	// fetchMu was released and before the park on f.done — so to keep this
+	// fence safe for this and any future call site the hook SHOULD be
+	// non-blocking and SHOULD NOT take fetchMu. Tests use it as a
+	// deterministic join fence: a value on this hook PROVES the caller joined
+	// the leader instead of starting its own round, which polling the fetches
+	// map cannot (that entry is the leader's own registration). nil means no
+	// hook (production).
 	fetchJoinHook func(provider string)
 
 	// fetchBudget overrides the ONE total failover timeout applied to a
