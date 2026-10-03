@@ -31,7 +31,7 @@ func RenderTable(snaps []Snapshot) string {
 // account is one MODULE: its windows are consecutive rows, the account
 // name sits on the module's first window row, later rows leave the
 // account cell empty. Modules are sorted by provider display order
-// first (see providerDisplayOrder: gemini < clinepass < xai, unlisted
+// first (see providerDisplayOrder: gemini < xai < clinepass, unlisted
 // providers after them), then by account name, so they never
 // interleave (a bare row can not look like it belongs to the previous
 // module). Load-balanced plans are never merged. Snapshots without
@@ -156,7 +156,7 @@ type CardOptions struct {
 }
 
 // RenderCards renders the quota cards; cards are sorted by provider
-// display order (gemini < clinepass < xai; unlisted providers fall back
+// display order (gemini < xai < clinepass; unlisted providers fall back
 // to lexicographic) and then by account name, separated by one blank
 // line. ANSI true-color escapes are emitted by default — pass
 // CardOptions{NoColor: true} for pipes, redirects and --no-color, which
@@ -656,14 +656,14 @@ func clineTokenPairWindow(name string) bool {
 }
 
 // clineCountdownField is a row's countdown text: the reset countdown ("2h
-// 15m 后重置"), or "已重置" once the window has rolled over, in the column
+// 15m"), or "已重置" once the window has rolled over, in the column
 // the token pair would occupy. It returns "" when the window has no reset
 // instant at all — the caller then falls back to "-" — and serves every
 // window: the 5-hour one always, a weekly/monthly one when it has no token
 // total to show.
 //
 // The text fits the 13-column metric field for every real 5-hour window
-// (the countdown cannot exceed 5h, so at most "4h 59m 后重置" = 13
+// (the countdown cannot exceed 5h, so at most "4h 59m" = 6
 // columns); the caller's PadLeft caps anything longer without widening the
 // row.
 func clineCountdownField(w Window, now time.Time) string {
@@ -860,7 +860,7 @@ func windowTitle(name string) string {
 	}
 }
 
-// resetText is the reset wording shared by the metric field: "3h 12m 后重置"
+// resetText is the reset wording shared by the metric field: "3h 12m"
 // when the upstream reported ResetsAt, "已重置" once the window has rolled
 // over, and "-" when there is no reset time at all. The countdown itself
 // comes from cardCountdown, so the 13-column metric field keeps its width at
@@ -873,7 +873,7 @@ func resetText(w Window, now time.Time) string {
 	if !w.ResetsAt.After(now) {
 		return "已重置"
 	}
-	return cardCountdown(now, *w.ResetsAt) + " 后重置"
+	return cardCountdown(now, *w.ResetsAt)
 }
 
 // pctLabel is a row's percentage: the consumed share, right-aligned into
@@ -942,7 +942,7 @@ func (pal cardPalette) red(s string) string {
 // ── legacy helpers (kept) ─────────────────────────────────────────────────
 
 // accountSortKey orders snapshots by provider display order first (see
-// providerDisplayOrder: gemini < clinepass < xai), then by their first
+// providerDisplayOrder: gemini < xai < clinepass), then by their first
 // account name (provider as fallback), so modules never interleave in
 // the table or the cards.
 func accountSortKey(s Snapshot) string {

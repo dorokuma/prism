@@ -514,7 +514,7 @@ func TestApplyQuotaClinePassEstimate(t *testing.T) {
 	for _, wantText := range []string{
 		"50.0K/100.0K",
 		"10.0K/200.0K",
-		"2h 后重置",
+		"2h │",
 	} {
 		if !strings.Contains(cards, wantText) {
 			t.Fatalf("cards missing %q:\n%s", wantText, cards)

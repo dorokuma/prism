@@ -7,7 +7,7 @@ import (
 )
 
 // TestAccountSortKeyProviderDisplayOrder pins the curated order Gemini →
-// ClinePass → SuperGrok. The account names alone would sort ClinePass
+// SuperGrok → ClinePass. The account names alone would sort ClinePass
 // FIRST ("ClinePass" < "Gemini" < "SuperGrok"), so the provider rank has
 // to decide before the name.
 func TestAccountSortKeyProviderDisplayOrder(t *testing.T) {
@@ -17,8 +17,8 @@ func TestAccountSortKeyProviderDisplayOrder(t *testing.T) {
 	gemini := key("gemini", "Gemini")
 	clinepass := key("clinepass", "ClinePass")
 	xai := key("xai", "SuperGrok")
-	if !(gemini < clinepass && clinepass < xai) {
-		t.Fatalf("provider display order broken: gemini=%q clinepass=%q xai=%q", gemini, clinepass, xai)
+	if !(gemini < xai && xai < clinepass) {
+		t.Fatalf("provider display order broken: gemini=%q xai=%q clinepass=%q", gemini, xai, clinepass)
 	}
 	// Case-insensitive provider key (config keys are lowercase, but the
 	// rank lookup normalizes).
@@ -47,7 +47,7 @@ func TestAccountSortKeyUncuratedFallback(t *testing.T) {
 }
 
 // TestRenderCardsCuratedProviderOrder is the card-level contract the CLI
-// shows: shuffled snapshots render Gemini, ClinePass, SuperGrok — and a
+// shows: shuffled snapshots render Gemini, SuperGrok, ClinePass — and a
 // provider without a curated rank stays after them.
 func TestRenderCardsCuratedProviderOrder(t *testing.T) {
 	now := time.Date(2026, 9, 24, 10, 0, 0, 0, time.UTC)
@@ -67,7 +67,7 @@ func TestRenderCardsCuratedProviderOrder(t *testing.T) {
 	}
 	// Every title is the provider + its window label: the ACCOUNT lives on the
 	// card's row (see RenderCards), never on the title.
-	want := []string{"╭─ Gemini ·", "╭─ ClinePass ·", "╭─ SuperGrok ·", "╭─ Opus ·"}
+	want := []string{"╭─ Gemini ·", "╭─ SuperGrok ·", "╭─ ClinePass ·", "╭─ Opus ·"}
 	if len(titles) != len(want) {
 		t.Fatalf("got %d cards, want %d:\n%s", len(titles), len(want), got)
 	}
@@ -83,7 +83,7 @@ func TestRenderCardsCuratedProviderOrder(t *testing.T) {
 			rows = append(rows, line)
 		}
 	}
-	for i, acc := range []string{"Gemini", "ClinePass", "SuperGrok", "a"} {
+	for i, acc := range []string{"Gemini", "SuperGrok", "ClinePass", "a"} {
 		if i >= len(rows) || !strings.HasPrefix(rows[i], "│ · "+acc+" ") {
 			t.Fatalf("row %d = %q, want the account %q:\n%s", i, rows, acc, got)
 		}
