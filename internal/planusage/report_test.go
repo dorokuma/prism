@@ -448,10 +448,11 @@ const (
 )
 
 // cardLines splits a card render into ANSI-stripped lines and asserts that
-// every line of ONE card is exactly as wide as that card's own title. Cards
-// are separated by a blank line, which resets the expectation: the width is
-// derived per card from the longest account name cell and the title, so there
-// is no global card width any more.
+// EVERY line of the render is exactly as wide as the first one. The width is
+// ONE per render — every card of it is laid out at the render-wide width
+// (cardWidth: the widest card need, floored by the name column's minimum) —
+// so a blank line only separates two cards, it does not reset the
+// expectation: two cards of one render may never differ in width.
 func cardLines(t *testing.T, got string) []string {
 	t.Helper()
 	raw := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
@@ -460,7 +461,6 @@ func cardLines(t *testing.T, got string) []string {
 	for i, l := range raw {
 		if l == "" {
 			out = append(out, "")
-			width = -1
 			continue
 		}
 		plain := render.StripANSI(l)
@@ -468,11 +468,26 @@ func cardLines(t *testing.T, got string) []string {
 		if width == -1 {
 			width = w
 		} else if w != width {
-			t.Fatalf("line %d: width %d, want the card's %d:\n%q", i, w, width, plain)
+			t.Fatalf("line %d: width %d, want the render-wide %d:\n%q", i, w, width, plain)
 		}
 		out = append(out, plain)
 	}
 	return out
+}
+
+// wantCardWidth is the width a card render must come out at for a given set of
+// name cells: the widest cell's row width, floored by the name column's
+// minimum (4 + clineRowFixed + clineNameColMin, 58 for the names this package
+// knows today). Spelled out here rather than calling the production cardWidth,
+// so the assertion states the contract instead of restating the code.
+func wantCardWidth(nameCells ...string) int {
+	width := 4 + clineRowFixed + clineNameColMin
+	for _, c := range nameCells {
+		if w := 4 + clineRowFixed + render.DisplayWidth(c); w > width {
+			width = w
+		}
+	}
+	return width
 }
 
 // cardTitleLines returns the title line of every card of a render, in order.
@@ -628,14 +643,15 @@ func TestRenderCardsBasic(t *testing.T) {
 			t.Fatalf("the unified card must not carry %q:\n%q", bad, got)
 		}
 	}
-	// Bottom border: ╰ + width-2 dashes + ╯, the width being the card's own.
+	// Bottom border: ╰ + width-2 dashes + ╯, the width being the render-wide
+	// one.
 	width := render.DisplayWidth(lines[0])
 	bottom := lines[len(lines)-1]
 	if !strings.HasPrefix(bottom, "╰") || !strings.HasSuffix(bottom, "╯") ||
 		strings.Count(bottom, "─") != width-2 {
 		t.Fatalf("bottom border malformed:\n%q", bottom)
 	}
-	if want := 4 + clineRowFixed + render.DisplayWidth("claude-main"); width != want {
+	if want := wantCardWidth("claude-main"); width != want {
 		t.Fatalf("card width = %d, want %d (row width): %q", width, want, lines[0])
 	}
 }
@@ -664,8 +680,8 @@ func TestRenderCardsTitleTextIsPlainText(t *testing.T) {
 		}
 	}
 	// The card is as wide as its longest row: name cell(claude-main) + the
-	// fixed columns.
-	width := 4 + clineRowFixed + render.DisplayWidth("claude-main")
+	// fixed columns, floored by the name column's minimum.
+	width := wantCardWidth("claude-main")
 	if got := render.DisplayWidth(title); got != width {
 		t.Fatalf("card width = %d, want %d: %q", got, width, title)
 	}
@@ -1309,11 +1325,13 @@ func TestRenderCardsTitleNeverCarriesAccount(t *testing.T) {
 				t.Fatalf("nothing may be truncated on a card sized from its own content:\n%s", got)
 			}
 			// The account name renders in FULL on its own row, and the card is
-			// exactly as wide as that name + the fixed columns needs.
+			// as wide as that name + the fixed columns needs — floored by the
+			// name column's minimum (a short name no longer narrows the card;
+			// see TestRenderCardsUniformWidthAcrossProviders).
 			if !strings.Contains(lines[1], clineDisplayName(clineRow{name: tc.account})) {
 				t.Fatalf("the account must render in full on its row: %q", lines[1])
 			}
-			want := 4 + clineRowFixed + render.DisplayWidth(clineDisplayName(clineRow{name: tc.account}))
+			want := wantCardWidth(clineDisplayName(clineRow{name: tc.account}))
 			if w := render.DisplayWidth(lines[0]); w != want {
 				t.Fatalf("card width = %d, want %d:\n%s", w, want, got)
 			}
@@ -1891,8 +1909,9 @@ func TestRenderCardsDisplayNameDropsNumericSuffix(t *testing.T) {
 	if len(colors) != 2 {
 		t.Fatalf("the two same-reading rows must carry different colours: %v", colors)
 	}
-	// The card is as wide as its longest DISPLAY name, not the full one.
-	if want := 4 + clineRowFixed + render.DisplayWidth("Cline"); render.DisplayWidth(lines[0]) != want {
+	// The card is as wide as its longest DISPLAY name, not the full one —
+	// floored by the name column's minimum.
+	if want := wantCardWidth("Cline"); render.DisplayWidth(lines[0]) != want {
 		t.Fatalf("card width = %d, want %d (no column for the dropped suffix):\n%s",
 			render.DisplayWidth(lines[0]), want, render.StripANSI(got))
 	}
@@ -1934,7 +1953,7 @@ func TestRenderCardsDisplayNameEveryProvider(t *testing.T) {
 	if !strings.HasPrefix(lines[1], "│ · gemini-acct- ") {
 		t.Fatalf("the trailing digit run must be dropped (%q):\n%s", "gemini-acct-1", got)
 	}
-	if want := 4 + clineRowFixed + render.DisplayWidth("gemini-acct-"); render.DisplayWidth(lines[0]) != want {
+	if want := wantCardWidth("gemini-acct-"); render.DisplayWidth(lines[0]) != want {
 		t.Fatalf("card width = %d, want %d:\n%s", render.DisplayWidth(lines[0]), want, got)
 	}
 }
@@ -2040,11 +2059,11 @@ func TestRenderCardsLongNameWidensCard(t *testing.T) {
 		clinePassSnap("cccc3333dddd4444", long, w),
 	}, now)
 
-	lines := cardLines(t, got) // every line of the card shares one width
+	lines := cardLines(t, got) // every line of the render shares one width
 	if len(lines) != 4 {
 		t.Fatalf("want 4 lines, got %d:\n%s", len(lines), render.StripANSI(got))
 	}
-	wantWidth := 4 + clineRowFixed + render.DisplayWidth(long)
+	wantWidth := wantCardWidth(long)
 	if w := render.DisplayWidth(lines[0]); w != wantWidth {
 		t.Fatalf("card width = %d, want %d:\n%s", w, wantWidth, render.StripANSI(got))
 	}
@@ -2113,8 +2132,146 @@ func TestRenderCardsStaleMarkerRidesInTheRow(t *testing.T) {
 		!strings.HasSuffix(lines[2], rowTail("34%", "2h 后重置")) {
 		t.Fatalf("the two rows must share their columns:\n%q\n%q", lines[1], lines[2])
 	}
-	want := 4 + clineRowFixed + render.DisplayWidth("ClineOther 旧")
+	want := wantCardWidth("ClineOther 旧")
 	if w := render.DisplayWidth(lines[0]); w != want {
 		t.Fatalf("card width = %d, want %d (the marked cell sizes the column):\n%s", w, want, got)
+	}
+}
+
+// TestRenderCardsUniformWidthAcrossProviders is the headline contract of the
+// shared width: a render holding THREE providers — short account names next to
+// a 9-column one ("SuperGrok", the longest name this package knows) — gives
+// every card ONE width, and that width is the name column's floor (58
+// columns), not each card's own longest name. Before the change the three
+// cards came out 54 / 55 / 58 columns wide, so the right border and the
+// capsule start of each card sat at a different column.
+func TestRenderCardsUniformWidthAcrossProviders(t *testing.T) {
+	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(2 * time.Hour)
+	fiveHour := func() Window {
+		return Window{Name: "5h", Status: "ok", Percent: 34, ResetsAt: &reset}
+	}
+	// One card per provider (a different PROVIDER each, so no two snapshots
+	// can merge), with name cells of 6, 8 and 9 columns — every one of them
+	// SHORT enough for the floor to decide the width.
+	snaps := []Snapshot{
+		clinePassSnap("aaaa1111bbbb2222", "cline-1", fiveHour()), // displays "cline-", 6 columns
+		{Provider: "gemini", Accounts: []string{"gemini-x"}, Windows: []Window{fiveHour()}},
+		{Provider: "xai", Accounts: []string{"SuperGrok"}, Windows: []Window{fiveHour()}},
+	}
+	got := RenderCards(snaps, now, CardOptions{NoColor: true})
+	lines := cardLines(t, got) // ALL lines of ALL cards share one width
+	titles := cardTitleLines(lines)
+	if len(titles) != 3 {
+		t.Fatalf("want 3 cards, got %d:\n%s", len(titles), got)
+	}
+
+	// Every card's border line — and every other line of it — is exactly 58
+	// display columns wide.
+	for i, title := range titles {
+		if w := render.DisplayWidth(title); w != 58 {
+			t.Fatalf("card %d title: width %d, want 58:\n%q", i, w, title)
+		}
+	}
+	for i, l := range lines {
+		if l == "" {
+			continue
+		}
+		if w := render.DisplayWidth(l); w != 58 {
+			t.Fatalf("line %d: width %d, want the shared 58:\n%q", i, w, l)
+		}
+	}
+	// The width is the floor the common case is pinned at, and it is NOT the
+	// numeric coincidence of one card's own name.
+	if want := wantCardWidth("cline-", "gemini-x", "SuperGrok"); want != 58 {
+		t.Fatalf("the three name cells must ask for the 58-column floor, got %d", want)
+	}
+
+	// The floor decides the width on its own as soon as the roster holds only
+	// SHORT names: the same render minus the 9-column account still comes out
+	// 58 columns wide — the width does not follow the longest name down, so
+	// the same command cannot jump between widths from run to run.
+	shortOnly := RenderCards(snaps[:2], now, CardOptions{NoColor: true})
+	for i, l := range cardLines(t, shortOnly) {
+		if l == "" {
+			continue
+		}
+		if w := render.DisplayWidth(l); w != 58 {
+			t.Fatalf("short-name-only render, line %d: width %d, want the 58-column floor:\n%q", i, w, l)
+		}
+	}
+
+	// Every row's capsule starts at the SAME display column, on every card:
+	// that is what the padded name column buys. The rows are the lines that
+	// carry a capsule cell.
+	start := -1
+	rows := 0
+	for _, l := range lines {
+		i := strings.Index(l, capUsed)
+		if i < 0 {
+			continue // title / border / note lines carry no capsule
+		}
+		rows++
+		if c := render.DisplayWidth(l[:i]); start == -1 {
+			start = c
+		} else if c != start {
+			t.Fatalf("capsule starts at column %d, want the shared %d:\n%q", c, start, l)
+		}
+	}
+	if rows != 3 {
+		t.Fatalf("want 3 data rows (one per card), got %d:\n%s", rows, got)
+	}
+	// "│ " + dot + " " + the 9-column name cell + " " is 14 columns, i.e.
+	// width - clineRowFixed + 1.
+	if wantStart := 58 - clineRowFixed + 1; start != wantStart {
+		t.Fatalf("capsule starts at column %d, want %d", start, wantStart)
+	}
+
+	// The short names are padded, never shortened, and every name still reads
+	// in full on its own row.
+	for _, name := range []string{"cline-", "gemini-x", "SuperGrok"} {
+		if !strings.Contains(got, "│ · "+name+" ") {
+			t.Fatalf("row for %q missing:\n%s", name, got)
+		}
+	}
+	if strings.Contains(got, "…") {
+		t.Fatalf("nothing may be truncated:\n%s", got)
+	}
+}
+
+// TestRenderCardsNameColumnFloorWidensEveryCard: the floor (clineNameColMin) is
+// a MINIMUM, never a cap. An account name LONGER than it widens EVERY card of
+// the render — the short card grows with the long one, so the cards stay
+// exactly as wide as each other — and the long name is still rendered in full.
+func TestRenderCardsNameColumnFloorWidensEveryCard(t *testing.T) {
+	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(2 * time.Hour)
+	long := "SuperGrok-extra-long-name" // 25 columns, far past the 9-column floor
+	fiveHour := Window{Name: "5h", Status: "ok", Percent: 34, ResetsAt: &reset}
+	snaps := []Snapshot{
+		clinePassSnap("aaaa1111bbbb2222", "Cline-1", fiveHour), // displays "Cline-", 6 columns
+		{Provider: "xai", Accounts: []string{long}, Windows: []Window{fiveHour}},
+	}
+	got := RenderCards(snaps, now, CardOptions{NoColor: true})
+	lines := cardLines(t, got) // both cards, one width
+	titles := cardTitleLines(lines)
+	if len(titles) != 2 {
+		t.Fatalf("want 2 cards, got %d:\n%s", len(titles), got)
+	}
+	want := 4 + clineRowFixed + render.DisplayWidth(long)
+	if want <= 4+clineRowFixed+clineNameColMin {
+		t.Fatalf("the test name must exceed the floor: %d", want)
+	}
+	for i, title := range titles {
+		if w := render.DisplayWidth(title); w != want {
+			t.Fatalf("card %d title: width %d, want %d (every card widens together):\n%q",
+				i, w, want, title)
+		}
+	}
+	if !strings.Contains(got, "│ · "+long+" ") {
+		t.Fatalf("the long account name must render in full:\n%s", got)
+	}
+	if strings.Contains(got, "…") {
+		t.Fatalf("rows must never be truncated:\n%s", got)
 	}
 }

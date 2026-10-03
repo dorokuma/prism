@@ -128,6 +128,13 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 // overflows its own border. There is no fixed card width any more: the old
 // 56-column two-row layout (title account + 47-cell capsule + detail row +
 // 已达限额 footer) is gone for good.
+//
+// ONE width is shared by every card of ONE render (see cardWidth): the
+// widest card need of that render, floored by the name column's minimum
+// (clineNameColMin). The three providers' cards therefore line up column
+// for column instead of each being exactly as wide as its own longest
+// account name. A name longer than the floor still widens every card of
+// the render TOGETHER — the name column is never truncated.
 
 // Capsule glyphs, the per-cell ramp and the equal-color run merging live in
 // internal/render (CapUsed / CapEmpty / CapsuleRamp / CapsuleUsedCells /
@@ -179,6 +186,10 @@ func RenderCards(snaps []Snapshot, now time.Time, opts ...CardOptions) string {
 	})
 
 	groups := cardGroups(sorted)
+	// ONE width for the whole render: every card (title line, rows, notes,
+	// borders) is laid out at it, so the providers' cards are exactly as
+	// wide as each other.
+	width := cardWidth(groups)
 	emitted := make(map[clineKey]bool)
 
 	var cards []string
@@ -192,7 +203,7 @@ func RenderCards(snaps []Snapshot, now time.Time, opts ...CardOptions) string {
 				continue
 			}
 			emitted[key] = true
-			cards = append(cards, renderGroupCard(groups[key], now, pal))
+			cards = append(cards, renderGroupCard(groups[key], width, now, pal))
 		}
 	}
 	return strings.Join(cards, "\n\n") + "\n"
@@ -243,12 +254,15 @@ func cardProfileName(provider string) string {
 //	color dot(1) account name(n) capsule(23) pct(4) metric(13)
 //
 // so a row is clineRowFixed+n display columns and the CARD is 4 columns
-// wider than its widest row. n is the LONGEST account DISPLAY name in the
-// card (see clineDisplayName): the displayed name is never truncated, a long
-// name widens the whole card instead, and every row of one card shares that
-// width, so the capsules, the percentages and the metric fields stay in one
-// column each. The account name and its dot carry the same accountColor(fp)
-// (see accountNameText/accountDot), so rows of one card are told apart by
+// wider than that row. n is the render's name column (see cardWidth): the
+// LONGEST account DISPLAY name CELL of EVERY card of the render, floored by
+// clineNameColMin. The displayed name is never truncated — a name longer
+// than the floor widens every card of the render together (see
+// clineCardWidth/cardWidth) — and every row of every card shares that one
+// column, so the capsules, the percentages and the metric fields stay in one
+// column each across all of them. The account name and its dot carry the same
+// accountColor(fp) (see accountNameText/accountDot), so rows of one card are
+// told apart by
 // color AND by name even when two accounts share a name. A stale snapshot's
 // account cell carries the 旧 marker (the title used to hold it): the marker
 // rides in the name column, which is sized from the MARKED cell, so it can
@@ -281,6 +295,18 @@ const (
 	// clineRowFixed is a row's display columns WITHOUT the account name:
 	// dot(1) + 4 one-column gaps + capsule + pct + metric.
 	clineRowFixed = 1 + 4 + clineCapCells + clinePctWidth + clineNumberWidth // 45
+	// clineNameColMin is the FLOOR of the name column in display columns: the
+	// longest account name in the current production roster — the accounts the
+	// user's config and the metapi account table feed in — i.e. "SuperGrok",
+	// 9 columns. That is a deployment fact, not a property of this package's
+	// display table. One render lays every card out at ONE width (cardWidth),
+	// so without a floor the same command would come out narrower when only
+	// short-named providers answer than when SuperGrok is in the roster — the
+	// width would jump between runs. The floor pins the common case at
+	// max(...) >= 4 + clineRowFixed + 9 = 58 columns; a name LONGER than the
+	// floor still widens every card of the render together (it is never
+	// truncated).
+	clineNameColMin = 9
 )
 
 // clineKey identifies one card: the provider (normalized provider key)
@@ -429,12 +455,17 @@ func containsString(list []string, s string) bool {
 	return false
 }
 
-// clineCardWidth is a card's width in display columns: the row's fixed
-// columns plus the LONGEST account name cell in the card (the name the row
-// actually shows — display name plus the 旧 marker, clineRowNameCell), so a
-// long name widens the card instead of being truncated. The title's own
+// clineCardWidth is the width ONE card NEEDS in display columns: the row's
+// fixed columns plus the LONGEST account name cell in the card (the name the
+// row actually shows — display name plus the 旧 marker, clineRowNameCell), so
+// a long name widens the card instead of being truncated. The title's own
 // needs are a floor, so a short account name can never squeeze the provider
 // + window title into an ellipsis.
+//
+// This is the card's own NEED, NOT the width it is rendered at: one render
+// gives every card the same width (cardWidth, the widest need of the whole
+// render), so the three providers' cards cannot come out at three different
+// widths.
 func clineCardWidth(g *clineGroup) int {
 	name := 0
 	for _, r := range g.rows {
@@ -449,12 +480,37 @@ func clineCardWidth(g *clineGroup) int {
 	return width
 }
 
-// renderGroupCard renders one (provider, window) card: the title (provider
-// display name + window label, never an account), one row per account, the
-// failure notes, and the bottom border. now is only needed by the rows'
-// countdown field (see clineCountdownField).
-func renderGroupCard(g *clineGroup, now time.Time, pal cardPalette) string {
-	width := clineCardWidth(g)
+// cardWidth is the ONE width, in display columns, that every card of ONE
+// render is laid out at: the widest card need the render contains
+// (clineCardWidth — the card's longest name cell plus the fixed row columns,
+// the title's own need included), floored by the name column's minimum
+// (clineNameColMin) so a render whose providers all answer with short
+// account names is exactly as wide as one that carries the longest known
+// name. The floor is a MINIMUM, never a cap: a name longer than it widens
+// every card of the render together, and no name column is ever truncated
+// (see clineRowLine).
+//
+// Iteration order is irrelevant: the result is a maximum over all groups,
+// and the groups of one render are exactly the cards it emits.
+func cardWidth(groups map[clineKey]*clineGroup) int {
+	width := 4 + clineRowFixed + clineNameColMin
+	for _, g := range groups {
+		if w := clineCardWidth(g); w > width {
+			width = w
+		}
+	}
+	return width
+}
+
+// renderGroupCard renders one (provider, window) card at the render's shared
+// width: the title (provider display name + window label, never an account),
+// one row per account, the failure notes, and the bottom border. now is only
+// needed by the rows' countdown field (see clineCountdownField).
+//
+// width is cardWidth's render-wide value, not this card's own need, so all
+// cards of the render — their borders, titles, rows and note lines alike —
+// start and end in the same columns.
+func renderGroupCard(g *clineGroup, width int, now time.Time, pal cardPalette) string {
 	lines := []string{cardTitleLineAt(width, g.profile, g.window, pal)}
 	for _, r := range g.rows {
 		lines = append(lines, clineRowLine(r, width, now, pal))
@@ -494,9 +550,11 @@ func clineRowNameCell(r clineRow) string {
 	return name
 }
 
-// clineRowLine renders one row. The account name is padded to the card's
-// name column, so the capsule, the percentage and the metric field of every
-// row start at the same column. The dot and the name share one color
+// clineRowLine renders one row at the render's shared width. The account name
+// is padded to that width's name column — the render-wide one (cardWidth),
+// NOT this card's own longest name — so the capsule, the percentage and the
+// metric field of every row start at the same column, on this card and on
+// every other card of the render. The dot and the name share one color
 // (accountColor of the account's fingerprint); with no usable fingerprint
 // the dot degrades to the plain · and the name stays plain. The row shows
 // the account's DISPLAY name (clineDisplayName) plus the 旧 marker of a
@@ -506,6 +564,13 @@ func clineRowNameCell(r clineRow) string {
 func clineRowLine(r clineRow, width int, now time.Time, pal cardPalette) string {
 	display := clineDisplayName(r)
 	cell := clineRowNameCell(r)
+	// The pad is what makes the name cell occupy the FULL render-wide name
+	// column (cardWidth >= this card's own need, so the cell always fits):
+	// the cell plus its padding are width-4-clineRowFixed columns wide, and
+	// the trailing space of the name segment is the pad's +1. The clamp is a
+	// guard only — a cell wider than the render width is what cardWidth
+	// exists to rule out — and it never truncates: the cell is written in
+	// full either way.
 	pad := width - 4 - clineRowFixed - render.DisplayWidth(cell)
 	if pad < 0 {
 		pad = 0
