@@ -351,8 +351,8 @@ func TestApplyClinePassEstimates(t *testing.T) {
 
 	cards := RenderCards([]Snapshot{got}, now, CardOptions{NoColor: true})
 	for _, want := range []string{
-		"100.0K/~1.2M",
-		"100.0K/~2.5M",
+		"100.0K/1.2M",
+		"100.0K/2.5M",
 	} {
 		if !strings.Contains(cards, want) {
 			t.Fatalf("cards missing %q:\n%s", want, cards)
@@ -407,11 +407,11 @@ func TestApplyClinePassEstimatesWeeklyResetFallsBackToMonthly(t *testing.T) {
 // L = tokens_m / (2 × frac_m), and BOTH rows are written from it.
 //
 // The point of the case is the drained week: because a pool IS derivable
-// (from the monthly), the drained weekly row must render that pool (X/~X),
+// (from the monthly), the drained weekly row must render that pool (X/X),
 // NOT the last-resort measured pair (T/T) that applies only when no pool can
-// be derived anywhere. The monthly row reads 2L/~2L: its displayPercent still
-// ceils 99.9 % to 100 %, so its used side equals its total — both sides carry
-// the "~" because the total is an inference.
+// be derived anywhere. The monthly row reads 2L/2L: its displayPercent still
+// ceils 99.9 % to 100 %, so its used side equals its total. No side carries a
+// "~" marker: the derived pool is written like any other total.
 func TestApplyClinePassEstimatesDrainedWeekAnchorsMonthly(t *testing.T) {
 	now := time.Date(2026, 10, 3, 7, 0, 0, 0, time.UTC)
 	startW := time.Date(2026, 10, 2, 6, 39, 0, 0, time.UTC)
@@ -423,8 +423,8 @@ func TestApplyClinePassEstimatesDrainedWeekAnchorsMonthly(t *testing.T) {
 	// 5M happens to equal L, which is what a drained week means.
 	// Monthly: 99.9 % used (UsedFraction set, Percent floored to 99) ⇒ partial,
 	// hence the only usable anchor: 9990000 / (2 × 0.999) = 5000000 = L. The
-	// pool is sized so BOTH sides fit the 13-column number field
-	// ("5.0M/~5.0M" = 10, "10.0M/~10.0M" = 12) instead of being truncated.
+	// pool is sized so BOTH sides fit the 13-column metric field
+	// ("5.0M/5.0M" = 9, "10.0M/10.0M" = 11) instead of being truncated.
 	snap := Snapshot{Provider: "clinepass", Windows: []Window{
 		{Name: "weekly", Status: "rate-limited", Percent: 100, PeriodStart: &startW, ResetsAt: &endW},
 		{Name: "monthly", Status: "ok", Percent: 99, UsedFraction: 0.999, PeriodStart: &startM, ResetsAt: &endM},
@@ -455,8 +455,8 @@ func TestApplyClinePassEstimatesDrainedWeekAnchorsMonthly(t *testing.T) {
 
 	cards := RenderCards([]Snapshot{got}, now, CardOptions{NoColor: true})
 	for _, want := range []string{
-		"5.0M/~5.0M",   // weekly: the derived pool, not the measured 5.0M/5.0M pair
-		"10.0M/~10.0M", // monthly: 2L, its used side ceiled to 100 %
+		"5.0M/5.0M",   // weekly: the derived pool, not the measured 5.0M/5.0M pair
+		"10.0M/10.0M", // monthly: 2L, its used side ceiled to 100 %
 	} {
 		if !strings.Contains(cards, want) {
 			t.Fatalf("cards missing %q:\n%s", want, cards)

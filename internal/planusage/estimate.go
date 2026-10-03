@@ -288,8 +288,8 @@ func ApplyGrokWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum,
 //
 // The 5-hour window is deliberately NOT estimated: it is a rolling rate
 // limit with its own percent, so reversing it would produce yet another
-// unrelated pool. Its card shows the reset countdown in place of the
-// token pair (see clineNumberField).
+// unrelated pool. Its card row shows the reset countdown in place of the
+// token pair (see clineMetricField).
 //
 // An exhausted window (frac >= 1) keeps the X/X wording from the derived
 // L (L/L, or 2L/2L for the monthly window). Only when there is no L at

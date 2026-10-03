@@ -65,13 +65,27 @@ func TestRenderCardsCuratedProviderOrder(t *testing.T) {
 			titles = append(titles, line)
 		}
 	}
-	want := []string{"╭─ Gemini ·", "╭─ ClinePass ·", "╭─ SuperGrok ·", "╭─ Opus a1 ·"}
+	// Every title is the provider + its window label: the ACCOUNT lives on the
+	// card's row (see RenderCards), never on the title.
+	want := []string{"╭─ Gemini ·", "╭─ ClinePass ·", "╭─ SuperGrok ·", "╭─ Opus ·"}
 	if len(titles) != len(want) {
 		t.Fatalf("got %d cards, want %d:\n%s", len(titles), len(want), got)
 	}
 	for i, prefix := range want {
 		if !strings.HasPrefix(titles[i], prefix) {
 			t.Fatalf("card %d = %q, want prefix %q:\n%s", i, titles[i], prefix, got)
+		}
+	}
+	// The rows still carry their accounts, in the same provider order.
+	var rows []string
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "│ · ") {
+			rows = append(rows, line)
+		}
+	}
+	for i, acc := range []string{"Gemini", "ClinePass", "SuperGrok", "a"} {
+		if i >= len(rows) || !strings.HasPrefix(rows[i], "│ · "+acc+" ") {
+			t.Fatalf("row %d = %q, want the account %q:\n%s", i, rows, acc, got)
 		}
 	}
 }

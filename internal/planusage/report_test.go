@@ -414,59 +414,114 @@ func TestRenderTableEmpty(t *testing.T) {
 	}
 }
 
-// ── card TUI tests (流光胶囊 / streaming capsule) ───────────────────────
+// ── unified quota card tests ─────────────────────────────────────────────
 //
-// These tests guard the layout invariants: every card line is EXACTLY 56
-// display columns (ANSI stripped) at every percentage the user can hit
-// (0, 1, 34, 59, 99, 100) and for the exhaustion paths (≥100 %, used up,
-// rate-limited); the capsule is ▰ (used) + ▱ (remaining) with a per-cell
-// green→yellow→red ramp and a solid red capsule for exhausted windows;
-// the title is plain-text service + plain-text account + plain-text window
-// label (no color, no bold) with a right-only dash fill; the account never
-// leaks into the bar or detail rows; no-color output is the same layout
-// minus the escapes; and no cycle dots are invented.
+// ONE layout for every provider: one card per (provider, window) group, one
+// ROW per account of that group. These tests guard it: the title is provider
+// + window label and NEVER an account, the row is
+//
+//	dot + name + capsule(23) + pct(4) + metric(13)
+//
+// every line of a card is exactly THAT card's width (the card is sized from
+// its longest account name cell and its title, so no name is truncated and
+// no border is ever pushed out), the capsule is ▰ (used) + ▱ (remaining) on a
+// per-cell green→yellow→red ramp with a solid red drained pill, the metric is
+// the smart single metric (countdown / used-total token pair / "-"), the
+// title text carries no color and no bold, and the account display name, the
+// row identity and the 旧 marker all survive the merge.
+//
+// The old two-row card (title account + 47-cell capsule + 已用/总额 detail row
+// + 已达限额 footer) is gone; the tests that pinned it were rewritten, so no
+// assertion of that layout survives here.
 
 const (
 	ansiBrandCyan = "\x1b[38;2;0;180;216m"
 	ansiGreen     = "\x1b[38;2;82;183;136m"
-	ansiYellow    = "\x1b[38;2;244;162;97m" // #F4A261: ramp stop + footer
+	ansiYellow    = "\x1b[38;2;244;162;97m" // #F4A261: a ramp stop
 	ansiRed       = "\x1b[38;2;230;57;70m"
 	ansiDim       = "\x1b[38;2;102;102;102m"
-	cardLineWidth = 56
-	cardBarCells  = 47 // capsule = cardInner(52) − indent(0) − pct(4) − gap(1)
 	ansiReset     = "\x1b[0m"
+	// cardCapCells is the capsule width the assertions talk about. It is
+	// clineCapCells: the card width itself is no longer a constant (see
+	// clineCardWidth), but the capsule still is.
+	cardCapCells = clineCapCells
 )
 
-// cardLines splits a card render into lines and asserts every non-empty
-// line is exactly cardLineWidth display columns wide (ANSI counted as 0).
-// Lines are returned ANSI-stripped.
+// cardLines splits a card render into ANSI-stripped lines and asserts that
+// every line of ONE card is exactly as wide as that card's own title. Cards
+// are separated by a blank line, which resets the expectation: the width is
+// derived per card from the longest account name cell and the title, so there
+// is no global card width any more.
 func cardLines(t *testing.T, got string) []string {
 	t.Helper()
 	raw := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
 	out := make([]string, 0, len(raw))
+	width := -1
 	for i, l := range raw {
 		if l == "" {
 			out = append(out, "")
-			continue // blank separator between cards
+			width = -1
+			continue
 		}
 		plain := render.StripANSI(l)
-		if w := render.DisplayWidth(plain); w != cardLineWidth {
-			t.Fatalf("line %d: width %d, want %d:\n%q", i, w, cardLineWidth, plain)
+		w := render.DisplayWidth(plain)
+		if width == -1 {
+			width = w
+		} else if w != width {
+			t.Fatalf("line %d: width %d, want the card's %d:\n%q", i, w, width, plain)
 		}
 		out = append(out, plain)
 	}
 	return out
 }
 
-// assertCardTitle checks a stripped title line: "╭─ <service> <account> ·
-// <window>" followed by one space, ONLY dash fill, then "╮". No left-side
-// fill, no ╶, and the window label is never truncated.
-func assertCardTitle(t *testing.T, line, service, account, window string) {
-	t.Helper()
-	head := "╭─ " + service
-	if account != "" {
-		head += " " + account
+// cardTitleLines returns the title line of every card of a render, in order.
+func cardTitleLines(lines []string) []string {
+	var out []string
+	for _, l := range lines {
+		if strings.HasPrefix(l, "╭─ ") {
+			out = append(out, l)
+		}
 	}
+	return out
+}
+
+// rowTail is the fixed right-hand end of a row: one space, the 4-column
+// right-aligned percentage, one space, the 13-column right-aligned metric,
+// one space and the right border. EVERY row ends with exactly this whatever
+// the account name is, which is what keeps the columns lined up down the card.
+func rowTail(pct, metric string) string {
+	return render.PadLeft(pct, clinePctWidth) + " " +
+		render.PadLeft(metric, clineNumberWidth) + " │"
+}
+
+// rowCapsule extracts one row's capsule: the run of ▰/▱ cells that follows
+// the account name.
+func rowCapsule(t *testing.T, row string) string {
+	t.Helper()
+	var b strings.Builder
+	for _, r := range row {
+		if r == '▰' || r == '▱' {
+			b.WriteRune(r)
+			continue
+		}
+		if b.Len() > 0 {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		t.Fatalf("no capsule in row: %q", row)
+	}
+	return b.String()
+}
+
+// assertCardTitle checks a stripped title line: "╭─ <provider> · <window>"
+// followed by one space, ONLY dash fill, then "╮". No left-side fill, no ╶,
+// and no account name (the row carries the account). An empty window means a
+// windowless card: no separator and no window label at all.
+func assertCardTitle(t *testing.T, line, provider, window string) {
+	t.Helper()
+	head := "╭─ " + provider
 	if window != "" {
 		head += " · " + window
 	}
@@ -487,19 +542,6 @@ func assertCardTitle(t *testing.T, line, service, account, window string) {
 	}
 }
 
-// barArea extracts the capsule zone (the last cardBarCells runes) of a
-// stripped bar row. Only ▰ and ▱ appear there. The trailing percentage
-// label is trimmed first, so the helper does not depend on the label's
-// width.
-func barArea(t *testing.T, row string) string {
-	t.Helper()
-	rest := []rune(strings.TrimRight(strings.TrimSuffix(row, " │"), " %0123456789"))
-	if len(rest) < cardBarCells {
-		t.Fatalf("row too short for a capsule: %q", row)
-	}
-	return string(rest[len(rest)-cardBarCells:])
-}
-
 func TestRenderCardsEmpty(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	if got := RenderCards(nil, now); got != "  没有套餐数据\n" {
@@ -517,16 +559,17 @@ func TestRenderCardsBasic(t *testing.T) {
 	}}, now)
 	lines := cardLines(t, got)
 
-	// Title: plain-text service + plain-text account + plain-text window
-	// label + right-only dash fill (no color and no bold on any of the
-	// title text, exactly like the usage report's card title).
-	assertCardTitle(t, lines[0], "Claude", "claude-main", "5小时限额")
+	// Title: plain-text provider + plain-text window label + right-only dash
+	// fill (no color and no bold on any of the title text, exactly like the
+	// usage report's card title). The ACCOUNT is not on it.
+	assertCardTitle(t, lines[0], "Claude", "5小时限额")
+	if strings.Contains(lines[0], "claude-main") {
+		t.Fatalf("the title must not carry an account name: %q", lines[0])
+	}
 	for _, bad := range []string{
 		"\x1b[1m",                            // bold
-		ansiBrandCyan + "Claude" + ansiReset, // colored service name
+		ansiBrandCyan + "Claude" + ansiReset, // colored provider name
 		ansiBrandCyan + "5小时限额" + ansiReset,  // colored window label
-		ansiDim + "claude-main" + ansiReset,  // colored account
-		ansiDim + " · " + ansiReset,          // colored separator
 	} {
 		if strings.Contains(got, bad) {
 			t.Fatalf("title text must stay unstyled, found %q:\n%q", bad, got)
@@ -540,64 +583,69 @@ func TestRenderCardsBasic(t *testing.T) {
 		t.Fatalf("left-side title fill artifact (╶) present:\n%q", got)
 	}
 
-	// Bar row: the capsule, one space, right-aligned percent.
+	// One account, one window: title + one data row + bottom border.
+	if len(lines) != 3 {
+		t.Fatalf("want 3 lines (title + row + border), got %d:\n%q", len(lines), lines)
+	}
 	row := lines[1]
-	if !strings.HasPrefix(row, "│ ") {
-		t.Fatalf("bar row must start with the border gutter (no indent of its own):\n%q", row)
+	if !strings.HasPrefix(row, "│ · claude-main ") {
+		t.Fatalf("the row must be dot + account name: %q", row)
 	}
-	if !strings.HasSuffix(row, " 59% │") {
-		t.Fatalf("bar row must end with the right-aligned pct:\n%q", row)
+	// The capsule's FILLED LENGTH is the used share: 59 % → 14 ▰ + 9 ▱.
+	bar := rowCapsule(t, row)
+	if n := strings.Count(bar, capUsed); n != 14 {
+		t.Fatalf("used cells = %d, want 14: %q", n, bar)
 	}
-	// The capsule's FILLED LENGTH is the used share: 59 % → 28 ▰ + 19 ▱.
-	bar := barArea(t, row)
-	if n := strings.Count(bar, capUsed); n != 28 {
-		t.Fatalf("used cells = %d, want 28: %q", n, bar)
+	if n := strings.Count(bar, capEmpty); n != cardCapCells-14 {
+		t.Fatalf("remaining cells = %d, want %d: %q", n, cardCapCells-14, bar)
 	}
-	if n := strings.Count(bar, capEmpty); n != cardBarCells-28 {
-		t.Fatalf("remaining cells = %d, want %d: %q", n, cardBarCells-28, bar)
+	if n := len([]rune(bar)); n != cardCapCells {
+		t.Fatalf("capsule width = %d, want %d: %q", n, cardCapCells, bar)
 	}
-	// The used run keeps the healthy band flat green; the rest is dim gray.
-	if !strings.Contains(got, ansiGreen+strings.Repeat(capUsed, 19)+ansiReset) {
+	// The healthy band is flat green up to the 40 % ramp stop (cells 0..8 for
+	// a 23-cell capsule); the rest is dim gray.
+	if !strings.Contains(got, ansiGreen+strings.Repeat(capUsed, 9)+ansiReset) {
 		t.Fatalf("flat green used run missing:\n%q", got)
 	}
-	if !strings.Contains(got, ansiDim+strings.Repeat(capEmpty, 19)+ansiReset) {
+	if !strings.Contains(got, ansiDim+strings.Repeat(capEmpty, 9)+ansiReset) {
 		t.Fatalf("dim remaining run missing:\n%q", got)
 	}
 	if strings.Contains(got, ansiRed) {
 		t.Fatalf("59 %% is not exhausted, red must not appear:\n%q", got)
 	}
-
-	// Detail row: used/total left, reset countdown right.
-	detail := lines[2]
-	if !strings.HasPrefix(detail, "│ 已用 59%") {
-		t.Fatalf("detail left text wrong:\n%q", detail)
-	}
-	if !strings.HasSuffix(detail, "2h 01m 后重置 │") {
-		t.Fatalf("detail right text wrong:\n%q", detail)
+	// Percentage and metric columns: 59 % and the reset countdown (a 5-hour
+	// window has no pool, so its metric IS the countdown).
+	if !strings.HasSuffix(row, rowTail("59%", "2h 01m 后重置")) {
+		t.Fatalf("row tail wrong:\n%q", row)
 	}
 
-	// No invented cycle dots, no exhausted footer.
+	// No invented cycle dots, no detail text, no 估算池 marker, no footer.
 	if strings.ContainsAny(got, "○●◆") {
 		t.Fatalf("cycle dots must not be fabricated:\n%q", got)
 	}
-	if strings.Contains(got, "已达限额") {
-		t.Fatalf("exhausted footer must not appear:\n%q", got)
+	for _, bad := range []string{"已达限额", "已用", "总额", "词元", "估算池", "~"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("the unified card must not carry %q:\n%q", bad, got)
+		}
 	}
-
-	// Bottom border: ╰ + 54 dashes + ╯.
+	// Bottom border: ╰ + width-2 dashes + ╯, the width being the card's own.
+	width := render.DisplayWidth(lines[0])
 	bottom := lines[len(lines)-1]
 	if !strings.HasPrefix(bottom, "╰") || !strings.HasSuffix(bottom, "╯") ||
-		strings.Count(bottom, "─") != cardLineWidth-2 {
+		strings.Count(bottom, "─") != width-2 {
 		t.Fatalf("bottom border malformed:\n%q", bottom)
+	}
+	if want := 4 + clineRowFixed + render.DisplayWidth("claude-main"); width != want {
+		t.Fatalf("card width = %d, want %d (row width): %q", width, want, lines[0])
 	}
 }
 
-// TestRenderCardsTitleTextIsPlainText locks the plain-text title
-// contract: in a COLORED render no title segment (service name, account,
-// " · " separator, window label) carries an escape, the only colored part
-// of the title line is the dim ╭─/─…╮ border, and the plain and colored
-// renders are byte identical once the escapes are stripped — so the
-// palette can never re-introduce color or bold into the card text.
+// TestRenderCardsTitleTextIsPlainText locks the plain-text title contract: in
+// a COLORED render no title segment (provider name, " · " separator, window
+// label) carries an escape, the only colored part of the title line is the
+// dim ╭─/─…╮ border, and the plain and colored renders are byte identical
+// once the escapes are stripped — so the palette can never re-introduce color
+// or bold into the card text.
 func TestRenderCardsTitleTextIsPlainText(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h2 := now.Add(2 * time.Hour)
@@ -610,20 +658,24 @@ func TestRenderCardsTitleTextIsPlainText(t *testing.T) {
 	plain := RenderCards(snaps, now, CardOptions{NoColor: true})
 
 	title := strings.SplitN(render.StripANSI(colored), "\n", 2)[0]
-	// Every title segment must appear in the colored render with no escape
-	// around it: the raw run sits directly in the escape-free text.
-	for _, seg := range []string{"Claude", "claude-main", " · ", "5小时限额"} {
+	for _, seg := range []string{"Claude", " · ", "5小时限额"} {
 		if !strings.Contains(title, seg) {
 			t.Fatalf("title segment %q missing from %q", seg, title)
 		}
 	}
-	rawTitle := strings.SplitN(colored, "\n", 2)[0]
+	// The card is as wide as its longest row: name cell(claude-main) + the
+	// fixed columns.
+	width := 4 + clineRowFixed + render.DisplayWidth("claude-main")
+	if got := render.DisplayWidth(title); got != width {
+		t.Fatalf("card width = %d, want %d: %q", got, width, title)
+	}
 	// The whole title line is pinned byte for byte: dim border, plain text,
 	// dim dash fill — and nothing else.
-	fill := cardLineWidth - 3 - 1 - render.DisplayWidth("Claude claude-main · 5小时限额") - 1
+	fill := width - 3 - 1 - render.DisplayWidth("Claude · 5小时限额") - 1
 	wantTitle := ansiDim + "╭─ " + ansiReset +
-		"Claude claude-main · 5小时限额" +
+		"Claude · 5小时限额" +
 		ansiDim + " " + strings.Repeat("─", fill) + "╮" + ansiReset
+	rawTitle := strings.SplitN(colored, "\n", 2)[0]
 	if rawTitle != wantTitle {
 		t.Fatalf("title line mismatch\n got: %q\nwant: %q", rawTitle, wantTitle)
 	}
@@ -643,58 +695,259 @@ func TestRenderCardsTitleTextIsPlainText(t *testing.T) {
 	cardLines(t, colored)
 }
 
-// TestRenderCardsCapsuleGeometry walks every percentage the user can hit
-// — including the exhausted paths and a sub-percent window refined through
-// UsedFraction — and checks the capsule length, the percentage label, the
-// detail text and the 56-column invariant in one go.
+// TestRenderCardsUnifiedSingleRowEveryProvider is the headline contract of
+// this change: Gemini, SuperGrok and ClinePass all render the ONE single-row
+// layout — a title carrying the provider and the window only, one row per
+// account starting with the dot and the account name, and title + N rows +
+// border lines — with no 已用/总额 detail text, no 估算池 marker, no "~" and
+// no 已达限额 footer anywhere.
+func TestRenderCardsUnifiedSingleRowEveryProvider(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(3*time.Hour + 12*time.Minute)
+	cases := []struct {
+		name   string
+		snap   Snapshot
+		title  string
+		head   string // row prefix: dot + account display name + space
+		tail   string // row tail: pct + metric
+		window string // window label on the title
+	}{
+		{
+			name: "gemini",
+			snap: Snapshot{Provider: "gemini", Accounts: []string{"gemini-acct"},
+				Windows: []Window{{Name: "5h", Status: "ok", Percent: 34, ResetsAt: &reset}}},
+			title:  "╭─ Gemini · 5小时限额 ",
+			window: "5小时限额",
+			head:   "│ · gemini-acct ",
+			tail:   rowTail("34%", "3h 12m 后重置"),
+		},
+		{
+			name: "supergrok",
+			snap: Snapshot{Provider: "xai", Accounts: []string{"grok-acct"},
+				Windows: []Window{{Name: "weekly", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}}},
+			title:  "╭─ SuperGrok · 周限额 ",
+			window: "周限额",
+			head:   "│ · grok-acct ",
+			tail:   rowTail("34%", "3.4M/10.0M"),
+		},
+		{
+			name: "clinepass",
+			snap: Snapshot{Provider: "clinepass", Accounts: []string{"cline-user"},
+				Windows: []Window{{Name: "monthly", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}}},
+			title:  "╭─ ClinePass · 月限额 ",
+			window: "月限额",
+			head:   "│ · cline-user ",
+			tail:   rowTail("34%", "3.4M/10.0M"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RenderCards([]Snapshot{tc.snap}, now, CardOptions{NoColor: true})
+			if n := strings.Count(got, "╭─ "); n != 1 {
+				t.Fatalf("want ONE card, got %d:\n%s", n, got)
+			}
+			if n := strings.Count(got, "╰"); n != 1 {
+				t.Fatalf("want ONE bottom border, got %d:\n%s", n, got)
+			}
+			lines := cardLines(t, got)
+			if len(lines) != 3 { // title + N(1) rows + border
+				t.Fatalf("want 3 lines (title + 1 row + border), got %d:\n%s", len(lines), got)
+			}
+			assertCardTitle(t, lines[0], providerDisplayName(tc.snap.Provider), tc.window)
+			if !strings.HasPrefix(lines[0], tc.title) {
+				t.Fatalf("title = %q, want prefix %q", lines[0], tc.title)
+			}
+			for _, acc := range tc.snap.Accounts {
+				if strings.Contains(lines[0], acc) {
+					t.Fatalf("the title must not carry the account %q: %q", acc, lines[0])
+				}
+			}
+			if !strings.HasPrefix(lines[1], tc.head) {
+				t.Fatalf("row = %q, want prefix %q", lines[1], tc.head)
+			}
+			if !strings.HasSuffix(lines[1], tc.tail) {
+				t.Fatalf("row = %q, want tail %q", lines[1], tc.tail)
+			}
+			// The old two-row card's vocabulary is gone for EVERY provider.
+			for _, bad := range []string{"已用", "总额", "词元", "估算池", "已达限额", "~"} {
+				if strings.Contains(got, bad) {
+					t.Fatalf("unified card must not carry %q:\n%s", bad, got)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderCardsGroupsAccountsIntoOneCard: the accounts of one provider +
+// window are ROWS of one card (N accounts of the group = N rows + the title
+// and the border), ordered like the rest of the report (by account name), and
+// every row keeps its OWN numbers in the shared columns.
+func TestRenderCardsGroupsAccountsIntoOneCard(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(72 * time.Hour)
+	pct := map[string]int{"gm-a": 20, "gm-b": 10, "gm-c": 30}
+	var snaps []Snapshot
+	for _, name := range []string{"gm-b", "gm-a", "gm-c"} { // deliberately unsorted
+		snaps = append(snaps, Snapshot{
+			Provider: "gemini",
+			Accounts: []string{name},
+			Windows: []Window{{
+				Name: "weekly", Status: "ok", Percent: pct[name],
+				LimitTokensEstimate: 10_000_000, ResetsAt: &reset,
+			}},
+		})
+	}
+	got := RenderCards(snaps, now, CardOptions{NoColor: true})
+	if n := strings.Count(got, "╭─ "); n != 1 {
+		t.Fatalf("want ONE card for the three accounts, got %d:\n%s", n, got)
+	}
+	lines := cardLines(t, got)
+	if len(lines) != 5 { // title + 3 rows + border
+		t.Fatalf("want 5 lines (title + 3 rows + border), got %d:\n%s", len(lines), got)
+	}
+	want := []struct{ name, pct, metric string }{
+		{"gm-a", "20%", "2.0M/10.0M"},
+		{"gm-b", "10%", "1.0M/10.0M"},
+		{"gm-c", "30%", "3.0M/10.0M"},
+	}
+	for i, w := range want {
+		row := lines[1+i]
+		if !strings.HasPrefix(row, "│ · "+w.name+" ") {
+			t.Fatalf("row %d = %q, want the dot + %q", i, row, w.name)
+		}
+		if !strings.HasSuffix(row, rowTail(w.pct, w.metric)) {
+			t.Fatalf("row %d = %q, want tail %q", i, row, rowTail(w.pct, w.metric))
+		}
+	}
+}
+
+// TestRenderCardsMetricField is the metric matrix — the smart single metric:
+//
+//   - a window without a pool (the 5-hour one, named "5h" or "rolling")
+//     shows the reset countdown, and "-" when the upstream reported no reset;
+//   - a weekly/monthly window shows used/total tokens with NO "~" marker,
+//     whether the total is the derived pool or the measured consumption;
+//   - a weekly/monthly window with no tokens at all falls back to the
+//     countdown when it has a reset instant, and reads "-" when it has
+//     neither;
+//   - a drained (100 %) token window is forced to X/X.
+func TestRenderCardsMetricField(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(3*time.Hour + 12*time.Minute)
+	past := now.Add(-time.Minute)
+	cases := []struct {
+		name   string
+		win    Window
+		pct    string
+		metric string
+		drain  bool
+	}{
+		{name: "5h countdown", win: Window{Name: "5h", Status: "ok", Percent: 34, ResetsAt: &reset},
+			pct: "34%", metric: "3h 12m 后重置"},
+		{name: "5h without reset", win: Window{Name: "5h", Status: "ok", Percent: 34},
+			pct: "34%", metric: "-"},
+		{name: "rolling is the 5h window too", win: Window{Name: "rolling", Status: "ok", Percent: 7, ResetsAt: &reset},
+			pct: "7%", metric: "3h 12m 后重置"},
+		{name: "5h after reset", win: Window{Name: "5h", Status: "ok", Percent: 7, ResetsAt: &past},
+			pct: "7%", metric: "已重置"},
+		{name: "weekly token pair", win: Window{Name: "weekly", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000},
+			pct: "34%", metric: "3.4M/10.0M"},
+		{name: "monthly measured pair", win: Window{Name: "monthly", Status: "ok", Percent: 50, MeasuredTokens: 4_000_000},
+			pct: "50%", metric: "2.0M/4.0M"},
+		{name: "weekly no data falls back to the countdown",
+			win: Window{Name: "weekly", Status: "ok", Percent: 34, ResetsAt: &reset},
+			pct: "34%", metric: "3h 12m 后重置"},
+		{name: "weekly with neither tokens nor reset",
+			win: Window{Name: "weekly", Status: "ok", Percent: 34},
+			pct: "34%", metric: "-"},
+		{name: "weekly drained", win: Window{Name: "weekly", Status: "used up", Percent: 100,
+			LimitTokensEstimate: 1_700_000_000, MeasuredTokens: 1_700_000_000},
+			pct: "100%", metric: "1.7B/1.7B", drain: true},
+		{name: "weekly drained measured only", win: Window{Name: "weekly", Status: "ok", Percent: 100,
+			MeasuredTokens: 4_200_000},
+			pct: "100%", metric: "4.2M/4.2M", drain: true},
+		// A drained 5-hour window has no token total to force: its own rule
+		// (countdown) wins, so it never claims an X/X it does not know.
+		{name: "5h drained keeps its countdown", win: Window{Name: "5h", Status: "rate-limited", Percent: 100, ResetsAt: &reset},
+			pct: "100%", metric: "3h 12m 后重置", drain: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RenderCards([]Snapshot{{
+				Provider: "gemini",
+				Accounts: []string{"gemini"},
+				Windows:  []Window{tc.win},
+			}}, now, CardOptions{NoColor: true})
+			lines := cardLines(t, got)
+			if len(lines) != 3 {
+				t.Fatalf("want 3 lines, got %d:\n%s", len(lines), got)
+			}
+			if !strings.HasSuffix(lines[1], rowTail(tc.pct, tc.metric)) {
+				t.Fatalf("row = %q, want tail %q", lines[1], rowTail(tc.pct, tc.metric))
+			}
+			if strings.Contains(got, "~") {
+				t.Fatalf("the token pair must not carry a ~ marker:\n%s", got)
+			}
+			used := strings.Count(rowCapsule(t, lines[1]), capUsed)
+			if tc.drain {
+				if used != cardCapCells {
+					t.Fatalf("a drained window must draw a solid capsule, got %d cells:\n%s", used, got)
+				}
+			}
+		})
+	}
+
+	// The drained capsule is RED (in color mode), the drain signal the metric
+	// and the percentage share.
+	colored := RenderCards([]Snapshot{{
+		Provider: "gemini",
+		Accounts: []string{"gemini"},
+		Windows:  []Window{{Name: "weekly", Status: "used up", Percent: 100, MeasuredTokens: 4_200_000}},
+	}}, now)
+	if !strings.Contains(colored, ansiRed+strings.Repeat(capUsed, cardCapCells)+ansiReset) {
+		t.Fatalf("drained capsule must be solid red:\n%q", colored)
+	}
+}
+
+// TestRenderCardsCapsuleGeometry walks every percentage the user can hit —
+// including the exhausted paths and a sub-percent window refined through
+// UsedFraction — and checks the capsule length, the percentage label and the
+// per-card width invariant in one go.
 func TestRenderCardsCapsuleGeometry(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h := now.Add(3*time.Hour + 12*time.Minute)
 	cases := []struct {
-		name        string
-		win         Window
-		wantUsed    int
-		wantPct     string
-		wantDetail  string
-		wantExhaust bool
+		name    string
+		win     Window
+		wantUse int
+		wantPct string
 	}{{
 		name: "zero", win: Window{Percent: 0},
-		wantUsed: 0, wantPct: "  0%", wantDetail: "已用 0%",
+		wantUse: 0, wantPct: "  0%",
 	}, {
 		name: "one", win: Window{Percent: 1},
-		wantUsed: 1, wantPct: "  1%", wantDetail: "已用 1%",
+		wantUse: 1, wantPct: "  1%",
 	}, {
 		name: "thirty-four", win: Window{Percent: 34},
-		wantUsed: 16, wantPct: " 34%", wantDetail: "已用 34%",
+		wantUse: 8, wantPct: " 34%",
 	}, {
 		name: "fifty-nine", win: Window{Percent: 59},
-		wantUsed: 28, wantPct: " 59%", wantDetail: "已用 59%",
+		wantUse: 14, wantPct: " 59%",
 	}, {
 		name: "ninety-nine", win: Window{Percent: 99},
-		wantUsed: 47, wantPct: " 99%", wantDetail: "已用 99%",
+		wantUse: cardCapCells, wantPct: " 99%",
 	}, {
 		name: "hundred", win: Window{Percent: 100},
-		wantUsed: 47, wantPct: "100%", wantDetail: "已用 100%", wantExhaust: true,
+		wantUse: cardCapCells, wantPct: "100%",
 	}, {
 		name: "used up", win: Window{Status: "used up", Percent: 100},
-		wantUsed: 47, wantPct: "100%", wantDetail: "已耗尽 100%", wantExhaust: true,
+		wantUse: cardCapCells, wantPct: "100%",
 	}, {
 		name: "rate limited", win: Window{Status: "rate-limited", Percent: 40},
-		wantUsed: 47, wantPct: " 40%", wantDetail: "限流 40%", wantExhaust: true,
+		wantUse: cardCapCells, wantPct: " 40%",
 	}, {
 		name: "sub-percent fraction", win: Window{Percent: 0, UsedFraction: 0.004},
-		wantUsed: 1, wantPct: "  1%", wantDetail: "已用 1%",
-	}, {
-		name: "token pool", win: Window{Percent: 34, LimitTokensEstimate: 3_500_000},
-		wantUsed: 16, wantPct: " 34%", wantDetail: "已用 34% / 总额 3.5M 词元",
-	}, {
-		// A billion-plus pool carries past M: the card shows 4.6B instead
-		// of the wide "4557.8M" the M-only formatter produced.
-		name: "large token pool", win: Window{Percent: 34, LimitTokensEstimate: 4_557_800_000},
-		wantUsed: 16, wantPct: " 34%", wantDetail: "已用 34% / 总额 4.6B 词元",
-	}, {
-		name: "dollar estimate", win: Window{Percent: 12, LimitUSDEstimate: 60, USDStatus: "estimated"},
-		wantUsed: 6, wantPct: " 12%", wantDetail: "额度 12% / $60.00",
+		wantUse: 1, wantPct: "  1%",
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -706,33 +959,20 @@ func TestRenderCardsCapsuleGeometry(t *testing.T) {
 				Accounts: []string{"claude-main"},
 				Windows:  []Window{w},
 			}}, now)
-			// Every line — colored or not — is exactly 56 columns.
+			// Every line — colored or not — is the card's own width.
 			lines := cardLines(t, got)
-			wantLines := 4 // title, bar, detail, bottom
-			if tc.wantExhaust {
-				wantLines++ // the 已达限额 footer
+			if len(lines) != 3 {
+				t.Fatalf("the old extra rows are gone: want 3 lines, got %d:\n%q", len(lines), lines)
 			}
-			if len(lines) != wantLines {
-				t.Fatalf("want %d lines, got %d:\n%q", wantLines, len(lines), lines)
+			bar := rowCapsule(t, lines[1])
+			if n := strings.Count(bar, capUsed); n != tc.wantUse {
+				t.Fatalf("used cells = %d, want %d: %q", n, tc.wantUse, bar)
 			}
-			bar := barArea(t, lines[1])
-			if n := strings.Count(bar, capUsed); n != tc.wantUsed {
-				t.Fatalf("used cells = %d, want %d: %q", n, tc.wantUsed, bar)
+			if n := strings.Count(bar, capEmpty); n != cardCapCells-tc.wantUse {
+				t.Fatalf("remaining cells = %d, want %d: %q", n, cardCapCells-tc.wantUse, bar)
 			}
-			if n := strings.Count(bar, capEmpty); n != cardBarCells-tc.wantUsed {
-				t.Fatalf("remaining cells = %d, want %d: %q", n, cardBarCells-tc.wantUsed, bar)
-			}
-			if !strings.HasSuffix(strings.TrimSuffix(lines[1], " │"), tc.wantPct) {
-				t.Fatalf("pct label = %q, want %q", lines[1], tc.wantPct)
-			}
-			if !strings.HasPrefix(strings.TrimPrefix(lines[2], "│ "), tc.wantDetail) {
-				t.Fatalf("detail = %q, want %q", lines[2], tc.wantDetail)
-			}
-			if !strings.HasSuffix(lines[2], "3h 12m 后重置 │") {
-				t.Fatalf("reset countdown missing: %q", lines[2])
-			}
-			if tc.wantExhaust && !strings.Contains(lines[3], "已达限额") {
-				t.Fatalf("exhausted window needs the footer: %q", lines[3])
+			if !strings.HasSuffix(lines[1], rowTail(tc.wantPct, "3h 12m 后重置")) {
+				t.Fatalf("row = %q, want tail %q", lines[1], rowTail(tc.wantPct, "3h 12m 后重置"))
 			}
 			// The colors off render must be the same layout, escapes stripped.
 			plain := RenderCards([]Snapshot{{
@@ -741,7 +981,8 @@ func TestRenderCardsCapsuleGeometry(t *testing.T) {
 				Windows:  []Window{w},
 			}}, now, CardOptions{NoColor: true})
 			if render.StripANSI(got) != plain {
-				t.Fatalf("no-color render is not the colored render minus escapes:\ngot:\n%q\nwant:\n%q", plain, render.StripANSI(got))
+				t.Fatalf("no-color render is not the colored render minus escapes:\ngot:\n%q\nwant:\n%q",
+					plain, render.StripANSI(got))
 			}
 			if strings.Contains(plain, "\x1b") {
 				t.Fatalf("no-color render still carries escapes:\n%q", plain)
@@ -750,34 +991,39 @@ func TestRenderCardsCapsuleGeometry(t *testing.T) {
 	}
 }
 
-// TestRenderCardsAllRowsWidthAtEveryPercent is the user's headline
-// complaint — "边框被顶出、表格错位". It renders one snapshot that carries
-// every percentage and every exhaustion path at once, in both color modes,
-// and asserts EVERY line is exactly cardWidth columns.
+// TestRenderCardsAllRowsWidthAtEveryPercent is the user's headline complaint —
+// "边框被顶出、表格错位". It renders every percentage and every exhaustion path
+// at once — colored and not — and asserts EVERY line of every card is exactly
+// that card's width, plus the card count (a windowless snapshot and a
+// windowless unknown provider each keep ONE card).
 func TestRenderCardsAllRowsWidthAtEveryPercent(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h := now.Add(3*time.Hour + 12*time.Minute)
-	windows := []Window{
-		{Name: "rolling", Percent: 0, ResetsAt: &h},
-		{Name: "weekly", Percent: 1, ResetsAt: &h},
-		{Name: "monthly", Percent: 34, ResetsAt: &h, LimitTokensEstimate: 3_500_000},
-		{Name: "rolling", Percent: 59, ResetsAt: &h, UsedFraction: 0.594},
-		{Name: "weekly", Percent: 99, ResetsAt: &h},
-		{Name: "monthly", Status: "used up", Percent: 100, ResetsAt: &h},
-		{Name: "rolling", Status: "rate-limited", Percent: 40, ResetsAt: &h},
-		{Name: "weekly", Status: "ok", Percent: 12, LimitUSDEstimate: 60, USDStatus: "estimated"},
-		{Name: "weird-upstream-name", Status: "ok", Percent: 7},
+	window := func(name string, w Window) Window {
+		w.Name = name
+		if w.ResetsAt == nil {
+			w.ResetsAt = &h
+		}
+		return w
 	}
 	snaps := []Snapshot{
-		{Provider: "gemini", Accounts: []string{"gemini-acct-1"}, Windows: windows},
-		{Provider: "xai", Accounts: []string{"acct-1"}, Err: "fetch_failed", Windows: windows},
+		{Provider: "gemini", Accounts: []string{"gemini-acct"}, Windows: []Window{
+			window("rolling", Window{Status: "ok", Percent: 0}),
+			window("weekly", Window{Status: "ok", Percent: 1}),
+			window("monthly", Window{Status: "ok", Percent: 34, LimitTokensEstimate: 3_500_000}),
+			window("weird-upstream-name", Window{Status: "ok", Percent: 7}),
+		}},
+		{Provider: "xai", Accounts: []string{"acct"}, Err: "fetch_failed", Windows: []Window{
+			window("weekly", Window{Status: "ok", Percent: 99}),
+			window("monthly", Window{Status: "used up", Percent: 100, LimitTokensEstimate: 3_500_000}),
+		}},
 		{Provider: "opencode-go", Accounts: []string{"a1"}, Err: "unauthorized"},
 		{Provider: "unknown-provider", Accounts: nil, Stale: true},
 	}
 	for _, noColor := range []bool{false, true} {
 		got := RenderCards(snaps, now, CardOptions{NoColor: noColor})
 		lines := cardLines(t, got)
-		wantCards := len(windows)*2 + 2 // 2 accounts with windows + 2 empty ones
+		wantCards := 4 + 2 + 1 + 1 // gemini's four windows, xai's two, two windowless
 		if n := strings.Count(got, "╭─ "); n != wantCards {
 			t.Fatalf("noColor=%v: got %d cards, want %d:\n%s", noColor, n, wantCards, got)
 		}
@@ -787,9 +1033,9 @@ func TestRenderCardsAllRowsWidthAtEveryPercent(t *testing.T) {
 	}
 }
 
-// TestRenderCardsNoColorStripsEverything renders a mixed snapshot with
-// colors off and asserts not a single escape survives while the layout
-// stays identical to the colored render.
+// TestRenderCardsNoColorStripsEverything renders a mixed snapshot with colors
+// off and asserts not a single escape survives while the layout stays
+// identical to the colored render.
 func TestRenderCardsNoColorStripsEverything(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h := now.Add(3*time.Hour + 12*time.Minute)
@@ -816,38 +1062,48 @@ func TestRenderCardsNoColorStripsEverything(t *testing.T) {
 	cardLines(t, plain)
 }
 
+// TestRenderCardsExhausted: a drained window shows the solid red capsule, the
+// 100 % percentage and the X/X pair — and NOTHING else. The 已达限额 footer is
+// gone, so the yellow (#F4A261) the footer used never reaches a card.
 func TestRenderCardsExhausted(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	got := RenderCards([]Snapshot{{
 		Provider: "xai",
 		Accounts: []string{"acct-1"},
-		Windows:  []Window{{Name: "weekly", Status: "used up", Percent: 100}},
+		Windows: []Window{{
+			Name: "weekly", Status: "used up", Percent: 100,
+			LimitTokensEstimate: 1_700_000_000, MeasuredTokens: 1_700_000_000,
+		}},
 	}}, now)
 	lines := cardLines(t, got)
+	if len(lines) != 3 {
+		t.Fatalf("want 3 lines (no footer any more), got %d:\n%q", len(lines), lines)
+	}
 
-	// The whole capsule is one solid red ▰ run — a drained pill, not a
-	// hollow one: hollow would read as "nothing used", the opposite of an
-	// exhausted window.
+	// The whole capsule is one solid red ▰ run — a drained pill, not a hollow
+	// one: hollow would read as "nothing used", the opposite of an exhausted
+	// window.
 	row := lines[1]
-	if n := strings.Count(row, capUsed); n != cardBarCells {
-		t.Fatalf("solid red cells = %d, want %d:\n%q", n, cardBarCells, row)
+	if n := strings.Count(row, capUsed); n != cardCapCells {
+		t.Fatalf("solid red cells = %d, want %d:\n%q", n, cardCapCells, row)
 	}
 	if strings.ContainsAny(row, capEmpty) {
 		t.Fatalf("exhausted capsule must be solid:\n%q", row)
 	}
-	if !strings.Contains(got, ansiRed+strings.Repeat(capUsed, cardBarCells)+ansiReset) {
+	if !strings.Contains(got, ansiRed+strings.Repeat(capUsed, cardCapCells)+ansiReset) {
 		t.Fatalf("red ANSI capsule missing:\n%q", got)
 	}
-	if !strings.Contains(lines[2], "已耗尽 100%") {
-		t.Fatalf("detail '已耗尽 100%%' missing:\n%q", lines[2])
+	// The drain state is spelled by the percentage and the X/X pair.
+	if !strings.HasSuffix(row, rowTail("100%", "1.7B/1.7B")) {
+		t.Fatalf("drained row tail wrong:\n%q", row)
 	}
-
-	// Footer: #F4A261 已达限额.
-	if !strings.Contains(got, ansiYellow+"已达限额"+ansiReset) {
-		t.Fatalf("#F4A261 footer missing:\n%q", got)
+	for _, bad := range []string{"已达限额", "已耗尽", "限流", "总额"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("the drain state must not be spelled with %q:\n%q", bad, got)
+		}
 	}
-	if lines[3] == "" || !strings.HasPrefix(lines[3], "│ 已达限额") {
-		t.Fatalf("footer row malformed:\n%q", lines[3])
+	if strings.Contains(got, ansiYellow) {
+		t.Fatalf("the yellow footer is gone, its color must not appear on a drained card:\n%q", got)
 	}
 }
 
@@ -856,54 +1112,45 @@ func TestRenderCardsRateLimited(t *testing.T) {
 	h2 := now.Add(2*time.Hour + 1*time.Minute)
 	got := RenderCards([]Snapshot{{
 		Provider: "xai",
-		Accounts: []string{"acct-2"},
+		Accounts: []string{"acct"},
 		Windows:  []Window{{Name: "5h", Status: "rate-limited", Percent: 50, ResetsAt: &h2}},
 	}}, now)
 	lines := cardLines(t, got)
-
-	// The detail row must not lie with "remains" for a rate-limited window.
-	detail := lines[2]
-	if !strings.Contains(detail, "限流 50%") {
-		t.Fatalf("detail '限流 50%%' missing for rate-limited:\n%q", detail)
+	if len(lines) != 3 {
+		t.Fatalf("want 3 lines, got %d:\n%q", len(lines), lines)
 	}
-	if strings.Contains(detail, "remains") {
-		t.Fatalf("rate-limited window must not claim 'remains':\n%q", detail)
-	}
-	// Same determination as the footer: solid red capsule, and the honest
-	// percentage stays visible next to it.
-	if !strings.Contains(got, ansiRed+strings.Repeat(capUsed, cardBarCells)+ansiReset) {
+	// Same determination as the drained token window: a solid red capsule and
+	// the honest percentage next to it, with the 5-hour window's countdown in
+	// the metric column.
+	if !strings.Contains(got, ansiRed+strings.Repeat(capUsed, cardCapCells)+ansiReset) {
 		t.Fatalf("rate-limited capsule must be solid red:\n%q", got)
 	}
-	if !strings.HasSuffix(detail, "2h 01m 后重置 │") {
-		t.Fatalf("rate-limited pct missing:\n%q", detail)
+	if !strings.HasSuffix(lines[1], rowTail("50%", "2h 01m 后重置")) {
+		t.Fatalf("rate-limited row tail wrong:\n%q", lines[1])
 	}
-	// Reset countdown still shown (ResetsAt exists).
-	if !strings.HasSuffix(lines[2], "2h 01m 后重置 │") {
-		t.Fatalf("countdown missing for rate-limited:\n%q", lines[2])
-	}
-	if !strings.Contains(got, "已达限额") {
-		t.Fatalf("rate-limited must trigger the exhausted footer:\n%q", got)
+	if strings.Contains(got, "已达限额") || strings.Contains(lines[1], "限流") {
+		t.Fatalf("rate-limited window must not claim a footer or a status word:\n%q", got)
 	}
 }
 
 // The capsule ramp's stop boundaries, its monotonicity and the shared cell
-// arithmetic now live with the implementation itself, in
+// arithmetic live with the implementation itself, in
 // internal/render/capsule_test.go (TestCapsuleRampBoundaries,
-// TestCapsuleUsedCells, TestCapsuleLevel). The tests below pin what the
-// QUOTA cards do with the shared primitive: the direction of the gradient
-// (a consumed share warms toward red), the level arithmetic bound to the
-// 47-cell card geometry, and the exhausted paths.
+// TestCapsuleUsedCells, TestCapsuleLevel). The tests below pin what the QUOTA
+// cards do with the shared primitive: the direction of the gradient (a
+// consumed share warms toward red) over the card's own 23-cell capsule.
 
-// TestCapsuleGradientInBar checks that the ramp really reaches the
-// rendered capsule: a healthy bar is flat green, a nearly-full bar warms
-// from green to red cell by cell.
+// TestCapsuleGradientInBar checks that the ramp really reaches the rendered
+// capsule: a healthy bar is flat green, a nearly-full bar warms from green to
+// red cell by cell. The ramp stops at 40 % (green) and 100 % (red), and a
+// 23-cell capsule puts the first cell at ~4 % and the last at 100 %.
 func TestCapsuleGradientInBar(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	low := RenderCards([]Snapshot{
 		{Provider: "gemini", Accounts: []string{"a"}, Windows: []Window{{Name: "5h", Percent: 34}}},
 	}, now)
-	if !strings.Contains(low, ansiGreen+strings.Repeat(capUsed, 16)+ansiReset) {
-		t.Fatalf("34%% must be one flat green run:\n%q", low)
+	if !strings.Contains(low, ansiGreen+strings.Repeat(capUsed, 8)+ansiReset) {
+		t.Fatalf("34%% must be one flat green run (8 cells):\n%q", low)
 	}
 	if strings.Contains(low, ansiRed) || strings.Contains(low, ansiYellow) {
 		t.Fatalf("34%% must stay in the green band:\n%q", low)
@@ -912,22 +1159,21 @@ func TestCapsuleGradientInBar(t *testing.T) {
 	high := RenderCards([]Snapshot{
 		{Provider: "gemini", Accounts: []string{"a"}, Windows: []Window{{Name: "5h", Percent: 99}}},
 	}, now)
-	if !strings.Contains(high, ansiGreen+strings.Repeat(capUsed, 19)+ansiReset) {
-		t.Fatalf("99%% must start flat green:\n%q", high)
+	if !strings.Contains(high, ansiGreen+strings.Repeat(capUsed, 9)+ansiReset) {
+		t.Fatalf("99%% must start flat green (9 cells):\n%q", high)
 	}
 	if !strings.Contains(high, ansiRed+capUsed+ansiReset) {
 		t.Fatalf("99%% must reach red on its last cell:\n%q", high)
 	}
 	// The used cells must carry more than one distinct color: the gradient
 	// is per cell, not one flat color for the whole bar.
-	runs := strings.Count(high, "\x1b[38;2;")
-	if runs < 5 {
+	if runs := strings.Count(high, "\x1b[38;2;"); runs < 5 {
 		t.Fatalf("99%% capsule has %d color runs, want a per-cell gradient", runs)
 	}
 }
 
 // TestCapsuleGlyphWidth guards the capsule's cell arithmetic: ▰ and ▱ are
-// both exactly one display column.
+// both exactly one display column, and the card capsule is 23 of them.
 func TestCapsuleGlyphWidth(t *testing.T) {
 	if w := render.DisplayWidth(capUsed); w != 1 {
 		t.Errorf("DisplayWidth(%q) = %d, want 1", capUsed, w)
@@ -935,88 +1181,61 @@ func TestCapsuleGlyphWidth(t *testing.T) {
 	if w := render.DisplayWidth(capEmpty); w != 1 {
 		t.Errorf("DisplayWidth(%q) = %d, want 1", capEmpty, w)
 	}
-	if w := render.DisplayWidth(strings.Repeat(capUsed, cardBarCells)); w != cardBarCells {
-		t.Errorf("capsule width = %d, want %d", w, cardBarCells)
+	if w := render.DisplayWidth(strings.Repeat(capUsed, cardCapCells)); w != cardCapCells {
+		t.Errorf("capsule width = %d, want %d", w, cardCapCells)
 	}
 }
 
-// TestCapsuleUsedCells locks ceil(pct/100 * barCells) with clamping.
-func TestCapsuleUsedCells(t *testing.T) {
-	cases := []struct{ pct, want int }{
-		{-10, 0}, {0, 0}, {1, 1}, {2, 1}, {3, 2},
-		{34, 16}, {50, 24}, {59, 28}, {98, 47}, {99, 47}, {100, 47}, {140, 47},
-	}
-	for _, tc := range cases {
-		if got := capsuleUsedCells(tc.pct); got != tc.want {
-			t.Errorf("capsuleUsedCells(%d) = %d, want %d", tc.pct, got, tc.want)
-		}
-	}
-}
-
-// TestCapsuleLevel covers the per-cell level the ramp is evaluated at.
-func TestCapsuleLevel(t *testing.T) {
-	if got := capsuleLevel(0); got != 2 {
-		t.Errorf("capsuleLevel(0) = %d, want 2 (100/47)", got)
-	}
-	if got := capsuleLevel(cardBarCells - 1); got != 100 {
-		t.Errorf("capsuleLevel(last) = %d, want 100", got)
-	}
-}
-
-// TestRenderCardsWindowCards checks that one window is one card: every
-// window gets its own title (with its own window label), its own capsule
-// and its own detail row, and the account never leaks into a row.
+// TestRenderCardsWindowCards checks that one (provider, window) group is one
+// card: every window gets its own title (with its own window label), its own
+// row and its own metric, and the account travels with its row.
 func TestRenderCardsWindowCards(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h := now.Add(3*time.Hour + 12*time.Minute)
 	w := now.Add(49 * time.Hour)
 	got := RenderCards([]Snapshot{{
 		Provider: "gemini",
-		Accounts: []string{"gemini-acct-1"},
+		Accounts: []string{"gemini"},
 		Windows: []Window{
 			{Name: "5h", Status: "ok", Percent: 34, ResetsAt: &h},
 			{Name: "weekly", Status: "ok", Percent: 94, LimitTokensEstimate: 3_500_000, ResetsAt: &w},
 		},
 	}}, now)
 	lines := cardLines(t, got)
-	if len(lines) != 9 { // 2 cards × 4 lines + 1 blank separator
-		t.Fatalf("want 9 lines, got %d:\n%q", len(lines), lines)
+	if len(lines) != 7 { // 2 cards × 3 lines + 1 blank separator
+		t.Fatalf("want 7 lines, got %d:\n%q", len(lines), lines)
 	}
-	assertCardTitle(t, lines[0], "Gemini", "gemini-acct-1", "5小时限额")
-	assertCardTitle(t, lines[5], "Gemini", "gemini-acct-1", "周限额")
+	assertCardTitle(t, lines[0], "Gemini", "5小时限额")
+	assertCardTitle(t, lines[4], "Gemini", "周限额")
 
+	// 34 % → 8 ▰ of the 23-cell capsule, and the 5-hour metric is the
+	// countdown (no pool on that window).
 	five := lines[1]
-	if n := strings.Count(barArea(t, five), capUsed); n != 16 {
-		t.Fatalf("5h used cells = %d, want 16:\n%q", n, five)
+	if n := strings.Count(rowCapsule(t, five), capUsed); n != 8 {
+		t.Fatalf("5h used cells = %d, want 8:\n%q", n, five)
 	}
-	if !strings.HasSuffix(five, " 34% │") {
-		t.Fatalf("5h pct wrong:\n%q", five)
+	if !strings.HasSuffix(five, rowTail("34%", "3h 12m 后重置")) {
+		t.Fatalf("5h row tail wrong:\n%q", five)
 	}
-	if !strings.HasPrefix(strings.TrimPrefix(lines[2], "│ "), "已用 34%") {
-		t.Fatalf("5h detail wrong:\n%q", lines[2])
+	// 94 % → 22 ▰, and the weekly metric is the token pair (no "~").
+	weekly := lines[5]
+	if n := strings.Count(rowCapsule(t, weekly), capUsed); n != 22 {
+		t.Fatalf("weekly used cells = %d, want 22:\n%q", n, weekly)
 	}
-
-	weekly := lines[6]
-	if n := strings.Count(barArea(t, weekly), capUsed); n != 45 {
-		t.Fatalf("weekly used cells = %d, want 45:\n%q", n, weekly)
-	}
-	if !strings.HasSuffix(weekly, " 94% │") {
-		t.Fatalf("weekly pct wrong:\n%q", weekly)
-	}
-	if !strings.HasPrefix(strings.TrimPrefix(lines[7], "│ "), "已用 94% / 总额 3.5M 词元") {
-		t.Fatalf("weekly detail wrong:\n%q", lines[7])
-	}
-	if !strings.HasSuffix(lines[7], "2d 1h 后重置 │") {
-		t.Fatalf("weekly reset wrong:\n%q", lines[7])
+	if !strings.HasSuffix(weekly, rowTail("94%", "3.3M/3.5M")) {
+		t.Fatalf("weekly row tail wrong:\n%q", weekly)
 	}
 
-	// The account identifier never leaks into a card row (the titles are
-	// the only place it belongs).
-	for _, l := range lines[1:] {
-		if !strings.HasPrefix(l, "╭─ ") && strings.Contains(l, "gemini-acct-1") {
-			t.Fatalf("account leaked into a card row:\n%q", l)
+	// The account identifier is on the ROW of every card and never on a title.
+	if n := strings.Count(got, "gemini"); n != 2 {
+		t.Fatalf("the account must appear once per row, got %d:\n%s", n, got)
+	}
+	for _, title := range cardTitleLines(lines) {
+		if strings.Contains(title, "gemini") {
+			t.Fatalf("account leaked onto a title:\n%q", title)
 		}
 	}
+
 	// 94 % is NOT exhausted: no red capsule, no footer, no cycle dots.
 	if strings.Contains(got, ansiRed) || strings.Contains(got, "已达限额") {
 		t.Fatalf("94%% must not look exhausted:\n%q", got)
@@ -1026,8 +1245,9 @@ func TestRenderCardsWindowCards(t *testing.T) {
 	}
 }
 
-// TestRenderCardsZeroUsedWindow: 0 % used draws an all-hollow capsule —
-// the value is readable from the capsule's length alone.
+// TestRenderCardsZeroUsedWindow: 0 % used draws an all-hollow capsule — the
+// value is readable from the capsule's length alone — and a window with no
+// reset instant reads "-" in the metric column.
 func TestRenderCardsZeroUsedWindow(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	got := RenderCards([]Snapshot{{
@@ -1036,151 +1256,77 @@ func TestRenderCardsZeroUsedWindow(t *testing.T) {
 		Windows:  []Window{{Name: "5h", Status: "ok", Percent: 0}},
 	}}, now)
 	lines := cardLines(t, got)
-	bar := barArea(t, lines[1])
+	bar := rowCapsule(t, lines[1])
 	if n := strings.Count(bar, capUsed); n != 0 {
 		t.Fatalf("0%% used must draw no ▰ at all, got %d: %q", n, bar)
 	}
-	if n := strings.Count(bar, capEmpty); n != cardBarCells {
-		t.Fatalf("remaining cells = %d, want %d: %q", n, cardBarCells, bar)
+	if n := strings.Count(bar, capEmpty); n != cardCapCells {
+		t.Fatalf("remaining cells = %d, want %d: %q", n, cardCapCells, bar)
 	}
-	if !strings.Contains(got, ansiDim+strings.Repeat(capEmpty, cardBarCells)+ansiReset) {
+	if !strings.Contains(got, ansiDim+strings.Repeat(capEmpty, cardCapCells)+ansiReset) {
 		t.Fatalf("the whole capsule must be dim gray:\n%q", got)
 	}
-	if !strings.HasSuffix(lines[2], "- │") {
-		t.Fatalf("no ResetsAt must render the '-' placeholder:\n%q", lines[2])
+	// No ResetsAt and no pool: the metric is the honest "-".
+	if !strings.HasSuffix(lines[1], rowTail("0%", "-")) {
+		t.Fatalf("no ResetsAt must render the '-' placeholder:\n%q", lines[1])
 	}
 }
 
-// TestRenderCardsTitleDeduplicatesServiceAndAccount: when the account name
-// is exactly the provider display name, the title carries the name ONCE
-// ("Gemini · 5小时限额") instead of the redundant "Gemini Gemini". An account
-// that differs from the service keeps the usual service + account pair, both
-// plain text.
-func TestRenderCardsTitleDeduplicatesServiceAndAccount(t *testing.T) {
+// TestRenderCardsTitleNeverCarriesAccount is the title half of the unified
+// contract: an account name — short, equal to the provider display name, or
+// very long — is NEVER a title segment, so the account can no longer be
+// truncated with an ellipsis and no other title segment can be squeezed by
+// it either.
+func TestRenderCardsTitleNeverCarriesAccount(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
-	got := RenderCards([]Snapshot{{
-		Provider: "gemini",
-		Accounts: []string{"Gemini"},
-		Windows:  []Window{{Name: "5h", Status: "ok", Percent: 12}},
-	}}, now)
-	lines := cardLines(t, got)
-	assertCardTitle(t, lines[0], "Gemini", "", "5小时限额")
-	if n := strings.Count(lines[0], "Gemini"); n != 1 {
-		t.Fatalf("service must appear exactly once, got %d:\n%q", n, lines[0])
+	h := now.Add(3 * time.Hour)
+	cases := []struct{ name, account string }{
+		{"short", "a1"},
+		{"same as the provider", "Gemini"},
+		{"long ascii", "very-long-account-name-that-just-keeps-going-and-going"},
+		{"long cjk", strings.Repeat("账", 40)},
 	}
-
-	// Same provider, different account: both segments stay.
-	got = RenderCards([]Snapshot{{
-		Provider: "gemini",
-		Accounts: []string{"gemini-acct-1"},
-		Windows:  []Window{{Name: "5h", Status: "ok", Percent: 12}},
-	}}, now)
-	lines = cardLines(t, got)
-	assertCardTitle(t, lines[0], "Gemini", "gemini-acct-1", "5小时限额")
-	if !strings.Contains(lines[0], "Gemini gemini-acct-1") {
-		t.Fatalf("distinct account must keep both title segments:\n%q", lines[0])
-	}
-}
-
-func TestRenderCardsErrorAndEmpty(t *testing.T) {
-	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
-
-	// Error, no windows: title + note + bottom.
-	got := RenderCards([]Snapshot{{
-		Provider: "opencode-go",
-		Accounts: []string{"a1"},
-		Err:      "unauthorized",
-	}}, now)
-	lines := cardLines(t, got)
-	assertCardTitle(t, lines[0], "Opus", "a1", "")
-	if !strings.Contains(lines[1], "⚠ 未授权") {
-		t.Fatalf("error note missing:\n%q", lines[1])
-	}
-	if len(lines) != 3 {
-		t.Fatalf("error card should have 3 lines, got %d:\n%q", len(lines), lines)
-	}
-
-	// No windows, no error: title + bottom only, no spurious note.
-	got = RenderCards([]Snapshot{{
-		Provider: "opencode-go",
-		Accounts: []string{"a1"},
-	}}, now)
-	lines = cardLines(t, got)
-	if len(lines) != 2 {
-		t.Fatalf("empty card should have 2 lines, got %d:\n%q", len(lines), lines)
-	}
-	if strings.Contains(got, "⚠") {
-		t.Fatalf("spurious warning note:\n%q", got)
-	}
-
-	// Stale + error + window: stale marker lives in the TITLE only, the
-	// error note rides along on the window card.
-	h := now.Add(45 * time.Minute)
-	got = RenderCards([]Snapshot{{
-		Provider: "opencode-go",
-		Accounts: []string{"a1"},
-		Stale:    true,
-		Err:      "fetch_failed",
-		Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 3, ResetsAt: &h}},
-	}}, now)
-	lines = cardLines(t, got)
-	if !strings.Contains(lines[0], "a1 旧 · 5小时限额") {
-		t.Fatalf("stale marker missing from title:\n%q", lines[0])
-	}
-	if n := strings.Count(got, "a1 旧"); n != 1 {
-		t.Fatalf("stale marker occurs %d times, want 1 (title only):\n%q", n, got)
-	}
-	if !strings.Contains(lines[3], "⚠ 拉取失败") {
-		t.Fatalf("error note missing from the window card:\n%q", lines[3])
-	}
-	if !strings.Contains(lines[1], " 3%") || !strings.HasSuffix(lines[2], "45m 后重置 │") {
-		t.Fatalf("window card missing data:\n%q", lines)
-	}
-	if strings.Contains(lines[1], "a1") || strings.Contains(lines[2], "a1") {
-		t.Fatalf("account leaked into a window card row:\n%q", lines)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RenderCards([]Snapshot{{
+				Provider: "gemini",
+				Accounts: []string{tc.account},
+				Windows:  []Window{{Name: "5h", Status: "ok", Percent: 12, ResetsAt: &h}},
+			}}, now, CardOptions{NoColor: true})
+			lines := cardLines(t, got) // title + row + border, all one width
+			if len(lines) != 3 {
+				t.Fatalf("want 3 lines, got %d:\n%s", len(lines), got)
+			}
+			assertCardTitle(t, lines[0], "Gemini", "5小时限额")
+			// The account is not a title segment: assertCardTitle above proves the
+			// title holds nothing but the provider and the window, so the only
+			// occurrence left to check is the one of an account whose name differs
+			// from the provider's (an equal name IS the provider segment).
+			if tc.account != "Gemini" && strings.Contains(lines[0], tc.account) {
+				t.Fatalf("the account must stay out of the title: %q", lines[0])
+			}
+			if strings.Contains(got, "…") {
+				t.Fatalf("nothing may be truncated on a card sized from its own content:\n%s", got)
+			}
+			// The account name renders in FULL on its own row, and the card is
+			// exactly as wide as that name + the fixed columns needs.
+			if !strings.Contains(lines[1], clineDisplayName(clineRow{name: tc.account})) {
+				t.Fatalf("the account must render in full on its row: %q", lines[1])
+			}
+			want := 4 + clineRowFixed + render.DisplayWidth(clineDisplayName(clineRow{name: tc.account}))
+			if w := render.DisplayWidth(lines[0]); w != want {
+				t.Fatalf("card width = %d, want %d:\n%s", w, want, got)
+			}
+		})
 	}
 }
 
-func TestRenderCardsLongTitleTruncates(t *testing.T) {
-	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
-	h2 := now.Add(2 * time.Hour)
-	long := "very-long-account-name-that-just-keeps-going-and-going-and-going"
-	got := RenderCards([]Snapshot{{
-		Provider: "opencode-go",
-		Accounts: []string{long},
-		Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 7, ResetsAt: &h2}},
-	}}, now)
-	lines := cardLines(t, got) // width invariant covers the whole card
-
-	title := lines[0]
-	if !strings.HasPrefix(title, "╭─ Opus ") {
-		t.Fatalf("title prefix wrong:\n%q", title)
-	}
-	if !strings.Contains(title, "…") {
-		t.Fatalf("over-long account must be truncated with an ellipsis:\n%q", title)
-	}
-	if strings.Contains(title, long) {
-		t.Fatalf("account was not truncated:\n%q", title)
-	}
-	// The window label survives the truncation and stays readable.
-	if !strings.Contains(title, "· 5小时限额 ─") {
-		t.Fatalf("window label must survive title truncation:\n%q", title)
-	}
-	// Rows never carry the account, truncated or not.
-	for _, l := range lines[1:] {
-		if strings.Contains(l, "very-long") {
-			t.Fatalf("account leaked into a card row:\n%q", l)
-		}
-	}
-}
-
-// TestRenderCardsOverLongWindowNameTitle is the title half of the
-// width pits: an unknown upstream window name can be arbitrarily long (the
-// known ones are short and fixed). The title must shrink the VARIABLE
-// segments — account, then service, then the window label — and recompute
-// the dash fill from the width the segments ACTUALLY occupy. It must never
-// truncate the whole line: that old safety net ate the right border ╮ and
-// could leave the card at 59 columns.
+// TestRenderCardsOverLongWindowNameTitle is the title half of the width pits:
+// an unknown upstream window name can be arbitrarily long (the known ones are
+// short and fixed). The card is sized from the title's own need, so a long
+// window name WIDENS the card instead of being truncated, and the fill stays
+// dashes-only with the ╮ intact — that old safety net ate the right border and
+// could leave the card one column short.
 func TestRenderCardsOverLongWindowNameTitle(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h2 := now.Add(2 * time.Hour)
@@ -1193,103 +1339,86 @@ func TestRenderCardsOverLongWindowNameTitle(t *testing.T) {
 	for _, name := range names {
 		got := RenderCards([]Snapshot{{
 			Provider: "opencode-go",
-			Accounts: []string{"a1"},
+			Accounts: []string{"acct"},
 			Windows:  []Window{{Name: name, Status: "ok", Percent: 7, ResetsAt: &h2}},
 		}}, now, CardOptions{NoColor: true})
-		// cardLines asserts EVERY line — title included — is 56 columns.
+		// cardLines asserts EVERY line — title included — is the card's width.
 		lines := cardLines(t, got)
 		title := lines[0]
 		if !strings.HasPrefix(title, "╭─ Opus · ") {
-			// The account is the first thing dropped; the service and its
-			// separator must survive the window-label truncation.
 			t.Fatalf("window name %q: title head wrong: %q", name, title)
+		}
+		if !strings.Contains(title, name) {
+			t.Fatalf("window name %q: the label must render in full: %q", name, title)
 		}
 		if !strings.HasSuffix(title, "╮") {
 			t.Fatalf("window name %q: the ╮ was cut off: %q", name, title)
 		}
-		if !strings.Contains(title, "…") {
-			t.Fatalf("window name %q: not truncated: %q", name, title)
+		if strings.Contains(title, "…") {
+			t.Fatalf("window name %q: the card sizes itself, nothing is truncated: %q", name, title)
 		}
-		// After the ellipsis: one space, dash fill only, then ╮.
-		fill := title[strings.LastIndex(title, "…")+len("…"):]
-		if !strings.HasPrefix(fill, " ") || !strings.Contains(fill, "─") ||
-			strings.Trim(fill, " ─╮") != "" {
+		// After the window label: one space, dash fill only, then ╮.
+		rest := strings.TrimPrefix(title, "╭─ Opus · "+name)
+		if !strings.HasPrefix(rest, " ") || !strings.Contains(rest, "─") ||
+			strings.Trim(rest, " ─╮") != "" {
 			t.Fatalf("window name %q: dash fill malformed: %q", name, title)
 		}
-		// The other card rows are untouched by the long window name.
-		if !strings.HasPrefix(lines[1], "│ ") || !strings.HasSuffix(lines[1], " 7% │") {
-			t.Fatalf("window name %q: bar row wrong: %q", name, lines[1])
+		// The row is untouched by the long window name and still lines up.
+		if !strings.HasPrefix(lines[1], "│ · acct ") || !strings.HasSuffix(lines[1], rowTail("7%", "2h 后重置")) {
+			t.Fatalf("window name %q: row wrong: %q", name, lines[1])
 		}
 	}
 }
 
-// TestRenderCardsCJKAccountTitleFill pins the OTHER half: the account is
-// the first segment to shrink, and a CJK account whose truncation budget
-// ends on an odd column stops one column short of it. The dash fill is
-// derived from the MEASURED width, so the card stays at exactly 56
-// columns — assuming the budget was consumed in full would push the right
-// border out.
-func TestRenderCardsCJKAccountTitleFill(t *testing.T) {
-	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
-	h2 := now.Add(2 * time.Hour)
-	got := RenderCards([]Snapshot{{
-		Provider: "opencode-go",
-		Accounts: []string{strings.Repeat("账", 40)}, // 80 columns
-		Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 7, ResetsAt: &h2}},
-	}}, now, CardOptions{NoColor: true})
-	lines := cardLines(t, got) // title is 56 columns, ╮ intact
-	title := lines[0]
-	if !strings.HasPrefix(title, "╭─ Opus ") {
-		t.Fatalf("title head wrong: %q", title)
-	}
-	if !strings.Contains(title, "…") {
-		t.Fatalf("over-long CJK account must be truncated: %q", title)
-	}
-	if !strings.Contains(title, " · 5小时限额 ─") {
-		t.Fatalf("window label and dash fill must survive: %q", title)
-	}
-}
-
-func TestRenderCardsModuleSortAndWindowCards(t *testing.T) {
+// TestRenderCardsProviderSortAndWindowCards pins the card ORDER: accounts of
+// one provider+window group into ONE card whose rows follow the report's
+// account order, and the provider groups keep the curated order.
+func TestRenderCardsProviderSortAndWindowCards(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h2 := now.Add(2 * time.Hour)
 	got := RenderCards([]Snapshot{
-		{Provider: "opencode-go", Accounts: []string{"z9"}, Windows: []Window{
+		{Provider: "opencode-go", Accounts: []string{"acct-z"}, Windows: []Window{
 			{Name: "rolling", Status: "ok", Percent: 12, ResetsAt: &h2},
 			{Name: "weekly", Status: "ok", Percent: 8},
 		}},
-		{Provider: "opencode-go", Accounts: []string{"a1"}, Windows: []Window{
+		{Provider: "opencode-go", Accounts: []string{"acct-a"}, Windows: []Window{
 			{Name: "rolling", Status: "ok", Percent: 1, ResetsAt: &h2},
 		}},
 	}, now)
 	lines := cardLines(t, got)
 
-	// Collect title indices (stable sort: a1 before z9, one card per
-	// window: a1 1 card, z9 2 cards).
-	var titleIdx []int
-	for i, l := range lines {
-		if strings.HasPrefix(l, "╭─ ") {
-			titleIdx = append(titleIdx, i)
-		}
+	titles := cardTitleLines(lines)
+	if len(titles) != 2 {
+		t.Fatalf("want 2 cards (one per window), got %d:\n%q", len(titles), titles)
 	}
-	if len(titleIdx) != 3 {
-		t.Fatalf("want 3 cards (1 + 2 windows), got %d:\n%q", len(titleIdx), lines)
+	// The first card is the rolling window, carrying BOTH accounts as rows
+	// (acct-a first: the report sorts accounts by name).
+	assertCardTitle(t, titles[0], "Opus", "5小时限额")
+	assertCardTitle(t, titles[1], "Opus", "周限额")
+	fiveHour := render.StripANSI(strings.Split(strings.TrimSuffix(got, "\n"), "\n\n")[0])
+	card := strings.Split(fiveHour, "\n")
+	rows := card[1 : len(card)-1] // drop the title and the bottom border
+	if len(rows) != 2 {
+		t.Fatalf("want 2 rows on the first card, got %d:\n%s", len(rows), fiveHour)
 	}
-	if !strings.Contains(lines[titleIdx[0]], "a1") {
-		t.Fatalf("cards not sorted by account:\n%q", lines)
+	if !strings.HasPrefix(rows[0], "│ · acct-a ") ||
+		!strings.HasPrefix(rows[1], "│ · acct-z ") {
+		t.Fatalf("rows must follow the account order:\n%s", fiveHour)
 	}
-	if !strings.Contains(lines[titleIdx[1]], "z9") || !strings.Contains(lines[titleIdx[2]], "z9") {
-		t.Fatalf("z9 window cards missing:\n%q", lines)
+	if !strings.HasSuffix(rows[0], rowTail("1%", "2h 后重置")) ||
+		!strings.HasSuffix(rows[1], rowTail("12%", "2h 后重置")) {
+		t.Fatalf("each row must carry its own numbers:\n%s", fiveHour)
 	}
-	if !strings.Contains(lines[titleIdx[2]], "周限额") {
-		t.Fatalf("second z9 card must carry the weekly window label:\n%q", lines[titleIdx[2]])
+	// The weekly card holds acct-z only: acct-a has no weekly window.
+	weekly := render.StripANSI(strings.Split(strings.TrimSuffix(got, "\n"), "\n\n")[1])
+	if n := strings.Count(weekly, "│ · "); n != 1 {
+		t.Fatalf("weekly card must hold one row, got %d:\n%s", n, weekly)
 	}
-	// Inside the z9 cards, no row after a title mentions the account (the
-	// titles themselves legitimately carry it).
-	for i := titleIdx[1] + 1; i < len(lines) && lines[i] != ""; i++ {
-		if strings.Contains(lines[i], "z9") {
-			t.Fatalf("account leaked into row %d:\n%q", i, lines[i])
-		}
+	if !strings.Contains(weekly, "│ · acct-z ") {
+		t.Fatalf("weekly card must hold acct-z:\n%s", weekly)
+	}
+	if !strings.HasSuffix(strings.Split(weekly, "\n")[1], rowTail("8%", "-")) {
+		t.Fatalf("weekly row tail wrong:\n%s", weekly)
 	}
 }
 
@@ -1315,6 +1444,9 @@ func TestCardCountdownZeroPadsMinutes(t *testing.T) {
 	}
 }
 
+// TestResetText pins the reset wording the metric field shares (and the "-"
+// and 已重置 states clineCountdownField turns into an empty string / a
+// countdown).
 func TestResetText(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h := now.Add(3*time.Hour + 12*time.Minute)
@@ -1337,19 +1469,20 @@ func TestResetText(t *testing.T) {
 	}
 }
 
-// TestRenderCardsLocalizedCardText pins the Chinese wording of the three
-// card texts that used to be English: the exhausted footer, the reset
-// countdown and the fetch-failure note. The data layer keeps the English
-// code; the RENDER layer maps it, so the card shows Chinese for every
-// mapped code and passes an unmapped one through behind the ⚠ prefix. No
-// old English string may survive anywhere in a rendered card.
+// TestRenderCardsLocalizedCardText pins the Chinese wording of the card texts
+// that used to be English: the reset countdown and the fetch-failure note. The
+// data layer keeps the English code; the RENDER layer maps it, so the card
+// shows Chinese for every mapped code and passes an unmapped one through
+// behind the ⚠ prefix. The note carries the ACCOUNT, because the title no
+// longer does. No old English string may survive anywhere in a rendered card,
+// and the deleted 已达限额 footer must not come back.
 func TestRenderCardsLocalizedCardText(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	h := now.Add(3*time.Hour + 12*time.Minute)
 	past := now.Add(-time.Minute)
 	got := RenderCards([]Snapshot{{
 		Provider: "opencode-go",
-		Accounts: []string{"a1"},
+		Accounts: []string{"acct"},
 		Err:      "unauthorized",
 		Windows:  []Window{{Name: "rolling", Status: "used up", Percent: 100, ResetsAt: &h}},
 	}, {
@@ -1358,27 +1491,27 @@ func TestRenderCardsLocalizedCardText(t *testing.T) {
 		Err:      "no_subscription",
 		Windows:  []Window{{Name: "weekly", Percent: 12, ResetsAt: &past}},
 	}}, now)
-	cardLines(t, got) // every row still exactly cardLineWidth columns
-	for _, want := range []string{"3h 12m 后重置", "已达限额", "⚠ 未授权", "⚠ 无订阅", "已重置"} {
+	cardLines(t, got) // every row still the card's own width
+	for _, want := range []string{"3h 12m 后重置", "已重置", "⚠ acct: 未授权", "⚠ b2: 无订阅"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("localized card text %q missing:\n%q", want, got)
 		}
 	}
 	for _, bad := range []string{
 		"limit reached", "resets in", "resets now", "unauthorized",
-		"no_subscription", "unexpected_status", "fetch_failed",
+		"no_subscription", "unexpected_status", "fetch_failed", "已达限额",
 	} {
 		if strings.Contains(got, bad) {
-			t.Fatalf("English card text %q survived:\n%q", bad, got)
+			t.Fatalf("English or deleted card text %q survived:\n%q", bad, got)
 		}
 	}
 
 	// The remaining mapped codes, and an unmapped code that must pass
 	// through unchanged behind the ⚠ prefix.
 	for _, tc := range []struct{ code, want string }{
-		{"unexpected_status", "⚠ 上游状态异常"},
-		{"fetch_failed", "⚠ 拉取失败"},
-		{"timeout", "⚠ timeout"},
+		{"unexpected_status", "⚠ c3: 上游状态异常"},
+		{"fetch_failed", "⚠ c3: 拉取失败"},
+		{"timeout", "⚠ c3: timeout"},
 	} {
 		plain := RenderCards([]Snapshot{{
 			Provider: "gemini",
@@ -1391,6 +1524,76 @@ func TestRenderCardsLocalizedCardText(t *testing.T) {
 		cardLines(t, plain)
 	}
 }
+
+// TestRenderCardsErrorAndEmpty: a snapshot without windows still shows its
+// account — as a ROW, with the metric columns blank — plus the failure note
+// (which carries the account attribution) and the border. The 旧 marker of a
+// stale snapshot rides in the name cell of the row, and the name column is
+// sized from the MARKED cell, so a stale row stays aligned.
+func TestRenderCardsErrorAndEmpty(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+
+	// Error, no windows: title (no window label) + row + note + bottom.
+	got := RenderCards([]Snapshot{{
+		Provider: "opencode-go",
+		Accounts: []string{"acct"},
+		Err:      "unauthorized",
+	}}, now, CardOptions{NoColor: true})
+	lines := cardLines(t, got)
+	assertCardTitle(t, lines[0], "Opus", "")
+	if len(lines) != 4 {
+		t.Fatalf("error card should have 4 lines, got %d:\n%q", len(lines), lines)
+	}
+	if !strings.HasPrefix(lines[1], "│ · acct ") || !strings.HasSuffix(lines[1], " │") {
+		t.Fatalf("windowless row must be the dot + account, padded to the card:\n%q", lines[1])
+	}
+	if strings.ContainsAny(lines[1], "▰▱%") {
+		t.Fatalf("a windowless row has no metric to show:\n%q", lines[1])
+	}
+	if !strings.Contains(lines[2], "⚠ acct: 未授权") {
+		t.Fatalf("error note missing:\n%q", lines[2])
+	}
+
+	// No windows, no error: title + row + bottom only, no spurious note.
+	got = RenderCards([]Snapshot{{
+		Provider: "opencode-go",
+		Accounts: []string{"acct"},
+	}}, now, CardOptions{NoColor: true})
+	lines = cardLines(t, got)
+	if len(lines) != 3 {
+		t.Fatalf("empty card should have 3 lines, got %d:\n%q", len(lines), lines)
+	}
+	if strings.Contains(got, "⚠") {
+		t.Fatalf("spurious warning note:\n%q", got)
+	}
+
+	// Stale + error + window: the stale marker lives in the ROW's name cell
+	// (the title no longer holds the account), and the error note rides along.
+	h := now.Add(45 * time.Minute)
+	got = RenderCards([]Snapshot{{
+		Provider: "opencode-go",
+		Accounts: []string{"acct"},
+		Stale:    true,
+		Err:      "fetch_failed",
+		Windows:  []Window{{Name: "rolling", Status: "ok", Percent: 3, ResetsAt: &h}},
+	}}, now, CardOptions{NoColor: true})
+	lines = cardLines(t, got)
+	assertCardTitle(t, lines[0], "Opus", "5小时限额")
+	if n := strings.Count(got, "acct 旧"); n != 1 {
+		t.Fatalf("stale marker occurs %d times, want 1 (the row's name cell):\n%q", n, got)
+	}
+	if !strings.HasPrefix(lines[1], "│ · acct 旧 ") {
+		t.Fatalf("stale marker must ride in the row's name cell:\n%q", lines[1])
+	}
+	if !strings.HasSuffix(lines[1], rowTail("3%", "45m 后重置")) {
+		t.Fatalf("window row missing its data:\n%q", lines[1])
+	}
+	if !strings.Contains(got, "⚠ acct: 拉取失败") {
+		t.Fatalf("error note missing from the window card:\n%q", got)
+	}
+}
+
+// ── the shared palette & window labels ───────────────────────────────────
 
 func TestWindowTitle(t *testing.T) {
 	cases := map[string]string{
@@ -1438,75 +1641,31 @@ func TestAccountColor(t *testing.T) {
 	}
 }
 
-// ── ClinePass merged cards (one card per profile + window) ──────────────
+// ── per-account rows (the merged group shape, now the only shape) ────────
 //
-// ClinePass is the only provider whose cards merge: every account of the
-// plan is polled with its own key (its own snapshot), so the plan's accounts
-// only become ROWS of one card once the snapshots are grouped by (profile,
-// window). Everything below pins that layout: one row per account, the title
-// free of account names, the row's exact columns, X/X on a drained row and
-// the fixed bright palette.
+// One card per (provider, window) holds one ROW per account. Everything below
+// pins that row: the account name (display name + colour), the row identity,
+// the X/X of a drained token window and the exact columns.
 
-// clinePassSnap is one ClinePass account's snapshot: one account and its
-// own key fingerprint (the shape the poller produces — one snapshot per
-// account key).
+// clinePassSnap is one ClinePass account's snapshot: one account and its own
+// key fingerprint (the shape the poller produces — one snapshot per account
+// key), mirroring what the CLI assembles in cmd/prism/quota.go.
 func clinePassSnap(fp, account string, windows ...Window) Snapshot {
 	s := Snapshot{Provider: "clinepass", Accounts: []string{account}, Windows: windows}
 	s.SetAccountFPs([]string{fp})
 	return s
 }
 
-// mergedCardLines splits a merged-card render into ANSI-stripped lines and
-// asserts that every line of one card shares that card's width. The merged
-// card is exactly as wide as its longest account name needs (names are never
-// truncated), so the width invariant is PER CARD: cards are separated by a
-// blank line, which resets the expectation.
-func mergedCardLines(t *testing.T, got string) []string {
-	t.Helper()
-	raw := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
-	out := make([]string, 0, len(raw))
-	width := -1
-	for i, l := range raw {
-		if l == "" {
-			out = append(out, "")
-			width = -1
-			continue
-		}
-		plain := render.StripANSI(l)
-		w := render.DisplayWidth(plain)
-		if width == -1 {
-			width = w
-		} else if w != width {
-			t.Fatalf("line %d: width %d, want the card's %d:\n%q", i, w, width, plain)
-		}
-		out = append(out, plain)
-	}
-	return out
-}
-
-// mergedRowNumber is a merged row's 13-column number field. The field is
-// ASCII whenever it holds a token pair; the 5-hour countdown rows carry CJK
-// (后重置), so callers checking those must compare the row's suffix instead of
-// slicing bytes.
-func mergedRowNumber(t *testing.T, row string) string {
-	t.Helper()
-	body := strings.TrimSuffix(strings.TrimPrefix(row, "│ "), " │")
-	if w := render.DisplayWidth(body); w < clineNumberWidth {
-		t.Fatalf("row too short for a number field: %q", row)
-	}
-	return body[len(body)-clineNumberWidth:]
-}
-
-// TestRenderCardsClinePassMergesSameWindowAccounts is the headline contract:
-// two accounts of one plan are two snapshots, and they must land in ONE card
-// with exactly TWO rows (never four, never a duplicated name) when they share
-// a window. The title carries the plan and the window only, the row carries
-// the account, and no row carries the other providers' detail text, reset
-// countdown or 已达限额 footer.
+// TestRenderCardsClinePassMergesSameWindowAccounts is the headline contract of
+// the merged shape: two accounts of one plan are two snapshots, and they must
+// land in ONE card with exactly TWO rows (never four, never a duplicated name)
+// when they share a window. The title carries the provider and the window
+// only, the row carries the account, and no row carries a detail text, a
+// 估算池 marker or a 已达限额 footer.
 func TestRenderCardsClinePassMergesSameWindowAccounts(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
-	full := Window{Name: "5h", Status: "used up", Percent: 100, LimitTokensEstimate: 4_200_000, MeasuredTokens: 4_200_000}
-	part := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	full := Window{Name: "weekly", Status: "used up", Percent: 100, LimitTokensEstimate: 4_200_000, MeasuredTokens: 4_200_000}
+	part := Window{Name: "weekly", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
 	got := RenderCards([]Snapshot{
 		clinePassSnap("aaaa1111bbbb2222", "cline-user", full),
 		clinePassSnap("cccc3333dddd4444", "cline-user", part),
@@ -1515,15 +1674,15 @@ func TestRenderCardsClinePassMergesSameWindowAccounts(t *testing.T) {
 	if n := strings.Count(got, "╭─ "); n != 1 {
 		t.Fatalf("want ONE merged card, got %d:\n%s", n, render.StripANSI(got))
 	}
-	lines := mergedCardLines(t, got)
+	lines := cardLines(t, got)
 	if len(lines) != 4 { // title + 2 rows + bottom border
 		t.Fatalf("want 4 lines (title + 2 rows + border), got %d:\n%s", len(lines), got)
 	}
-	if !strings.HasPrefix(lines[0], "╭─ ClinePass · 5小时限额") {
-		t.Fatalf("title must be plan + window: %q", lines[0])
+	if !strings.HasPrefix(lines[0], "╭─ ClinePass · 周限额") {
+		t.Fatalf("title must be provider + window: %q", lines[0])
 	}
 	if strings.Contains(lines[0], "cline-user") {
-		t.Fatalf("the account must not appear in a merged title: %q", lines[0])
+		t.Fatalf("the account must not appear on a title: %q", lines[0])
 	}
 
 	rows := lines[1:3]
@@ -1532,19 +1691,17 @@ func TestRenderCardsClinePassMergesSameWindowAccounts(t *testing.T) {
 			t.Fatalf("row %d must be dot + account name: %q", i, r)
 		}
 	}
-	if !strings.Contains(rows[0], "100%") || !strings.Contains(rows[0], "4.2M/4.2M") {
+	if !strings.HasSuffix(rows[0], rowTail("100%", "4.2M/4.2M")) {
 		t.Fatalf("drained row wrong: %q", rows[0])
 	}
-	if !strings.Contains(rows[1], " 34%") || !strings.Contains(rows[1], "3.4M/10.0M") {
+	if !strings.HasSuffix(rows[1], rowTail("34%", "3.4M/10.0M")) {
 		t.Fatalf("34%% row wrong: %q", rows[1])
 	}
 
-	// The merged row has no detail text, no 已达限额 footer and no suffix
-	// after the account name. A countdown appears ONLY on a 5-hour row that
-	// has no number at all; here both rows carry a pair, so none appears.
-	for _, bad := range []string{"已用", "总额", "词元", "后重置", "已重置", "已达限额"} {
+	// The row has no detail text, no marker and no footer.
+	for _, bad := range []string{"已用", "总额", "词元", "后重置", "已重置", "估算池", "已达限额", "~"} {
 		if strings.Contains(got, bad) {
-			t.Fatalf("merged card must not carry %q:\n%s", bad, render.StripANSI(got))
+			t.Fatalf("card must not carry %q:\n%s", bad, render.StripANSI(got))
 		}
 	}
 	if strings.Count(got, "cline-user") != 2 {
@@ -1573,9 +1730,9 @@ func TestRenderCardsClinePassMergesSameWindowAccounts(t *testing.T) {
 	}
 }
 
-// TestRenderCardsClinePassExhaustedShowsXOverX pins the exhausted wording:
-// a 100 % row ALWAYS shows X/X — the measured consumption as both sides when
-// the pool is unknown — and never "-".
+// TestRenderCardsClinePassExhaustedShowsXOverX pins the exhausted wording: a
+// 100 % TOKEN window ALWAYS shows X/X — the measured consumption as both sides
+// when the pool is unknown — and never "-".
 func TestRenderCardsClinePassExhaustedShowsXOverX(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
@@ -1587,28 +1744,28 @@ func TestRenderCardsClinePassExhaustedShowsXOverX(t *testing.T) {
 			// The estimate pipeline sets LimitTokensEstimate = MeasuredTokens
 			// on a drained window.
 			name: "measured pair",
-			w:    Window{Name: "5h", Status: "used up", Percent: 100, LimitTokensEstimate: 3_800, MeasuredTokens: 3_800},
+			w:    Window{Name: "weekly", Status: "used up", Percent: 100, LimitTokensEstimate: 3_800, MeasuredTokens: 3_800},
 			want: "    3.8K/3.8K",
 		},
 		{
 			// Unknown pool: the measured consumption IS the total.
 			name: "measured only",
-			w:    Window{Name: "5h", Status: "ok", Percent: 100, MeasuredTokens: 4_200_000},
+			w:    Window{Name: "monthly", Status: "ok", Percent: 100, MeasuredTokens: 4_200_000},
 			want: "    4.2M/4.2M",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := RenderCards([]Snapshot{clinePassSnap("aaaa1111bbbb2222", "cline-user", tc.w)}, now)
-			rows := mergedCardLines(t, got)
-			if len(rows) != 3 {
-				t.Fatalf("want 3 lines, got %d:\n%s", len(rows), got)
+			lines := cardLines(t, got)
+			if len(lines) != 3 {
+				t.Fatalf("want 3 lines, got %d:\n%s", len(lines), got)
 			}
-			if num := mergedRowNumber(t, rows[1]); num != tc.want {
-				t.Fatalf("number field = %q, want %q", num, tc.want)
+			if !strings.HasSuffix(lines[1], tc.want+" │") {
+				t.Fatalf("row tail = %q, want %q", lines[1], tc.want+" │")
 			}
-			if strings.Contains(rows[1], "      -") || strings.HasSuffix(rows[1], "- │") {
-				t.Fatalf("a drained row must not fall back to \"-\": %q", rows[1])
+			if strings.Contains(lines[1], "  -") || strings.HasSuffix(lines[1], "- │") {
+				t.Fatalf("a drained row must not fall back to \"-\": %q", lines[1])
 			}
 			// The one exhausted signal: the capsule went solid red.
 			if !strings.Contains(got, ansiRed+strings.Repeat(capUsed, clineCapCells)+ansiReset) {
@@ -1625,13 +1782,13 @@ func TestRenderCardsClinePassExhaustedShowsXOverX(t *testing.T) {
 // that happen to share a name stay two rows.
 func TestRenderCardsClinePassRowIdentity(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
-	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	w := Window{Name: "weekly", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
 
 	rowsOf := func(t *testing.T, snaps []Snapshot) int {
 		t.Helper()
-		lines := mergedCardLines(t, RenderCards(snaps, now))
+		lines := cardLines(t, RenderCards(snaps, now))
 		if len(lines) < 3 {
-			t.Fatalf("no merged rows:\n%v", lines)
+			t.Fatalf("no rows:\n%v", lines)
 		}
 		return len(lines) - 2 // title + bottom border
 	}
@@ -1672,16 +1829,18 @@ func TestRenderCardsClinePassRowIdentity(t *testing.T) {
 	}
 }
 
-// TestRenderCardsClinePassDisplayNameDropsNumericSuffix pins the DISPLAY name
-// of a merged row: the trailing pure-digit suffix is dropped, so the two
-// accounts of one plan read as ONE name (Cline and Cline2 both show "Cline").
-// Stripping is display-only: the row identity (clineRowID) still keys on the
-// FULL name plus the fingerprint, so the pair stays exactly TWO rows (also
-// without a fingerprint, where the key falls back to the position), and the
-// dot plus the name colour are what tells the two same-reading rows apart.
-func TestRenderCardsClinePassDisplayNameDropsNumericSuffix(t *testing.T) {
+// TestRenderCardsDisplayNameDropsNumericSuffix pins the DISPLAY name of a row:
+// the trailing pure-digit suffix is dropped, so the two accounts of one plan
+// read as ONE name (Cline and Cline2 both show "Cline"). Stripping is
+// display-only: the row identity (clineRowID) still keys on the FULL name plus
+// the fingerprint, so the pair stays exactly TWO rows (also without a
+// fingerprint, where the key falls back to the position), and the dot plus the
+// name colour are what tells the two same-reading rows apart. The card is as
+// wide as the DISPLAY name, so the dropped suffix reserves no invisible
+// column.
+func TestRenderCardsDisplayNameDropsNumericSuffix(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
-	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	w := Window{Name: "weekly", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
 	fps := []string{"aaaa1111bbbb2222", "cccc3333dddd4444"}
 
 	got := RenderCards([]Snapshot{
@@ -1692,7 +1851,7 @@ func TestRenderCardsClinePassDisplayNameDropsNumericSuffix(t *testing.T) {
 	if n := strings.Count(got, "╭─ "); n != 1 {
 		t.Fatalf("want ONE merged card, got %d:\n%s", n, render.StripANSI(got))
 	}
-	lines := mergedCardLines(t, got)
+	lines := cardLines(t, got)
 	if len(lines) != 4 { // title + 2 rows + bottom border
 		t.Fatalf("want 4 lines (title + 2 rows + border), got %d:\n%s", len(lines), render.StripANSI(got))
 	}
@@ -1732,8 +1891,7 @@ func TestRenderCardsClinePassDisplayNameDropsNumericSuffix(t *testing.T) {
 	if len(colors) != 2 {
 		t.Fatalf("the two same-reading rows must carry different colours: %v", colors)
 	}
-	// The card is as wide as its longest DISPLAY name, not the full one: the
-	// dropped suffix must not reserve an invisible blank column.
+	// The card is as wide as its longest DISPLAY name, not the full one.
 	if want := 4 + clineRowFixed + render.DisplayWidth("Cline"); render.DisplayWidth(lines[0]) != want {
 		t.Fatalf("card width = %d, want %d (no column for the dropped suffix):\n%s",
 			render.DisplayWidth(lines[0]), want, render.StripANSI(got))
@@ -1745,7 +1903,7 @@ func TestRenderCardsClinePassDisplayNameDropsNumericSuffix(t *testing.T) {
 		{Provider: "clinepass", Accounts: []string{"Cline1"}, Windows: []Window{w}},
 		{Provider: "clinepass", Accounts: []string{"Cline2"}, Windows: []Window{w}},
 	}, now, CardOptions{NoColor: true})
-	plainLines := mergedCardLines(t, plain)
+	plainLines := cardLines(t, plain)
 	if len(plainLines) != 4 {
 		t.Fatalf("fingerprint-less pair: want 4 lines (2 rows), got %d:\n%s", len(plainLines), plain)
 	}
@@ -1756,6 +1914,28 @@ func TestRenderCardsClinePassDisplayNameDropsNumericSuffix(t *testing.T) {
 	}
 	if plainLines[1] != plainLines[2] {
 		t.Fatalf("fingerprint-less rows must share one visible text:\n%q\n%q", plainLines[1], plainLines[2])
+	}
+}
+
+// TestRenderCardsDisplayNameEveryProvider: the display-name contract is ONE
+// contract, so a NON-ClinePass account with a trailing digit run reads the
+// same stripped name a ClinePass one does (the hyphen is not a digit and
+// stays: "gemini-acct-1" → "gemini-acct-"). The name is display-only; the row
+// identity keeps the full name plus the fingerprint.
+func TestRenderCardsDisplayNameEveryProvider(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	w := Window{Name: "weekly", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	got := RenderCards([]Snapshot{{
+		Provider: "gemini",
+		Accounts: []string{"gemini-acct-1"},
+		Windows:  []Window{w},
+	}}, now, CardOptions{NoColor: true})
+	lines := cardLines(t, got)
+	if !strings.HasPrefix(lines[1], "│ · gemini-acct- ") {
+		t.Fatalf("the trailing digit run must be dropped (%q):\n%s", "gemini-acct-1", got)
+	}
+	if want := 4 + clineRowFixed + render.DisplayWidth("gemini-acct-"); render.DisplayWidth(lines[0]) != want {
+		t.Fatalf("card width = %d, want %d:\n%s", render.DisplayWidth(lines[0]), want, got)
 	}
 }
 
@@ -1786,25 +1966,26 @@ func TestStripNumericSuffix(t *testing.T) {
 	}
 
 	// End to end: an all-digit account name must still render its name on the
-	// merged row (dot + name), not a dot followed by blanks.
+	// row (dot + name), not a dot followed by blanks.
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
-	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	w := Window{Name: "weekly", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
 	got := RenderCards([]Snapshot{clinePassSnap("aaaa1111bbbb2222", "12345", w)}, now)
-	lines := mergedCardLines(t, got)
+	lines := cardLines(t, got)
 	if !strings.HasPrefix(lines[1], "│ · 12345 ") {
 		t.Fatalf("an all-digit account name must stay visible: %q", lines[1])
 	}
 }
 
-// TestRenderCardsClinePassEstimateMarkerAndFiveHourCountdown pins the two
-// display rules of the estimated pools and of the window that has none:
+// TestRenderCardsClinePassPlainTokenPairAndFiveHourCountdown pins the two
+// display rules of the metric field and the two deletions of this change:
 //
-//   - a weekly/monthly card SAYS it is an estimate — the title carries 估算池
-//     and every row prefixes its total with "~", because the upstream never
-//     reports an absolute pool (see ApplyClinePassEstimates);
-//   - the 5-hour row (no pool at all) shows the reset COUNTDOWN in its number
-//     field instead of "-": what that window has is a reset instant.
-func TestRenderCardsClinePassEstimateMarkerAndFiveHourCountdown(t *testing.T) {
+//   - a weekly/monthly row shows used/total PLAINLY: no "~" prefix on the
+//     total and no 估算池 segment on the title, even though the pool is the
+//     inference ApplyClinePassEstimates derives (an inferred total is still
+//     the only total that window has);
+//   - a 5-hour row (no pool at all) shows the reset COUNTDOWN in its metric
+//     column instead of "-": what that window has is a reset instant.
+func TestRenderCardsClinePassPlainTokenPairAndFiveHourCountdown(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	reset := now.Add(2*time.Hour + 15*time.Minute)
 
@@ -1813,48 +1994,53 @@ func TestRenderCardsClinePassEstimateMarkerAndFiveHourCountdown(t *testing.T) {
 	got := RenderCards([]Snapshot{clinePassSnap("aaaa1111bbbb2222", "Cline", weekly, monthly)}, now, CardOptions{NoColor: true})
 
 	for _, want := range []string{
-		"╭─ ClinePass · 周限额 · 估算池 ",
-		"╭─ ClinePass · 月限额 · 估算池 ",
+		"╭─ ClinePass · 周限额 ",
+		"╭─ ClinePass · 月限额 ",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("pool card title missing %q:\n%s", want, got)
 		}
 	}
-	for _, want := range []string{"400.0K/~2.0M", "2.4M/~4.0M"} {
+	for _, want := range []string{rowTail("20%", "400.0K/2.0M"), rowTail("60%", "2.4M/4.0M")} {
 		if !strings.Contains(got, want) {
-			t.Fatalf("estimated total missing the ~ marker %q:\n%s", want, got)
+			t.Fatalf("token pair %q missing:\n%s", want, got)
+		}
+	}
+	for _, gone := range []string{"~", "估算池"} {
+		if strings.Contains(got, gone) {
+			t.Fatalf("%q must be gone from the cards:\n%s", gone, got)
 		}
 	}
 
-	// The 5-hour window carries no pool, so it is neither marked nor given a
-	// token pair: its field is the countdown, in the same 13 columns.
+	// The 5-hour window carries no pool: its metric is the countdown, in the
+	// same 13 columns.
 	fiveHour := Window{Name: "5h", Status: "ok", Percent: 12, ResetsAt: &reset}
 	got = RenderCards([]Snapshot{clinePassSnap("aaaa1111bbbb2222", "Cline", fiveHour)}, now, CardOptions{NoColor: true})
-	lines := mergedCardLines(t, got)
-	if !strings.HasPrefix(lines[0], "╭─ ClinePass · 5小时限额 ") || strings.Contains(lines[0], clineEstimatePoolLabel) {
-		t.Fatalf("the 5-hour card has no pool and must not be marked: %q", lines[0])
+	lines := cardLines(t, got)
+	if !strings.HasPrefix(lines[0], "╭─ ClinePass · 5小时限额 ") {
+		t.Fatalf("the 5-hour card title is wrong: %q", lines[0])
 	}
-	if !strings.HasSuffix(lines[1], "2h 15m 后重置 │") {
-		t.Fatalf("the 5h number field must be the reset countdown: %q", lines[1])
+	if !strings.HasSuffix(lines[1], rowTail("12%", "2h 15m 后重置")) {
+		t.Fatalf("the 5h metric must be the reset countdown: %q", lines[1])
 	}
 	if strings.Contains(lines[1], "-") {
 		t.Fatalf("the 5h row must not fall back to \"-\": %q", lines[1])
 	}
 }
 
-// TestRenderCardsClinePassLongNameWidensCard: the account name is never
-// truncated — a long name widens the whole card, and every row of that card
-// stays aligned. A long name must not leak into the title either.
-func TestRenderCardsClinePassLongNameWidensCard(t *testing.T) {
+// TestRenderCardsLongNameWidensCard: the account name is never truncated — a
+// long name widens the whole card, and every row of that card stays aligned. A
+// long name must not leak onto the title either.
+func TestRenderCardsLongNameWidensCard(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	long := strings.Repeat("账", 20) // 40 display columns
-	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	w := Window{Name: "weekly", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
 	got := RenderCards([]Snapshot{
 		clinePassSnap("aaaa1111bbbb2222", "ab", w),
 		clinePassSnap("cccc3333dddd4444", long, w),
 	}, now)
 
-	lines := mergedCardLines(t, got) // every line of the card shares one width
+	lines := cardLines(t, got) // every line of the card shares one width
 	if len(lines) != 4 {
 		t.Fatalf("want 4 lines, got %d:\n%s", len(lines), render.StripANSI(got))
 	}
@@ -1866,24 +2052,24 @@ func TestRenderCardsClinePassLongNameWidensCard(t *testing.T) {
 		t.Fatalf("the long account name must render in full on its row: %q", lines[2])
 	}
 	if strings.Contains(got, "…") {
-		t.Fatalf("merged rows must never be truncated:\n%s", render.StripANSI(got))
+		t.Fatalf("rows must never be truncated:\n%s", render.StripANSI(got))
 	}
 	if strings.Contains(lines[0], long) {
 		t.Fatalf("the account name must stay out of the title: %q", lines[0])
 	}
 }
 
-// TestRenderCardsClinePassDegradesWithoutFingerprint pins the palette's
-// fallback: an empty or short fingerprint renders the plain · and an
-// uncoloured name instead of reading past the fingerprint (the old
-// out-of-range read), so it must not panic and must not carry colour.
-func TestRenderCardsClinePassDegradesWithoutFingerprint(t *testing.T) {
+// TestRenderCardsDegradesWithoutFingerprint pins the palette's fallback: an
+// empty or short fingerprint renders the plain · and an uncoloured name
+// instead of reading past the fingerprint (the old out-of-range read), so it
+// must not panic and must not carry colour.
+func TestRenderCardsDegradesWithoutFingerprint(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
-	w := Window{Name: "5h", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
+	w := Window{Name: "weekly", Status: "ok", Percent: 34, LimitTokensEstimate: 10_000_000}
 	for _, tc := range []struct{ name, fp string }{{"empty", ""}, {"short", "abc123"}} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := RenderCards([]Snapshot{clinePassSnap(tc.fp, "cline-user", w)}, now)
-			lines := mergedCardLines(t, got)
+			lines := cardLines(t, got)
 			if !strings.HasPrefix(lines[1], "│ · cline-user ") {
 				t.Fatalf("want a plain · and an uncoloured name: %q", lines[1])
 			}
@@ -1900,28 +2086,35 @@ func TestRenderCardsClinePassDegradesWithoutFingerprint(t *testing.T) {
 	}
 }
 
-// TestRenderCardsClinePassKeepsOtherProvidersLegacy: the merge is ClinePass
-// only. The same (account, window) shape under a ClinePass key and under any
-// other key must come out as a merged card and as the one-card-per-(account,
-// window) legacy card respectively — the legacy card keeps its title account,
-// its detail text, its countdown and its 已达限额 footer.
-func TestRenderCardsClinePassKeepsOtherProvidersLegacy(t *testing.T) {
+// TestRenderCardsStaleMarkerRidesInTheRow: a stale snapshot keeps its 旧
+// marker — the title no longer holds the account, so the marker moved into the
+// row's name cell, and the name column is sized from the MARKED cell, so the
+// row keeps its columns.
+func TestRenderCardsStaleMarkerRidesInTheRow(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
-	h := now.Add(3*time.Hour + 12*time.Minute)
-	w := Window{Name: "5h", Status: "used up", Percent: 100, LimitTokensEstimate: 3_800, MeasuredTokens: 3_800, ResetsAt: &h}
-	for _, provider := range []string{"gemini", "xai", "opencode-go"} {
-		t.Run(provider, func(t *testing.T) {
-			s := Snapshot{Provider: provider, Accounts: []string{"acct-1"}, Windows: []Window{w}}
-			got := RenderCards([]Snapshot{s}, now, CardOptions{NoColor: true})
-			title := strings.SplitN(got, "\n", 2)[0]
-			if !strings.Contains(title, "acct-1") {
-				t.Fatalf("%s title must keep the account: %q", provider, title)
-			}
-			for _, want := range []string{"已耗尽 100%", "总额 3k 词元", "3h 12m 后重置", "已达限额"} {
-				if !strings.Contains(got, want) {
-					t.Fatalf("%s card lost %q:\n%s", provider, want, got)
-				}
-			}
-		})
+	reset := now.Add(2 * time.Hour)
+	fresh := Snapshot{Provider: "clinepass", Accounts: []string{"Cline"}, Stale: false,
+		Windows: []Window{{Name: "5h", Percent: 34, ResetsAt: &reset}}}
+	stale := Snapshot{Provider: "clinepass", Accounts: []string{"ClineOther"}, Stale: true,
+		Windows: []Window{{Name: "5h", Percent: 34, ResetsAt: &reset}}}
+	got := RenderCards([]Snapshot{fresh, stale}, now, CardOptions{NoColor: true})
+	lines := cardLines(t, got)
+	if len(lines) != 4 {
+		t.Fatalf("want 4 lines, got %d:\n%s", len(lines), got)
+	}
+	if !strings.HasPrefix(lines[1], "│ · Cline ") {
+		t.Fatalf("the fresh row is wrong: %q", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "│ · ClineOther 旧 ") {
+		t.Fatalf("the stale row must carry the 旧 marker in its name cell: %q", lines[2])
+	}
+	// The marked cell sizes the name column, so both rows still line up.
+	if !strings.HasSuffix(lines[1], rowTail("34%", "2h 后重置")) ||
+		!strings.HasSuffix(lines[2], rowTail("34%", "2h 后重置")) {
+		t.Fatalf("the two rows must share their columns:\n%q\n%q", lines[1], lines[2])
+	}
+	want := 4 + clineRowFixed + render.DisplayWidth("ClineOther 旧")
+	if w := render.DisplayWidth(lines[0]); w != want {
+		t.Fatalf("card width = %d, want %d (the marked cell sizes the column):\n%s", w, want, got)
 	}
 }
