@@ -420,15 +420,18 @@ func TestRenderTableEmpty(t *testing.T) {
 // ROW per account of that group. These tests guard it: the title is provider
 // + window label and NEVER an account, the row is
 //
-//	dot + name + capsule(23) + pct(4) + metric(13)
+//	dot + name + capsule(23) + pct + metric + fill
 //
-// every line of a card is exactly THAT card's width (the card is sized from
-// its longest account name cell and its title, so no name is truncated and
-// no border is ever pushed out), the capsule is ▰ (used) + ▱ (remaining) on a
-// per-cell green→yellow→red ramp with a solid red drained pill, the metric is
-// the smart single metric (countdown / used-total token pair / "-"), the
-// title text carries no color and no bold, and the account display name, the
-// row identity and the 旧 marker all survive the merge.
+// with exactly ONE space between the modules (the percentage and the metric
+// are written LEFT-aligned at their own width, and the trailing fill takes
+// the columns a short value leaves unused), every line of a card is exactly
+// THAT card's width (the card is sized from its longest account name cell and
+// its title, so no name is truncated and no border is ever pushed out), the
+// capsule is ▰ (used) + ▱ (remaining) on a per-cell green→yellow→red ramp
+// with a solid red drained pill, the metric is the smart single metric
+// (countdown / used-total token pair / "-"), the title text carries no color
+// and no bold, and the account display name, the row identity and the 旧
+// marker all survive the merge.
 //
 // The old two-row card (title account + 47-cell capsule + 已用/总额 detail row
 // + 已达限额 footer) is gone; the tests that pinned it were rewritten, so no
@@ -477,7 +480,7 @@ func cardLines(t *testing.T, got string) []string {
 
 // wantCardWidth is the width a card render must come out at for a given set of
 // name cells: the widest cell's row width, floored by the name column's
-// minimum (4 + clineRowFixed + clineNameColMin, 61 while the longest account
+// minimum (4 + clineRowFixed + clineNameColMin, 58 while the longest account
 // name in the current production roster is 9 columns wide — that is a
 // deployment fact, not a property of this package — and a longer name widens
 // every card of the render instead of being truncated). Spelled out here
@@ -504,14 +507,19 @@ func cardTitleLines(lines []string) []string {
 	return out
 }
 
-// rowTail is the fixed right-hand end of a row: one space, the 4-column
-// right-aligned percentage, clineMetricGap (4) spaces, the 13-column
-// right-aligned metric, one space and the right border. EVERY row ends with
-// exactly this whatever the account name is, which is what keeps the columns
-// lined up down the card.
+// rowTail is the right-hand end of a row: one space, the percentage written
+// LEFT-aligned at its own width, one space, the metric written LEFT-aligned at
+// its own width, the row's TRAILING fill and the right border. The two
+// segments reserve clinePctWidth / clineNumberWidth columns (see
+// clineRowFixed); the columns a shorter value leaves unused are exactly what
+// the fill makes up, so EVERY row ends with this same tail whatever the
+// account name is — which is what keeps the borders and the module boundaries
+// lined up down the card. The one space before the percentage and the one
+// before the metric are the fixed module gaps: they do not depend on how many
+// digits a value has.
 func rowTail(pct, metric string) string {
-	return render.PadLeft(pct, clinePctWidth) + strings.Repeat(" ", clineMetricGap) +
-		render.PadLeft(metric, clineNumberWidth) + " │"
+	fill := clinePctWidth + clineNumberWidth - render.DisplayWidth(pct) - render.DisplayWidth(metric)
+	return " " + pct + " " + metric + strings.Repeat(" ", fill) + " │"
 }
 
 // rowCapsule extracts one row's capsule: the run of ▰/▱ cells that follows
@@ -943,19 +951,19 @@ func TestRenderCardsCapsuleGeometry(t *testing.T) {
 		wantPct string
 	}{{
 		name: "zero", win: Window{Percent: 0},
-		wantUse: 0, wantPct: "  0%",
+		wantUse: 0, wantPct: "0%",
 	}, {
 		name: "one", win: Window{Percent: 1},
-		wantUse: 1, wantPct: "  1%",
+		wantUse: 1, wantPct: "1%",
 	}, {
 		name: "thirty-four", win: Window{Percent: 34},
-		wantUse: 8, wantPct: " 34%",
+		wantUse: 8, wantPct: "34%",
 	}, {
 		name: "fifty-nine", win: Window{Percent: 59},
-		wantUse: 14, wantPct: " 59%",
+		wantUse: 14, wantPct: "59%",
 	}, {
 		name: "ninety-nine", win: Window{Percent: 99},
-		wantUse: cardCapCells, wantPct: " 99%",
+		wantUse: cardCapCells, wantPct: "99%",
 	}, {
 		name: "hundred", win: Window{Percent: 100},
 		wantUse: cardCapCells, wantPct: "100%",
@@ -964,10 +972,10 @@ func TestRenderCardsCapsuleGeometry(t *testing.T) {
 		wantUse: cardCapCells, wantPct: "100%",
 	}, {
 		name: "rate limited", win: Window{Status: "rate-limited", Percent: 40},
-		wantUse: cardCapCells, wantPct: " 40%",
+		wantUse: cardCapCells, wantPct: "40%",
 	}, {
 		name: "sub-percent fraction", win: Window{Percent: 0, UsedFraction: 0.004},
-		wantUse: 1, wantPct: "  1%",
+		wantUse: 1, wantPct: "1%",
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1768,13 +1776,13 @@ func TestRenderCardsClinePassExhaustedShowsXOverX(t *testing.T) {
 			// on a drained window.
 			name: "measured pair",
 			w:    Window{Name: "weekly", Status: "used up", Percent: 100, LimitTokensEstimate: 3_800, MeasuredTokens: 3_800},
-			want: "    3.8K/3.8K",
+			want: "3.8K/3.8K",
 		},
 		{
 			// Unknown pool: the measured consumption IS the total.
 			name: "measured only",
 			w:    Window{Name: "monthly", Status: "ok", Percent: 100, MeasuredTokens: 4_200_000},
-			want: "    4.2M/4.2M",
+			want: "4.2M/4.2M",
 		},
 	}
 	for _, tc := range cases {
@@ -1784,8 +1792,8 @@ func TestRenderCardsClinePassExhaustedShowsXOverX(t *testing.T) {
 			if len(lines) != 3 {
 				t.Fatalf("want 3 lines, got %d:\n%s", len(lines), got)
 			}
-			if !strings.HasSuffix(lines[1], tc.want+" │") {
-				t.Fatalf("row tail = %q, want %q", lines[1], tc.want+" │")
+			if !strings.HasSuffix(lines[1], rowTail("100%", tc.want)) {
+				t.Fatalf("row tail = %q, want %q", lines[1], rowTail("100%", tc.want))
 			}
 			if strings.Contains(lines[1], "  -") || strings.HasSuffix(lines[1], "- │") {
 				t.Fatalf("a drained row must not fall back to \"-\": %q", lines[1])
@@ -2146,7 +2154,7 @@ func TestRenderCardsStaleMarkerRidesInTheRow(t *testing.T) {
 // TestRenderCardsUniformWidthAcrossProviders is the headline contract of the
 // shared width: a render holding THREE providers — short account names next to
 // a 9-column one ("SuperGrok", the longest name this package knows) — gives
-// every card ONE width, and that width is the name column's floor (61
+// every card ONE width, and that width is the name column's floor (58
 // columns), not each card's own longest name. Under the old per-card layout the
 // three cards came out at their own widths instead — 54 / 55 / 58 columns at the
 // time — so the right border and the
@@ -2172,38 +2180,38 @@ func TestRenderCardsUniformWidthAcrossProviders(t *testing.T) {
 		t.Fatalf("want 3 cards, got %d:\n%s", len(titles), got)
 	}
 
-	// Every card's border line — and every other line of it — is exactly 61
+	// Every card's border line — and every other line of it — is exactly 58
 	// display columns wide.
 	for i, title := range titles {
-		if w := render.DisplayWidth(title); w != 61 {
-			t.Fatalf("card %d title: width %d, want 61:\n%q", i, w, title)
+		if w := render.DisplayWidth(title); w != 58 {
+			t.Fatalf("card %d title: width %d, want 58:\n%q", i, w, title)
 		}
 	}
 	for i, l := range lines {
 		if l == "" {
 			continue
 		}
-		if w := render.DisplayWidth(l); w != 61 {
-			t.Fatalf("line %d: width %d, want the shared 61:\n%q", i, w, l)
+		if w := render.DisplayWidth(l); w != 58 {
+			t.Fatalf("line %d: width %d, want the shared 58:\n%q", i, w, l)
 		}
 	}
 	// The width is the floor the common case is pinned at, and it is NOT the
 	// numeric coincidence of one card's own name.
-	if want := wantCardWidth("cline-", "gemini-x", "SuperGrok"); want != 61 {
-		t.Fatalf("the three name cells must ask for the 61-column floor, got %d", want)
+	if want := wantCardWidth("cline-", "gemini-x", "SuperGrok"); want != 58 {
+		t.Fatalf("the three name cells must ask for the 58-column floor, got %d", want)
 	}
 
 	// The floor decides the width on its own as soon as the roster holds only
 	// SHORT names: the same render minus the 9-column account still comes out
-	// 61 columns wide — the width does not follow the longest name down, so
+	// 58 columns wide — the width does not follow the longest name down, so
 	// the same command cannot jump between widths from run to run.
 	shortOnly := RenderCards(snaps[:2], now, CardOptions{NoColor: true})
 	for i, l := range cardLines(t, shortOnly) {
 		if l == "" {
 			continue
 		}
-		if w := render.DisplayWidth(l); w != 61 {
-			t.Fatalf("short-name-only render, line %d: width %d, want the 61-column floor:\n%q", i, w, l)
+		if w := render.DisplayWidth(l); w != 58 {
+			t.Fatalf("short-name-only render, line %d: width %d, want the 58-column floor:\n%q", i, w, l)
 		}
 	}
 
@@ -2229,7 +2237,7 @@ func TestRenderCardsUniformWidthAcrossProviders(t *testing.T) {
 	}
 	// "│ " + dot + " " + the 9-column name cell + " " is 14 columns, i.e.
 	// width - clineRowFixed + 1.
-	if wantStart := 61 - clineRowFixed + 1; start != wantStart {
+	if wantStart := 58 - clineRowFixed + 1; start != wantStart {
 		t.Fatalf("capsule starts at column %d, want %d", start, wantStart)
 	}
 
@@ -2242,6 +2250,31 @@ func TestRenderCardsUniformWidthAcrossProviders(t *testing.T) {
 	}
 	if strings.Contains(got, "…") {
 		t.Fatalf("nothing may be truncated:\n%s", got)
+	}
+
+	// The WIDEST row a card can hold lands exactly ON the card's width: a
+	// 100 % share ("100%", clinePctWidth columns) next to the widest metric a
+	// real window prints — a 13-column used/total pair ("185.8M/185.8M",
+	// clineNumberWidth) — fills BOTH reserved segments completely, so its
+	// trailing fill is exactly ZERO and the right border sits where the short
+	// rows put it. That is the bound the trailing fill exists for: every
+	// shorter row is padded up to this same width, and this row needs no pad
+	// at all.
+	widest := RenderCards([]Snapshot{{
+		Provider: "gemini",
+		Accounts: []string{"gemini-x"},
+		Windows: []Window{{
+			Name: "weekly", Status: "used up", Percent: 100,
+			LimitTokensEstimate: 185_800_000,
+		}},
+	}}, now, CardOptions{NoColor: true})
+	widestLines := cardLines(t, widest)
+	if w, cardW := render.DisplayWidth(widestLines[1]), render.DisplayWidth(widestLines[0]); w != cardW {
+		t.Fatalf("the widest row (100%% + a 13-column pair) is %d columns, want the card's %d:\n%s", w, cardW, widest)
+	}
+	if !strings.HasSuffix(widestLines[1], rowTail("100%", "185.8M/185.8M")) {
+		t.Fatalf("the widest row must end with the zero-fill tail %q:\n%q",
+			rowTail("100%", "185.8M/185.8M"), widestLines[1])
 	}
 }
 

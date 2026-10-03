@@ -117,12 +117,15 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 // section below). A card is a title line, N data rows, the fetch-failure
 // notes (if any) and the bottom border:
 //
-//	╭─ Gemini · 周限额 ───────────────────────────────────────────╮
-//	│ · gemini-acct ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  34%       3.4M/10.0M │
-//	╰─────────────────────────────────────────────────────────────╯
+//	╭─ Gemini · 周限额 ────────────────────────────────────────╮
+//	│ · gemini-acct ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 34% 3.4M/10.0M     │
+//	╰──────────────────────────────────────────────────────────╯
 //
 // Row: "│ " + dot(1) + " " + name(n) + " " + capsule(23) + " " +
-// pct(4) + clineMetricGap + metric(13) + " │" = clineRowFixed + n + 4 columns.
+// pct(3-4) + " " + metric(1-13) + fill + " │" = clineRowFixed + n + 4
+// display columns, whatever the percentage and the metric happen to be:
+// every module boundary carries exactly ONE space and the trailing fill
+// absorbs the columns a short value leaves unused.
 // The card is max(row width, the width the title needs) columns wide, so the
 // LONGEST account display name and the title both fit and no line ever
 // overflows its own border. There is no fixed card width any more: the old
@@ -241,21 +244,23 @@ func cardProfileName(provider string) string {
 // cline* identifier names below are historical. One card per (provider,
 // window) holds one ROW per account of that group:
 //
-//	╭─ ClinePass · 5小时限额 ────────────────────────────────────╮
-//	│ · cline-user ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  34%       3.4M/10.0M │
-//	│ · cline-user ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰ 100%        4.2M/4.2M │
-//	╰────────────────────────────────────────────────────────────╯
+//	╭─ ClinePass · 月限额 ────────────────────────────────────╮
+//	│ · cline-user ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 34% 3.4M/10.0M     │
+//	│ · cline-user ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰ 100% 4.2M/4.2M     │
+//	╰─────────────────────────────────────────────────────────╯
 //
 // The title NEVER carries an account name (it is the provider plus the
 // window label), so a long account name can never collide with the metrics;
-// the account is the row's first element instead. Row format, left to right
-// (one space between the elements — except the percentage→metric break,
-// which is clineMetricGap = 4 columns):
+// the account is the row's first element instead. Row format, left to right,
+// with exactly ONE space between the elements:
 //
-//	color dot(1) account name(n) capsule(23) pct(4) metric(13)
+//	color dot(1) account name(n) capsule(23) pct metric
 //
-// so a row is clineRowFixed+n display columns and the CARD is 4 columns
-// wider than that row. n is the render's name column (see cardWidth): the
+// The percentage and the metric are written LEFT-aligned at their own width
+// (3–4 and 1–13 columns); the row's trailing fill then takes whatever column
+// they did not use, so a row is clineRowFixed+n display columns — the same
+// for every row of every card — and the CARD is 4 columns wider than that
+// row. n is the render's name column (see cardWidth): the
 // LONGEST account DISPLAY name CELL of EVERY card of the render, floored by
 // clineNameColMin. The displayed name is never truncated — a name longer
 // than the floor widens every card of the render together (see
@@ -290,20 +295,29 @@ func cardProfileName(provider string) string {
 //   - a window that cannot answer either way — no token total AND no reset
 //     instant — reads "-".
 const (
-	clineCapCells    = 23 // capsule columns
-	clinePctWidth    = 4  // right-aligned pct: "100%" / " 34%"
-	clineNumberWidth = 13 // right-aligned used/total, or the countdown
-	// clineMetricGap is the display columns between the pct field and the
-	// metric field. It is 4, not 1: the break between the percentage and
-	// the value it belongs to has to read as a break, so the user asked
-	// for a wider gap — every row (and with it every card) gains 3
-	// columns. The capsule stays 23 cells: the gap is the only thing that
-	// grew.
-	clineMetricGap = 4
-	// clineRowFixed is a row's display columns WITHOUT the account name:
-	// dot(1) + 3 one-column gaps + the pct/metric gap + capsule + pct +
-	// metric.
-	clineRowFixed = 1 + 3 + clineMetricGap + clineCapCells + clinePctWidth + clineNumberWidth // 48
+	clineCapCells = 23 // capsule columns
+
+	// clinePctWidth and clineNumberWidth are what a row's percentage and its
+	// metric segment can occupy at their LONGEST: "100%" and a used/total
+	// token pair ("1.7B/1.7B"). They are NOT padding widths any more — both
+	// segments are written LEFT-aligned at their own natural width (see
+	// clineRowLine), so a short value keeps its spare columns on its RIGHT
+	// instead of being pushed against the value next to it, and the gap
+	// between two modules no longer depends on how many digits the value
+	// happens to have. The two widths survive as what a row RESERVES —
+	// through clineRowFixed, so the widest possible row still fits inside the
+	// card's border — and as the blank placeholders of a windowless row.
+	clinePctWidth    = 4  // widest percentage: "100%"
+	clineNumberWidth = 13 // widest metric: a used/total token pair
+	// clineRowFixed is a row's display columns WITHOUT the account name
+	// column: the space that separates it from the capsule (1), the capsule
+	// (clineCapCells), the space after the capsule (1), the widest percentage
+	// (clinePctWidth), the space before the metric (1), the widest metric
+	// (clineNumberWidth) and the closing " │" (2). Every module boundary
+	// carries exactly ONE space; the columns a short value leaves unused are
+	// taken by the row's TRAILING fill (see clineRowLine), which is what keeps
+	// the border at one column for a short value and a long one alike.
+	clineRowFixed = 1 + clineCapCells + 1 + clinePctWidth + 1 + clineNumberWidth + 2 // 45
 	// clineNameColMin is the FLOOR of the name column in display columns: the
 	// longest account name in the current production roster — the accounts the
 	// user's config and the metapi account table feed in — i.e. "SuperGrok",
@@ -312,7 +326,7 @@ const (
 	// so without a floor the same command would come out narrower when only
 	// short-named providers answer than when SuperGrok is in the roster — the
 	// width would jump between runs. The floor pins the common case at
-	// max(...) >= 4 + clineRowFixed + 9 = 61 columns; a name LONGER than the
+	// max(...) >= 4 + clineRowFixed + 9 = 58 columns; a name LONGER than the
 	// floor still widens every card of the render together (it is never
 	// truncated).
 	clineNameColMin = 9
@@ -562,16 +576,23 @@ func clineRowNameCell(r clineRow) string {
 // clineRowLine renders one row at the render's shared width. The account name
 // is padded to that width's name column — the render-wide one (cardWidth),
 // NOT this card's own longest name — so the capsule, the percentage and the
-// metric field of every row start at the same column, on this card and on
-// every other card of the render. The percentage and the metric field are
-// separated by clineMetricGap = 4 columns — the wider break between the
-// share and the value it belongs to (it used to be one space). The dot and
-// the name share one color (accountColor of the account's fingerprint); with
-// no usable fingerprint the dot degrades to the plain · and the name stays
-// plain. The row shows the account's DISPLAY name (clineDisplayName) plus the
-// 旧 marker of a stale snapshot; the row identity (clineRowID) keeps the full
-// name plus the fingerprint. A windowless snapshot (a failed fetch) leaves
-// the three metric columns blank, so its account still stays visible.
+// metric of every row start at the same column, on this card and on every
+// other card of the render. The percentage and the metric are written
+// LEFT-aligned at their own natural width and exactly ONE space away from the
+// capsule and from each other, so the modules keep a fixed distance whatever
+// the values are (a right-aligned field made that distance grow with every
+// digit a short value was missing); the display columns a shorter value does
+// not use are taken by the row's TRAILING fill — the blanks between the last
+// segment and the right border — which is what holds the line at the card's
+// width without a padded field. A windowless snapshot (a failed fetch) shows
+// neither a percentage nor a metric: it keeps the two segments as blanks of
+// the width they RESERVE (clinePctWidth / clineNumberWidth), so its blank row
+// carries the same structure — and the same total width — as a row with data.
+// The dot and the name share one color (accountColor of the account's
+// fingerprint); with no usable fingerprint the dot degrades to the plain ·
+// and the name stays plain. The row shows the account's DISPLAY name
+// (clineDisplayName) plus the 旧 marker of a stale snapshot; the row identity
+// (clineRowID) keeps the full name plus the fingerprint.
 func clineRowLine(r clineRow, width int, now time.Time, pal cardPalette) string {
 	display := clineDisplayName(r)
 	cell := clineRowNameCell(r)
@@ -591,15 +612,31 @@ func clineRowLine(r clineRow, width int, now time.Time, pal cardPalette) string 
 	metric := strings.Repeat(" ", clineNumberWidth)
 	if r.win != nil {
 		capsule = clineBar(*r.win, pal)
-		pct = render.PadLeft(pctLabel(*r.win), clinePctWidth)
-		metric = render.PadLeft(clineMetricField(*r.win, now), clineNumberWidth)
+		pct = pctLabel(*r.win)
+		// Truncate keeps the one-row-width invariant a hard guarantee: a
+		// metric wider than the segment reserved for it (no real window has
+		// one — the widest token pair is 13 columns) is cut off at the border
+		// instead of pushing it out. A SHORTER metric is not padded: the
+		// row's trailing fill takes those columns.
+		metric = render.Truncate(clineMetricField(*r.win, now), clineNumberWidth)
 	}
-	return pal.dim("│ ") +
+	row := pal.dim("│ ") +
 		accountDot(r.fp, pal) + " " +
 		accountNameText(display, r.fp, pal) + strings.TrimPrefix(cell, display) +
 		strings.Repeat(" ", pad+1) +
-		capsule + " " + pct + strings.Repeat(" ", clineMetricGap) + metric +
-		pal.dim(" │")
+		capsule + " " + pct + " " + metric
+	// The row is completed at its END: the percentage and the metric are
+	// written at their own width, so whatever they did not use becomes ONE run
+	// of blanks between the last segment and the right border. That trailing
+	// fill is what holds every row — and with it every card of the render — at
+	// the card's width. The clamp is a guard: pct <= clinePctWidth and
+	// metric <= clineNumberWidth make the row fit the width cardWidth
+	// computed.
+	fill := width - render.DisplayWidth(row) - 2
+	if fill < 0 {
+		fill = 0
+	}
+	return row + strings.Repeat(" ", fill) + pal.dim(" │")
 }
 
 // clineBar is a row's capsule: the used share solid ▰, the rest hollow ▱,
@@ -615,8 +652,10 @@ func clineBar(w Window, pal cardPalette) string {
 	return render.CapsuleBar(clineCapCells, render.CapsuleUsedCells(pct, clineCapCells), nil, pal.color)
 }
 
-// clineMetricField is a row's metric field (13 columns, right-aligned), the
-// single rule of the smart single-metric layout:
+// clineMetricField is a row's metric field — the text the row writes there,
+// LEFT-aligned at its own width (the card reserves clineNumberWidth = 13
+// columns for the widest of them, a used/total token pair) — and the single
+// rule of the smart single-metric layout:
 //
 //   - a TOKEN window (weekly / monthly, clineTokenPairWindow) shows the
 //     used/total pair with NO "~": the total is the window's pool —
@@ -673,9 +712,9 @@ func clineTokenPairWindow(name string) bool {
 // window: the 5-hour one always, a weekly/monthly one when it has no token
 // total to show.
 //
-// The text fits the 13-column metric field for every real 5-hour window
-// (the countdown cannot exceed 5h, so at most "4h 59m" = 6
-// columns); the caller's PadLeft caps anything longer without widening the
+// The text fits the metric segment's 13 reserved columns for every real
+// 5-hour window (the countdown cannot exceed 5h, so at most "4h 59m" = 6
+// columns); the caller's Truncate caps anything longer without widening the
 // row.
 func clineCountdownField(w Window, now time.Time) string {
 	if w.ResetsAt == nil || w.ResetsAt.IsZero() {
@@ -874,9 +913,10 @@ func windowTitle(name string) string {
 // resetText is the reset wording shared by the metric field: "3h 12m"
 // when the upstream reported ResetsAt, "已重置" once the window has rolled
 // over, and "-" when there is no reset time at all. The countdown itself
-// comes from cardCountdown, so the 13-column metric field keeps its width at
-// every value (see clineCountdownField, which turns the "no reset" case into
-// the empty string its caller falls back from).
+// comes from cardCountdown, so the metric's wording never depends on the
+// card's geometry: the segment is written at its own width and the row's
+// trailing fill makes up the difference (see clineCountdownField, which turns
+// the "no reset" case into the empty string its caller falls back from).
 func resetText(w Window, now time.Time) string {
 	if w.ResetsAt == nil || w.ResetsAt.IsZero() {
 		return "-"
@@ -887,8 +927,10 @@ func resetText(w Window, now time.Time) string {
 	return cardCountdown(now, *w.ResetsAt)
 }
 
-// pctLabel is a row's percentage: the consumed share, right-aligned into
-// the 4-column pct field (" 34%" / "100%").
+// pctLabel is a row's percentage: the consumed share, written LEFT-aligned at
+// its own width ("34%" / "100%", 3 to 4 columns). It used to be padded into a
+// 4-column right-aligned field, which pushed a short value right and left the
+// gap to the metric next to it depending on how many digits the value had.
 func pctLabel(w Window) string {
 	return strconv.Itoa(displayPercent(w)) + "%"
 }
@@ -1126,10 +1168,10 @@ func hexValue(s string) int {
 }
 
 // formatTokenPair formats a used/total token pair with one decimal per
-// side: "3.4M/10.0M". Joined without spaces, because the pair shares ONE
-// right-aligned column (a row's 13-column metric field). Neither side is
-// marked: the package writes a derived pool the same way it writes a
-// measured one (see clineMetricField).
+// side: "3.4M/10.0M". Joined without spaces, because the pair IS one metric
+// segment (a row's left-aligned metric field, 13 columns at its widest).
+// Neither side is marked: the package writes a derived pool the same way it
+// writes a measured one (see clineMetricField).
 func formatTokenPair(used, total int64) string {
 	u := render.FormatTokensOneDecimal(used)
 	t := render.FormatTokensOneDecimal(total)

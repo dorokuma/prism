@@ -509,12 +509,13 @@ func TestApplyQuotaClinePassEstimate(t *testing.T) {
 
 	// The CLI renders the totals: the derived pool is written like any other
 	// total (no "~" marker, no 估算池 title segment), and the 5-hour row
-	// carries the countdown instead of a pair.
+	// carries the countdown instead of a pair — left-aligned like every metric,
+	// exactly one space after the percentage.
 	cards := planusage.RenderCards([]planusage.Snapshot{got}, now, planusage.CardOptions{NoColor: true})
 	for _, wantText := range []string{
 		"50.0K/100.0K",
 		"10.0K/200.0K",
-		"2h │",
+		"10% 2h",
 	} {
 		if !strings.Contains(cards, wantText) {
 			t.Fatalf("cards missing %q:\n%s", wantText, cards)
