@@ -163,11 +163,21 @@ func FormatCostCompact(v *float64) string {
 // the quota card's used/total pair uses: the count is scaled by 1e8 and
 // rendered with one decimal, and a whole 亿 drops its fraction ("13亿",
 // never "13.0亿"). There is deliberately no 万 / 千万 step and no
-// "<0.1亿"-style fallback: a value that scales below 0.05 亿 simply reads
-// "0亿", which is the honest "the pair has nothing useful to say at this
-// unit" answer rather than an invented precision. The quota card reserves
-// 13 columns for the widest pair — "9999亿/9999亿" — so this formatter is
-// what that budget is sized against.
+// "<0.1亿"-style fallback.
+//
+// A NON-ZERO value that one decimal would collapse to "0" (anything below
+// 0.05 亿) is rendered with TWO decimals instead, so a tiny pool still
+// reads as a number rather than as the "no data" zero: 2_000_000 → "0.02亿",
+// 500_000 → "0.01亿". Exactly 0 — and only exactly 0, plus values below
+// 0.005 亿 where even two decimals round to zero — keeps reading "0亿".
+// That is what separates "a pool of 0.02亿" from "no pool at all" (the card
+// renders the latter as "-").
+//
+// The two-decimal form cannot widen the column: both "9999亿" and "0.04亿"
+// are 4 characters plus the wide 亿, i.e. 6 display columns, so a pair stays
+// inside the quota card's clineNumberWidth budget of 13 columns
+// ("0.02亿/9999亿" = 6 + 1 + 6 = 13, the same as "9999亿/9999亿") and the
+// formatter is what that budget is sized against.
 //
 // Integers never show a decimal point: 1_300_000_000 is "13亿", not
 // "13.0亿" (trailing zeros and then the point itself are trimmed, exactly
@@ -179,7 +189,14 @@ func FormatTokensYi(n int64) string {
 		sign = "-"
 		u = uint64(-(n + 1)) + 1
 	}
-	return sign + trimTrailingZeros(strconv.FormatFloat(float64(u)/1e8, 'f', 1, 64)) + "亿"
+	text := trimTrailingZeros(strconv.FormatFloat(float64(u)/1e8, 'f', 1, 64))
+	if text == "0" && u > 0 {
+		// One decimal collapsed a non-zero count to zero: keep it readable
+		// with two decimals. Values below 0.005 亿 still round to zero here
+		// and stay "0亿" — the pair has nothing more precise to say.
+		text = trimTrailingZeros(strconv.FormatFloat(float64(u)/1e8, 'f', 2, 64))
+	}
+	return sign + text + "亿"
 }
 
 // FormatPercent formats part/total*100 with one decimal and a "%" suffix

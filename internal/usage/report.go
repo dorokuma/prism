@@ -114,27 +114,37 @@ type ReportOptions struct {
 // ── capsule card layout (A1·命中率胶囊) ──────────────────────────────────
 //
 // The report is one fixed-width card that mirrors the quota capsule card
-// (internal/planusage.RenderCards): the same 56 display columns, the same
+// (internal/planusage.RenderCards): the SAME 45 display columns — the quota
+// card is 4 + clineRowFixed(32) + clineNameColMin(9) = 45 — the same
 // ╭─ / ├─ / ╰─ border vocabulary, the same palette and the same capsule
 // primitive (internal/render.CapsuleBar). Every line — title, summary,
 // separators, header, detail rows, bottom border — is EXACTLY reportWidth
 // display columns wide, whatever the data looks like:
 //
-//	╭─ 按模型分组 ─────────────────────────────────────────╮
-//	│ 请求 1,783 · 词元 2.23M · 开销 $0.836                │
-//	├──────────────────────────────────────────────────────┤
-//	│ 模型                   请求   缓存            命中率 │
-//	│ ──────────────────────────────────────────────────── │
-//	│ deepseek-v4-pro          1k     1M ▰▰▰▰▰▰▰▱▱▱  66.7% │
-//	│ glm-5.2                 283   100k ▰▰▱▱▱▱▱▱▱▱  20.0% │
-//	╰──────────────────────────────────────────────────────╯
+//	╭─ 按模型分组 ──────────────────────────────╮
+//	│ 请求 1,783 · 词元 2.23M · 开销 $0.836     │
+//	├───────────────────────────────────────────┤
+//	│ 模型        请求   缓存            命中率 │
+//	│ ───────────────────────────────────────── │
+//	│ deepseek…     1k     1M ▰▰▰▰▰▰▰▱▱▱  66.7% │
+//	│ glm-5.2      283   100k ▰▰▱▱▱▱▱▱▱▱  20.0% │
+//	╰───────────────────────────────────────────╯
 //
 // Geometry (display columns, ANSI counted as 0):
 //
 //	title     Dim("╭─ ") + desc + Dim(" " + fill + "╮")
-//	body      Dim("│ ") + content(52) + Dim(" │") = 56
-//	rules     "├" + "─"×54 + "┤" / "╰" + "─"×54 + "╯" = 56
-//	table     group columns + 请求 + 缓存 + 命中率 = 52
+//	body      Dim("│ ") + content(41) + Dim(" │") = 45
+//	rules     "├" + "─"×43 + "┤" / "╰" + "─"×43 + "╯" = 45
+//	table     group columns + 请求 + 缓存 + 命中率 = 41
+//
+// The two reports (usage and quota) are the SAME width on purpose: a user
+// who runs `prism usage` and `prism quota` sees one column count, not two.
+// This supersedes the earlier "usage stays at its own 56" decision (see
+// .agents/notes/20261003-usage-width-stays-56.md, superseded by
+// .agents/notes/20261004-quota-card-followups.md). The accepted cost is a
+// much harder truncation of the group column: the single-group budget is
+// 41 − 6 − 6 − 17 − 3 = 9 columns (it was 20 at 56), so a long model or
+// provider name is cut to 9 columns instead of 20.
 //
 // The body gutter is SYMMETRIC: one space either side of the content
 // ("│ " / " │") and nothing else — no extra indent inside the card — so
@@ -149,9 +159,11 @@ type ReportOptions struct {
 // which are ANSI-aware; the row builders additionally pad (and, as a
 // safety net, truncate) the whole body to reportInner.
 const (
-	// reportWidth is the total display width of every report line.
-	reportWidth = 56
-	// reportInner is the width between "│ " and " │" (56 - 4).
+	// reportWidth is the total display width of every report line. It is
+	// deliberately the SAME as the quota card's regular width
+	// (internal/planusage: 4 + clineRowFixed + clineNameColMin = 45).
+	reportWidth = 45
+	// reportInner is the width between "│ " and " │" (45 - 4).
 	reportInner = reportWidth - 4
 	// colGap separates two table columns.
 	colGap = " "
@@ -179,8 +191,13 @@ const (
 	// the symmetric one-space body gutter.
 	tableWidth = reportInner
 
-	// modelMaxWidth keeps the established model column cap: a formatted
-	// model name longer than 20 columns is truncated with an ellipsis.
+	// modelMaxWidth is the historical cap on a group column's VALUE when
+	// that column is the model column. At reportWidth = 45 the
+	// single-group budget is 9 columns (41 − 6 − 6 − 17 − 3), which is
+	// BELOW this cap, so the column budget always binds first and the cap
+	// is a ceiling that no longer truncates anything by itself. It is kept
+	// for a future wider card (and it still guards a multi-key layout if
+	// reportWidth ever grows back), not because it shapes today's output.
 	modelMaxWidth = 20
 
 	// noDataLine is the friendly hint rendered instead of detail rows.
@@ -199,7 +216,7 @@ const (
 )
 
 // reportColumn is one detail column of the usage card. width is the fixed
-// display width the column occupies inside the 52-column table area, so a
+// display width the column occupies inside the 41-column table area, so a
 // row's columns always add up to tableWidth exactly; maxWidth caps the
 // VALUE before padding (0 = uncapped, the model column is capped at
 // modelMaxWidth).
@@ -578,14 +595,14 @@ func (pal reportPalette) rule(left, right string) string {
 // fit the column the ellipsis needs stops the truncation one column short,
 // and the extra dash is what keeps the line at reportWidth. The line
 // itself is never truncated: that safety net used to eat the right border
-// ╮ and could leave the card at 59 columns, so the fill — never the
+// ╮ and could leave the card one column short, so the fill — never the
 // line — absorbs the difference.
 func (pal reportPalette) titleLine(desc string) string {
 	const prefixW, suffixW = 3, 1 // "╭─ " and "╮"
 	// The line is "╭─ " + desc + " " + fill + "╮", so the description may
-	// take at most reportWidth - prefixW - suffixW - 2 columns (50 here) and
+	// take at most reportWidth - prefixW - suffixW - 2 columns (39 here) and
 	// still leave one space and one fill dash: total = 3 + descW + 1 + fill
-	// + 1 = 56.
+	// + 1 = 45.
 	descMax := reportWidth - prefixW - suffixW - 2
 	desc = render.Truncate(desc, descMax)
 	descW := render.DisplayWidth(desc)
