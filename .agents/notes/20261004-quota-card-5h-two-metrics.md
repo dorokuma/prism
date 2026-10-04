@@ -69,6 +69,43 @@ supersedes: ""
 - `2026-10-03-unified-quota-cards-spec.md`：其**「智能单指标（5h 显示倒计时 / 周月显示 token 对 / 回落倒计时）」整节被本笔取代**（改为「行内 token 对或 `-`，倒计时只在标题」）；其**单行式版式、标题不含账号、无详情行/无 footer、版式不按 provider 分叉仍 active**。
 - `20260925-token-format-carry-chain.md`：其 **K/M/B/T/P/E 进位链本身仍 active**（`render.FormatTokens` 仍服务 legacy 表格与 usage 报告）；本笔只是让 quota 卡片的 token 对走中文「亿」单位，**不是**修改该进位链。
 
+## 返修（同一分支第二个 commit）：整数百分比的中点修正
+
+### 实测证据
+- 用户只读 GET 了 ClinePass `plan/usage-limits` 的原始响应：`five_hour=2`、`weekly=51`、`monthly=75`，**三个值全是整数，无小数点**。即 `Percent` 是上游 `percentUsed` 的**向下取整**，真实 used fraction 落在区间 `[Percent/100, (Percent+1)/100)` 内（51% 可能是 51.0% ~ 51.99…%）。
+
+### 决策
+- `windowUsedFraction` 回落到 `Percent/100` 的分支改为**区间中点**：`Percent >= 1` 时取 `(Percent + 0.5) / 100`。这是该区间的无偏点估计，把最坏相对误差减半（`P=1`：原来的 50T~100T 两倍区间收窄成以 66.7T 为中心的 1.5 倍区间），并消除整套 roster 的系统性高估。
+- **`Percent == 0` 的例外不动**：仍返回 0。中点会凭空造出 0.5%，一个 token 的流量就能反推出 200 倍的池——那是「自信的假数字」。0 继续表示「无流量 / 未知」：不写估算、卡片该行读 `-`，与 Gemini 交真实 `UsedFraction` 的小数路径在语义上一致。
+- **中点 clamp 到 1**：上游把 `percentUsed` 钳在 100%，区间顶端塌缩到 1，因此**耗尽窗口仍走 T/T 兜底**（`reversePool(tokens, 1) = tokens`），不会因为这次修正反而丢了估算。
+- **小数路径逐字不动**：`UsedFraction > 0`（Gemini 的 `remainingFraction` 反转）不进这个分支，v0.35.0 的未取整口径不受影响。
+
+### 数值影响（T = 该窗口实测词元；新池 = 旧池 × `P/(P+0.5)`）
+| 窗口 / Percent | 旧分母 | 新分母 | 旧池 | 新池 | 变化 |
+| --- | --- | --- | --- | --- | --- |
+| 5h，P=2（线上实测） | 0.02 | 0.025 | 50T | 40T | **−20.0%** |
+| 5h，P=5 | 0.05 | 0.055 | 20T | 18.18T | −9.1% |
+| 5h，P=7 | 0.07 | 0.075 | 14.29T | 13.33T | −6.7% |
+| 5h，P=10 | 0.10 | 0.105 | 10T | 9.52T | −4.8% |
+| weekly，P=8 | 0.08 | 0.085 | 12.5T | 11.76T | −5.9% |
+| weekly，P=51（线上实测） | 0.51 | 0.515 | 1.960T | 1.940T | −1.0% |
+| monthly，P=75（线上实测） | 0.75 | 0.755 | 1.333T | 1.325T | −0.7% |
+| monthly，P=25 | 0.25 | 0.255 | 4T | 3.92T | −2.0% |
+| 任何 P=100（打满） | 1.0 | 1.0（clamp） | T | T | 0% |
+| 任何 P=0 | — | — | 无估算 | 无估算 | 0% |
+- 百分比列与「已用」一侧同比例缩小（`used = total × Percent/100`），因此**百分比读数不变**，只有 token 对的绝对值下移；「月 = 2 × 周」的构造关系不受影响（两侧分母同时变）。
+- 低占比窗口收益最大（P=2 的 5h 降 20%，P=8 降 5.9%），高占比窗口几乎无感（P=51/75 降 1% 上下）——这正是想要的：**修正只发生在原来偏差最大的地方**。
+
+### 测试同步与取证
+- 只改断言，**未新增测试文件、未新增 `func Test`**：`estimate_test.go`（`TestApplyWeekEstimateEatsCombinedAgySum` 2000→1980、`TestApplyWeekEstimateFiveHourWindow` 周 200000→198020、`TestApplyClinePassEstimates` 三窗 1.0B/1.0B/2.0B → 909090909/941176471/1882352942 且卡片对 `0.5亿/9.1亿`、`0.8亿/9.4亿`、`0.8亿/18.8亿`、`TestApplyClinePassEstimatesWeeklyResetFallsBackToMonthly` 800000/1600000 → 784314/1568628、`TestApplyGrokWeekEstimateFirstPeriodUsesLive` 2000→1980、`TestApplyGrokWeekEstimateShowsLiveAfterRollover` 1000→667、`TestApplyGrokWeekEstimateLiveEveryPeriod` 10000→9913）、`poller_test.go`（5h 14286→13333、weekly 12500→11765、monthly 25000→23530、账号 9 37500→35294）、`cmd/prism/metapi_test.go`（12353→12174、20588→20290、5h 200000→190476、weekly 100000→99010、monthly 200000→198020）。
+- **未受影响（小数路径 / 例外路径，断言逐字未动）**：`TestApplyWeekEstimateUsesUnflooredFraction`、`TestApplyWeekEstimateSubPercentStillInverts`、`TestApplyClinePassEstimatesUsesUnflooredFraction`、`TestApplyClinePassEstimatesSubPercentStillInverts`、`TestApplyClinePassEstimatesDrainedWeekAnchorsMonthly`（frac=0.999）、`TestApplyGrokWeekEstimateIgnoresNonGrokSumZeroPercent`（P=0）、`TestApplyClinePassEstimatesGuards`（P=0 与 P=100 两条例外）、`TestApplyClinePassEstimatesExhaustedUsesMeasured`（P=100 clamp）。
+- **变异自证**：把 `w.Percent > 0` 条件临时去掉（让中点也作用于 P=0）→ `TestApplyClinePassEstimatesGuards` / `TestApplyGrokWeekEstimateIgnoresNonGrokSumZeroPercent` FAIL；去掉 clamp → 两个耗尽用例 FAIL；改回 `Percent/100`（旧口径）→ 上述 10 个断言 FAIL。恢复后 `go test -count=1 ./...` 全绿。
+
+### 与既有笔记的取代范围（本次返修）
+- 本篇上一节的「遗留 → 整数百分比的精度风险」条目**由本节修正**（从「已知未决」变为「已用中点修正、残余为区间内 ±25% 中心估计」），原文保留不改。
+- `20261003-clinepass-quota-estimate-derivation.md`：其**整数占比口径被第二次修正**——v0.35.0 只给 Gemini 补了未取整 `UsedFraction`，ClinePass / SuperGrok 的整数 `Percent` 仍按地板值反推；本笔把它改为区间中点。其周锚定单向派生、分子剔 cache、T/T 语义全部仍 active。
+- `20260925-clinepass-quota-total-estimate.md`：其「5h/weekly/monthly 各自反推」的历史描述属早期形态，已被 v0.35.0 与本笔两次迭代取代，本篇不再重复声明。
+
 ## 遗留（未决 / 需后续处理）
 - **5h 反推的语义风险（已知、未消除）**：5h 的「池」是把 5 小时滚动限流窗口内观测到的词元 ÷ 该窗口 used fraction 得到的**推断量**，它不是一个上游承诺的额度——窗口越短、流量越小、占比越低，反推值越不稳（见下「精度风险」）。是否需要按置信度（如占比 < 5% 不显示）留给后续决策；本笔如实显示，不加门槛。
 - **整数百分比的精度风险**：ClinePass 上游 `percentUsed` 是整数，`windowUsedFraction` 回落到 `Percent/100`，真实 frac ∈ `[P/100, (P+1)/100)`，反推池落在 `(100T/(P+1), 100T/P]`——`P=1` 时是 **50T ~ 100T** 的 2 倍区间。5h 窗口的 T 本身就小，这个相对误差比周/月更显眼；`displayPercent` 的 ceil 也会让「已用」一侧略大于分子的实际占比。

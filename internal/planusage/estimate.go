@@ -170,12 +170,44 @@ type grokWeekEstimate struct {
 }
 
 // windowUsedFraction is the reversal denominator. Prefer the unfloored
-// share when the fetcher set it (Gemini remainingFraction); otherwise
-// Percent/100 (Grok). Values too small to invert stably return 0.
+// share when the fetcher set it (Gemini remainingFraction); otherwise the
+// integer Percent. Values too small to invert stably return 0.
+//
+// MIDPOINT CORRECTION (verified against the live ClinePass upstream: a plain
+// GET of plan/usage-limits returns INTEGER percentUsed — five_hour=2,
+// weekly=51, monthly=75, no decimal point anywhere — so Percent is the FLOOR
+// of the true used fraction and the true fraction lies in the interval
+// [Percent/100, (Percent+1)/100): 51 % can be anything from 51.0 % up to but
+// not including 52 %).
+//
+// Reversing from the FLOOR puts the denominator at the interval's bottom, so
+// every integer-percentage pool comes out too LARGE by up to 100/P % — at
+// P=1 the derived pool is up to TWICE the truth (a single token at 1 % reads
+// as a 100-token pool), and even a mid-range P=8 is biased up by ~6 %
+// (100/8 vs 100/8.5). Taking the interval's MIDPOINT — (Percent + 0.5)/100 —
+// is the unbiased point estimate of that interval: it halves the worst-case
+// relative error (P=1: the 50T..100T spread narrows to 66.7T centred, a 2×
+// spread becomes 1.5×) and removes the systematic upward bias across the
+// whole roster instead of only its extremes.
+//
+// THE EXCEPTION THAT MUST NOT MOVE: Percent == 0 still returns 0. A midpoint
+// there would invent 0.5 % and turn one token of traffic into a 200-token
+// pool — a confident-looking number out of nothing. Zero stays "no traffic /
+// unknown" (no estimate, the card reads "-", the title still carries the
+// countdown), which is also what the sub-percent fractional path already
+// does when Gemini hands us a real UsedFraction.
+//
+// The midpoint is CLAMPED to 1: the upstream clamps percentUsed at 100 %, so
+// the interval's top collapses onto 1 and an exhausted window keeps the T/T
+// wording (reversePool(tokens, 1) = tokens) instead of losing its estimate
+// entirely to this correction.
 func windowUsedFraction(w Window) float64 {
 	f := w.UsedFraction
 	if f <= 0 && w.Percent > 0 {
-		f = float64(w.Percent) / 100
+		f = (float64(w.Percent) + 0.5) / 100
+		if f > 1 {
+			f = 1
+		}
 	}
 	if f < 1e-9 || f > 1 {
 		return 0

@@ -159,10 +159,10 @@ func TestPollerClinePassEstimateApplied(t *testing.T) {
 	if len(snaps) != 1 || len(snaps[0].Windows) != 3 {
 		t.Fatalf("snapshots = %+v, want 1 snapshot with 3 windows", snaps)
 	}
-	// clinepassUsageBody percentUsed 7 / 8 / 4 (integral → Percent/100).
-	// The weekly percent anchors the pool; monthly = 2 × weekly; the 5-hour
-	// window is reversed on its own percent (7 %), so 1000/0.07.
-	want := map[string]int64{"5h": 14286, "weekly": 12500, "monthly": 25000}
+	// clinepassUsageBody percentUsed 7 / 8 / 4 (integral → the midpoint of each
+	// interval: 7 % → 0.075, 8 % → 0.085). The weekly percent anchors the pool;
+	// monthly = 2 × weekly; the 5-hour window is reversed on its own percent.
+	want := map[string]int64{"5h": 13333, "weekly": 11765, "monthly": 23530}
 	for _, w := range snaps[0].Windows {
 		if w.LimitTokensEstimate != want[w.Name] {
 			t.Fatalf("%s estimate = %d, want %d", w.Name, w.LimitTokensEstimate, want[w.Name])
@@ -211,8 +211,8 @@ func TestPollerEstimateDispatchPerProvider(t *testing.T) {
 	got := collect(t, p)
 	// The POOL windows are estimated (weekly anchors the pool, monthly is
 	// 2 × weekly); the 5-hour window is reversed on its OWN percent (7 %), so
-	// it is 1000/0.07 and not 0 and not the pool.
-	pool := map[string]int64{"weekly": 12500, "monthly": 25000, "5h": 14286}
+	// it is 1000/0.075 and not 0 and not the pool.
+	pool := map[string]int64{"weekly": 11765, "monthly": 23530, "5h": 13333}
 	if len(got["clinepass"]) != 3 {
 		t.Fatalf("clinepass windows = %+v, want 3", got["clinepass"])
 	}
@@ -335,8 +335,8 @@ func TestPollerClinePassPerAccountEstimate(t *testing.T) {
 
 	// Each snapshot counts only its own account's consumption:
 	// clinepassUsageBody is 7 % / 8 % / 4 %, so the WEEKLY window (the pool
-	// anchor) takes 1000 → 12500 and 3000 → 37500, while the 5-hour window is
-	// reversed on its own 7 % (1000 → 14285, 3000 → 42857).
+	// anchor) takes 1000 → 11765 and 3000 → 35294, while the 5-hour window is
+	// reversed on its own 7 % (1000 → 13333, 3000 → 40000).
 	snaps := c.List()
 	byFP := map[string]int64{}
 	for _, s := range snaps {
@@ -361,11 +361,11 @@ func TestPollerClinePassPerAccountEstimate(t *testing.T) {
 	if len(byFP) != 2 {
 		t.Fatalf("snapshots = %d, want 2 (one per account)", len(byFP))
 	}
-	if got := byFP[KeyFingerprint(tokA)]; got != 12500 {
-		t.Fatalf("account 7 (1000 tokens ÷ 8%%) weekly estimate = %d, want 12500", got)
+	if got := byFP[KeyFingerprint(tokA)]; got != 11765 {
+		t.Fatalf("account 7 (1000 tokens ÷ 8%%) weekly estimate = %d, want 11765", got)
 	}
-	if got := byFP[KeyFingerprint(tokB)]; got != 37500 {
-		t.Fatalf("account 9 (3000 tokens ÷ 8%%) weekly estimate = %d, want 37500", got)
+	if got := byFP[KeyFingerprint(tokB)]; got != 35294 {
+		t.Fatalf("account 9 (3000 tokens ÷ 8%%) weekly estimate = %d, want 35294", got)
 	}
 }
 

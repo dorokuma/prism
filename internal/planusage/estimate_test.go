@@ -194,10 +194,12 @@ func TestApplyWeekEstimateEatsCombinedAgySum(t *testing.T) {
 	usageSum := func(context.Context, int64, int64) (int64, error) { return 400, nil }
 	agySum := func(context.Context, int64, int64) (int64, error) { return 600, nil }
 	got := ApplyWeekEstimate(context.Background(), snap, CombineTokenSums(usageSum, agySum), path, start.Add(time.Hour))
-	// 400+600 = 1000 tokens at 50% → pool 2000. ApplyWeekEstimate itself
-	// is unchanged; the combined sum is what feeds it.
-	if got.Windows[0].LimitTokensEstimate != 2000 {
-		t.Fatalf("combined estimate = %d, want 2000", got.Windows[0].LimitTokensEstimate)
+	// 400+600 = 1000 tokens at an integer 50 % → pool 1000/0.505 = 1980. The
+	// midpoint correction (windowUsedFraction) is what makes this 1980 and not
+	// 2000; ApplyWeekEstimate itself is unchanged, the combined sum is what
+	// feeds it.
+	if got.Windows[0].LimitTokensEstimate != 1980 {
+		t.Fatalf("combined estimate = %d, want 1980", got.Windows[0].LimitTokensEstimate)
 	}
 }
 
@@ -225,9 +227,9 @@ func TestApplyWeekEstimateFiveHourWindow(t *testing.T) {
 		switch from {
 		case start5h.Unix():
 			gotTo5h = to
-			return 2_000_000, nil // 2M at 10 % → 20M pool
+			return 2_000_000, nil // an exact fraction: 2M / 0.1 → 20M pool
 		case startW.Unix():
-			return 100_000, nil // 100k at 50 % → 200k pool
+			return 100_000, nil // an INTEGER 50 % → midpoint 0.505 → 198020
 		default:
 			t.Errorf("unexpected sum window from=%d", from)
 			return 0, nil
@@ -237,8 +239,10 @@ func TestApplyWeekEstimateFiveHourWindow(t *testing.T) {
 	if got.Windows[0].LimitTokensEstimate != 20_000_000 {
 		t.Fatalf("5h estimate = %d, want its own reversal 20000000", got.Windows[0].LimitTokensEstimate)
 	}
-	if got.Windows[1].LimitTokensEstimate != 200_000 {
-		t.Fatalf("weekly estimate = %d, want 200000", got.Windows[1].LimitTokensEstimate)
+	// The weekly window carries an INTEGER percent, so the midpoint
+	// correction applies: 100000 / 0.505 = 198020, not 200000.
+	if got.Windows[1].LimitTokensEstimate != 198_020 {
+		t.Fatalf("weekly estimate = %d, want 198020 (the midpoint reversal)", got.Windows[1].LimitTokensEstimate)
 	}
 	if gotTo5h != now.Unix() {
 		t.Fatalf("5h sum to = %d, want min(now, reset) = now = %d", gotTo5h, now.Unix())
@@ -391,7 +395,10 @@ func TestApplyClinePassEstimates(t *testing.T) {
 		{Name: "weekly", Status: "ok", Percent: 8, PeriodStart: &startW, ResetsAt: &endW},
 		{Name: "monthly", Status: "ok", Percent: 4, PeriodStart: &startM, ResetsAt: &endM},
 	}}
-	// Window-specific sums: 5h 50M@5%, weekly 80M@8%, monthly 40M@4%.
+	// Window-specific sums: 5h 50M@5%, weekly 80M@8%, monthly 40M@4%. Every
+	// percent here is an INTEGER, so the midpoint correction applies to all
+	// three denominators (5 % → 0.055, 8 % → 0.085, and the monthly fallback
+	// would use 0.045 — but it never does, the weekly window anchors).
 	sum := func(_ context.Context, from, to int64) (int64, error) {
 		switch from {
 		case start5h.Unix():
@@ -413,34 +420,34 @@ func TestApplyClinePassEstimates(t *testing.T) {
 	}
 	got := ApplyClinePassEstimates(context.Background(), snap, sum, now)
 
-	// The 5-hour window is reversed on its OWN: 50000000 / 0.05 = 1000000000.
+	// The 5-hour window is reversed on its OWN: 50000000 / 0.055 = 909090909.
 	// It is derived from its own percent and its own sum, never from the
-	// weekly-anchored pool (which happens to land on the same number here).
-	if got.Windows[0].LimitTokensEstimate != 1_000_000_000 {
-		t.Fatalf("5h estimate = %d, want its own reversal 1000000000: %+v",
+	// weekly-anchored pool.
+	if got.Windows[0].LimitTokensEstimate != 909_090_909 {
+		t.Fatalf("5h estimate = %d, want its own midpoint reversal 909090909: %+v",
 			got.Windows[0].LimitTokensEstimate, got.Windows[0])
 	}
-	// L = 80000000 / 0.08 = 1_000_000_000; the monthly window is 2L, whatever
+	// L = 80000000 / 0.085 = 941176471; the monthly window is 2L, whatever
 	// its own percent (4 %) would have reversed to on its own.
-	if got.Windows[1].LimitTokensEstimate != 1_000_000_000 {
-		t.Fatalf("weekly estimate = %d, want 1000000000", got.Windows[1].LimitTokensEstimate)
+	if got.Windows[1].LimitTokensEstimate != 941_176_471 {
+		t.Fatalf("weekly estimate = %d, want 941176471 (the midpoint reversal, not 1000000000)", got.Windows[1].LimitTokensEstimate)
 	}
-	if got.Windows[2].LimitTokensEstimate != 2_000_000_000 {
-		t.Fatalf("monthly estimate = %d, want exactly 2 × weekly = 2000000000", got.Windows[2].LimitTokensEstimate)
+	if got.Windows[2].LimitTokensEstimate != 1_882_352_942 {
+		t.Fatalf("monthly estimate = %d, want exactly 2 × weekly = 1882352942", got.Windows[2].LimitTokensEstimate)
 	}
 
 	cards := RenderCards([]Snapshot{got}, now, CardOptions{NoColor: true})
 	for _, want := range []string{
-		rowTail("5%", "0.5亿/10亿"), // 5h: its own reversal
-		rowTail("8%", "0.8亿/10亿"), // weekly: L
-		rowTail("4%", "0.8亿/20亿"), // monthly: 2L
+		rowTail("5%", "0.5亿/9.1亿"),  // 5h: its own reversal
+		rowTail("8%", "0.8亿/9.4亿"),  // weekly: L
+		rowTail("4%", "0.8亿/18.8亿"), // monthly: 2L
 	} {
 		if !strings.Contains(cards, want) {
 			t.Fatalf("cards missing %q:\n%s", want, cards)
 		}
 	}
 	table := RenderTableAt([]Snapshot{got}, now)
-	for _, want := range []string{"1B", "2B"} {
+	for _, want := range []string{"909.1M", "941.2M", "1.9B"} {
 		if !strings.Contains(table, want) {
 			t.Fatalf("table missing %q:\n%s", want, table)
 		}
@@ -470,12 +477,15 @@ func TestApplyClinePassEstimatesWeeklyResetFallsBackToMonthly(t *testing.T) {
 		return 400_000, nil
 	}
 	got := ApplyClinePassEstimates(context.Background(), snap, sum, now)
-	if got.Windows[0].LimitTokensEstimate != 800_000 {
-		t.Fatalf("fresh week estimate = %d, want 800000 (half the monthly reversal)",
+	// 400000 / (2 × 0.255) = 784314 — the monthly percent is an INTEGER (25 %),
+	// so the midpoint correction lifts the denominator to 0.255 and the pool
+	// comes out lower than the old 800000.
+	if got.Windows[0].LimitTokensEstimate != 784_314 {
+		t.Fatalf("fresh week estimate = %d, want 784314 (half the monthly reversal)",
 			got.Windows[0].LimitTokensEstimate)
 	}
-	if got.Windows[1].LimitTokensEstimate != 1_600_000 {
-		t.Fatalf("monthly estimate = %d, want 2 × the weekly pool = 1600000",
+	if got.Windows[1].LimitTokensEstimate != 1_568_628 {
+		t.Fatalf("monthly estimate = %d, want 2 × the weekly pool = 1568628",
 			got.Windows[1].LimitTokensEstimate)
 	}
 }
@@ -697,8 +707,10 @@ func TestApplyGrokWeekEstimateFirstPeriodUsesLive(t *testing.T) {
 	}}}
 	sum := func(context.Context, int64, int64) (int64, error) { return 1000, nil }
 	got := ApplyGrokWeekEstimate(context.Background(), snap, sum, path, start.Add(time.Hour))
-	if got.Windows[0].LimitTokensEstimate != 2000 {
-		t.Fatalf("first period live estimate = %d, want 2000", got.Windows[0].LimitTokensEstimate)
+	// 1000 / 0.505 = 1980: an integer 50 % goes through the midpoint
+	// correction, so the live reversal is 1980 and not 2000.
+	if got.Windows[0].LimitTokensEstimate != 1980 {
+		t.Fatalf("first period live estimate = %d, want 1980", got.Windows[0].LimitTokensEstimate)
 	}
 }
 
@@ -719,10 +731,10 @@ func TestApplyGrokWeekEstimateShowsLiveAfterRollover(t *testing.T) {
 		Name: "weekly", Percent: 1, PeriodStart: &p2, ResetsAt: &p2end,
 	}}}
 	got := ApplyGrokWeekEstimate(context.Background(), snap2, sum2, path, p2.Add(time.Hour))
-	// LIVE reversal: 10 tokens at 1% used → pool ≈ 1000, not the previous
-	// period's frozen value.
-	if got.Windows[0].LimitTokensEstimate != 1000 {
-		t.Fatalf("after rollover = %d, want live 1000", got.Windows[0].LimitTokensEstimate)
+	// LIVE reversal: 10 tokens at an integer 1 % → 10 / 0.015 = 667 (the
+	// midpoint correction, not the previous period's frozen value).
+	if got.Windows[0].LimitTokensEstimate != 667 {
+		t.Fatalf("after rollover = %d, want live 667", got.Windows[0].LimitTokensEstimate)
 	}
 }
 
@@ -774,7 +786,9 @@ func TestApplyGrokWeekEstimateLiveEveryPeriod(t *testing.T) {
 	got := ApplyGrokWeekEstimate(context.Background(), Snapshot{Windows: []Window{{
 		Name: "weekly", Percent: 57, PeriodStart: &p1, ResetsAt: &p1end,
 	}}}, liveSum, path, p1.Add(6*24*time.Hour))
-	if got.Windows[0].LimitTokensEstimate != 10000 {
-		t.Fatalf("older snapshot reversed live = %d, want 10000", got.Windows[0].LimitTokensEstimate)
+	// 5700 / 0.575 = 9913: the integer 57 % percent goes through the midpoint
+	// correction, so the live reversal is 9913 and not 10000.
+	if got.Windows[0].LimitTokensEstimate != 9913 {
+		t.Fatalf("older snapshot reversed live = %d, want 9913", got.Windows[0].LimitTokensEstimate)
 	}
 }
