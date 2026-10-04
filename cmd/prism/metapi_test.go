@@ -148,12 +148,14 @@ func TestApplyQuotaClinePassEstimatePerAccount(t *testing.T) {
 	skippedBefore := clinepassEstimateSkipped.Value()
 
 	got := applyQuotaClinePassEstimate(context.Background(), snapshot(), 38)
-	if got.Windows[0].LimitTokensEstimate != 12_353 {
-		t.Fatalf("account 38 estimate = %d, want 12353 (its own 4200 tokens ÷ 34%%)", got.Windows[0].LimitTokensEstimate)
+	// 4200 / 0.345 = 12174: the integer 34 % percent goes through the midpoint
+	// correction, so the pool is 12174 and not the old 12353.
+	if got.Windows[0].LimitTokensEstimate != 12_174 {
+		t.Fatalf("account 38 estimate = %d, want 12174 (its own 4200 tokens ÷ 34%%)", got.Windows[0].LimitTokensEstimate)
 	}
 	other := applyQuotaClinePassEstimate(context.Background(), snapshot(), 40)
-	if other.Windows[0].LimitTokensEstimate != 20_588 {
-		t.Fatalf("account 40 estimate = %d, want 20588 (its own 7000 tokens ÷ 34%%)", other.Windows[0].LimitTokensEstimate)
+	if other.Windows[0].LimitTokensEstimate != 20_290 {
+		t.Fatalf("account 40 estimate = %d, want 20290 (its own 7000 tokens ÷ 34%%)", other.Windows[0].LimitTokensEstimate)
 	}
 	// A scoped account is NOT a skip: the counter must not move for either
 	// accountID > 0 call above.
@@ -251,7 +253,9 @@ func TestCLIAssemblyCarriesAccountFingerprints(t *testing.T) {
 	if len(byFP) != 2 {
 		t.Fatalf("fingerprints = %d, want 2 distinct", len(byFP))
 	}
-	for tok, want := range map[string]int64{tokA: 12_353, tokB: 20_588} {
+	// 4200 / 0.345 = 12174 and 7000 / 0.345 = 20290: the integer 34 % percent
+	// goes through the midpoint correction (windowUsedFraction).
+	for tok, want := range map[string]int64{tokA: 12_174, tokB: 20_290} {
 		s, ok := byFP[planusage.KeyFingerprint(tok)]
 		if !ok {
 			t.Fatalf("no snapshot for the account keyed by %s", tok)
@@ -481,9 +485,13 @@ func TestApplyQuotaClinePassEstimate(t *testing.T) {
 		{Name: "monthly", Status: "ok", Percent: 5, PeriodStart: &startM, ResetsAt: &endM},
 	}}
 	got := applyQuotaClinePassEstimate(context.Background(), snap, 34)
-	// The weekly molecule is 20000+30000 = 50000 at 50 % → L = 100000, and the
-	// monthly window is 2L whatever its own 5 % would have reversed to.
-	want := map[string]int64{"5h": 0, "weekly": 100_000, "monthly": 200_000}
+	// Midpoint correction on every integer percent (10 % → 0.105, 50 % → 0.505,
+	// 5 % → 0.055): the weekly molecule is 20000+30000 = 50000 at 50 % →
+	// L = 50000/0.505 = 99010, the monthly window is 2L whatever its own 5 %
+	// would have reversed to, and the 5-hour window is reversed on its OWN
+	// molecule (20000 in the window) and its own percent: 20000/0.105 = 190476
+	// — not 0 and not the weekly-anchored pool.
+	want := map[string]int64{"5h": 190_476, "weekly": 99_010, "monthly": 198_020}
 	for _, w := range got.Windows {
 		if w.LimitTokensEstimate != want[w.Name] {
 			t.Fatalf("%s estimate = %d, want %d", w.Name, w.LimitTokensEstimate, want[w.Name])
@@ -508,18 +516,23 @@ func TestApplyQuotaClinePassEstimate(t *testing.T) {
 	}
 
 	// The CLI renders the totals: the derived pool is written like any other
-	// total (no "~" marker, no 估算池 title segment), and the 5-hour row
-	// carries the countdown instead of a pair — left-aligned like every metric,
-	// exactly one space after the percentage.
+	// total (no "~" marker, no 估算池 title segment), and the 5-hour row now
+	// carries its own pair. The reset countdown moved to the title, once per
+	// card. At 亿 granularity these small fixtures read "0亿/0亿".
 	cards := planusage.RenderCards([]planusage.Snapshot{got}, now, planusage.CardOptions{NoColor: true})
 	for _, wantText := range []string{
-		"50.0K/100.0K",
-		"10.0K/200.0K",
-		"10% 2h",
+		"╭─ ClinePass · 5小时限额 · 2小时00分 ",
+		"╭─ ClinePass · 周限额 · 3天 ",
+		"╭─ ClinePass · 月限额 · 10天 ",
+		"0亿/0亿",
 	} {
 		if !strings.Contains(cards, wantText) {
 			t.Fatalf("cards missing %q:\n%s", wantText, cards)
 		}
+	}
+	// The countdown is window-level: once on the 5h title, never on a row.
+	if n := strings.Count(cards, "2小时00分"); n != 1 {
+		t.Fatalf("countdown occurs %d times, want 1 (the title):\n%s", n, cards)
 	}
 }
 

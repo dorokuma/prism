@@ -83,6 +83,37 @@ func TestFormatTokens(t *testing.T) {
 	}
 }
 
+// TestFormatTokensYi pins the Chinese-unit formatter the quota card's
+// used/total pair uses: ONE unit (亿), one decimal, and a whole 亿 that
+// drops its fraction. There is no 万 / 千万 step and no "<0.1亿" fallback:
+// a count below 0.05 亿 reads "0" rather than borrowing precision the unit
+// does not have. "9999亿" is the widest single side the pair's 13-column
+// budget is sized for.
+func TestFormatTokensYi(t *testing.T) {
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{0, "0亿"},
+		{1, "0亿"},
+		{4_000_000, "0亿"},
+		{10_000_000, "0.1亿"},
+		{30_000_000, "0.3亿"},
+		{220_000_000, "2.2亿"},
+		{340_000_000, "3.4亿"},
+		{1_000_000_000, "10亿"},
+		{1_300_000_000, "13亿"},
+		{999_900_000_000, "9999亿"},
+		{-1_300_000_000, "-13亿"},
+		{-30_000_000, "-0.3亿"},
+	}
+	for _, c := range cases {
+		if got := FormatTokensYi(c.in); got != c.want {
+			t.Errorf("FormatTokensYi(%d) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func f(v float64) *float64 { return &v }
 
 func TestFormatCost(t *testing.T) {

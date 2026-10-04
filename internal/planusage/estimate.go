@@ -170,12 +170,44 @@ type grokWeekEstimate struct {
 }
 
 // windowUsedFraction is the reversal denominator. Prefer the unfloored
-// share when the fetcher set it (Gemini remainingFraction); otherwise
-// Percent/100 (Grok). Values too small to invert stably return 0.
+// share when the fetcher set it (Gemini remainingFraction); otherwise the
+// integer Percent. Values too small to invert stably return 0.
+//
+// MIDPOINT CORRECTION (verified against the live ClinePass upstream: a plain
+// GET of plan/usage-limits returns INTEGER percentUsed — five_hour=2,
+// weekly=51, monthly=75, no decimal point anywhere — so Percent is the FLOOR
+// of the true used fraction and the true fraction lies in the interval
+// [Percent/100, (Percent+1)/100): 51 % can be anything from 51.0 % up to but
+// not including 52 %).
+//
+// Reversing from the FLOOR puts the denominator at the interval's bottom, so
+// every integer-percentage pool comes out too LARGE by up to 100/P % — at
+// P=1 the derived pool is up to TWICE the truth (a single token at 1 % reads
+// as a 100-token pool), and even a mid-range P=8 is biased up by ~6 %
+// (100/8 vs 100/8.5). Taking the interval's MIDPOINT — (Percent + 0.5)/100 —
+// is the unbiased point estimate of that interval: it halves the worst-case
+// relative error (P=1: the 50T..100T spread narrows to 66.7T centred, a 2×
+// spread becomes 1.5×) and removes the systematic upward bias across the
+// whole roster instead of only its extremes.
+//
+// THE EXCEPTION THAT MUST NOT MOVE: Percent == 0 still returns 0. A midpoint
+// there would invent 0.5 % and turn one token of traffic into a 200-token
+// pool — a confident-looking number out of nothing. Zero stays "no traffic /
+// unknown" (no estimate, the card reads "-", the title still carries the
+// countdown), which is also what the sub-percent fractional path already
+// does when Gemini hands us a real UsedFraction.
+//
+// The midpoint is CLAMPED to 1: the upstream clamps percentUsed at 100 %, so
+// the interval's top collapses onto 1 and an exhausted window keeps the T/T
+// wording (reversePool(tokens, 1) = tokens) instead of losing its estimate
+// entirely to this correction.
 func windowUsedFraction(w Window) float64 {
 	f := w.UsedFraction
 	if f <= 0 && w.Percent > 0 {
-		f = float64(w.Percent) / 100
+		f = (float64(w.Percent) + 0.5) / 100
+		if f > 1 {
+			f = 1
+		}
 	}
 	if f < 1e-9 || f > 1 {
 		return 0
@@ -209,51 +241,72 @@ func withEstimateLock(path string, fn func() error) error {
 	return fn()
 }
 
-// ApplyWeekEstimate fills LimitTokensEstimate on the weekly window of
-// any provider with the LIVE reversal: consumed tokens in the current
-// period ÷ used fraction. Gemini supplies UsedFraction from the quota
-// remainingFraction so a sub-1% week still inverts and a 12.7% week is
-// not treated as 12%. Grok keeps Percent/100. The on-disk file keeps
-// period_start plus the live snapshot for inspection; sum errors leave
-// the estimate empty rather than showing a stale value.
+// ApplyWeekEstimate fills LimitTokensEstimate on a provider's reversible
+// windows from the LIVE reversal: consumed tokens in the window's own
+// [PeriodStart, min(now, ResetsAt)] range ÷ the window's used fraction.
+//
+// Two window names are reversed, in this order:
+//
+//   - "weekly" (every provider that HAS a week): Gemini supplies
+//     UsedFraction from the quota remainingFraction so a sub-1% week still
+//     inverts and a 12.7% week is not treated as 12%. Grok keeps
+//     Percent/100. The reversal is frozen to the on-disk estimate file
+//     (period_start plus the live snapshot) — the only part of this
+//     function that still writes there.
+//   - "5h" (Gemini today, the only provider this function sees with a
+//     5-hour window): the SAME reversal over a 5-hour span, anchored on the
+//     PeriodStart the Gemini fetcher derives (ResetsAt − 5h). It is
+//     deliberately NOT frozen to the estimate file: that file is the WEEK
+//     anchor (GeminiWeekStartUnix reads its period_start), so a 5-hour
+//     period_start in it would move the usage default range. A 5-hour
+//     window with no usable fraction — a fresh window, or used fraction 0 —
+//     keeps an empty estimate, and its card row reads "-" (the title still
+//     carries the countdown). SuperGrok has only a weekly window, so this
+//     branch is a no-op for it.
+//
+// Sum errors leave the estimate empty rather than showing a stale value.
 func ApplyWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum, path string, now time.Time) Snapshot {
 	if sum == nil || path == "" {
 		return snap
 	}
-	idx := -1
-	for i := range snap.Windows {
-		if snap.Windows[i].Name == "weekly" {
-			idx = i
-			break
+	for _, name := range []string{"weekly", "5h"} {
+		idx := -1
+		for i := range snap.Windows {
+			if snap.Windows[i].Name == name {
+				idx = i
+				break
+			}
 		}
-	}
-	if idx < 0 || snap.Windows[idx].PeriodStart == nil {
-		return snap
-	}
-	w := snap.Windows[idx]
-	from := w.PeriodStart.Unix()
-	to := now.Unix()
-	if w.ResetsAt != nil && !w.ResetsAt.After(now) {
-		to = w.ResetsAt.Unix()
-	}
-	tokens, err := sum(ctx, from, to)
-	if err != nil {
-		slog.Warn("quota week token sum failed", "error", err)
-		return snap
-	}
-	frac := windowUsedFraction(w)
-	est := reversePool(tokens, frac)
-	snap.Windows[idx].LimitTokensEstimate = est
-	if err := withEstimateLock(path, func() error {
-		st, _ := loadGrokWeekEstimate(path)
-		st.PeriodStart = w.PeriodStart.UTC().Format(time.RFC3339Nano)
-		st.LiveTokens = tokens
-		st.LivePercent = w.Percent
-		st.LiveUsedFraction = frac
-		st.LiveEstimate = est
-		return saveGrokWeekEstimate(path, st)
-	}); err != nil {
-		slog.Warn("quota week estimate lock failed", "error", err)
+		if idx < 0 || snap.Windows[idx].PeriodStart == nil {
+			continue
+		}
+		w := snap.Windows[idx]
+		from := w.PeriodStart.Unix()
+		to := now.Unix()
+		if w.ResetsAt != nil && !w.ResetsAt.After(now) {
+			to = w.ResetsAt.Unix()
+		}
+		tokens, err := sum(ctx, from, to)
+		if err != nil {
+			slog.Warn("quota window token sum failed", "window", name, "error", err)
+			continue
+		}
+		frac := windowUsedFraction(w)
+		snap.Windows[idx].LimitTokensEstimate = reversePool(tokens, frac)
+		if name != "weekly" {
+			continue // the 5-hour reversal is not frozen (see the note above)
+		}
+		if err := withEstimateLock(path, func() error {
+			st, _ := loadGrokWeekEstimate(path)
+			st.PeriodStart = w.PeriodStart.UTC().Format(time.RFC3339Nano)
+			st.LiveTokens = tokens
+			st.LivePercent = w.Percent
+			st.LiveUsedFraction = frac
+			st.LiveEstimate = snap.Windows[idx].LimitTokensEstimate
+			return saveGrokWeekEstimate(path, st)
+		}); err != nil {
+			slog.Warn("quota week estimate lock failed", "error", err)
+		}
 	}
 	return snap
 }
@@ -286,10 +339,16 @@ func ApplyGrokWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum,
 // L = tokens_m / (2 * frac_m): half the monthly reversal, because the
 // monthly pool is twice the weekly one.
 //
-// The 5-hour window is deliberately NOT estimated: it is a rolling rate
-// limit with its own percent, so reversing it would produce yet another
-// unrelated pool. Its card row shows the reset countdown in place of the
-// token pair (see clineMetricField).
+// The 5-hour window is reversed on its OWN and never joins that pool: it is
+// a rolling rate limit with its own percent, its own period start and its
+// own traffic, so folding it into the weekly-anchored L is exactly what
+// produced the old three mutually contradictory pools. It therefore gets
+// its OWN reversal — tokens_5h / frac_5h over [PeriodStart, min(now,
+// ResetsAt)] — written to that window's LimitTokensEstimate, which is what
+// its card row now shows as an X/X pair. A drained 5-hour window (frac >= 1)
+// reverses to its own measured consumption, the same T/T last resort the
+// weekly window uses; a fresh one (frac 0, no traffic yet) gets nothing and
+// its row reads "-".
 //
 // An exhausted window (frac >= 1) keeps the X/X wording from the derived
 // L (L/L, or 2L/2L for the monthly window). Only when there is no L at
@@ -314,17 +373,20 @@ func ApplyClinePassEstimates(ctx context.Context, snap Snapshot, sum GrokTokenSu
 		tokens int64
 		frac   float64
 	}
-	var weekly, monthly observed
+	var weekly, monthly, fiveHour observed
 	for i := range snap.Windows {
 		w := snap.Windows[i]
-		// Only the pool windows are estimated; the 5-hour window is
-		// skipped without a sum call (nothing to reverse it against).
+		// Every window with a pool of its own is summed: weekly and monthly
+		// pool-window observations feed the weekly-anchored L, the 5-hour one
+		// is reversed on its own (see the note above).
 		var slot *observed
 		switch w.Name {
 		case "weekly":
 			slot = &weekly
 		case "monthly":
 			slot = &monthly
+		case "5h":
+			slot = &fiveHour
 		default:
 			continue
 		}
@@ -353,6 +415,19 @@ func ApplyClinePassEstimates(ctx context.Context, snap Snapshot, sum GrokTokenSu
 		pool = reversePool(weekly.tokens, weekly.frac)
 	case monthly.set && monthly.tokens > 0 && monthly.frac > 0 && monthly.frac < 1:
 		pool = reversePool(monthly.tokens, 2*monthly.frac)
+	}
+	// The 5-hour window is written from its OWN reversal, whatever the
+	// weekly-anchored pool above does: it is a different denominator, so it
+	// must not be scaled by or folded into L. reversePool is the same
+	// function and the same rounding the weekly reversal uses, so an
+	// exhausted 5-hour window (frac >= 1) comes out as its own measured
+	// consumption and carries MeasuredTokens with it, exactly like a drained
+	// weekly window does.
+	if fiveHour.set && fiveHour.tokens > 0 && fiveHour.frac > 0 {
+		snap.Windows[fiveHour.idx].LimitTokensEstimate = reversePool(fiveHour.tokens, fiveHour.frac)
+		if fiveHour.frac >= 1 {
+			snap.Windows[fiveHour.idx].MeasuredTokens = fiveHour.tokens
+		}
 	}
 	if pool > 0 {
 		if weekly.set {
