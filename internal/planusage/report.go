@@ -1194,9 +1194,10 @@ func hexValue(s string) int {
 // (a row's right-aligned metric field, 13 columns at its widest,
 // "9999亿/9999亿"). Neither side is marked: the package writes a derived pool
 // the same way it writes a measured one (see clineMetricField). Both sides go
-// through render.FormatTokensYi, so a whole 亿 drops its fraction and a value
-// below 0.05 亿 reads "0亿" rather than borrowing a 万 / 千万 unit the card
-// does not have.
+// through render.FormatTokensYi, so a whole 亿 drops its fraction, a value one
+// decimal would collapse to zero is shown with TWO decimals instead ("0.02亿",
+// see FormatTokensYi), and only a true zero — or a value below 0.005 亿, where
+// even two decimals round away — reads "0亿".
 func formatTokenPair(used, total int64) string {
 	return render.FormatTokensYi(used) + "/" + render.FormatTokensYi(total)
 }

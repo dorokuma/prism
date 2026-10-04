@@ -82,7 +82,7 @@ func ptr64(v float64) *float64 { return &v }
 
 // ── capsule card tests (A1·命中率胶囊) ───────────────────────────────────
 //
-// The invariants these tests guard: every report line is EXACTLY 56 display
+// The invariants these tests guard: every report line is EXACTLY 45 display
 // columns (ANSI counted as 0) at every shape the data can take — long names,
 // missing hit rates, an empty result, several group keys — in both color
 // modes; the card mirrors the quota capsule card (borders, palette,

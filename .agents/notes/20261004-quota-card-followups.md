@@ -75,9 +75,17 @@ supersedes: ""
 ## 遗留（未决 / 需后续处理）
 - **多分组键视图已到可用性下限**：2 键 4/4、3 键 3/2/2、5 键 1/1/1/1/1，`供应商` 表头会变成 `供…`。45 列是用户拍的同宽目标，若后续要多键视图可用，方向是「多键视图另给一版布局」或「窄终端下提示用 `--json`」，而不是回退宽度。
 - **`<0.005亿` 仍读 `0亿`**：与「真正的 0」在视觉上仍同形。这是用户认可的原状（两位小数也分不出），若要区分只能上「整数词元 + 单位」的结构性改法。
+- **（oracle 观察，登记不阻塞）`0.05亿` 边界读数不连续**：`FormatTokensYi` 在一位小数会塌成 0 时改用两位小数，因此 `4_999_999 → 0.05亿`、`5_000_000 → 0.1亿`——**相差 1 个 token，读数翻倍**（一位小数进位 + 两位小数兜底的切换点恰好在 0.05亿）。这是**知情取舍**（要么接受这个跳变，要么像用户否掉的 `<0.1亿` 那样加兜底文案，要么为小值整体换成「整数词元 + 单位」的另一种口径），但**下一个读者极可能把它当 bug 报**，故在此显式登记：
+  - 触发条件：值落在 `[0.005亿, 0.05亿)` 时读两位小数（`0.01亿`…`0.05亿`），`>= 0.05亿` 读一位小数（`0.1亿`…），两段在 `0.05亿` 处相接；
+  - 典型读数序列：`499_999 → 0亿`、`500_000 → 0.01亿`、`2_000_000 → 0.02亿`、`4_999_999 → 0.05亿`、`5_000_000 → 0.1亿`；
+  - 处置：**不改**（用户已否掉兜底文案；`TestFormatTokensYi` 已把 4_999_999/5_000_000 两个边界值钉死，跳变是既定契约而非疏漏）。若要消除跳变，方向是「小值一律两位小数、`>=1亿` 才一位小数」，代价是 `9999亿` 也要两位（撑爆 13 列预算）或引入第三档规则。
+- **（oracle 观察，登记不阻塞）usage 的 45 列「与 quota 卡同宽」是部署事实、不是机制保证**：usage 侧 `reportWidth = 45` 是**硬编码常量**，与 planusage 侧 `4 + clineRowFixed(32) + clineNameColMin(9) = 45` **没有共享常量、没有编译期或运行期校验**。45 这个数相等，依赖的是 planusage 的部署事实——当前生产 roster 最长账号名恰好 9 列（`SuperGrok`）。**若 planusage 侧再调宽**（改 `clineRowFixed` / `clineCapCells` / `clineNumberWidth` / `clineNameColMin`，或生产出现更长的账号名把 `clineNameColMin` 顶上去），**usage 必须人工同步**，否则两条命令的宽度会再一次分叉（本轮之前正是 56 vs 45 差 11 列的状态）。
+  - 已采取的缓解：`internal/usage/report.go` 的版式注释里写明了「the quota card is 4 + clineRowFixed(32) + clineNameColMin(9) = 45」，让下一个改宽的人能看见这个依赖；
+  - 未做（**明确不做**）：把两个包的宽度合成一个共享常量会让 `internal/usage` 依赖 `internal/planusage`（或反之），既破坏两包的独立测试边界，也不是用户要求的方向；加一个跨包断言测试则需要导出内部常量。留作人工同步点，**本轮只登记，不改代码**。
 - **`modelMaxWidth = 20` 现为不可达上限**：保留是为将来卡片变宽时省一次改动；若认为死常量应删，可单开一笔清理（会连带删 `reportColumns` 的 `capWidth` 分支与一条断言）。
 
 ## 来源
 - 用户指令：三条双审观察项「当场修掉、不要遗留条目」，其中 ③ 明确「usage 从 56 缩到 45 与 quota 同宽，quota 本轮不动」。
+- **本轮修订（纯注释 + 笔记，无行为改动）**：双审结论 reviewer 放行、oracle 有条件放行（两条放行条件均为注释口径）。修正三处注释偏差——① `internal/planusage/report.go` 的 `formatTokenPair` 注释（「below 0.05 亿 reads 0亿」改为两位小数兜底口径，`0亿` 只留给真正的零与 `<0.005亿`）；② `internal/usage/report_test.go` 包级注释的 `EXACTLY 56` → `45`；③ `internal/usage/report.go` 头部 ASCII 示例图 4 行只有 44 显示列（每行少 1 个 `─`），换成与渲染器逐字节一致的 45 列版本（8 行全部 45，其中 ├/╰ 规则行为 43 个 `─`）。另按 oracle 要求把两条观察项（`0.05亿` 边界读数不连续、usage 45 列依赖 planusage 部署事实需人工同步）登记进上文「遗留」节，**均不改代码**。
 - 相关实现：`internal/render/numbers.go`（`FormatTokensYi` 两位小数兜底）、`internal/render/numbers_test.go`、`internal/planusage/estimate_test.go`（`TestWindowUsedFraction`）、`internal/usage/report.go`（`reportWidth` 45 与全部布局注释）、`internal/usage/handler.go`（注释）、`internal/usage/report_test.go`、`internal/usage/handler_test.go`、`cmd/prism/agy_test.go`。
 - 相关笔记：`20261004-quota-card-5h-two-metrics.md`（清理对象）、`20261003-usage-width-stays-56.md`（被本篇取代）、`20260924-card-width-60-to-56.md`（「52 列最小可行宽度」结论被本篇取代）、`20260922-quota-capsule-bar.md`（命中率胶囊 10 格的由来，未动）。
