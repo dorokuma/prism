@@ -3,6 +3,7 @@ package planusage
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -647,6 +648,69 @@ func TestApplyClinePassEstimatesGuards(t *testing.T) {
 	}, now)
 	if skipped != 0 {
 		t.Fatalf("window without period start called the sum %d times", skipped)
+	}
+}
+
+// TestWindowUsedFraction is the pure-function, table-driven pin of the
+// reversal denominator: every branch and every abnormal boundary is spelled
+// out here instead of being reached only through an end-to-end estimate
+// number. It exists because windowUsedFraction is the denominator of EVERY
+// pool reversal in this package (ClinePass 5h/weekly/monthly, Gemini
+// weekly/5h, SuperGrok weekly), so a regression in the formula would
+// otherwise surface only as "some window's total moved".
+//
+// Boundaries pinned:
+//   - Percent == 0            → 0: the midpoint exception. A midpoint here
+//     would invent 0.5 % and turn one token of traffic into a 200× pool.
+//   - Percent 1 / 2 / 50      → the interval midpoints 0.015 / 0.025 / 0.505
+//     (the integer Percent is the FLOOR of the real used fraction, so the
+//     true fraction lies in [P/100, (P+1)/100) and its midpoint is the
+//     unbiased estimate of that interval).
+//   - Percent >= 100          → clamped to 1, never above: the upstream
+//     clamps percentUsed at 100 %, so the interval's top collapses onto 1
+//     and an exhausted window keeps its T/T last resort.
+//   - negative Percent        → 0: it must never reach the midpoint branch
+//     and produce a negative denominator.
+//   - UsedFraction > 1        → 0: the guard drops an impossible fraction
+//     instead of dividing by more than a full window.
+//   - UsedFraction <= 0       → falls back to the integer Percent midpoint.
+//   - UsedFraction > 0        → the fractional path is returned verbatim
+//     (Gemini's remainingFraction reversal), even when it disagrees with
+//     Percent — including Percent == 0, where the fraction wins.
+func TestWindowUsedFraction(t *testing.T) {
+	cases := []struct {
+		name    string
+		percent int
+		frac    float64
+		want    float64
+	}{
+		// ── the integer-Percent path (midpoint + exceptions) ──────────────
+		{name: "percent zero keeps zero", percent: 0, frac: 0, want: 0},
+		{name: "percent one midpoint", percent: 1, frac: 0, want: 0.015},
+		{name: "percent two midpoint", percent: 2, frac: 0, want: 0.025},
+		{name: "percent fifty midpoint", percent: 50, frac: 0, want: 0.505},
+		{name: "percent ninety-nine midpoint", percent: 99, frac: 0, want: 0.995},
+		{name: "percent hundred clamps to one", percent: 100, frac: 0, want: 1},
+		{name: "percent above hundred clamps to one", percent: 101, frac: 0, want: 1},
+		{name: "percent far above hundred clamps to one", percent: 150, frac: 0, want: 1},
+		{name: "negative percent stays zero", percent: -5, frac: 0, want: 0},
+		{name: "negative fraction falls back to the midpoint", percent: 34, frac: -0.2, want: 0.345},
+
+		// ── the UsedFraction path (verbatim, wins over Percent) ───────────
+		{name: "fraction wins over a disagreeing percent", percent: 34, frac: 0.34, want: 0.34},
+		{name: "sub-percent fraction still inverts", percent: 0, frac: 0.004, want: 0.004},
+		{name: "drained fraction is not dropped", percent: 100, frac: 1, want: 1},
+		{name: "fraction above one is dropped", percent: 34, frac: 1.5, want: 0},
+		{name: "zero fraction falls back to the midpoint", percent: 8, frac: 0, want: 0.085},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := windowUsedFraction(Window{Percent: tc.percent, UsedFraction: tc.frac})
+			if math.Abs(got-tc.want) > 1e-12 {
+				t.Fatalf("windowUsedFraction(Percent=%d, UsedFraction=%v) = %v, want %v",
+					tc.percent, tc.frac, got, tc.want)
+			}
+		})
 	}
 }
 

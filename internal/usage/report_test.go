@@ -190,10 +190,10 @@ func TestRenderUsageReportStructure(t *testing.T) {
 	if !strings.HasPrefix(got, "╭─ 按模型分组 ") {
 		t.Errorf("title border/description wrong:\n%s", got)
 	}
-	if !strings.Contains(got, "├──────────────────────────────────────────────────────┤\n") {
+	if !strings.Contains(got, "├───────────────────────────────────────────┤\n") {
 		t.Errorf("├─ separator missing:\n%s", got)
 	}
-	if !strings.HasSuffix(got, "╰──────────────────────────────────────────────────────╯\n") {
+	if !strings.HasSuffix(got, "╰───────────────────────────────────────────╯\n") {
 		t.Errorf("bottom border missing:\n%s", got)
 	}
 	// Compact detail headers: the model view uses the 模型 title, the Total
@@ -229,16 +229,18 @@ func TestRenderUsageReportExact(t *testing.T) {
 		{Groups: map[string]any{"model": "deepseek-v4-pro"}, Requests: 1500, PromptTokens: 1_500_000, CompletionTokens: 200_000, TotalTokens: 1_700_000, CachedTokens: 1_000_000, CostUSD: ptr64(0.65)},
 		{Groups: map[string]any{"model": "glm-5.2"}, Requests: 283, PromptTokens: 500_000, CompletionTokens: 30_000, TotalTokens: 530_000, CachedTokens: 100_000, CostUSD: nil},
 	}
-	// The group column takes the layout budget (52 − 29 − 3 = 20 columns),
-	// 请求/缓存 are 6 wide each and 命中率 is 10 cells + 1 gap + 6 pct.
-	want := "╭─ 按模型分组 ─────────────────────────────────────────╮\n" +
-		"│ 请求 1,783 · 词元 2.23M · 开销 $0.836                │\n" +
-		"├──────────────────────────────────────────────────────┤\n" +
-		"│ 模型                   请求   缓存            命中率 │\n" +
-		"│ ──────────────────────────────────────────────────── │\n" +
-		"│ deepseek-v4-pro          1k     1M ▰▰▰▰▰▰▰▱▱▱  66.7% │\n" +
-		"│ glm-5.2                 283   100k ▰▰▱▱▱▱▱▱▱▱  20.0% │\n" +
-		"╰──────────────────────────────────────────────────────╯\n"
+	// The group column takes the layout budget (41 − 29 − 3 = 9 columns),
+	// 请求/缓存 are 6 wide each and 命中率 is 10 cells + 1 gap + 6 pct. At the
+	// quota-card width of 45 a long model name is cut to 9 columns.
+	want := "╭─ 按模型分组 ──────────────────────────────╮\n" +
+		"│ 请求 1,783 · 词元 2.23M · 开销 $0.836     │\n" +
+		"├───────────────────────────────────────────┤\n" +
+		"│ 模型        请求   缓存            命中率 │\n" +
+		"│ ───────────────────────────────────────── │\n" +
+		"│ deepseek…     1k     1M ▰▰▰▰▰▰▰▱▱▱  66.7% │\n" +
+		"│ glm-5.2      283   100k ▰▰▱▱▱▱▱▱▱▱  20.0% │\n" +
+		"╰───────────────────────────────────────────╯\n" +
+		""
 	if got := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{}); got != want {
 		t.Fatalf("RenderUsageReport mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}
@@ -311,8 +313,8 @@ func TestRenderUsageReportTitleTextIsPlainText(t *testing.T) {
 
 	const ansiDim, ansiReset = "\x1b[38;2;102;102;102m", "\x1b[0m"
 	// The description is the whole title: one space, then the dash fill that
-	// absorbs whatever width the description does not take (3 + 10 + 1 + 41
-	// + 1 = 56 for 按模型分组).
+	// absorbs whatever width the description does not take (3 + 10 + 1 + 30
+	// + 1 = 45 for 按模型分组).
 	const desc = "按模型分组"
 	fill := reportWidth - 3 - 1 - render.DisplayWidth(desc) - 1
 	wantTitle := ansiDim + "╭─ " + ansiReset +
@@ -620,14 +622,17 @@ func TestRenderUsageReportMultiGroupKeys(t *testing.T) {
 	if !strings.Contains(got, "按模型/供应商分组") {
 		t.Errorf("the title must list every group key:\n%s", got)
 	}
-	for _, want := range []string{"gpt-5.5", "openai", "glm-5.2", "z-ai", "模型", "供应商"} {
+	// Two group keys share 41 − 6 − 6 − 17 − 4 = 8 columns, i.e. 4 each, so the
+	// values are truncated to 4 columns and the 供应商 header itself reads
+	// "供…" — that is what the quota-card width costs a multi-key view.
+	for _, want := range []string{"gpt…", "ope…", "glm…", "z-ai", "模型", "供…"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("multi-key view missing %q:\n%s", want, got)
 		}
 	}
 	assertCardWidth(t, got)
 
-	// Column budget: 2 group keys → 19 columns split 10/9, so a group value
+	// Column budget: 2 group keys → 8 columns split 4/4, so a group value
 	// longer than its share is ellipsis-truncated instead of pushing the
 	// border out.
 	cols := reportColumns([]string{"model", "provider"})
@@ -745,25 +750,26 @@ func TestRenderUsageReportModelColumnTruncation(t *testing.T) {
 	}
 	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{})
 
-	// claude-sonnet-4 (15 display width) fits the 20-column cap: formatted
-	// and not truncated.
-	if !strings.Contains(got, "claude-sonnet-4") {
-		t.Errorf("expected formatted model name 'claude-sonnet-4' in report:\n%s", got)
+	// At the 45-column card width the model column is the 9-column budget
+	// (41 − 6 − 6 − 17 − 3), so even a 16-column formatted name is truncated:
+	// "claude-s…" = 8 ASCII chars + the ellipsis = 9 display columns.
+	if !strings.Contains(got, "claude-s…") {
+		t.Errorf("expected 9-column truncated model name 'claude-s…' in report:\n%s", got)
 	}
 	if strings.Contains(got, "anthropic/claude-sonnet-4-20250514") {
 		t.Errorf("original unformatted model name must not appear:\n%s", got)
 	}
 
-	// Long ASCII model name is truncated to the 20-column cap with ellipsis
-	// ("very-long-model-nam…" = 19 ASCII chars + 1 ellipsis = 20).
-	if !strings.Contains(got, "very-long-model-nam…") {
-		t.Errorf("expected truncated model name 'very-long-model-nam…' in report:\n%s", got)
+	// Long ASCII model name is truncated to the 9-column budget with an
+	// ellipsis ("very-lon…" = 8 ASCII chars + the ellipsis).
+	if !strings.Contains(got, "very-lon…") {
+		t.Errorf("expected truncated model name 'very-lon…' in report:\n%s", got)
 	}
 
-	// CJK model name is truncated safely with ellipsis without corrupting
-	// UTF-8 (9 Chinese runes = 18 width + 1 ellipsis = 19 ≤ 20).
-	if !strings.Contains(got, "自定义超长中文模型…") {
-		t.Errorf("expected truncated CJK model name '自定义超长中文模型…' in report:\n%s", got)
+	// CJK model name is truncated safely with an ellipsis without corrupting
+	// UTF-8 (4 Chinese runes = 8 width + 1 ellipsis = 9 ≤ the 9-column budget).
+	if !strings.Contains(got, "自定义超…") {
+		t.Errorf("expected truncated CJK model name '自定义超…' in report:\n%s", got)
 	}
 
 	if !utf8.ValidString(got) {
@@ -776,7 +782,8 @@ func TestRenderUsageReportModelColumnTruncation(t *testing.T) {
 }
 
 // TestRenderUsageReportGroupColumnBudget pins the layout budget for group
-// columns: the model column keeps its 20-column cap while every other
+// columns: the model column IS the budget (9 columns at the 45-column card
+// width, below the historical modelMaxWidth cap) while every other
 // group column shares the same budget (so a long provider name is
 // ellipsis-truncated to the card width instead of overflowing the border,
 // and a short one is left intact).
@@ -796,8 +803,8 @@ func TestRenderUsageReportGroupColumnBudget(t *testing.T) {
 		},
 	}
 	got := RenderUsageReport(&Overview{}, rows, []string{"provider"}, ReportOptions{})
-	// The provider column gets the whole single-group budget (20 columns),
-	// so a 54-character value is ellipsis-truncated rather than printed in
+	// The provider column gets the whole single-group budget (9 columns), so a
+	// 54-character value is ellipsis-truncated rather than printed in
 	// full: a fixed card cannot grow to fit it.
 	if !strings.Contains(got, "…") {
 		t.Errorf("over-long group value must be ellipsis-truncated:\n%s", got)
@@ -814,11 +821,16 @@ func TestRenderUsageReportGroupColumnBudget(t *testing.T) {
 	}
 	assertCardWidth(t, got)
 
-	// The model column keeps its historical 20-column cap, which is
-	// exactly the single-group budget.
+	// The single-key model column is the layout budget itself: 41 − 6 − 6 − 17
+	// − 3 = 9 columns. modelMaxWidth (20) is now ABOVE that budget, so it is a
+	// ceiling that no longer truncates anything by itself — the assertion is
+	// that the column is the budget and that the cap stays above it.
 	cols := reportColumns([]string{"model"})
-	if len(cols) != 4 || cols[0].maxWidth != modelMaxWidth {
-		t.Fatalf("model column cap = %d, want %d (cols %+v)", cols[0].maxWidth, modelMaxWidth, cols)
+	if len(cols) != 4 || cols[0].width != 9 || cols[0].maxWidth != 9 {
+		t.Fatalf("model column = width %d / cap %d, want 9/9 (cols %+v)", cols[0].width, cols[0].maxWidth, cols)
+	}
+	if modelMaxWidth < cols[0].maxWidth {
+		t.Fatalf("modelMaxWidth = %d, must stay >= the reachable budget %d", modelMaxWidth, cols[0].maxWidth)
 	}
 }
 
@@ -845,7 +857,7 @@ func TestRenderUsageReportNoCacheSegmentsInOverview(t *testing.T) {
 
 // TestReportColumnsFillTheTableArea is the arithmetic guard behind the card
 // width: the fixed columns plus the group columns plus the gaps must fill
-// the 52-column table area exactly, for any number of group keys.
+// the 41-column table area exactly, for any number of group keys.
 func TestReportColumnsFillTheTableArea(t *testing.T) {
 	for n := 0; n <= 5; n++ {
 		groupBy := []string{"model", "provider", "account", "key_id", "stream", "success", "hour", "day"}[:n]

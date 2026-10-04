@@ -85,18 +85,26 @@ func TestFormatTokens(t *testing.T) {
 
 // TestFormatTokensYi pins the Chinese-unit formatter the quota card's
 // used/total pair uses: ONE unit (亿), one decimal, and a whole 亿 that
-// drops its fraction. There is no 万 / 千万 step and no "<0.1亿" fallback:
-// a count below 0.05 亿 reads "0" rather than borrowing precision the unit
-// does not have. "9999亿" is the widest single side the pair's 13-column
-// budget is sized for.
+// drops its fraction. A non-zero count below 0.05 亿 — which one decimal
+// would collapse to "0" — is rendered with TWO decimals instead, so a tiny
+// pool reads as a number ("0.02亿") instead of colliding with the "no data"
+// zero; only an exact zero, and anything below 0.005 亿, reads "0亿". There
+// is no 万 / 千万 step and no "<0.1亿" fallback. "9999亿" and "0.04亿" are
+// both the widest single side, so the quota card's 13-column pair budget
+// ("0.02亿/9999亿" = 13) is never exceeded.
 func TestFormatTokensYi(t *testing.T) {
 	cases := []struct {
 		in   int64
 		want string
 	}{
 		{0, "0亿"},
-		{1, "0亿"},
-		{4_000_000, "0亿"},
+		{499_999, "0亿"}, // below 0.005 亿: two decimals still round to zero
+		{500_000, "0.01亿"},
+		{1_000_000, "0.01亿"},
+		{2_000_000, "0.02亿"},
+		{4_000_000, "0.04亿"},
+		{4_999_999, "0.05亿"},
+		{5_000_000, "0.1亿"}, // one decimal takes over from here up
 		{10_000_000, "0.1亿"},
 		{30_000_000, "0.3亿"},
 		{220_000_000, "2.2亿"},
@@ -110,6 +118,13 @@ func TestFormatTokensYi(t *testing.T) {
 	for _, c := range cases {
 		if got := FormatTokensYi(c.in); got != c.want {
 			t.Errorf("FormatTokensYi(%d) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// The widest pair stays inside the quota card's clineNumberWidth = 13
+	// display columns: a two-decimal side is exactly as wide as "9999亿".
+	for _, pair := range [][2]int64{{999_900_000_000, 999_900_000_000}, {2_000_000, 999_900_000_000}, {999_900_000_000, 2_000_000}} {
+		if w := DisplayWidth(FormatTokensYi(pair[0]) + "/" + FormatTokensYi(pair[1])); w != 13 {
+			t.Errorf("pair %v = %d display columns, want 13", pair, w)
 		}
 	}
 }

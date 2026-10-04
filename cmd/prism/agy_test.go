@@ -72,7 +72,9 @@ func TestRunUsageMergesAgyGemini(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "gemini-3.7-flash") {
+	// The model column is the 9-column budget at the 45-column card width, so
+	// the agy row renders as its 9-column truncation.
+	if !strings.Contains(out, "gemini-3…") {
 		t.Errorf("table missing gemini row:\n%s", out)
 	}
 	if !strings.Contains(out, "80.0%") {

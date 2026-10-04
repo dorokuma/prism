@@ -414,18 +414,20 @@ func TestHandlerTableFormat(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
 		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
-	// widths: 模型 4 | 请求 4 | 缓存 4 | 命中率 6
-	// The same 56-column capsule card the CLI renders (see
+	// The same 45-column capsule card the CLI renders (see
 	// TestRenderUsageReportExact): title, summary row from Overview, ├─ rule,
-	// plain-text header, dim sub-separator, one card row per group.
-	want := "╭─ 按模型分组 ─────────────────────────────────────────╮\n" +
-		"│ 请求 2 · 词元 300 · 开销 $0.150                      │\n" +
-		"├──────────────────────────────────────────────────────┤\n" +
-		"│ 模型                   请求   缓存            命中率 │\n" +
-		"│ ──────────────────────────────────────────────────── │\n" +
-		"│ a                         1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
-		"│ b                         1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
-		"╰──────────────────────────────────────────────────────╯\n"
+	// plain-text header, dim sub-separator, one card row per group — the group
+	// column is the 9-column budget, 请求/缓存 are 6 each and 命中率 is
+	// 10 cells + 1 gap + 6 pct.
+	want := "╭─ 按模型分组 ──────────────────────────────╮\n" +
+		"│ 请求 2 · 词元 300 · 开销 $0.150           │\n" +
+		"├───────────────────────────────────────────┤\n" +
+		"│ 模型        请求   缓存            命中率 │\n" +
+		"│ ───────────────────────────────────────── │\n" +
+		"│ a              1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
+		"│ b              1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
+		"╰───────────────────────────────────────────╯\n" +
+		""
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("table body mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}
@@ -1098,7 +1100,9 @@ func TestHandlerMergesAgyGeminiRow(t *testing.T) {
 		t.Fatalf("got %d body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "gemini-3.7-flash") {
+	// The model column is the 9-column budget at the 45-column card width, so
+	// the agy row's name renders as its 9-column truncation.
+	if !strings.Contains(body, "gemini-3…") {
 		t.Errorf("table missing gemini row:\n%s", body)
 	}
 	if !strings.Contains(body, "80.0%") {
