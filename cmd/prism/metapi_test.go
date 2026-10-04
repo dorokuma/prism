@@ -482,8 +482,10 @@ func TestApplyQuotaClinePassEstimate(t *testing.T) {
 	}}
 	got := applyQuotaClinePassEstimate(context.Background(), snap, 34)
 	// The weekly molecule is 20000+30000 = 50000 at 50 % → L = 100000, and the
-	// monthly window is 2L whatever its own 5 % would have reversed to.
-	want := map[string]int64{"5h": 0, "weekly": 100_000, "monthly": 200_000}
+	// monthly window is 2L whatever its own 5 % would have reversed to. The
+	// 5-hour window is reversed on its OWN molecule (20000 in the window) and
+	// its own percent (10 %): 200000 — not 0 and not the weekly-anchored pool.
+	want := map[string]int64{"5h": 200_000, "weekly": 100_000, "monthly": 200_000}
 	for _, w := range got.Windows {
 		if w.LimitTokensEstimate != want[w.Name] {
 			t.Fatalf("%s estimate = %d, want %d", w.Name, w.LimitTokensEstimate, want[w.Name])
@@ -508,18 +510,23 @@ func TestApplyQuotaClinePassEstimate(t *testing.T) {
 	}
 
 	// The CLI renders the totals: the derived pool is written like any other
-	// total (no "~" marker, no 估算池 title segment), and the 5-hour row
-	// carries the countdown instead of a pair — left-aligned like every metric,
-	// exactly one space after the percentage.
+	// total (no "~" marker, no 估算池 title segment), and the 5-hour row now
+	// carries its own pair. The reset countdown moved to the title, once per
+	// card. At 亿 granularity these small fixtures read "0亿/0亿".
 	cards := planusage.RenderCards([]planusage.Snapshot{got}, now, planusage.CardOptions{NoColor: true})
 	for _, wantText := range []string{
-		"50.0K/100.0K",
-		"10.0K/200.0K",
-		"10% 2h",
+		"╭─ ClinePass · 5小时限额 · 2小时00分 ",
+		"╭─ ClinePass · 周限额 · 3天 ",
+		"╭─ ClinePass · 月限额 · 10天 ",
+		"0亿/0亿",
 	} {
 		if !strings.Contains(cards, wantText) {
 			t.Fatalf("cards missing %q:\n%s", wantText, cards)
 		}
+	}
+	// The countdown is window-level: once on the 5h title, never on a row.
+	if n := strings.Count(cards, "2小时00分"); n != 1 {
+		t.Fatalf("countdown occurs %d times, want 1 (the title):\n%s", n, cards)
 	}
 }
 

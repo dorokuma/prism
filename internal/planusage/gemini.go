@@ -219,12 +219,23 @@ func geminiBucketWindow(name string, b geminiBucket) Window {
 		w.Status = "rate-limited"
 	}
 	w.ResetsAt = parseXAITime(b.ResetTime)
-	// The weekly window is a rolling 7-day span; Google reports only the
-	// reset time, so the period start is inferred. Needed by the week
-	// estimate (usage range for the consumed-tokens sum).
-	if name == "weekly" && w.ResetsAt != nil {
-		start := w.ResetsAt.Add(-7 * 24 * time.Hour)
-		w.PeriodStart = &start
+	// Period start: Google reports only the reset time, so the span start is
+	// inferred from it. Needed by the token-pool reversal (the consumed-token
+	// sum's range, see ApplyWeekEstimate): the weekly window rolls back 7
+	// days, the 5-hour window 5 hours. A window without a reset instant has
+	// no period start (and therefore no estimate).
+	if w.ResetsAt != nil {
+		var span time.Duration
+		switch name {
+		case "weekly":
+			span = 7 * 24 * time.Hour
+		case "5h":
+			span = 5 * time.Hour
+		}
+		if span > 0 {
+			start := w.ResetsAt.Add(-span)
+			w.PeriodStart = &start
+		}
 	}
 	return w
 }
