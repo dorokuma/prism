@@ -129,59 +129,6 @@ func TestFormatTokensYi(t *testing.T) {
 	}
 }
 
-func f(v float64) *float64 { return &v }
-
-func TestFormatCost(t *testing.T) {
-	cases := []struct {
-		in   *float64
-		want string
-	}{
-		{nil, "-"},
-		{f(0.836), "$0.836"},
-		{f(0), "$0.000"},
-		{f(1234.5), "$1,234.500"},
-		{f(999.9999), "$1,000.000"},
-		{f(1000000.25), "$1,000,000.250"},
-		{f(-0.5), "-$0.500"},
-	}
-	for _, c := range cases {
-		if got := FormatCost(c.in); got != c.want {
-			t.Errorf("FormatCost(%v) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
-// TestFormatCostCompact pins the compact cost precision: nil stays "-",
-// amounts of $0.01 and above use at most two decimals ($21.0267 ->
-// "$21.03"), amounts below $0.01 keep three decimals ($0.005 stays
-// "$0.005") so a small fee never collapses to "$0.00" or "$0", and the
-// thousands separators stay. The value itself is never modified.
-func TestFormatCostCompact(t *testing.T) {
-	cases := []struct {
-		in   *float64
-		want string
-	}{
-		{nil, "-"},
-		{f(21.0267), "$21.03"},
-		{f(0.836), "$0.84"},
-		{f(0.6), "$0.60"},
-		{f(21), "$21.00"},
-		{f(0), "$0.000"},
-		{f(0.005), "$0.005"},
-		{f(0.004), "$0.004"},
-		{f(0.0099), "$0.010"},
-		{f(1234.5678), "$1,234.57"},
-		{f(999.9999), "$1,000.00"},
-		{f(1000000.25), "$1,000,000.25"},
-		{f(-0.5), "-$0.50"},
-	}
-	for _, c := range cases {
-		if got := FormatCostCompact(c.in); got != c.want {
-			t.Errorf("FormatCostCompact(%v) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
 func TestFormatPercent(t *testing.T) {
 	cases := []struct {
 		part, total float64

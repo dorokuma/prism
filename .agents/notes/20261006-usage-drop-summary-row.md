@@ -30,7 +30,7 @@ supersedes: ""
 - **连带删除 `render.FormatCost`/`FormatCostCompact`**：属独立的死代码清理主题（后者本就无生产调用方）。否决，见「遗留」。
 
 ## 遗留（未决 / 需后续处理）
-- **`render.FormatCost` / `FormatCostCompact` 均无生产调用方**（前者由本笔造成，后者更早），当前保留为带测试的渲染原语；要清理可单开一笔（连带 `numbers_test.go` 两个用例）。
+- **（已清理）`render.FormatCost` / `FormatCostCompact` 均无生产调用方**：前者由本笔造成、后者更早；登记时保留为带测试原语，随后按本条单开一笔删除（连带 `numbers_test.go` 的 `TestFormatCost` / `TestFormatCostCompact` 与仅服务于两者的 `f` helper；`groupDigits` 因 `FormatInt` 仍在用而保留），见 v0.38.1。
 - **usage 汇总数字在 HTTP 侧完全不可见**：HTTP JSON 无 overview 字段、表格无汇总行；需要总览只能走 CLI `--json`。这是本笔的既定结果，不是疏漏。
 - **按行数/行号解析输出的刮取方**（若有）需要适配卡片行数 −2；仓库内无此类调用方（`internal/usage` 与 `cmd/prism` 测试全部同步）。
 
