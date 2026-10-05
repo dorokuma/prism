@@ -415,13 +415,11 @@ func TestHandlerTableFormat(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
 	// The same 45-column capsule card the CLI renders (see
-	// TestRenderUsageReportExact): title, summary row from Overview, ├─ rule,
-	// plain-text header, dim sub-separator, one card row per group — the group
-	// column is the 9-column budget, 请求/缓存 are 6 each and 命中率 is
-	// 10 cells + 1 gap + 6 pct.
+	// TestRenderUsageReportExact): title, plain-text header, dim
+	// sub-separator, one card row per group — the group column is the
+	// 9-column budget, 请求/缓存 are 6 each and 命中率 is 10 cells + 1 gap
+	// + 6 pct. The summary row and its ├─ rule are gone (v0.38.0).
 	want := "╭─ 按模型分组 ──────────────────────────────╮\n" +
-		"│ 请求 2 · 词元 300 · 开销 $0.150           │\n" +
-		"├───────────────────────────────────────────┤\n" +
 		"│ 模型        请求   缓存            命中率 │\n" +
 		"│ ───────────────────────────────────────── │\n" +
 		"│ a              1      0 ▱▱▱▱▱▱▱▱▱▱   0.0% │\n" +
@@ -430,12 +428,6 @@ func TestHandlerTableFormat(t *testing.T) {
 		""
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("table body mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
-	}
-
-	// format=table must be equivalent to the CLI renderer: the summary
-	// counts come from Overview (not from the LIMIT-truncated rows).
-	if !strings.Contains(rec.Body.String(), "请求 2 ·") || !strings.Contains(rec.Body.String(), "词元 300") {
-		t.Errorf("table summary must come from Overview:\n%s", rec.Body.String())
 	}
 }
 
@@ -504,9 +496,6 @@ func TestHandlerTableFormatGroupByModelFiltersBlankModel(t *testing.T) {
 		t.Fatalf("table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "请求 2 ·") {
-		t.Errorf("overview must include blank-model events:\n%s", body)
-	}
 	// Table body must filter blank model rows and keep real model "a".
 	rows := tableDataRows(body)
 	if len(rows) != 1 {
@@ -548,12 +537,14 @@ func TestHandlerJSONGroupByModelFiltersBlankModel(t *testing.T) {
 	}
 }
 
-// TestHandlerOverviewIncludesAgyExtraBlankModel pins the contract that
-// AddOverview must use the unfiltered agy extra, so blank-model agy events
-// are counted in the overview header even though they are filtered from
-// the detail table. If AddOverview(ov, extra) were accidentally changed to
-// AddOverview(ov, filtered) this test would fail.
-func TestHandlerOverviewIncludesAgyExtraBlankModel(t *testing.T) {
+// TestHandlerTableFiltersAgyBlankModel pins the table half of the
+// blank-model contract: blank-model agy extra rows are merged into the
+// summary rows and then filtered, so the detail table shows only real
+// models. (The other half — AddOverview counts the UNFILTERED extra — is
+// pinned by TestAddOverviewIncludesBlankModelExtra in agy_test.go, and the
+// totals surface through the CLI --json overview since the table summary
+// row was removed in v0.38.0.)
+func TestHandlerTableFiltersAgyBlankModel(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "")
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -579,10 +570,6 @@ func TestHandlerOverviewIncludesAgyExtraBlankModel(t *testing.T) {
 		t.Fatalf("table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	// Overview must include both requests (1 usage_event + 2 blank-model agy).
-	if !strings.Contains(body, "请求 3 ·") {
-		t.Errorf("overview must include blank-model agy events:\n%s", body)
-	}
 	// Table body must filter blank model rows and keep real model "a".
 	rows := tableDataRows(body)
 	if len(rows) != 1 {
@@ -595,8 +582,8 @@ func TestHandlerOverviewIncludesAgyExtraBlankModel(t *testing.T) {
 
 // TestHandlerTableFormatMixedSources drives the two-segment cache summary
 // through the full HTTP format=table path (InsertBatch persists usage_source
-// → Overview splits → RenderUsageReport). It is the same renderer the CLI
-// uses, so the exact segment line here must match the CLI output.
+// → the renderer splits the denominators). It is the same renderer the CLI
+// uses, so the segment handling here must match the CLI output.
 func TestHandlerTableFormatMixedSources(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	s := openTestStore(t)
@@ -615,12 +602,10 @@ func TestHandlerTableFormatMixedSources(t *testing.T) {
 		t.Fatalf("table: got %d, body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	// Cache hit lines must not appear in overview.
+	// Cache hit lines must not appear anywhere in the card (they belonged
+	// to the summary row removed in v0.38.0).
 	if strings.Contains(body, "命中(OpenAI)") || strings.Contains(body, "命中(Anthropic)") || strings.Contains(body, "缓存命中") {
-		t.Errorf("cache segments must not appear in overview:\n%s", body)
-	}
-	if !strings.Contains(body, "请求 2 ·") {
-		t.Errorf("expected 3-line overview:\n%s", body)
+		t.Errorf("cache segments must not appear in the card:\n%s", body)
 	}
 	// Ungrouped table row: 1400 hits over openai prompt 1000 + anthropic
 	// assembled 501 = 1501 → 93.3%. cached/prompt (1400/1001 = 139.9%)
@@ -670,7 +655,8 @@ func TestHandlerTableNoData(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	h := NewSummaryHandler(openTestStore(t))
 	// group_by=model on an empty store → zero rows → the table renders the
-	// no-data hint; the summary still renders from Overview.
+	// no-data hint (the summary row that used to carry the Overview totals
+	// is gone since v0.38.0).
 	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?group_by=model&format=table", "127.0.0.1:1", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("empty table: got %d", rec.Code)
@@ -679,8 +665,8 @@ func TestHandlerTableNoData(t *testing.T) {
 		t.Errorf("Content-Type = %q", ct)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "请求 0 ·") {
-		t.Errorf("empty-range summary missing:\n%s", body)
+	if strings.Contains(body, "· 词元") {
+		t.Errorf("summary row must stay gone on an empty range:\n%s", body)
 	}
 	if !strings.Contains(body, "（暂无数据）") {
 		t.Errorf("no-data hint missing:\n%s", body)
@@ -858,11 +844,6 @@ func TestHandlerDefaultFromWeek(t *testing.T) {
 	if hasModelRow(rows, "old") {
 		t.Errorf("pre-week row must be excluded:\n%s", body)
 	}
-	// defaulted=true: the table header aggregates ALL history (old + cur =
-	// 2), never the week window (cur only = 1) the detail rows show.
-	if !strings.Contains(body, "请求 2 ·") {
-		t.Errorf("defaulted table header must be the all-history total (2), not the week-window count (1):\n%s", body)
-	}
 
 	rec = doRequest(h, http.MethodGet, "/admin/usage/summary?from=0&group_by=model&format=table", "127.0.0.1:1", "")
 	if rec.Code != http.StatusOK {
@@ -916,17 +897,15 @@ func TestHandlerToOnlyRange(t *testing.T) {
 		t.Errorf("to-only To = %d, want %d (caller's value untouched)", q.To, now.Unix())
 	}
 
-	// The full table path: overview and detail rows share [week start, to]
-	// — header counts the in-window event only (1), the pre-week row is
-	// excluded from both the header and the rows.
+	// The full table path: the detail rows share [week start, to] — the
+	// in-window event is listed, the pre-week row is excluded. (The header
+	// that used to count the window total is gone since v0.38.0; the
+	// windowed overview totals surface through the CLI --json overview.)
 	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?to="+strconv.FormatInt(now.Unix(), 10)+"&group_by=model&format=table", "127.0.0.1:1", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("to-only table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "请求 1 ·") {
-		t.Errorf("to-only header must be the [week start, to] window total (1), not all history (2):\n%s", body)
-	}
 	rows := tableDataRows(body)
 	if !hasModelRow(rows, "cur") {
 		t.Errorf("to-only detail must include the in-window row:\n%s", body)
@@ -1019,12 +998,13 @@ func TestHandlerInvalidRange(t *testing.T) {
 	}
 }
 
-// TestHandlerTableOverviewAllHistoryDefaulted drives the defaulted
-// format=table header through real events in two windows (the current week
-// and an earlier week, several each): with no time params the header must
-// aggregate ALL history (both windows summed) while the detail rows stay on
-// the default week window; an explicit from=0 keeps both on the full range.
-func TestHandlerTableOverviewAllHistoryDefaulted(t *testing.T) {
+// TestHandlerTableDefaultedVsExplicitRows drives format=table through real
+// events in two windows (the current week and an earlier week, several
+// each): with no time params the detail rows stay on the default week
+// window (the all-history header totals went away with the summary row in
+// v0.38.0 — they surface through the CLI --json overview); an explicit
+// from=0 keeps the rows on the full range.
+func TestHandlerTableDefaultedVsExplicitRows(t *testing.T) {
 	t.Setenv("PRISM_ADMIN_TOKEN", "") // unset: direct loopback allowed
 	s := openTestStore(t)
 	now := time.Now()
@@ -1042,16 +1022,13 @@ func TestHandlerTableOverviewAllHistoryDefaulted(t *testing.T) {
 	h := NewSummaryHandler(s)
 	h.DefaultFrom = func() int64 { return weekStart.Unix() }
 
-	// No time params → defaulted=true: header = all four events, detail
-	// rows = the two in-window models only.
+	// No time params → defaulted=true: detail rows = the two in-window
+	// models only.
 	rec := doRequest(h, http.MethodGet, "/admin/usage/summary?group_by=model&format=table", "127.0.0.1:1", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("defaulted table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "请求 4 ·") {
-		t.Errorf("defaulted header must sum both windows (4), not the week window (2):\n%s", body)
-	}
 	if !hasModelRow(tableDataRows(body), "cur-a") || !hasModelRow(tableDataRows(body), "cur-b") {
 		t.Errorf("defaulted detail must list the in-window models:\n%s", body)
 	}
@@ -1059,16 +1036,12 @@ func TestHandlerTableOverviewAllHistoryDefaulted(t *testing.T) {
 		t.Errorf("defaulted detail must exclude the earlier-week models:\n%s", body)
 	}
 
-	// from=0 (defaulted=false, fully explicit) → header AND rows cover all
-	// four events.
+	// from=0 (defaulted=false, fully explicit) → rows cover all four events.
 	rec = doRequest(h, http.MethodGet, "/admin/usage/summary?from=0&group_by=model&format=table", "127.0.0.1:1", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("from=0 table: got %d body %s", rec.Code, rec.Body.String())
 	}
 	explicit := rec.Body.String()
-	if !strings.Contains(explicit, "请求 4 ·") {
-		t.Errorf("from=0 header must also total 4:\n%s", explicit)
-	}
 	if !hasModelRow(tableDataRows(explicit), "old-a") || !hasModelRow(tableDataRows(explicit), "old-b") {
 		t.Errorf("from=0 detail must include the earlier-week models:\n%s", explicit)
 	}
@@ -1107,12 +1080,6 @@ func TestHandlerMergesAgyGeminiRow(t *testing.T) {
 	}
 	if !strings.Contains(body, "80.0%") {
 		t.Errorf("agy hit rate must be 400/500 = 80.0%% (not 0%%):\n%s", body)
-	}
-	if !strings.Contains(body, "请求 2 ·") {
-		t.Errorf("header must include agy requests:\n%s", body)
-	}
-	if !strings.Contains(body, "词元 570") {
-		t.Errorf("header must include agy tokens:\n%s", body)
 	}
 	wantGemini := h.GeminiFrom()
 	if gotFrom != wantGemini {

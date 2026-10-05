@@ -192,7 +192,9 @@ func runUsageWith(args []string, out io.Writer, now time.Time) error {
 		// The compact single-line table is the default and only layout: it
 		// never depends on the terminal width, so --watch redraws are
 		// stable and non-TTY output (e.g. a π panel capture) is identical.
-		_, err = io.WriteString(out, usage.RenderUsageReport(ov, rows, q.GroupBy, usage.ReportOptions{
+		// The overview numbers (ov) are --json-only since v0.38.0: the
+		// table card dropped its summary row and no longer reads them.
+		_, err = io.WriteString(out, usage.RenderUsageReport(rows, q.GroupBy, usage.ReportOptions{
 			Color: color,
 		}))
 		return err

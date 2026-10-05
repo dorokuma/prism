@@ -116,25 +116,29 @@ type ReportOptions struct {
 // The report is one fixed-width card that mirrors the quota capsule card
 // (internal/planusage.RenderCards): the SAME 45 display columns — the quota
 // card is 4 + clineRowFixed(32) + clineNameColMin(9) = 45 — the same
-// ╭─ / ├─ / ╰─ border vocabulary, the same palette and the same capsule
-// primitive (internal/render.CapsuleBar). Every line — title, summary,
-// separators, header, detail rows, bottom border — is EXACTLY reportWidth
+// ╭─ / ╰─ border vocabulary, the same palette and the same capsule
+// primitive (internal/render.CapsuleBar). Every line — title, header,
+// header rule, detail rows, bottom border — is EXACTLY reportWidth
 // display columns wide, whatever the data looks like:
 //
 //	╭─ 按模型分组 ──────────────────────────────╮
-//	│ 请求 1,783 · 词元 2.23M · 开销 $0.836     │
-//	├───────────────────────────────────────────┤
 //	│ 模型        请求   缓存            命中率 │
 //	│ ───────────────────────────────────────── │
 //	│ deepseek…     1k     1M ▰▰▰▰▰▰▰▱▱▱  66.7% │
 //	│ glm-5.2      283   100k ▰▰▱▱▱▱▱▱▱▱  20.0% │
 //	╰───────────────────────────────────────────╯
 //
+// The old summary row ("请求 … · 词元 … · 开销 …") and its ├─ rule are
+// GONE (v0.38.0): the totals were window-level facts duplicated at the top
+// of every grouping view and they are the ONLY thing a scrape-target that
+// wants the totals can no longer read — the CLI `--json` overview field
+// still carries them (see .agents/notes/20261006-usage-drop-summary-row.md).
+//
 // Geometry (display columns, ANSI counted as 0):
 //
 //	title     Dim("╭─ ") + desc + Dim(" " + fill + "╮")
 //	body      Dim("│ ") + content(41) + Dim(" │") = 45
-//	rules     "├" + "─"×43 + "┤" / "╰" + "─"×43 + "╯" = 45
+//	rule      "╰" + "─"×43 + "╯" = 45 (the ├ rule went with the summary row)
 //	table     group columns + 请求 + 缓存 + 命中率 = 41
 //
 // The two reports (usage and quota) are the SAME width on purpose: a user
@@ -276,20 +280,12 @@ func reportColumns(groupBy []string) []reportColumn {
 // apart. The layout never depends on the terminal width, so --watch
 // redraws are stable and non-TTY output (e.g. a π panel capture) is
 // identical.
-func RenderUsageReport(ov *Overview, rows []SummaryRow, groupBy []string, opts ReportOptions) string {
+func RenderUsageReport(rows []SummaryRow, groupBy []string, opts ReportOptions) string {
 	pal := reportPalette{color: opts.Color}
 	cols := reportColumns(groupBy)
 
 	var b strings.Builder
 	b.WriteString(pal.titleLine(groupDesc(groupBy)))
-	b.WriteByte('\n')
-	b.WriteString(pal.body(render.SummaryLine(render.Summary{
-		Requests: ov.Requests,
-		Tokens:   ov.TotalTokens,
-		Cost:     ov.TotalCost,
-	})))
-	b.WriteByte('\n')
-	b.WriteString(pal.rule("├", "┤"))
 	b.WriteByte('\n')
 	b.WriteString(pal.body(pal.headerContent(cols)))
 	b.WriteByte('\n')

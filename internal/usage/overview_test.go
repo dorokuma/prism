@@ -154,8 +154,8 @@ func TestOverviewMatchesSummaryTotals(t *testing.T) {
 
 // TestOverviewZeroTotalFallsBackToPromptPlusCompletion: a stored row with
 // total_tokens=0 (legacy OpenAI parse that omitted the field) still
-// contributes prompt+completion to the report "词元" figure. Summary and
-// Overview share the same expression.
+// contributes prompt+completion to the Overview totals (the --json
+// overview). Summary and Overview share the same expression.
 func TestOverviewZeroTotalFallsBackToPromptPlusCompletion(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

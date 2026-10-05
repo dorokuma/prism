@@ -124,29 +124,17 @@ func (h *SummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	util.WriteJSON(w, http.StatusOK, map[string]any{"rows": rows})
 }
 
-// serveTable renders the format=table response: the summary header comes
-// from Overview (never from summing the LIMIT-truncated rows) and the detail
-// section shares RenderUsageReport with the CLI, so both outputs are
-// produced by the same code. Since v0.31.0 that shared layout is the fixed
-// capsule card (title, summary row, rules, detail rows, borders — every line
-// exactly reportWidth columns, values ellipsis-truncated instead
-// of overflowing the card); since the usage/quota width alignment it is 45
-// columns, the same as the quota cards. There are no layout/width params and
-// no terminal-width dependency. format=json stays the default and is untouched.
+// serveTable renders the format=table response: the detail section shares
+// RenderUsageReport with the CLI, so both outputs are produced by the same
+// code. Since v0.31.0 that shared layout is the fixed capsule card (title,
+// header, header rule, detail rows, borders — every line exactly
+// reportWidth columns, values ellipsis-truncated instead of overflowing the
+// card); since the usage/quota width alignment it is 45 columns, the same as
+// the quota cards. The summary row went away in v0.38.0, so the table path
+// no longer runs the Overview query (the CLI --json overview field still
+// does). There are no layout/width params and no terminal-width dependency.
+// format=json stays the default and is untouched.
 func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q SummaryQuery, defaulted bool) {
-	qOverview := q
-	if defaulted {
-		qOverview.From = 0
-		qOverview.To = 0
-	}
-	ov, err := h.Store.Overview(r.Context(), qOverview)
-	if err != nil {
-		slog.Error("usage: overview query failed", "error", err)
-		util.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": map[string]any{"message": "usage store unavailable", "code": "store_unavailable"},
-		})
-		return
-	}
 	rows, err := h.Store.Summary(r.Context(), q)
 	if err != nil {
 		var qe *QueryError
@@ -165,8 +153,7 @@ func (h *SummaryHandler) serveTable(w http.ResponseWriter, r *http.Request, q Su
 	if len(q.GroupBy) == 1 && q.GroupBy[0] == "model" {
 		rows = FilterBlankModelRows(rows)
 	}
-	AddOverview(ov, extra)
-	body := RenderUsageReport(ov, rows, q.GroupBy, ReportOptions{})
+	body := RenderUsageReport(rows, q.GroupBy, ReportOptions{})
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, body)

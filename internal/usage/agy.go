@@ -31,10 +31,11 @@ func MergeSummaryRows(rows, extra []SummaryRow, groupBy []string) []SummaryRow {
 	return rows
 }
 
-// AddOverview adds extra (agy) token/request counters to the header
-// aggregate so table gemini rows match the summary totals. Cache semantics
-// follow the Anthropic bucket: prompt excludes cache, so the renderer
-// assembles prompt+cached as the hit-rate denominator.
+// AddOverview adds extra (agy) token/request counters to the overview
+// aggregate — surfaced by the CLI --json overview field since the table
+// summary row went away in v0.38.0 — so the totals cover both sources.
+// Cache semantics follow the Anthropic bucket: prompt excludes cache, so
+// hit-rate denominators assemble prompt+cached.
 func AddOverview(ov *Overview, extra []SummaryRow) {
 	if ov == nil {
 		return

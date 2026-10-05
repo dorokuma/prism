@@ -127,25 +127,6 @@ func assertCardWidth(t *testing.T, got string) {
 }
 
 func TestRenderUsageReportStructure(t *testing.T) {
-	ov := &Overview{
-		Requests:                  1783,
-		PromptTokens:              2_000_000,
-		CompletionTokens:          230_000,
-		TotalTokens:               2_230_000,
-		CachedTokens:              1_100_000,
-		ReasoningTokens:           0,
-		CacheWriteTokens:          0,
-		TotalCost:                 ptr64(0.836),
-		FailedRequests:            12,
-		StreamingRequests:         1690,
-		OpenAIRequests:            1783,
-		OpenAIPromptTokens:        2_000_000,
-		OpenAICachedTokens:        1_100_000,
-		AnthropicRequests:         0,
-		AnthropicPromptTokens:     0,
-		AnthropicCachedTokens:     0,
-		AnthropicCacheWriteTokens: 0,
-	}
 	rows := []SummaryRow{
 		{
 			Groups:           map[string]any{"model": "deepseek-v4-pro"},
@@ -170,12 +151,12 @@ func TestRenderUsageReportStructure(t *testing.T) {
 			CostUSD:          nil,
 		},
 	}
-	got := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{})
+	got := RenderUsageReport(rows, []string{"model"}, ReportOptions{})
 
-	// Summary row comes from Overview (2.23M total), not from summing the
-	// rows (which would be fine here, but the point is the source is Overview).
-	if !strings.Contains(got, "请求 1,783 · 词元 2.23M · 开销 $0.836") {
-		t.Errorf("summary row missing or wrong:\n%s", got)
+	// The summary row ("请求 … · 词元 … · 开销 …") is GONE: the card starts
+	// at the column header, and the totals live in the CLI --json overview.
+	if strings.Contains(got, "· 词元") || strings.Contains(got, "· 开销") {
+		t.Errorf("summary row must not appear:\n%s", got)
 	}
 	// Cache hit lines must not appear in the overview.
 	if strings.Contains(got, "命中(OpenAI)") || strings.Contains(got, "命中(Anthropic)") {
@@ -185,13 +166,14 @@ func TestRenderUsageReportStructure(t *testing.T) {
 	if strings.Contains(got, "未算出金额") {
 		t.Errorf("missing-cost warning must not appear:\n%s", got)
 	}
-	// Card structure: ╭─ title with the grouping description, ├─ rule,
-	// ╰─ bottom border.
+	// Card structure: ╭─ title with the grouping description, ╰─ bottom
+	// border. The ├─ rule went away together with the summary row, so no
+	// internal ├ border survives anywhere in the card.
 	if !strings.HasPrefix(got, "╭─ 按模型分组 ") {
 		t.Errorf("title border/description wrong:\n%s", got)
 	}
-	if !strings.Contains(got, "├───────────────────────────────────────────┤\n") {
-		t.Errorf("├─ separator missing:\n%s", got)
+	if strings.Contains(got, "├") {
+		t.Errorf("├─ separator must be gone with the summary row:\n%s", got)
 	}
 	if !strings.HasSuffix(got, "╰───────────────────────────────────────────╯\n") {
 		t.Errorf("bottom border missing:\n%s", got)
@@ -203,7 +185,7 @@ func TestRenderUsageReportStructure(t *testing.T) {
 			t.Errorf("table header %q missing:\n%s", h, got)
 		}
 	}
-	for _, gone := range []string{"输入词元", "输出词元", "未计价", "请求数", "Total", "花费", "总请求", "总词元", "总开销"} {
+	for _, gone := range []string{"输入词元", "输出词元", "未计价", "请求数", "Total", "花费", "总请求", "总词元", "总开销", "词元", "开销"} {
 		if strings.Contains(got, gone) {
 			t.Errorf("%q column/header must not appear:\n%s", gone, got)
 		}
@@ -220,11 +202,9 @@ func TestRenderUsageReportStructure(t *testing.T) {
 }
 
 // TestRenderUsageReportExact pins the whole card byte for byte: borders,
-// summary row, plain-text header (no color, no bold), the dim
-// sub-separator, the compact k/M numbers and the 10-cell capsule with its
-// right-aligned percentage.
+// plain-text header (no color, no bold), the dim sub-separator, the compact
+// k/M numbers and the 10-cell capsule with its right-aligned percentage.
 func TestRenderUsageReportExact(t *testing.T) {
-	ov := &Overview{Requests: 1783, PromptTokens: 2_000_000, CompletionTokens: 230_000, TotalTokens: 2_230_000, CachedTokens: 1_100_000, TotalCost: ptr64(0.836), OpenAIRequests: 1783, OpenAIPromptTokens: 2_000_000, OpenAICachedTokens: 1_100_000}
 	rows := []SummaryRow{
 		{Groups: map[string]any{"model": "deepseek-v4-pro"}, Requests: 1500, PromptTokens: 1_500_000, CompletionTokens: 200_000, TotalTokens: 1_700_000, CachedTokens: 1_000_000, CostUSD: ptr64(0.65)},
 		{Groups: map[string]any{"model": "glm-5.2"}, Requests: 283, PromptTokens: 500_000, CompletionTokens: 30_000, TotalTokens: 530_000, CachedTokens: 100_000, CostUSD: nil},
@@ -233,30 +213,26 @@ func TestRenderUsageReportExact(t *testing.T) {
 	// 请求/缓存 are 6 wide each and 命中率 is 10 cells + 1 gap + 6 pct. At the
 	// quota-card width of 45 a long model name is cut to 9 columns.
 	want := "╭─ 按模型分组 ──────────────────────────────╮\n" +
-		"│ 请求 1,783 · 词元 2.23M · 开销 $0.836     │\n" +
-		"├───────────────────────────────────────────┤\n" +
 		"│ 模型        请求   缓存            命中率 │\n" +
 		"│ ───────────────────────────────────────── │\n" +
 		"│ deepseek…     1k     1M ▰▰▰▰▰▰▰▱▱▱  66.7% │\n" +
 		"│ glm-5.2      283   100k ▰▰▱▱▱▱▱▱▱▱  20.0% │\n" +
 		"╰───────────────────────────────────────────╯\n" +
 		""
-	if got := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{}); got != want {
+	if got := RenderUsageReport(rows, []string{"model"}, ReportOptions{}); got != want {
 		t.Fatalf("RenderUsageReport mismatch\n--- got ---\n%q\n--- want ---\n%q", got, want)
 	}
 }
 
 // TestRenderUsageReportNoData keeps the empty result inside the card: the
-// title, the summary row (from Overview) and the friendly hint, all at the
-// card width.
+// title, the header row and the friendly hint, all at the card width.
 func TestRenderUsageReportNoData(t *testing.T) {
-	ov := &Overview{}
-	got := RenderUsageReport(ov, nil, []string{"model"}, ReportOptions{})
+	got := RenderUsageReport(nil, []string{"model"}, ReportOptions{})
 	if !strings.Contains(got, "（暂无数据）") {
 		t.Errorf("empty table must render the no-data hint:\n%s", got)
 	}
-	if !strings.Contains(got, "请求 0 · 词元 0 · 开销 -") {
-		t.Errorf("summary must still render from Overview on an empty range:\n%s", got)
+	if strings.Contains(got, "· 词元") {
+		t.Errorf("summary row must stay gone on an empty range:\n%s", got)
 	}
 	if !strings.HasPrefix(got, "╭─ ") || !strings.HasSuffix(got, "╯\n") {
 		t.Errorf("the empty card must keep its borders:\n%s", got)
@@ -270,10 +246,9 @@ func TestRenderUsageReportNoData(t *testing.T) {
 // capsule keep their escapes — and the two are byte identical once the
 // escapes are stripped.
 func TestRenderUsageReportColor(t *testing.T) {
-	ov := &Overview{Requests: 1, TotalCost: ptr64(0.5)}
 	rows := []SummaryRow{{Groups: map[string]any{"model": "m"}, Requests: 1, PromptTokens: 10, CachedTokens: 5}}
-	plain := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{})
-	colored := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{Color: true})
+	plain := RenderUsageReport(rows, []string{"model"}, ReportOptions{})
+	colored := RenderUsageReport(rows, []string{"model"}, ReportOptions{Color: true})
 	if strings.Contains(plain, "\x1b[") {
 		t.Errorf("plain output must not contain ANSI escapes:\n%q", plain)
 	}
@@ -306,10 +281,9 @@ func TestRenderUsageReportColor(t *testing.T) {
 // The colored render is the no-color render plus those escapes, byte for
 // byte, and no bold (ESC [ 1 m) survives anywhere in the card.
 func TestRenderUsageReportTitleTextIsPlainText(t *testing.T) {
-	ov := &Overview{Requests: 2, TotalCost: ptr64(0.15)}
 	rows := []SummaryRow{{Groups: map[string]any{"model": "gpt-5"}, Requests: 2, PromptTokens: 300}}
-	colored := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{Color: true})
-	plain := RenderUsageReport(ov, rows, []string{"model"}, ReportOptions{})
+	colored := RenderUsageReport(rows, []string{"model"}, ReportOptions{Color: true})
+	plain := RenderUsageReport(rows, []string{"model"}, ReportOptions{})
 
 	const ansiDim, ansiReset = "\x1b[38;2;102;102;102m", "\x1b[0m"
 	// The description is the whole title: one space, then the dash fill that
@@ -357,7 +331,7 @@ func TestRenderUsageReportHitRateCell(t *testing.T) {
 		{Groups: map[string]any{"model": "m1"}, Requests: 1, PromptTokens: 1000, CachedTokens: 968, CompletionTokens: 100, CostUSD: ptr64(0.1)},
 	}
 	// Model view: 命中率 968/1000 = 96.8% → 10 filled cells.
-	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{})
+	got := RenderUsageReport(rows, []string{"model"}, ReportOptions{})
 	if !strings.Contains(got, "96.8%") {
 		t.Errorf("model view hit rate must be 96.8%%:\n%s", got)
 	}
@@ -371,7 +345,7 @@ func TestRenderUsageReportHitRateCell(t *testing.T) {
 	}
 
 	// Other group views label the first column with the key's Chinese name.
-	got = RenderUsageReport(&Overview{}, rows, []string{"provider"}, ReportOptions{})
+	got = RenderUsageReport(rows, []string{"provider"}, ReportOptions{})
 	if !strings.Contains(got, "供应商") {
 		t.Errorf("provider view must label its first column 供应商:\n%s", got)
 	}
@@ -384,7 +358,7 @@ func TestRenderUsageReportHitRateCell(t *testing.T) {
 	rows = []SummaryRow{
 		{Groups: map[string]any{"model": "m0"}, Requests: 1, PromptTokens: 0, CachedTokens: 5, CompletionTokens: 0},
 	}
-	got = RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{})
+	got = RenderUsageReport(rows, []string{"model"}, ReportOptions{})
 	for _, bad := range []string{"NaN", "Inf", "0.0%", "▰", "▱"} {
 		if strings.Contains(got, bad) {
 			t.Errorf("missing denominator must render a bare %q placeholder (no %q):\n%s", "-", bad, got)
@@ -398,7 +372,7 @@ func TestRenderUsageReportHitRateCell(t *testing.T) {
 	rows = []SummaryRow{
 		{Groups: map[string]any{"model": "m1"}, Requests: 1, PromptTokens: 100, CachedTokens: 0, CompletionTokens: 10},
 	}
-	got = RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{})
+	got = RenderUsageReport(rows, []string{"model"}, ReportOptions{})
 	if !strings.Contains(got, "0.0%") {
 		t.Errorf("zero-cached hit rate must render 0.0%%:\n%s", got)
 	}
@@ -420,7 +394,7 @@ func TestRenderUsageReportAnthropicHitRate(t *testing.T) {
 			PromptTokens: 1, CachedTokens: 500, CacheWriteTokens: 0,
 			HitRateInputTokens: 501, CompletionTokens: 50},
 	}
-	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{})
+	got := RenderUsageReport(rows, []string{"model"}, ReportOptions{})
 	if !strings.Contains(got, "99.8%") {
 		t.Errorf("anthropic table hit rate must be 500/501 = 99.8%%:\n%s", got)
 	}
@@ -438,7 +412,7 @@ func TestRenderUsageReportAnthropicHitRate(t *testing.T) {
 			PromptTokens: 1001, CachedTokens: 1400, CacheWriteTokens: 0,
 			HitRateInputTokens: 1501, CompletionTokens: 150},
 	}
-	got = RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{})
+	got = RenderUsageReport(rows, []string{"model"}, ReportOptions{})
 	if !strings.Contains(got, "93.3%") {
 		t.Errorf("mixed-group table hit rate must be 1400/1501 = 93.3%%:\n%s", got)
 	}
@@ -507,7 +481,7 @@ func TestHitCellGradientDirection(t *testing.T) {
 func TestRenderUsageReportCardWidth(t *testing.T) {
 	loc := time.Local
 	dayStart := time.Date(2026, 3, 10, 0, 0, 0, 0, loc)
-	ov := &Overview{Requests: 4, PromptTokens: 10_000, CompletionTokens: 500, TotalTokens: 10_500, CachedTokens: 4_000, TotalCost: ptr64(0.5)}
+
 	cases := []struct {
 		name    string
 		rows    []SummaryRow
@@ -581,14 +555,14 @@ func TestRenderUsageReportCardWidth(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, color := range []bool{false, true} {
-				got := RenderUsageReport(ov, tc.rows, tc.groupBy, ReportOptions{Color: color})
+				got := RenderUsageReport(tc.rows, tc.groupBy, ReportOptions{Color: color})
 				assertCardWidth(t, got)
 				if !color && strings.Contains(got, "\x1b[") {
 					t.Fatalf("no-color render carries escapes:\n%q", got)
 				}
 			}
-			plain := RenderUsageReport(ov, tc.rows, tc.groupBy, ReportOptions{})
-			colored := RenderUsageReport(ov, tc.rows, tc.groupBy, ReportOptions{Color: true})
+			plain := RenderUsageReport(tc.rows, tc.groupBy, ReportOptions{})
+			colored := RenderUsageReport(tc.rows, tc.groupBy, ReportOptions{Color: true})
 			if render.StripANSI(colored) != plain {
 				t.Fatalf("no-color render is not the colored render minus escapes:\ngot  %q\nwant %q", plain, colored)
 			}
@@ -600,7 +574,7 @@ func TestRenderUsageReportCardWidth(t *testing.T) {
 // no group column at all, the fixed columns only, and the 未分组 title.
 func TestRenderUsageReportNoGroupBy(t *testing.T) {
 	rows := []SummaryRow{{Requests: 5, PromptTokens: 1000, CachedTokens: 250}}
-	got := RenderUsageReport(&Overview{Requests: 5, TotalTokens: 1000}, rows, nil, ReportOptions{})
+	got := RenderUsageReport(rows, nil, ReportOptions{})
 	if !strings.Contains(got, "未分组") {
 		t.Errorf("the ungrouped title description is 未分组:\n%s", got)
 	}
@@ -618,7 +592,7 @@ func TestRenderUsageReportMultiGroupKeys(t *testing.T) {
 		{Groups: map[string]any{"model": "gpt-5.5", "provider": "openai"}, Requests: 12, PromptTokens: 1000, CachedTokens: 900},
 		{Groups: map[string]any{"model": "glm-5.2", "provider": "z-ai"}, Requests: 40, PromptTokens: 900, CachedTokens: 30},
 	}
-	got := RenderUsageReport(&Overview{}, rows, []string{"model", "provider"}, ReportOptions{})
+	got := RenderUsageReport(rows, []string{"model", "provider"}, ReportOptions{})
 	if !strings.Contains(got, "按模型/供应商分组") {
 		t.Errorf("the title must list every group key:\n%s", got)
 	}
@@ -643,7 +617,7 @@ func TestRenderUsageReportMultiGroupKeys(t *testing.T) {
 		len(colGap)*(len(cols)-1) != tableWidth {
 		t.Fatalf("columns do not fill the table area: %+v", cols)
 	}
-	long := RenderUsageReport(&Overview{}, []SummaryRow{
+	long := RenderUsageReport([]SummaryRow{
 		{Groups: map[string]any{"model": "provider-with-a-very-long-name", "provider": "another-very-long-provider"}, Requests: 1, PromptTokens: 10, CachedTokens: 5},
 	}, []string{"model", "provider"}, ReportOptions{})
 	if !strings.Contains(long, "…") {
@@ -667,7 +641,7 @@ func TestRenderUsageReportCompactNumbers(t *testing.T) {
 			CostUSD:          ptr64(21.0267),
 		},
 	}
-	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{})
+	got := RenderUsageReport(rows, []string{"model"}, ReportOptions{})
 	for _, want := range []string{"938.6M", "50.91M"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("compact number %q missing:\n%s", want, got)
@@ -689,7 +663,6 @@ func TestRenderUsageReportCompactNumbers(t *testing.T) {
 // stays at exactly reportWidth columns (a whole-line truncation safety net
 // used to eat the ╮ and could leave the card at 59 columns).
 func TestRenderUsageReportOverLongTitle(t *testing.T) {
-	ov := &Overview{Requests: 1, PromptTokens: 10, CachedTokens: 5}
 	rows := []SummaryRow{{Requests: 1, PromptTokens: 10, CachedTokens: 5}}
 	cases := [][]string{
 		{strings.Repeat("k", 80)}, // ASCII key: 80 columns
@@ -698,7 +671,7 @@ func TestRenderUsageReportOverLongTitle(t *testing.T) {
 		{"模型", strings.Repeat("键", 26)}, // CJK key: 63 columns, truncated to 50
 	}
 	for _, groupBy := range cases {
-		got := RenderUsageReport(ov, rows, groupBy, ReportOptions{})
+		got := RenderUsageReport(rows, groupBy, ReportOptions{})
 		assertCardWidth(t, got)
 		title := reportLines(t, got)[0].plain
 		if !strings.HasPrefix(title, "╭─ ") {
@@ -748,7 +721,7 @@ func TestRenderUsageReportModelColumnTruncation(t *testing.T) {
 			CostUSD:          ptr64(0.10),
 		},
 	}
-	got := RenderUsageReport(&Overview{}, rows, []string{"model"}, ReportOptions{})
+	got := RenderUsageReport(rows, []string{"model"}, ReportOptions{})
 
 	// At the 45-column card width the model column is the 9-column budget
 	// (41 − 6 − 6 − 17 − 3), so even a 16-column formatted name is truncated:
@@ -802,7 +775,7 @@ func TestRenderUsageReportGroupColumnBudget(t *testing.T) {
 			CompletionTokens: 50,
 		},
 	}
-	got := RenderUsageReport(&Overview{}, rows, []string{"provider"}, ReportOptions{})
+	got := RenderUsageReport(rows, []string{"provider"}, ReportOptions{})
 	// The provider column gets the whole single-group budget (9 columns), so a
 	// 54-character value is ellipsis-truncated rather than printed in
 	// full: a fixed card cannot grow to fit it.
@@ -834,24 +807,16 @@ func TestRenderUsageReportGroupColumnBudget(t *testing.T) {
 	}
 }
 
-// TestRenderUsageReportNoCacheSegmentsInOverview verifies that the top-level
-// overview does not render source-family cache hit lines, while still
-// rendering the card.
-func TestRenderUsageReportNoCacheSegmentsInOverview(t *testing.T) {
-	ov := &Overview{
-		Requests:       2,
-		TotalTokens:    1001,
-		PromptTokens:   1001,
-		CachedTokens:   1400,
-		OpenAIRequests: 1, OpenAIPromptTokens: 1000, OpenAICachedTokens: 900,
-		AnthropicRequests: 1, AnthropicPromptTokens: 1, AnthropicCachedTokens: 500, AnthropicCacheWriteTokens: 0,
-	}
-	got := RenderUsageReport(ov, nil, []string{"model"}, ReportOptions{})
+// TestRenderUsageReportNoCacheSegments verifies the card never renders
+// source-family cache hit lines (they belonged to the summary row removed in
+// v0.38.0) while still rendering the card.
+func TestRenderUsageReportNoCacheSegments(t *testing.T) {
+	got := RenderUsageReport(nil, []string{"model"}, ReportOptions{})
 	if strings.Contains(got, "命中(OpenAI)") || strings.Contains(got, "命中(Anthropic)") || strings.Contains(got, "缓存命中") {
-		t.Errorf("cache segments must not appear in overview:\n%s", got)
+		t.Errorf("cache segments must not appear in the card:\n%s", got)
 	}
-	if !strings.Contains(got, "请求 2 · 词元 1k") {
-		t.Errorf("expected the summary row from Overview:\n%s", got)
+	if !strings.Contains(got, "（暂无数据）") {
+		t.Errorf("expected the no-data hint:\n%s", got)
 	}
 }
 

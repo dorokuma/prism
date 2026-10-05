@@ -554,10 +554,10 @@ func TestRunUsageTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	// summary from Overview: all 5 requests, 750 total tokens, 4 priced
-	// events × $0.15 (price 1000/1000 on 150 tokens each)
-	if !strings.Contains(out, "请求 5 · 词元 750 · 开销 $0.600") {
-		t.Errorf("summary line missing/wrong:\n%s", out)
+	// The summary row ("请求 … · 词元 … · 开销 …") is gone; the totals
+	// surface through the --json overview instead.
+	if strings.Contains(out, "· 词元") || strings.Contains(out, "· 开销") {
+		t.Errorf("summary line must not appear:\n%s", out)
 	}
 	// missing-price hint must not appear
 	if strings.Contains(out, "未算出金额") {
@@ -978,12 +978,10 @@ func TestRunUsageSplitCacheSegments(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	// Overview does not render cache hit lines
+	// The card does not render cache hit lines (they belonged to the
+	// summary row removed in v0.38.0).
 	if strings.Contains(out, "命中(OpenAI)") || strings.Contains(out, "命中(Anthropic)") || strings.Contains(out, "缓存命中") {
-		t.Errorf("cache segments must not appear in overview:\n%s", out)
-	}
-	if !strings.Contains(out, "请求 3 ·") {
-		t.Errorf("expected 3-line overview:\n%s", out)
+		t.Errorf("cache segments must not appear in the card:\n%s", out)
 	}
 	if strings.Contains(out, "50000") {
 		t.Errorf("claude table row still uses cached/prompt:\n%s", out)
@@ -1200,25 +1198,31 @@ func TestRunUsageGroupByModelFiltersBlankModel(t *testing.T) {
 	}
 	s.Close()
 
-	// --by model (default): table has only model "a", overview has 2 requests.
+	// --by model (default): table has only model "a" (the summary row that
+	// used to show the 2-request total is gone since v0.38.0).
 	var buf bytes.Buffer
 	if err := runUsageWith([]string{"--db", path}, &buf, base); err != nil {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "请求 2 ·") {
-		t.Errorf("default overview must include blank-model events:\n%s", out)
+	if strings.Contains(out, "· 词元") || strings.Contains(out, "· 开销") {
+		t.Errorf("summary line must not appear:\n%s", out)
 	}
-	// JSON path: verify no blank model leaks into the detail rows.
+	// JSON path: the overview still counts the blank-model events (2
+	// requests), and no blank model leaks into the detail rows.
 	var jsonBuf bytes.Buffer
 	if err := runUsageWith([]string{"--db", path, "--json"}, &jsonBuf, base); err != nil {
 		t.Fatal(err)
 	}
 	var doc struct {
-		Rows []usage.SummaryRow `json:"rows"`
+		Overview *usage.Overview    `json:"overview"`
+		Rows     []usage.SummaryRow `json:"rows"`
 	}
 	if err := json.Unmarshal(jsonBuf.Bytes(), &doc); err != nil {
 		t.Fatal(err)
+	}
+	if doc.Overview == nil || doc.Overview.Requests != 2 {
+		t.Errorf("overview must include blank-model events, got %+v", doc.Overview)
 	}
 	for _, row := range doc.Rows {
 		if s, _ := row.Groups["model"].(string); s == "" {
@@ -1226,17 +1230,18 @@ func TestRunUsageGroupByModelFiltersBlankModel(t *testing.T) {
 		}
 	}
 
-	// --by day: both events are counted in the overview, and the day
-	// bucket includes both (no blank-model filtering).
+	// --by day: the day bucket includes both events (no blank-model
+	// filtering); the overview line that used to show the 2-request total
+	// is gone since v0.38.0.
 	buf.Reset()
 	if err := runUsageWith([]string{"--db", path, "--by", "day"}, &buf, base); err != nil {
 		t.Fatal(err)
 	}
 	out = buf.String()
-	if !strings.Contains(out, "请求 2 ·") {
-		t.Errorf("day overview must include both events:\n%s", out)
-	}
 	if !strings.Contains(out, base.Format("01-02")) {
 		t.Errorf("day bucket missing for today:\n%s", out)
+	}
+	if !strings.Contains(out, "  2 ") {
+		t.Errorf("day bucket must include both events:\n%s", out)
 	}
 }

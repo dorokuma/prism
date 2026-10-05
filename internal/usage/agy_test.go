@@ -48,3 +48,19 @@ func TestCacheHitRateAgyDenom(t *testing.T) {
 		t.Fatalf("hit rate = %s, want 80.0%% (400/500, not 400/100)", got)
 	}
 }
+
+// TestAddOverviewIncludesBlankModelExtra pins the unfiltered-extra
+// contract: blank-model agy rows count toward the overview even though the
+// model table filters them. The totals surface through the CLI --json
+// overview since the table summary row went away in v0.38.0.
+func TestAddOverviewIncludesBlankModelExtra(t *testing.T) {
+	ov := &Overview{Requests: 1, PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}
+	extra := []SummaryRow{{
+		Groups: map[string]any{"model": ""}, Requests: 2, PromptTokens: 200,
+		CompletionTokens: 100, TotalTokens: 300,
+	}}
+	AddOverview(ov, extra)
+	if ov.Requests != 3 || ov.TotalTokens != 450 {
+		t.Fatalf("overview must count the unfiltered extra, got %+v", ov)
+	}
+}
