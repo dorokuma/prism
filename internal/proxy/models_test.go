@@ -673,9 +673,9 @@ func TestProxyModels_FetchFailureConcurrentMissNo200Empty(t *testing.T) {
 
 func TestProxyModels_NilModelCacheDoesNotPanic(t *testing.T) {
 	testCases := []struct {
-		name     string
-		cfg      *config.Config
-		header   string
+		name   string
+		cfg    *config.Config
+		header string
 	}{
 		{
 			name:   "explicit header non-aggregate",

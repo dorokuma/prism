@@ -809,4 +809,3 @@ providers:
 		t.Fatalf("error code = %q, want no_healthy", code)
 	}
 }
-

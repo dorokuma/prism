@@ -297,4 +297,3 @@ func idsOfUnion(us []UnionModel) []string {
 	}
 	return out
 }
-
