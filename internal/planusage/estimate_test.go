@@ -10,6 +10,77 @@ import (
 	"time"
 )
 
+// TestReversePoolNeverWraps is the regression for reversePool's float64 → int64
+// conversion: a quotient the type cannot hold (or a NaN) used to come back as a
+// NEGATIVE pool, and the card would then claim a window has a minus number of
+// tokens. The guard saturates at int64's top (the largest pool that can be
+// written down) and answers 0 for a quotient with no value at all, so no input
+// reaches a negative result — and no in-range quotient is changed beyond the
+// float64 rounding reversePool's own comment spells out. The rows below are the
+// measured cases; the expected values are the assertion.
+func TestReversePoolNeverWraps(t *testing.T) {
+	cases := []struct {
+		name   string
+		tokens int64
+		frac   float64
+		want   int64
+	}{
+		{"an in-range quotient is unchanged", 1000, 0.5, 2000},
+		{"the reversal poller_test pins is unchanged", 1000, 1 - 0.0558405, 1059},
+		// The off-by-one starts just above 2^52: the count in this row is exactly
+		// representable, but the 0.5 the quotient gets before the conversion lands
+		// exactly between two float64 values there and rounds to the even one, so the
+		// pool comes back one too large. The two rows above it still come back exact.
+		{"2^52-1 is still exact", 4503599627370495, 1, 4503599627370495},
+		{"2^52 itself is still exact", 4503599627370496, 1, 4503599627370496},
+		{"the first off-by-one is just above 2^52", 4503599627370497, 1, 4503599627370498},
+		{"the same rule one further up the grid", 9007199254740991, 1, 9007199254740992},
+		{"a count above 2^53 rounds to the nearest float64", 9007199254740995, 1, 9007199254740996},
+		// The quantum at the top: consecutive int64 counts of this magnitude
+		// collapse onto the same grid, whose step is the two rows' difference.
+		{"the quantum near 1e18 collapses one step down", 1e18 + 64, 1, 1e18},
+		{"the quantum near 1e18 collapses one step up", 1e18 + 65, 1, 1000000000000000128},
+		{"a quotient one float64 step past int64 saturates", math.MaxInt64 / 2, 0.5, math.MaxInt64},
+		{"a fraction that overflows the quotient saturates", math.MaxInt64, 1e-300, math.MaxInt64},
+		{"a NaN fraction has no pool", math.MaxInt64, math.NaN(), 0},
+		{"an infinite fraction has no pool", math.MaxInt64, math.Inf(1), 0},
+		{"a zero fraction has no pool", math.MaxInt64, 0, 0},
+		{"a negative fraction has no pool", 1000, -0.5, 0},
+		{"a zero count has no pool", 0, 0.5, 0},
+	}
+	for _, tc := range cases {
+		got := reversePool(tc.tokens, tc.frac)
+		if got != tc.want {
+			t.Fatalf("%s: reversePool(%d, %g) = %d, want %d", tc.name, tc.tokens, tc.frac, got, tc.want)
+		}
+	}
+
+	// The sign is the property, not the exact value: no combination of the
+	// extremes may come back negative (that is what the wrap produced).
+	for _, tokens := range []int64{1, 1000, math.MaxInt64 / 2, math.MaxInt64 - 1, math.MaxInt64, math.MinInt64} {
+		for _, frac := range []float64{math.SmallestNonzeroFloat64, 1e-300, 1e-9, 0.5, 1, 1e9, math.Inf(1), math.Inf(-1), math.NaN(), -1, 0} {
+			if got := reversePool(tokens, frac); got < 0 {
+				t.Fatalf("reversePool(%d, %g) = %d: a pool may never be negative", tokens, frac, got)
+			}
+		}
+	}
+
+	// The row above is the FIRST off-by-one, so the region below it has to come
+	// back exact. The band is sampled coarsely (a step far wider than the float64
+	// grid's own step at that magnitude, so it cannot jump over a whole deviating
+	// stretch) and then walked one by one up to the boundary.
+	for n := int64(1); n < 1<<52; n += 999_999_999 {
+		if got := reversePool(n, 1); got != n {
+			t.Fatalf("reversePool(%d, 1) = %d below the documented first off-by-one", n, got)
+		}
+	}
+	for n := int64(1<<52) - 10_000; n <= 1<<52; n++ {
+		if got := reversePool(n, 1); got != n {
+			t.Fatalf("reversePool(%d, 1) = %d, want it exact up to and including 2^52", n, got)
+		}
+	}
+}
+
 func TestWeekStartUnix(t *testing.T) {
 	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
 	start := time.Date(2026, 8, 22, 8, 0, 0, 0, time.UTC)
@@ -515,8 +586,8 @@ func TestApplyClinePassEstimatesDrainedWeekAnchorsMonthly(t *testing.T) {
 	// 5B happens to equal L, which is what a drained week means.
 	// Monthly: 99.9 % used (UsedFraction set, Percent floored to 99) ⇒ partial,
 	// hence the only usable anchor: 999000000 / (2 × 0.999) = 500000000 = L.
-	// The pool is sized so BOTH sides fit the 13-column metric field
-	// ("50亿/50亿" = 8, "100亿/100亿" = 10) instead of being truncated.
+	// The pool is sized so BOTH sides fit the metric field
+	// ("50亿/50亿" and "100亿/100亿") instead of being truncated.
 	snap := Snapshot{Provider: "clinepass", Windows: []Window{
 		{Name: "weekly", Status: "rate-limited", Percent: 100, PeriodStart: &startW, ResetsAt: &endW},
 		{Name: "monthly", Status: "ok", Percent: 99, UsedFraction: 0.999, PeriodStart: &startM, ResetsAt: &endM},
@@ -593,7 +664,7 @@ func TestApplyClinePassEstimatesSubPercentStillInverts(t *testing.T) {
 }
 
 // TestApplyClinePassEstimatesGuards pins the no-estimate branches: a sum
-// error (metapi missing/unreadable), a zero/absent fraction, a clamped
+// error (the magpie usage log missing/unreadable), a zero/absent fraction, a clamped
 // exhausted window (frac >= 1), zero tokens, and a window without a period
 // start. In every case the snapshot itself stays untouched.
 func TestApplyClinePassEstimatesGuards(t *testing.T) {
@@ -603,7 +674,7 @@ func TestApplyClinePassEstimatesGuards(t *testing.T) {
 	calls := 0
 	sum := func(context.Context, int64, int64) (int64, error) {
 		calls++
-		return 0, errors.New("no such table: proxy_logs")
+		return 0, errors.New("no usable usage lines")
 	}
 
 	// Sum error → every estimate stays empty, no fetch error appears.

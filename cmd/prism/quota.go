@@ -15,7 +15,7 @@ import (
 	"strings"
 
 	"github.com/dorokuma/prism/internal/config"
-	"github.com/dorokuma/prism/internal/metapiusage"
+	"github.com/dorokuma/prism/internal/magpieusage"
 	"github.com/dorokuma/prism/internal/oauth"
 	"github.com/dorokuma/prism/internal/oauth/google"
 	"github.com/dorokuma/prism/internal/oauth/xai"
@@ -130,8 +130,13 @@ func quotaCredential(cfg *config.Config, a config.AccountConfig) string {
 //   - the provider's 总额 estimate is applied on success only. A failed fetch
 //     keeps the snapshot's error code and gets no estimate, like before.
 //
+// magpieSrc is the caller's magpie source, shared with the account discovery
+// of this same invocation so the 总额 sums and "which accounts exist" read the
+// same files and reuse one scan of the usage log. It is only used for a
+// ClinePass snapshot.
+//
 // The HTTP fetch itself stays in the caller: this function is pure assembly.
-func buildQuotaSnapshot(ctx context.Context, cfg *config.Config, g planusage.KeyGroup, snap planusage.Snapshot, ferr error) planusage.Snapshot {
+func buildQuotaSnapshot(ctx context.Context, cfg *config.Config, g planusage.KeyGroup, snap planusage.Snapshot, ferr error, magpieSrc *magpieusage.Source) planusage.Snapshot {
 	planusage.AssignAccountViews(&snap, g.Accounts)
 	if ferr != nil {
 		snap.Err = planusage.ErrorCode(ferr)
@@ -143,7 +148,7 @@ func buildQuotaSnapshot(ctx context.Context, cfg *config.Config, g planusage.Key
 	case "gemini":
 		snap = applyQuotaGeminiEstimate(ctx, cfg, snap)
 	case "clinepass":
-		snap = applyQuotaClinePassEstimate(ctx, snap, planusage.AccountIDFrom(g.Accounts[0]))
+		snap = applyQuotaClinePassEstimate(ctx, snap, magpieSrc, planusage.AccountIDFrom(g.Accounts[0]))
 	}
 	return snap
 }
@@ -183,21 +188,22 @@ flags:
 	var accs []planusage.AccountView
 	for _, a := range cfg.Accounts {
 		if strings.EqualFold(a.Provider, "clinepass") {
-			// clinepass accounts are discovered from metapi, not config.
+			// clinepass accounts are discovered from magpie, not config.
 			continue
 		}
 		accs = append(accs, cliAccount{name: a.Name, provider: a.Provider, base: a.BaseURL, key: quotaCredential(cfg, a), authHeader: a.AuthHeader})
 	}
-	// Discover the ClinePass accounts from metapi (site_id=49, active only)
-	// for CLI quota. The CLI has no long-lived source to borrow, and it does
-	// not need one: metapiusage.Source keeps no connection, so a one-shot
-	// Source is exactly the "open per operation" behaviour this invocation
-	// wants (a replaced or newly created database is read as it is).
-	metapiSource := metapiusage.NewSource(metapiUsageDBPath)
-	if metapiAccs, err := readClinePassAccounts(context.Background(), metapiSource); err != nil {
-		slog.Warn("read clinepass accounts from metapi failed", "error", err)
-	} else if len(metapiAccs) > 0 {
-		accs = append(accs, metapiAccs...)
+	// Discover the ClinePass accounts from magpie's provider file for CLI
+	// quota. The CLI has no long-lived source to borrow, and it does not need
+	// one: magpieusage.Source keeps no file handle, so one Source for this
+	// invocation is exactly the "read the files as they are now" behaviour the
+	// CLI wants (a newly created or replaced file is read as it is) while the
+	// account discovery and the 总额 sums still share one scan of the log.
+	magpieSrc := newMagpieSource()
+	if magpieAccs, err := readClinePassAccounts(context.Background(), magpieSrc); err != nil {
+		slog.Warn("read clinepass accounts from magpie failed", "error", err)
+	} else if len(magpieAccs) > 0 {
+		accs = append(accs, magpieAccs...)
 	}
 	if *provider != "" {
 		var filtered []planusage.AccountView
@@ -223,7 +229,7 @@ flags:
 		if ferr != nil {
 			failed++
 		}
-		snaps = append(snaps, buildQuotaSnapshot(ctx, cfg, g, snap, ferr))
+		snaps = append(snaps, buildQuotaSnapshot(ctx, cfg, g, snap, ferr, magpieSrc))
 	}
 
 	if *jsonOut {

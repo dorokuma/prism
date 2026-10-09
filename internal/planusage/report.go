@@ -121,13 +121,16 @@ func RenderTableAt(snaps []Snapshot, now time.Time) string {
 //	│ · gemini-acct ▰▰▰▰▰▰▱▱▱▱  34%       3.4亿/10亿        │
 //	╰──────────────────────────────────────────────────────────╯
 //
-// Row: "│ " + dot(1) + " " + name(n) + " " + capsule(10) + " " +
-// pct(4, right-aligned) + " " + metric(13, right-aligned) + " │" =
-// clineRowFixed + n + 4 display columns, whatever the percentage and the
-// token pair happen to be: every module boundary carries exactly ONE space
-// and each segment sits in its OWN reserved width, so a row is exactly the
-// card's width with no fill to absorb (the trailing fill stays as the guard
-// for a value wider than its reservation, which no real window produces).
+// Row: "│ " + dot(1) + " " + name(n) + " " + capsule(clineCapCells) + " " +
+// pct(clinePctWidth, right-aligned) + " " + metric(clineNumberWidth, right-aligned) + " │" =
+// clineRowFixed + n + 4 display columns for every magnitude a real window
+// produces: every module boundary carries exactly ONE space and each segment
+// sits in its OWN reserved width. That is not a width law for the metric
+// segment: where no step of EITHER pair ladder fits the field — int64's tail,
+// which no real window reaches — the honest winner is wider than
+// clineNumberWidth and clineRowLine's Truncate is what cuts it back
+// (TestFormatTokenPairInt64Tail); the trailing fill stays as the guard of the
+// row-width invariant.
 // The card is max(row width, the width the title needs) columns wide, so the
 // LONGEST account display name and the title both fit and no line ever
 // overflows its own border. There is no fixed card width any more: the old
@@ -296,13 +299,17 @@ func cardProfileName(provider string) string {
 // capsule going solid red plus the percentage and the X/X metric (see
 // clineMetricField). The metric field is:
 //
-//   - weekly / monthly / 5h: the used/total TOKEN pair in Chinese 亿 units,
-//     no "~" and no 估算池 marker (the total is the pool
+//   - weekly / monthly / 5h: the used/total TOKEN pair in ONE Chinese unit —
+//     亿 / 万 / 千 / 原值, with 万亿 / 亿亿 reachable only through the backup
+//     pass (clinePairBackupUnits), scored per pair (see formatTokenPair) — so a
+//     pool a single unit would render as zeros is written in the unit that shows
+//     it.
+//     No "~" and no 估算池 marker (the total is the pool
 //     ApplyClinePassEstimates / ApplyWeekEstimate DERIVE from the live
 //     percent — the upstream never reports one — but an inferred total is
 //     still the only total that window has, so it is shown plainly);
 //   - a window that cannot answer — no pool AND no measured consumption
-//     (usage db / metapi unreadable, or a fresh window with no traffic) —
+//     (usage db / magpie log unreadable, or a fresh window with no traffic) —
 //     reads "-". Its countdown is already on the title, so the row does not
 //     repeat it.
 const (
@@ -310,27 +317,53 @@ const (
 
 	// clinePctWidth and clineNumberWidth are what a row's percentage and its
 	// token-pair segment can occupy at their LONGEST: "100%" and a used/total
-	// pair ("9999亿/9999亿"). Both segments are written RIGHT-aligned inside
+	// pair. Both segments are written RIGHT-aligned inside
 	// their own reserved width (see clineRowLine), so a value always ends on
 	// the same column no matter how many digits it has. The two widths decide
 	// what a row RESERVES — through clineRowFixed, so the widest possible row
 	// still fits inside the card's border — and are the blank placeholders of
-	// a windowless row.
+	// a windowless row. clineNumberWidth is also the budget the pair ladder is
+	// scored against (clinePairWidthBudget): a step of either ladder that fits
+	// these columns beats one that does not. It is NOT a cap on what the ladder
+	// returns — where no step of either ladder fits, the winner is wider and the
+	// row's Truncate is what cuts it (TestFormatTokenPairInt64Tail).
 	clinePctWidth    = 4  // widest percentage: "100%"
-	clineNumberWidth = 13 // widest metric: "9999亿/9999亿"
+	clineNumberWidth = 13 // the metric field's reserved columns
+	// clinePairWidthBudget is the display-column budget of the WHOLE used/total
+	// pair: the columns clineRowLine reserves for it (clineNumberWidth), written
+	// as its own constant because formatTokenPair judges candidate pairs BEFORE
+	// the row writes one — a pair inside this budget is a pair the row's
+	// Truncate never has to cut. It is the HARD rule of the unit ladder (see
+	// clinePairCandidate.beats): a step that stays inside it beats one that does
+	// not, so the ladder trades a digit for precision before it leaves the field
+	// (and only where NO step of either ladder stays inside it does the winner
+	// come back wider — see formatTokenPair).
+	clinePairWidthBudget = clineNumberWidth
+	// clinePairSideBudget is the per-side split the field was sized against:
+	// (clinePairWidthBudget - 1) / 2 display columns per half, i.e. a whole unit
+	// with its suffix on each side of the pair's one-column "/" separator. It is
+	// the shape a pair is readable in, but it is NOT the hard rule — the hard rule
+	// is clinePairWidthBudget on the WHOLE pair (see clinePairCandidate.beats) —
+	// so a pair whose halves need an uneven split (the raw step's "1/<total>") is
+	// still written as it is (TestFormatTokenPairUnitLadderBudget).
+	clinePairSideBudget = 6
 	// clineRowFixed is a row's display columns WITHOUT the account name
 	// column: the space that separates it from the capsule (1), the capsule
 	// (clineCapCells), the space after the capsule (1), the widest percentage
 	// (clinePctWidth), the space before the metric (1), the widest metric
 	// (clineNumberWidth) and the closing " │" (2). Every module boundary
 	// carries exactly ONE space; because both segments are right-aligned
-	// inside their reservation, the row lands on the card's width with NOTHING
-	// left over (the trailing fill in clineRowLine stays as the guard for a
-	// value wider than its reservation, which no real window produces).
+	// inside their reservation, a row of a real window lands exactly on the
+	// card's width. The metric segment is the one that can outgrow its
+	// reservation: where no step of EITHER ladder fits (int64's tail,
+	// TestFormatTokenPairInt64Tail) the honest winner is wider than
+	// clineNumberWidth and clineRowLine's Truncate is what cuts it back, the
+	// trailing fill in clineRowLine staying as the guard of the row-width
+	// invariant.
 	clineRowFixed = 1 + clineCapCells + 1 + clinePctWidth + 1 + clineNumberWidth + 2 // 32
 	// clineNameColMin is the FLOOR of the name column in display columns: the
 	// longest account name in the current production roster — the accounts the
-	// user's config and the metapi account table feed in — i.e. "SuperGrok",
+	// user's config and magpie's ClinePass provider keys feed in — i.e. "SuperGrok",
 	// 9 columns. That is a deployment fact, not a property of this package's
 	// display table. One render lays every card out at ONE width (cardWidth),
 	// so without a floor the same command would come out narrower when only
@@ -404,7 +437,8 @@ func clinePassKeys(s Snapshot) []clineKey {
 //
 // Row IDENTITY is (window, name, fingerprint): the fingerprint is what
 // makes TWO DIFFERENT accounts that share a name two rows (real case: two
-// metapi ClinePass rows with the same username but different api_tokens),
+// magpie-backed ClinePass accounts whose names collide once the display rule
+// drops a trailing digit run of the providerKeyId),
 // and it is also what keeps one account from being listed twice when it
 // shows up in more than one snapshot of the group (accounts that share a
 // key are ONE snapshot with several names, and a failed/retried round can
@@ -641,10 +675,12 @@ func clineRowLine(r clineRow, width int, pal cardPalette) string {
 	if r.win != nil {
 		capsule = clineBar(*r.win, pal)
 		pct = render.PadLeft(pctLabel(*r.win), clinePctWidth)
-		// Truncate keeps the one-row-width invariant a hard guarantee: a token
-		// pair wider than the segment reserved for it (no real window has one —
-		// "9999亿/9999亿" is 13 columns) is cut off at the border instead of
-		// pushing it out. PadLeft right-aligns what fits inside the reservation.
+		// Truncate stays as the LAST-RESORT guard of the one-row-width invariant:
+		// formatTokenPair already guarantees a pair inside clinePairWidthBudget
+		// (the columns reserved here) whenever ANY step can hold one, so the cut is
+		// reached only where no step of either ladder fits and the honest winner is
+		// wider than the field (the formatter's residual; the widths there are pinned
+		// by TestFormatTokenPairInt64Tail).
 		metric = render.PadLeft(render.Truncate(clineMetricField(*r.win), clineNumberWidth), clineNumberWidth)
 	}
 	row := pal.dim("│ ") +
@@ -684,20 +720,31 @@ func clineBar(w Window, pal cardPalette) string {
 }
 
 // clineMetricField is a row's metric field — the text the row writes there,
-// RIGHT-aligned inside the card's clineNumberWidth = 13 reservation — and the
+// RIGHT-aligned inside the card's clineNumberWidth reservation — and the
 // single rule of the two-metric-column layout:
 //
 //   - a TOKEN window (weekly / monthly / 5h, clineTokenPairWindow) shows the
-//     used/total pair in Chinese 亿 units with NO "~": the total is the
+//     used/total pair in ONE Chinese unit (亿 / 万 / 千 / 原值, plus 万亿 / 亿亿 on
+//     the backup pass only — see clinePairBackupUnits — SCORED per pair, see
+//     formatTokenPair) with NO "~": the total is the
 //     window's pool — LimitTokensEstimate, or the MEASURED consumption
-//     (MeasuredTokens) when there is no pool — and used is the window's share
-//     of it, the very percentage the pct column shows. The upstream never
+//     (MeasuredTokens) when there is no pool — and used is DERIVED from the very
+//     percentage the pct column shows (displayPercent, which rounds a sub-1 %
+//     share UP), not taken from the JSON's measured_tokens: a window whose
+//     displayed percent is 0 writes a zero used half even when its own
+//     consumption is not zero, and /admin/quota's measured_tokens stays exact.
+//     The upstream never
 //     REPORTS a pool (ApplyClinePassEstimates / ApplyWeekEstimate derive it
 //     from the live percent, see estimate.go), but the derived pool is the
 //     only total that window has, so it is shown plainly instead of being
 //     flagged as an inference.
+//   - the pool test is total > 0, so a NEGATIVE LimitTokensEstimate is dropped
+//     exactly like a missing one and the row falls back to MeasuredTokens: it
+//     shows the measured consumption (X/X once the window is exhausted, else
+//     displayPercent × measured / measured) and "-" when there is none either.
+//     A negative estimate is never a pair's denominator.
 //   - a window that cannot answer — no pool AND no measured consumption
-//     (usage db / metapi unreadable, or a fresh window that has seen no
+//     (usage db / magpie log unreadable, or a fresh window that has seen no
 //     traffic yet) — reads "-". It does NOT fall back to the countdown: the
 //     countdown is a window-level property the TITLE already carries, and a
 //     row repeating it per account is exactly what this layout removed.
@@ -1189,17 +1236,399 @@ func hexValue(s string) int {
 	return int(v)
 }
 
-// formatTokenPair formats a used/total token pair in the Chinese 亿 unit:
-// "3.4亿/10亿". Joined without spaces, because the pair IS one metric segment
-// (a row's right-aligned metric field, 13 columns at its widest,
-// "9999亿/9999亿"). Neither side is marked: the package writes a derived pool
-// the same way it writes a measured one (see clineMetricField). Both sides go
-// through render.FormatTokensYi, so a whole 亿 drops its fraction, a value one
-// decimal would collapse to zero is shown with TWO decimals instead ("0.02亿",
-// see FormatTokensYi), and only a true zero — or a value below 0.005 亿, where
-// even two decimals round away — reads "0亿".
+// clinePairUnit is one step of the used/total metric's unit ladder: the divisor
+// that scales a token count into the unit and the suffix it renders with. An
+// empty suffix is the raw count (原值), the ladder's floor.
+type clinePairUnit struct {
+	div    int64
+	suffix string
+}
+
+// clinePairUnits is that ladder, largest first: 亿 / 万 / 千 / 原值. It is FIXED at
+// these four steps — the pair is a MAGNITUDE readout (is this window's pool of
+// the order of a billion tokens or of ten thousand?), and the steps only have to
+// keep both of its halves readable; a step between them (十万 / 千万 / …) would buy
+// precision the field cannot show next to the total anyway and add one more
+// boundary to verify. These four are the steps every pair is scored against
+// FIRST (see formatTokenPair); the wider totals — the ones no step of this table
+// holds inside the field — are served by the ladder continued ABOVE 亿 in
+// clinePairBackupUnits, which is only consulted when none of these four fits.
+// TestFormatTokenPairUnitLadderBudget pins the decisions this table produces.
+//
+// The last step is the raw count (divisor 1, no suffix). It is never where the
+// search STARTS (see clinePairUnitStart) but the ladder's FLOOR: the step a half
+// drops to when every unit above it would render a non-zero value as "0<unit>",
+// which is the shape a one-token numerator under a small total has.
+var clinePairUnits = []clinePairUnit{
+	{div: 1e8, suffix: "亿"},
+	{div: 1e4, suffix: "万"},
+	{div: 1e3, suffix: "千"},
+	{div: 1, suffix: ""},
+}
+
+// clinePairRawIndex is clinePairUnits' raw-count (原值) step, the ladder's floor.
+const clinePairRawIndex = 3
+
+// clinePairUnitStart is the index in clinePairUnits the search for a pair's unit
+// BEGINS at: the largest unit the total reaches at least once (亿 at 1e8 and up,
+// 万 at 1e4 and up), and 千 — the smallest UNIT step — for anything smaller.
+// Starting there is what keeps a pair's unit close to the total's own whenever
+// nothing forces a change (see clinePairCandidate.beats); the start is a
+// preference, not the reading, because a candidate further down the ladder can
+// still win (a one-token numerator under such a total reads the raw step). The
+// readings that start produces are pinned by TestFormatTokenPairUnitLadderBudget
+// and TestRenderCardsTokenPairUnitLadder.
+//
+// The loop walks the three UNIT steps only
+// (clinePairUnits[:clinePairRawIndex]), so a total below 千 starts at 千 — the
+// smallest unit step — and 原值 is never a start. That is the whole of the "the
+// start is never the raw step" rule: the raw step is reached by the SCORING, not
+// by the start, whenever every unit above it would render a non-zero half as
+// "0<unit>" (a one-token numerator under a small total: 千 writes "0千", so the
+// plain key keeps the raw step — see clinePairCandidate.beats).
+func clinePairUnitStart(total int64) int {
+	for i, u := range clinePairUnits[:clinePairRawIndex] {
+		if total >= u.div {
+			return i
+		}
+	}
+	return clinePairRawIndex - 1
+}
+
+// clinePairCandidate is one ladder step's rendering of a WHOLE pair, with the
+// three readability properties clinePairCandidate.beats orders the steps by.
+type clinePairCandidate struct {
+	// index is the step's index in clinePairUnits.
+	index int
+	// text is the step's rendering of the pair: left + "/" + right, both halves
+	// in THIS step's unit.
+	text string
+	// fits reports that the pair is no wider than clinePairWidthBudget, i.e.
+	// that clineRowLine's metric field holds it whole and its Truncate never cuts
+	// a digit.
+	fits bool
+	// plain reports that neither half rendered a NON-ZERO count as all-zero
+	// ("0", "0千", "0万", "0亿"): that would hide a number the JSON reports
+	// (see clinePairPlain).
+	plain bool
+	// narrow reports that both halves fit the per-side split the field was sized
+	// against (clinePairSideBudget).
+	narrow bool
+}
+
+// beats reports whether c is the better rendering of the pair than other, given the
+// index the search started at (clinePairUnitStart). The properties are compared
+// in a fixed order, and that order IS the readability rule set:
+//
+//  1. fits — never let the row truncate a number. This is the one HARD rule: a
+//     truncated number is a number the reader cannot have, so a step that fits
+//     the field beats a more precise step that does not (宁舍精度也不许截断).
+//  2. plain — never hide a non-zero value behind a unit that is too large. A
+//     pair of zeros next to a JSON total that is NOT zero is exactly the
+//     card/JSON disagreement this ladder exists to remove, so among the steps
+//     that fit, an honest one always wins.
+//  3. narrow — the shape the field was sized for: both halves inside
+//     clinePairSideBudget around the one-column separator. A pair whose halves
+//     fit only with an uneven split (the raw step's "1/<total>" shape) is still
+//     written as it is; this preference only decides between steps that are
+//     already honest AND inside the field.
+//  4. distance — with the above equal, the step nearest the total's own unit
+//     wins, so a pair keeps the unit a reader already knows and the precision
+//     the card has always shown.
+//  5. coarser — the last tie goes to the larger unit (亿 over 万 over 千 over the
+//     raw step): the steps are equally readable and equally near the start, so
+//     the shorter, rounder half is the one to show.
+//
+// The ladder that is scored is a FIXED list (clinePairUnits, then
+// clinePairBackupUnits when the first one holds no step inside the field — see
+// formatTokenPair), every step of it is scored exactly once and the five keys
+// order the candidates totally, so the search always terminates and the winner is
+// unique. Both halves always come from the SAME step, which is what makes the pair
+// one comparison (never two halves the reader would have to convert).
+// TestFormatTokenPairUnitLadderBudget pins the outcomes of this order, and
+// TestFormatTokenPairBackupLadder the outcomes once the backup ladder is in play.
+func (c clinePairCandidate) beats(other clinePairCandidate, start int) bool {
+	if c.fits != other.fits {
+		return c.fits
+	}
+	if c.plain != other.plain {
+		return c.plain
+	}
+	if c.narrow != other.narrow {
+		return c.narrow
+	}
+	if cd, od := clinePairDistance(c.index, start), clinePairDistance(other.index, start); cd != od {
+		return cd < od
+	}
+	return c.index < other.index
+}
+
+// clinePairDistance is the ladder distance between a candidate step and the step
+// the search started at (both indexes into the ladder being scored — clinePairUnits
+// on the first pass, clinePairBackupUnits on the second, see formatTokenPair). It is
+// what keeps a pair's unit close to the total's own whenever no readability rule
+// forces a change.
+func clinePairDistance(index, start int) int {
+	if index < start {
+		return start - index
+	}
+	return index - start
+}
+
+// clinePairPlain reports whether ONE rendered half of the pair keeps its value in
+// the unit it was rendered in:
+//
+//   - the half must render something (an empty one says nothing);
+//   - a count of exactly 0 is plain in EVERY unit — "0", "0千" and "0亿" all say
+//     the one true thing, so a window with no consumption of a derived pool
+//     reads "0<unit>" without any ladder adjustment;
+//   - a NON-ZERO count that renders as all zero (the whole string holds no
+//     non-zero digit, fraction included) is NOT plain: a unit too large for this
+//     half hides a number that exists, which is the defect this ladder fixes.
+//     A half rendered with a non-zero fraction (the formatter's two-decimal
+//     fallback for a tiny non-zero count) is plain; "0万" and "0千" are not.
+func clinePairPlain(text string, value int64) bool {
+	if text == "" {
+		return false
+	}
+	if value == 0 {
+		return true
+	}
+	return hasNonZeroDigit(text)
+}
+
+// hasNonZeroDigit reports whether a rendered half carries a non-zero digit, i.e.
+// whether it renders a number at all ("0", "0千", "0万" and "0亿" do not). It is
+// clinePairPlain's test and the only place a half's digits are read.
+func hasNonZeroDigit(text string) bool {
+	for _, r := range strings.TrimPrefix(text, "-") {
+		if r >= '1' && r <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
+// clinePairCandidates renders ONE pair in every step of the ladder: the list
+// formatTokenPair scores (see clinePairCandidate.beats). Both halves of every candidate come
+// from that candidate's own unit, so a step can never mix two units.
+func clinePairCandidates(used, total int64) []clinePairCandidate {
+	out := make([]clinePairCandidate, 0, len(clinePairUnits))
+	for i, unit := range clinePairUnits {
+		left := render.FormatTokensUnit(used, unit.div, unit.suffix)
+		right := render.FormatTokensUnit(total, unit.div, unit.suffix)
+		text := left + "/" + right
+		out = append(out, clinePairCandidate{
+			index:  i,
+			text:   text,
+			fits:   render.DisplayWidth(text) <= clinePairWidthBudget,
+			plain:  clinePairPlain(left, used) && clinePairPlain(right, total),
+			narrow: render.DisplayWidth(left) <= clinePairSideBudget && render.DisplayWidth(right) <= clinePairSideBudget,
+		})
+	}
+	return out
+}
+
+// clinePairBackupUnits is the ladder the BACKUP pass scores (see
+// clinePairBackupCandidates): the four main steps with 万亿 (1e12) and 亿亿 (1e16)
+// added above 亿, i.e. the same ladder continued by the same 1e4 factor
+// (亿 1e8 → 万亿 1e12 → 亿亿 1e16), so that a pair can stay in ONE unit over the
+// band of large totals the backup pass can place. 亿亿 is the composition the
+// ladder's own arithmetic gives (1e8 × 1e8); it is not a new notation, and both
+// halves of a pair still render in the SAME step of it.
+//
+// The two added steps are only ever consulted when no step of the main ladder
+// holds the pair inside the field (see formatTokenPair): 万亿 is the step that
+// writes such a total in a coarser unit, and 亿亿 the coarser one above it — the
+// magnitudes it actually places are pinned by TestFormatTokenPairBackupLadder.
+// Above that band no step of EITHER ladder fits, so the main pass's winner stands
+// and the row's Truncate cuts it (TestFormatTokenPairInt64Tail): 亿亿 does not
+// place int64's top.
+var clinePairBackupUnits = []clinePairUnit{
+	{div: 1e16, suffix: "亿亿"},
+	{div: 1e12, suffix: "万亿"},
+	{div: 1e8, suffix: "亿"},
+	{div: 1e4, suffix: "万"},
+	{div: 1e3, suffix: "千"},
+	{div: 1, suffix: ""},
+}
+
+// clinePairBackupRawIndex is clinePairBackupUnits' raw-count (原值) step, the
+// backup ladder's floor.
+const clinePairBackupRawIndex = 5
+
+// clinePairBackupStart is clinePairUnitStart for the backup ladder: the largest
+// step the total reaches at least once (亿亿 at 1e16 and up, 万亿 at 1e12 and up,
+// …), and 千 — the smallest unit step — for anything smaller. 原值 is this
+// ladder's floor too, and never a start.
+func clinePairBackupStart(total int64) int {
+	for i, u := range clinePairBackupUnits[:clinePairBackupRawIndex] {
+		if total >= u.div {
+			return i
+		}
+	}
+	return clinePairBackupRawIndex - 1
+}
+
+// clinePairWholeText renders a count in ONE unit with its fraction DROPPED, i.e.
+// as that count's own integer part in the unit. It is the backup pass's second
+// rendering per step, and dropping the fraction of BOTH halves is what turns a
+// pair whose fraction is what overflows into one inside the field. The dropped
+// digits are never re-derived: the text is the count's own integer part in that
+// unit, so the same input always renders the same string, and a count below one
+// unit of the step renders "0<unit>" — which the plain key then scores as the
+// hidden number it is (see clinePairPlain), never as a free win.
+func clinePairWholeText(value, div int64, suffix string) string {
+	if div <= 0 {
+		div = 1
+	}
+	return strconv.FormatInt(value/div, 10) + suffix
+}
+
+// clinePairBackupCandidates renders ONE pair in every step of the backup ladder,
+// TWICE per step: once the way the main ladder renders it (one decimal, two for a
+// non-zero count one decimal would collapse — render.FormatTokensUnit) and once
+// with the fraction dropped (clinePairWholeText). The whole-number rendering is
+// scored exactly like the step it belongs to — same index, same keys — and is
+// written AFTER the step's own rendering, so a fraction that fits is never
+// replaced by the cruder text: a step whose own rendering is already inside the
+// field keeps its fraction, while one whose fraction is what overflows is written
+// by the whole-number candidate of the same step.
+func clinePairBackupCandidates(used, total int64) []clinePairCandidate {
+	out := make([]clinePairCandidate, 0, 2*len(clinePairBackupUnits))
+	for i, unit := range clinePairBackupUnits {
+		for _, whole := range []bool{false, true} {
+			left := render.FormatTokensUnit(used, unit.div, unit.suffix)
+			right := render.FormatTokensUnit(total, unit.div, unit.suffix)
+			if whole {
+				left = clinePairWholeText(used, unit.div, unit.suffix)
+				right = clinePairWholeText(total, unit.div, unit.suffix)
+			}
+			text := left + "/" + right
+			out = append(out, clinePairCandidate{
+				index:  i,
+				text:   text,
+				fits:   render.DisplayWidth(text) <= clinePairWidthBudget,
+				plain:  clinePairPlain(left, used) && clinePairPlain(right, total),
+				narrow: render.DisplayWidth(left) <= clinePairSideBudget && render.DisplayWidth(right) <= clinePairSideBudget,
+			})
+		}
+	}
+	return out
+}
+
+// formatTokenPair formats a used/total token pair in ONE Chinese unit: the step of
+// the ladder the SCORING picks (see clinePairUnits and clinePairCandidate.beats),
+// or the raw step (plain digits, no suffix) when no unit above it can hold a half
+// honestly. The pair is joined without spaces, because the pair IS one metric
+// segment (a row's right-aligned metric field, clineNumberWidth columns at its
+// widest).
+//
+// Both halves are always rendered in the SAME step of ONE ladder: the four-step
+// ladder 亿 / 万 / 千 / 原值 first (see clinePairUnits), and — only when that ladder
+// holds no step inside the field — the same ladder continued ABOVE 亿 with 万亿
+// (1e12) and 亿亿 (1e16) (see clinePairBackupUnits). A pair is one comparison, so
+// two halves the reader would have to convert before comparing them are never
+// written, on either ladder. The step is chosen by SCORING every step (see
+// clinePairCandidate.beats): the step that fits the field beats one that would be
+// truncated, an honest step beats one that renders a non-zero half as zero, the
+// split clinePairSideBudget describes beats an uneven one, and with everything
+// else equal the step nearest the total's own unit wins — which is what keeps the
+// card's long-standing reading of a pool whenever nothing forces a change.
+//
+// The TOTAL is the pair's denominator (the used half is a share of it, and an
+// exhausted window writes the total twice), so a small pool reads as a number of
+// its own instead of collapsing into zeros — the shape whose /admin/quota JSON
+// carried a non-zero total and whose card read zero.
+//
+// A pair returned here is inside clinePairWidthBudget — the columns clineRowLine
+// reserves for it, so that the row's Truncate never cuts a digit — whenever EITHER
+// ladder holds a step that can hold it, and the first ladder is always asked
+// first, so no pair it can already place changes. That condition is the whole of
+// the no-ellipsis rule, and it has three regimes:
+//
+//   - the main ladder decides: the totals it can place inside the field are
+//     scored exactly as they were, with no candidate of the backup ladder in play
+//     at all — the pools a real window has, and the larger totals whose 亿 half
+//     still leaves the pair inside the field;
+//   - the backup ladder decides: when no step of the main ladder holds the pair,
+//     the backup pass gets its turn and only its FITTING steps are eligible, so a
+//     pair one of them holds comes back inside the field. Its whole-number
+//     renderings are what place those pairs — the 亿 step for a total whose 亿 half
+//     has only just left the field, and 万亿 / 亿亿 for the larger totals of that
+//     band (TestFormatTokenPairBackupLadder pins which step each one lands on).
+//     Which step the pass returns is not a property of the
+//     total alone (the same total is placed by different steps for a drained pair
+//     and for a one-token numerator). TestFormatTokenPairBackupLadder pins this
+//     over the band of totals it feeds; TestFormatTokenPairInt64Tail pins the
+//     pairs above that band where no step of EITHER ladder holds one;
+//   - neither ladder decides: when no step of either ladder holds a pair, the
+//     main pass's winner stands, whatever its width — the row's Truncate is then
+//     what cuts it — 宁舍精度也不许截断, with no third rendering left to offer.
+//     Whether that happens is a property of the (used, total) PAIR and not of a
+//     total's magnitude: at one total the drained pair can have no fitting step
+//     while a one-token numerator still has one. TestFormatTokenPairInt64Tail pins
+//     those pairs, the shapes they come back in and a pair above them that is wider
+//     again than the residual's own width.
+//
+// Because the field is the hard rule and honesty is the second key, a pair may
+// come back with a half the reader has seen as zero before — the backup ladder is
+// no exception: a one-token numerator of a large enough pool reads as zeros, and a
+// DRAINED pool over a band of large magnitudes reads as zeros on BOTH sides,
+// because the only honest renders of those totals are outside the field (a step's
+// own pair with its fraction, or a narrower step whose digits do not fit). It is
+// the same tradeoff the main ladder has always made for large totals (a one-token
+// numerator read as "0<unit>"): the JSON keeps both exact numbers either way,
+// dropping the fraction is a display decision, and it is preferred to cutting a
+// number off the row. TestFormatTokenPairInt64Tail pins that band and the first
+// magnitude inside it that reads a digit again.
+//
+// Both halves go through render.FormatTokensUnit (and, on the backup ladder,
+// through clinePairWholeText), so they share its precision
+// rule: a whole unit drops its fraction, a value one decimal would collapse to
+// zero is shown with TWO decimals instead, and only a true
+// zero — or a value below 0.005 of the unit, where even two decimals round away —
+// reads "0<unit>".
+//
+// The package writes a derived pool the same way it writes a measured one (see
+// clineMetricField), and a window with neither renders "-" there, so a total of 0
+// never reaches this function.
 func formatTokenPair(used, total int64) string {
-	return render.FormatTokensYi(used) + "/" + render.FormatTokensYi(total)
+	start := clinePairUnitStart(total)
+	best := clinePairCandidate{index: -1}
+	fits := false
+	for _, c := range clinePairCandidates(used, total) {
+		if c.fits {
+			fits = true
+		}
+		if best.index < 0 || c.beats(best, start) {
+			best = c
+		}
+	}
+	if fits {
+		return best.text
+	}
+	// No step of the main ladder is inside the field, so the backup ladder gets
+	// its turn: its two added steps and its whole-number renderings are what hold
+	// a pair the main ladder only has in a form the row would cut. Only its
+	// FITTING candidates are eligible, so the pass can never return a pair wider
+	// than the field while any step of either ladder holds one; when none of them
+	// fits either — int64's tail — the main pass's winner stands and the row's
+	// Truncate is the only thing left (see the doc comment above).
+	backupStart := clinePairBackupStart(total)
+	backup := clinePairCandidate{index: -1}
+	for _, c := range clinePairBackupCandidates(used, total) {
+		if !c.fits {
+			continue
+		}
+		if backup.index < 0 || c.beats(backup, backupStart) {
+			backup = c
+		}
+	}
+	if backup.index >= 0 {
+		return backup.text
+	}
+	return best.text
 }
 
 // ── card title & body helpers ─────────────────────────────────────────

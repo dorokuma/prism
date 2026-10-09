@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -215,11 +216,40 @@ func windowUsedFraction(w Window) float64 {
 	return f
 }
 
+// reversePool inverts a used fraction back into the pool it was taken from:
+// tokens ÷ frac, rounded to the nearest token. It is the reversal every derived
+// pool is built from (see ApplyClinePassEstimates / ApplyWeekEstimate), so its
+// result is a POOL and may never come back negative.
+//
+// The quotient is computed in float64 and converted back to int64, and that
+// conversion is GUARDED: a quotient outside int64's range (a large count over a
+// fraction near 1e-19, or a fraction that underflows to 0 in the division) would
+// wrap to a negative int64 — "this window's pool is a minus number of tokens" —
+// and a NaN (0/0 or Inf/Inf) has no int64 value at all. Such a quotient
+// saturates at math.MaxInt64 (the largest pool that can be written down) and a
+// NaN or non-positive one returns 0 ("no pool"), so every return value is either
+// 0 or a positive pool. Nothing here is a CAP on the estimate — but the guard
+// promises only "no negative value" and "saturate at the top", NOT exactness:
+// the quotient is computed in float64 and 0.5 is added to it before the
+// conversion, so the result stops being exact well below the float64 integer
+// grid's own limit: adding 0.5 to a quotient just above 2^52 lands exactly
+// between two float64 values and rounds to the even one, so the pool comes back
+// one too large even though that count is representable. The quantum grows with
+// the magnitude. TestReversePoolNeverWraps pins the guard (no negative value) and
+// that first off-by-one's count, the rounding above it and the quantum at the
+// top of the range.
 func reversePool(tokens int64, frac float64) int64 {
 	if tokens <= 0 || frac <= 0 {
 		return 0
 	}
-	return int64(float64(tokens)/frac + 0.5)
+	pool := float64(tokens)/frac + 0.5
+	if math.IsNaN(pool) || pool < 0 {
+		return 0
+	}
+	if pool >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(pool)
 }
 
 func withEstimateLock(path string, fn func() error) error {
@@ -357,9 +387,9 @@ func ApplyGrokWeekEstimate(ctx context.Context, snap Snapshot, sum GrokTokenSum,
 // consumption (T/T), the best the data can answer. When neither window is
 // usable no estimate is written at all (the field stays empty).
 //
-// Sum errors (metapi database missing/unreadable, proxy_logs absent) are
-// logged and leave the estimate empty: they never fail the snapshot or
-// mark the fetch failed.
+// Sum errors (the magpie usage log missing, unreadable, holding no usable
+// line, or drifted in shape) are logged by the source and leave the estimate
+// empty: they never fail the snapshot or mark the fetch failed.
 func ApplyClinePassEstimates(ctx context.Context, snap Snapshot, sum GrokTokenSum, now time.Time) Snapshot {
 	if sum == nil {
 		return snap

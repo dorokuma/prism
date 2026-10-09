@@ -31,17 +31,24 @@ func KeyFingerprint(key string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// AccountIDFrom extracts the metapi account_id from an AccountView when
-// the view carries it (the metapi-backed clinepass accounts do). Non-
-// metapi accounts return 0.
-func AccountIDFrom(acc AccountView) int64 {
+// AccountIDFrom extracts the ClinePass account id from an AccountView when
+// the view carries it (the magpie-backed clinepass accounts do). Non-
+// magpie accounts return "".
+//
+// The id is magpie's providerKeyId — the hex of the first 10 characters of
+// SHA-256 of the account's provider key (see magpieusage.KeyID) — and NOT a
+// number: the source it is summed from is a JSONL log keyed by that string,
+// not a SQL row with an integer primary key. An account whose view carries no
+// id yields "", which the ClinePass estimate treats as "cannot be summed"
+// rather than as "sum everything" (see the note in cmd/prism).
+func AccountIDFrom(acc AccountView) string {
 	type accountIDER interface {
-		AccountID() int64
+		AccountID() string
 	}
 	if a, ok := acc.(accountIDER); ok {
 		return a.AccountID()
 	}
-	return 0
+	return ""
 }
 
 // GroupByKey collapses accounts that share a key. Order of first appearance

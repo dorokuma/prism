@@ -1,6 +1,8 @@
 package planusage
 
 import (
+	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -424,8 +426,8 @@ func TestRenderTableEmpty(t *testing.T) {
 //	dot + name + capsule(10) + pct + token pair
 //
 // with exactly ONE space between the modules (the percentage is right-aligned
-// in its 4-column reservation and the token pair right-aligned in its
-// 13-column one, so a row needs no fill), every line of a card is exactly
+// in its clinePctWidth reservation and the token pair right-aligned in its
+// clineNumberWidth one, so a row needs no fill), every line of a card is exactly
 // THAT card's width (the card is sized from its longest account name cell and
 // its title, so no name is truncated and no border is ever pushed out), the
 // capsule is ▰ (used) + ▱ (remaining) on a per-cell green→yellow→red ramp
@@ -952,6 +954,617 @@ func TestRenderCardsMetricField(t *testing.T) {
 	if !strings.Contains(colored, ansiRed+strings.Repeat(capUsed, cardCapCells)+ansiReset) {
 		t.Fatalf("drained capsule must be solid red:\n%q", colored)
 	}
+}
+
+// TestRenderCardsTokenPairUnitLadder pins the unit of a token pair against the
+// window's TOTAL, and that both halves of the pair share it:
+//
+//   - the unit is the largest one the total reaches (亿 at its own divisor and up,
+//     then 万, then 千 below that), so a pool just above a unit's divisor reads in
+//     that unit while a small pool reads as a number of its own — the readings the
+//     cases below state — instead of both collapsing into zeros.
+//
+// That collapse was the bug: with the 亿 unit alone, a small window's card read
+// zeros while its /admin/quota JSON carried the real numbers — the display, not
+// the data, was wrong, and the two surfaces disagreed about the same window. A pair
+// is also one comparison, so the unit is picked ONCE from the total and the used
+// side is rendered in it too (never two halves the reader would have to convert
+// before comparing).
+func TestRenderCardsTokenPairUnitLadder(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		win    Window
+		metric string
+	}{
+		{
+			// 亿 from its own divisor up: unchanged by the ladder (the big pools the
+			// card was originally sized for).
+			name:   "exactly 1e8 stays 亿",
+			win:    Window{Name: "weekly", Status: "ok", Percent: 10, LimitTokensEstimate: 100_000_000},
+			metric: "0.1亿/1亿",
+		},
+		{
+			name:   "just below 1e8 is 万",
+			win:    Window{Name: "weekly", Status: "ok", Percent: 50, LimitTokensEstimate: 99_000_000},
+			metric: "4950万/9900万",
+		},
+		{
+			// The measured-only shape: no pool, so the consumption IS the total
+			// (and a drained window writes it twice).
+			name:   "a measured 1299 is 1.3千, not 0亿",
+			win:    Window{Name: "monthly", Status: "ok", Percent: 100, MeasuredTokens: 1_299},
+			metric: "1.3千/1.3千",
+		},
+		{
+			// 万 for the total, and the used side stays in the same unit even
+			// though its own value is tiny (two decimals, see FormatTokensUnit).
+			name:   "a tiny share keeps the total's unit",
+			win:    Window{Name: "weekly", Status: "ok", Percent: 1, LimitTokensEstimate: 20_000},
+			metric: "0.02万/2万",
+		},
+		{
+			// Below the smallest unit the ladder stops at 千: a small pool is still a
+			// number.
+			name:   "below 1e4 is 千",
+			win:    Window{Name: "5h", Status: "ok", Percent: 50, LimitTokensEstimate: 500},
+			metric: "0.2千/0.5千",
+		},
+		{
+			// The boundary guard: a total that a coarse step's own rounding carries
+			// into one integer digit too many for the field — the reader would see a
+			// number that is not the total — steps up to the finer unit instead.
+			name:   "a total that rounds past four 万 digits steps up to 亿",
+			win:    Window{Name: "weekly", Status: "ok", Percent: 34, LimitTokensEstimate: 99_999_999},
+			metric: "0.3亿/1亿",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RenderCards([]Snapshot{{
+				Provider: "clinepass",
+				Accounts: []string{"clinepass#aaaaaaaaaa"},
+				Windows:  []Window{tc.win},
+			}}, now, CardOptions{NoColor: true})
+			if !strings.Contains(got, tc.metric) {
+				t.Fatalf("cards missing %q:\n%s", tc.metric, got)
+			}
+		})
+	}
+
+	// No unit step, however small the pool, may push the metric field past its
+	// clineNumberWidth reservation: the card's width invariant is what clineNumberWidth
+	// exists for, and a 千 pair must not widen a border.
+	got := RenderCards([]Snapshot{{
+		Provider: "clinepass",
+		Accounts: []string{"clinepass#aaaaaaaaaa"},
+		Windows:  []Window{{Name: "5h", Status: "ok", Percent: 100, MeasuredTokens: 940}},
+	}}, now, CardOptions{NoColor: true})
+	lines := cardLines(t, got)
+	for _, l := range lines {
+		if w, cardW := render.DisplayWidth(l), render.DisplayWidth(lines[0]); w != cardW {
+			t.Fatalf("line %q is %d columns, want the card's %d:\n%s", l, w, cardW, got)
+		}
+	}
+	if !strings.Contains(lines[1], "0.9千/0.9千") {
+		t.Fatalf("row = %q, want the 千 pair", lines[1])
+	}
+}
+
+// TestFormatTokenPairUnitLadderBudget pins the C4 fix at the formatter: the
+// used/total pair walks the ladder 亿 / 万 / 千 / 原值 (see clinePairUnits) and the
+// step is SCORED (see clinePairCandidate.beats), so that
+//
+//   - a non-zero half is never rendered as "0<unit>" — the card/JSON
+//     disagreement C4 reported: a unit too large for the window's numbers read
+//     them as zeros while /admin/quota's JSON carried the real ones;
+//   - the pair is inside the columns the row reserves for it (clineNumberWidth)
+//     wherever some step of EITHER ladder fits there, so the row's Truncate never
+//     cuts a digit for those pairs: a 万 step whose halves need more than the
+//     field holds used to be written anyway and the card showed the cut. Above
+//     the scan's upper bound no step fits at all and the width is no longer
+//     bounded (see TestFormatTokenPairInt64Tail).
+//
+// Both halves of a pair share ONE step, and among the steps that fit and are
+// honest the step nearest the total's own unit wins, which is what keeps the
+// units the table below pins. This is the guard for the ladder's scoring; the
+// widths and the residual above the scan's upper bound are pinned by
+// TestFormatTokenPairInt64Tail, and the second pass by
+// TestFormatTokenPairBackupLadder.
+//
+// The pair is the FORMATTER's contract, so the mandated cases are stated as
+// direct pairs: the card derives its used side from the percent
+// (clineMetricField), which cannot produce every pair a unit boundary turns on
+// (a one-token used side under a small total has no percent).
+func TestFormatTokenPairUnitLadderBudget(t *testing.T) {
+	cases := []struct {
+		name  string
+		used  int64
+		total int64
+		want  string
+	}{
+		{"a one-token pair drops to the raw step", 1, 1, "1/1"},
+		{"a four-token pair drops to the raw step", 4, 4, "4/4"},
+		{"a tiny numerator drops to the raw step", 1, 1_299, "1/1299"},
+		{"a small drained pair keeps 千", 1_299, 1_299, "1.3千/1.3千"},
+		{"a total that rounds past four 万 digits steps up to 亿", 99_999_999, 99_999_999, "1亿/1亿"},
+		{"a 万 pair the field would cut steps up to 亿", 9_999_500, 99_995_000, "0.1亿/1亿"},
+		{"a share of a boundary total reads in 亿", 33_999_999, 99_999_999, "0.3亿/1亿"},
+		{"a drained 999.5万 pool steps up to 亿", 9_995_000, 9_995_000, "0.1亿/0.1亿"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatTokenPair(tc.used, tc.total); got != tc.want {
+				t.Fatalf("formatTokenPair(%d, %d) = %q, want %q", tc.used, tc.total, got, tc.want)
+			}
+		})
+	}
+
+	// The card side of the same fix: a window whose 万 pair the metric field used
+	// to cut now reads a pair the field holds whole, and no line of the card
+	// carries the truncation marker.
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	cards := RenderCards([]Snapshot{{
+		Provider: "clinepass",
+		Accounts: []string{"clinepass#aaaaaaaaaa"},
+		Windows: []Window{{
+			Name: "weekly", Status: "ok", Percent: 10, LimitTokensEstimate: 99_995_000,
+		}},
+	}}, now, CardOptions{NoColor: true})
+	if strings.Contains(cards, "…") {
+		t.Fatalf("the metric field may not truncate a pair:\n%s", cards)
+	}
+	if !strings.Contains(cards, "0.1亿/1亿") {
+		t.Fatalf("cards missing the 亿 pair of the 99_995_000 pool:\n%s", cards)
+	}
+
+	// ── the property scan ───────────────────────────────────────────────
+	// Whatever the ladder picks has to keep BOTH values readable, use ONE unit
+	// for both halves and stay inside the field's columns. Totals cover every
+	// turn-over the ladder has (raw/千, 千/万, a 万 total that rounds into the
+	// next decade, 万/亿), plus a dense strip of the 万/亿 boundary. The upper
+	// bound is where the raw step's own digits stop fitting the field next to a
+	// one-token numerator (the ladder's documented residual, see
+	// TestFormatTokenPairInt64Tail).
+	//
+	// The per-side split is asserted as a CONDITIONAL property — the ladder may
+	// never pass over a step that is honest, inside the field AND inside the
+	// split, but it is allowed to end up outside the split when no step can have
+	// all three: a small share of a 万 total needs one column more than the split
+	// allows for its 万 half and has no honest 亿 half to step up to (the 亿 step
+	// reads that share as zero), so the 万 pair — inside the field's whole budget,
+	// and the shape the card wrote before this fix — is the honest answer there.
+	narrowReachable := func(used, total int64) bool {
+		for _, c := range clinePairCandidates(used, total) {
+			if c.fits && c.plain && c.narrow {
+				return true
+			}
+		}
+		return false
+	}
+	check := func(used, total int64) {
+		t.Helper()
+		pair := formatTokenPair(used, total)
+		if w := render.DisplayWidth(pair); w > clineNumberWidth {
+			t.Fatalf("formatTokenPair(%d, %d) = %q: %d display columns, the field holds %d — the row would truncate it",
+				used, total, pair, w, clineNumberWidth)
+		}
+		left, right, ok := strings.Cut(pair, "/")
+		if !ok {
+			t.Fatalf("formatTokenPair(%d, %d) = %q: not a pair", used, total, pair)
+		}
+		if lu, ru := pairUnitOf(left), pairUnitOf(right); lu != ru {
+			t.Fatalf("formatTokenPair(%d, %d) = %q: one unit per pair, got %q and %q", used, total, pair, lu, ru)
+		}
+		if used != 0 && !hasNonZeroDigit(left) {
+			t.Fatalf("formatTokenPair(%d, %d) = %q: a non-zero used side read as zero", used, total, pair)
+		}
+		if total != 0 && !hasNonZeroDigit(right) {
+			t.Fatalf("formatTokenPair(%d, %d) = %q: a non-zero total read as zero", used, total, pair)
+		}
+		if narrowReachable(used, total) {
+			if w := render.DisplayWidth(left); w > clinePairSideBudget {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: used side is %d columns, but a %d-column split was reachable",
+					used, total, pair, w, clinePairSideBudget)
+			}
+			if w := render.DisplayWidth(right); w > clinePairSideBudget {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: total side is %d columns, but a %d-column split was reachable",
+					used, total, pair, w, clinePairSideBudget)
+			}
+		}
+	}
+
+	totals := []int64{
+		1, 2, 4, 5, 49, 50, 499, 500, 999, 1_000, 1_001, 1_299, 4_999, 5_000,
+		9_999, 10_000, 19_047, 20_000, 99_999, 100_000, 500_000, 999_999,
+		1_000_000, 4_999_999, 5_000_000, 9_990_000, 9_999_999, 19_800_000,
+		99_000_000, 99_990_000, 99_995_000, 99_999_000, 99_999_999,
+		100_000_000, 190_476_000, 999_999_999, 1_000_000_000, 5_000_000_000,
+		10_000_000_000, 99_999_999_999,
+	}
+	for i := int64(99_990_000); i <= 99_999_000; i += 1_000 {
+		totals = append(totals, i)
+	}
+	for i := int64(9_994_999); i <= 9_995_010; i++ { // the 999.5万 rounding edge
+		totals = append(totals, i)
+	}
+	pcts := []int{0, 1, 5, 10, 34, 50, 99, 100}
+	for _, total := range totals {
+		// The pairs a window derives (used = total × percent) are the ones the
+		// card writes, so every one of them goes through the whole property set.
+		for _, pct := range pcts {
+			check(int64(float64(total)*float64(pct)/100), total)
+		}
+		// Hostile absolute numerators no percent produces on a big total: the
+		// ladder still has to keep them readable and inside the field — the raw
+		// step is what covers them, and the width check above is what proves it.
+		for _, used := range []int64{1, 4, total - 1, total} {
+			if used < 0 {
+				continue
+			}
+			if used > total {
+				used = total
+			}
+			check(used, total)
+		}
+	}
+
+	// Past the scan's upper bound the raw step stops fitting next to a one-token
+	// numerator, so the field's invariant
+	// turns into the CONDITIONAL form of rule 1: whenever SOME step of EITHER
+	// ladder (the main one or the 万亿/亿亿 backup) is inside the field, the winner
+	// is inside it too — 宁舍精度也不许截断, i.e. a step that hides that one token
+	// is preferred to a step clineRowLine's Truncate would cut. The cut is reachable
+	// only for a (used, total) PAIR that has no fitting step on either ladder — the
+	// loop below decides that per pair, since one total can have a drained pair
+	// with no fitting step while a one-token numerator of the same total still has
+	// one.
+	// TestFormatTokenPairInt64Tail pins those widths, the wider tail above them and
+	// the zero-reading blocks below the scan. Even here the key order is the first
+	// pass's, unchanged: fits
+	// still outranks plain, so a step that reads a non-zero count as "0<unit>" can
+	// beat a wider honest one — 读 0 可能优先于截断 (the same trade the main ladder
+	// has always made for a large total, not a separate honesty rule). What this
+	// tail pins
+	// is the width and the shape, not a promise that the number is always kept.
+	for _, total := range []int64{
+		100_000_000_000, 1_000_000_000_000, 99_999_999_999_999, 1_000_000_000_000_000_000,
+		9_223_372_036_854_775_807,
+	} {
+		for _, used := range []int64{1, 4, total / 10, total - 1, total} {
+			pair := formatTokenPair(used, total)
+			left, right, ok := strings.Cut(pair, "/")
+			if !ok {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: not a pair", used, total, pair)
+			}
+			if lu, ru := pairUnitOf(left), pairUnitOf(right); lu != ru {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: one unit per pair, got %q and %q", used, total, pair, lu, ru)
+			}
+			fitsReachable := false
+			for _, c := range clinePairCandidates(used, total) {
+				if c.fits {
+					fitsReachable = true
+				}
+			}
+			if !fitsReachable {
+				for _, c := range clinePairBackupCandidates(used, total) {
+					if c.fits {
+						fitsReachable = true
+					}
+				}
+			}
+			if w := render.DisplayWidth(pair); fitsReachable && w > clineNumberWidth {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: %d display columns though a fitting step exists — the row would truncate it",
+					used, total, pair, w)
+			}
+			if !fitsReachable && used != 0 && !hasNonZeroDigit(left) {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: a non-zero used side read as zero and no step fits anyway", used, total, pair)
+			}
+		}
+	}
+
+	// What the loop above deliberately does NOT flag: at the residual's magnitude
+	// the one-token shape reads as zeros on both sides — a non-zero count hidden
+	// behind a step that DOES fit.
+	// That is the same trade the main ladder has always made for a large total and
+	// is intentional (fits is the first key), not a regression; the other used
+	// shapes land where the number survives and so would never have caught it.
+	// Recorded here so no later reader "fixes" the surviving step back into a
+	// truncation: when a step fits, reading a non-zero count as 0 is an accepted
+	// trade, not a bug.
+	if got := formatTokenPair(1, 1e18); got != "0亿亿/100亿亿" {
+		t.Fatalf("formatTokenPair(1, 1e18) = %q, want the intentional %q (fits outranks plain)", got, "0亿亿/100亿亿")
+	}
+}
+
+// TestFormatTokenPairInt64Tail pins the two regimes no real window
+// reaches (a window's pool is orders of magnitude below them), all measured on
+// this tree; the comment on formatTokenPair sets out the mechanism.
+//
+//   - at the residual's magnitude neither ladder has a fitting step for the pairs
+//     the table below states, and each comes back wider than the field — the
+//     widths clineRowLine's Truncate cuts;
+//   - above it the width is NOT capped at the residual pair's own width: a total
+//     whose 亿 half gains a fraction comes back wider than its predecessor, and
+//     the table below states the widths the tail reaches. The scan below locates
+//     that first total;
+//   - below that, both the one-token numerator and the drained pool read a
+//     NON-ZERO count as zeros on both sides — but only in blocks, because the only
+//     step that
+//     fits inside the field is 亿亿's whole-number rendering. The test pins one
+//     measured example of each shape plus one further point: it does
+//     NOT claim they are the only blocks, nor that the pinned ones are the earliest
+//     — the region repeats block-wise. Both examples live in the constants below.
+//
+// The numbers live in the table and the constants below; this comment does not
+// restate them.
+func TestFormatTokenPairInt64Tail(t *testing.T) {
+	const (
+		firstWideTotal  = int64(1000000000005000001)
+		firstWideBefore = firstWideTotal - 1
+		firstZeroBlock  = int64(100_000_005_000_000)
+		laterZeroBlock  = int64(998_443_705_000_000)
+		drainedZeroTop  = int64(9_500_000_000_000_001)
+	)
+	for _, tc := range []struct {
+		name        string
+		used, total int64
+		want        string
+		columns     int
+	}{
+		{"a tenth of a 1e18 pool", 1e18 / 10, 1e18, "1000000000亿/10000000000亿", 26},
+		{"half a 1e18 pool", 1e18 / 2, 1e18, "5000000000亿/10000000000亿", 26},
+		{"a 1e18 pool one token short", 1e18 - 1, 1e18, "10000000000亿/10000000000亿", 27},
+		{"a drained 1e18 pool", 1e18, 1e18, "10000000000亿/10000000000亿", 27},
+		{"a one-token numerator of a 1e18 pool", 1, 1e18, "0亿亿/100亿亿", 13},
+		{"the widest total below the 1e18 residual", firstWideBefore, firstWideBefore, "10000000000亿/10000000000亿", 27},
+		{"the first total above 1e18 whose 亿 half gains a fraction", firstWideTotal, firstWideTotal, "10000000000.1亿/10000000000.1亿", 31},
+		{"a later crossing of the same kind", 1515344939205000063, 1515344939205000063, "15153449392亿/15153449392亿", 27},
+		{"a later crossing of the same kind, one token on", 1515344939205000064, 1515344939205000064, "15153449392.1亿/15153449392.1亿", 31},
+		{"a drained pool at int64's top", math.MaxInt64, math.MaxInt64, "92233720368.5亿/92233720368.5亿", 31},
+		{"a one-token numerator, one token below the first zero block", 1, firstZeroBlock - 1, "0亿/1000000亿", 13},
+		{"a one-token numerator at the first zero block", 1, firstZeroBlock, "0亿亿/0亿亿", 11},
+		{"a one-token numerator, one token below a later zero block", 1, laterZeroBlock - 1, "0亿/9984437亿", 13},
+		{"a one-token numerator inside a later zero block", 1, laterZeroBlock, "0亿亿/0亿亿", 11},
+		{"a drained pool one decade below its zero block", 99_999_999_999_999, 99_999_999_999_999, "99万亿/99万亿", 13},
+		{"a drained pool at its zero block's lower edge", 1e14, 1e14, "0亿亿/0亿亿", 11},
+		{"a drained pool at its zero block's upper edge", drainedZeroTop, drainedZeroTop, "0亿亿/0亿亿", 11},
+		{"the first drained total above the block that reads a digit", drainedZeroTop + 1, drainedZeroTop + 1, "1亿亿/1亿亿", 11},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatTokenPair(tc.used, tc.total)
+			if got != tc.want {
+				t.Fatalf("formatTokenPair(%d, %d) = %q, want %q", tc.used, tc.total, got, tc.want)
+			}
+			if w := render.DisplayWidth(got); w != tc.columns {
+				t.Fatalf("formatTokenPair(%d, %d) = %q is %d columns, want %d", tc.used, tc.total, got, w, tc.columns)
+			}
+		})
+	}
+
+	// The first drained total above the residual that is WIDER than the residual's
+	// own width: every 1000th total is sampled and then every single one inside the
+	// step that first came back wide — the wide band is millions of totals long, so
+	// a step of 1000 cannot overshoot it. The width compared against and the total
+	// expected are the constants above.
+	const residualWidth = 27
+	firstWide := int64(-1)
+	for x := int64(1e18); x <= 1e18+20_000_000; x += 1000 {
+		if render.DisplayWidth(formatTokenPair(x, x)) > residualWidth {
+			for y := x - 1000; y <= x; y++ {
+				if render.DisplayWidth(formatTokenPair(y, y)) > residualWidth {
+					firstWide = y
+					break
+				}
+			}
+			break
+		}
+	}
+	if firstWide != firstWideTotal {
+		t.Fatalf("the first drained total above the residual that is over %d columns is %d, want %d", residualWidth, firstWide, firstWideTotal)
+	}
+
+	// Same scan for the one-token shape's first all-zero block, plus the decade
+	// below it sampled coarsely (no all-zero reading below the block).
+	firstZero := int64(-1)
+	for x := int64(1e14); x <= 1e14+20_000_000; x += 1000 {
+		if formatTokenPair(1, x) == "0亿亿/0亿亿" {
+			for y := x - 1000; y <= x; y++ {
+				if formatTokenPair(1, y) == "0亿亿/0亿亿" {
+					firstZero = y
+					break
+				}
+			}
+			break
+		}
+	}
+	if firstZero != firstZeroBlock {
+		t.Fatalf("the first all-zero one-token block starts at %d, want %d", firstZero, firstZeroBlock)
+	}
+	for x := int64(1e13); x < 1e14; x += 1e7 {
+		if got := formatTokenPair(1, x); got == "0亿亿/0亿亿" {
+			t.Fatalf("a one-token numerator of %d reads %q, want a digit", x, got)
+		}
+	}
+	// The block is a block: the same reading holds across the block's opening
+	// stretch of totals.
+	for _, off := range []int64{1, 1000, 1_000_000, 4_999_999, 5_000_000, 9_999_999} {
+		if got := formatTokenPair(1, firstZeroBlock+off); got != "0亿亿/0亿亿" {
+			t.Fatalf("the zero block starting at %d stops at +%d: %q", firstZeroBlock, off, got)
+		}
+	}
+}
+
+// TestFormatTokenPairBackupLadder pins the SECOND pass of the ladder: a pair the
+// main ladder has no fitting step for gets the 万亿 / 亿亿 steps and their
+// whole-number renderings (see clinePairBackupUnits), while a pair the main ladder
+// already fits is untouched — the first pass returns before the backup one is
+// reached (TestFormatTokenPairUnitLadderBudget above is the guard for that side).
+// The property loop below is the backup pass's own guard.
+func TestFormatTokenPairBackupLadder(t *testing.T) {
+	cases := []struct {
+		name  string
+		used  int64
+		total int64
+		want  string
+	}{
+		{"a drained 10205000000 pool fits 亿 as it always did", 10_205_000_000, 10_205_000_000, "102亿/102亿"},
+		{"a drained 10205000001 pool drops 亿's fraction", 10_205_000_001, 10_205_000_001, "102亿/102亿"},
+		{"the same pool one token short of drained keeps the fraction", 10_205_000_000, 10_205_000_001, "102亿/102.1亿"},
+		{"a one-token numerator still prefers the raw step — it fits", 1, 10_205_000_001, "1/10205000001"},
+		{"a drained 1e12 pool reaches 万亿", 1e12, 1e12, "1万亿/1万亿"},
+		{"a tenth of a 1e12 pool reads 0.1万亿", 1e11, 1e12, "0.1万亿/1万亿"},
+		{"a one-token numerator of a 1e12 pool keeps the 亿 step", 1, 1e12, "0亿/10000亿"},
+		{"a drained 1e13 pool reads 10万亿", 1e13, 1e13, "10万亿/10万亿"},
+		{"a drained 1e16 pool reads 1亿亿", 1e16, 1e16, "1亿亿/1亿亿"},
+		{"a drained 1e17 pool reads 10亿亿", 1e17, 1e17, "10亿亿/10亿亿"},
+		// A magnitude the field cannot hold honestly in ONE unit: the 万亿 pair
+		// needs more columns than the field has and the 亿 step needs more still, so
+		// only the whole-number rendering of the coarser step is inside the budget
+		// (its fraction rounds away). The JSON keeps the exact count either way.
+		{"a drained 1e15 pool falls back to the whole 亿亿 step", 1e15, 1e15, "0亿亿/0亿亿"},
+		// The documented residual: past the point where no step of EITHER ladder
+		// fits, the main winner stands and clineRowLine's Truncate is what cuts it.
+		{"a drained 1e18 pool is the residual the row truncates", 1e18, 1e18, "10000000000亿/10000000000亿"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatTokenPair(tc.used, tc.total); got != tc.want {
+				t.Fatalf("formatTokenPair(%d, %d) = %q, want %q", tc.used, tc.total, got, tc.want)
+			}
+		})
+	}
+
+	// The property the second pass exists for: over the band of totals below, for
+	// each of the used shapes the loop feeds, the pair comes back inside the field,
+	// carries no ellipsis, keeps ONE unit for both halves and is the same string
+	// every time it is asked. The totals and shapes themselves are the slices
+	// below; the band is where the main ladder alone has no step that fits.
+	band := []int64{1e11, 10_205_000_001, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17}
+	for _, total := range band {
+		for _, used := range []int64{1, 4, total / 10, total / 2, total - 1, total} {
+			if used > total {
+				continue
+			}
+			pair := formatTokenPair(used, total)
+			if w := render.DisplayWidth(pair); w > clineNumberWidth {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: %d columns, the field holds %d", used, total, pair, w, clineNumberWidth)
+			}
+			if strings.Contains(pair, "…") {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: the pair may not carry the truncation marker", used, total, pair)
+			}
+			left, right, ok := strings.Cut(pair, "/")
+			if !ok {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: not a pair", used, total, pair)
+			}
+			if lu, ru := pairUnitOf(left), pairUnitOf(right); lu != ru {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: one unit per pair, got %q and %q", used, total, pair, lu, ru)
+			}
+			if again := formatTokenPair(used, total); again != pair {
+				t.Fatalf("formatTokenPair(%d, %d) = %q then %q: the ladder is not a function of its input", used, total, pair, again)
+			}
+		}
+	}
+
+	// A step change as the total grows is fine; for the four shapes below
+	// (drained / a tenth / a half / one token) a flip BACK is not, and the
+	// totals around every step boundary may not read A-B-A.
+	modes := []func(int64) int64{
+		func(total int64) int64 { return total },
+		func(total int64) int64 { return total / 10 },
+		func(total int64) int64 { return total / 2 },
+		func(total int64) int64 { return 1 },
+	}
+	bases := []int64{10_005_000_001, 10_205_000_001, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17}
+	for _, base := range bases {
+		for _, usedOf := range modes {
+			prev2, prev1 := "", ""
+			for total := base - 50; total <= base+50; total++ {
+				cur := formatTokenPair(usedOf(total), total)
+				if cur == prev2 && cur != prev1 {
+					t.Fatalf("the pair oscillates around total=%d: %q then %q then %q", total, prev2, prev1, cur)
+				}
+				prev2, prev1 = prev1, cur
+			}
+		}
+	}
+
+	// The total−1 shape is the one exception, and it is pinned HERE rather than
+	// by the A-B-A loop above. The numerator one token short of the total makes
+	// the 亿 step's own rounding read its right half a decimal higher than its left
+	// half at isolated totals: the spike's shape is a whole 亿 count against the
+	// same count with a tenth (a block index k and its k.1), and it sits at one of
+	// two offsets inside every block of totals that share the same 亿 integer part.
+	// The loop below pins that shape over every block it walks: exactly one
+	// field-wide single-point spike per block, its offset counted into the split
+	// the constants below state, and the narrower equal pair on either side. Those
+	// are single-point SPIKES that RETURN to the value around them — not the A-B-A
+	// oscillations the loop above forbids — so an unconditional "no A-B-A" would be
+	// FALSE for this shape, which is why it is not fed to the loop above. The
+	// measured counts themselves live in the constants below, not in this comment.
+	const wantSpikesAt5_000_001, wantSpikesAt5_000_000 = 516, 384 // the split the loop below counts into
+	var at5_000_001, at5_000_000 int
+	for k := int64(100); k <= 999; k++ {
+		base := k*1e8 + 5_000_000
+		hits, offset := 0, int64(0)
+		for d := int64(-16); d <= 16; d++ {
+			if render.DisplayWidth(formatTokenPair(base+d-1, base+d)) == clineNumberWidth {
+				hits++
+				offset = d
+			}
+		}
+		if hits != 1 {
+			t.Fatalf("the total−1 window around %d holds %d field-wide totals, want a single spike", base, hits)
+		}
+		spike := base + offset
+		want := fmt.Sprintf("%d亿/%d.1亿", k, k)
+		if got := formatTokenPair(spike-1, spike); got != want {
+			t.Fatalf("the total−1 spike at %d reads %q, want the documented shape %q", spike, got, want)
+		}
+		before := formatTokenPair(spike-2, spike-1)
+		after := formatTokenPair(spike, spike+1)
+		if before != after {
+			t.Fatalf("the total−1 spike at %d does not return: %q vs %q", spike, before, after)
+		}
+		if w := render.DisplayWidth(before); w != clineNumberWidth-2 {
+			t.Fatalf("the total−1 spike at %d falls back to %d columns, want %d: %q", spike, w, clineNumberWidth-2, before)
+		}
+		switch offset {
+		case 1:
+			at5_000_001++
+		case 0:
+			at5_000_000++
+		default:
+			t.Fatalf("the total−1 spike in the block starting at %d sits at offset %d, want +5_000_000 or +5_000_001", base, offset)
+		}
+	}
+	if at5_000_001 != wantSpikesAt5_000_001 || at5_000_000 != wantSpikesAt5_000_000 {
+		t.Fatalf("the total−1 spikes split %d at +5_000_001 / %d at +5_000_000, want %d / %d",
+			at5_000_001, at5_000_000, wantSpikesAt5_000_001, wantSpikesAt5_000_000)
+	}
+	for _, base := range bases {
+		for total := base - 50; total <= base+50; total++ {
+			pair := formatTokenPair(total-1, total)
+			if w := render.DisplayWidth(pair); w > clineNumberWidth {
+				t.Fatalf("formatTokenPair(%d, %d) = %q: %d display columns around the step boundary %d",
+					total-1, total, pair, w, base)
+			}
+			if again := formatTokenPair(total-1, total); again != pair {
+				t.Fatalf("formatTokenPair(%d, %d) = %q then %q: the ladder is not a function of its input", total-1, total, pair, again)
+			}
+		}
+	}
+}
+
+// pairUnitOf is the unit suffix a rendered pair half ends with ("" for the raw
+// step, see clinePairUnits); the pair test uses it to pin "one unit per pair".
+func pairUnitOf(side string) string {
+	for i := len(side) - 1; i >= 0; i-- {
+		if side[i] >= '0' && side[i] <= '9' || side[i] == '.' || side[i] == '-' {
+			return side[i+1:]
+		}
+	}
+	return side
 }
 
 // TestRenderCardsCapsuleGeometry walks every percentage the user can hit —
@@ -2066,7 +2679,7 @@ func TestStripNumericSuffix(t *testing.T) {
 //     total is still the only total that window has);
 //   - the COUNTDOWN moved to the TITLE (" · 2小时15分") and is no longer
 //     repeated per row;
-//   - a 5-hour row WITHOUT a pool (metapi unreadable / a fresh window) shows
+//   - a 5-hour row WITHOUT a pool (magpie log unreadable / a fresh window) shows
 //     "-" in the token-pair column instead of a countdown, and WITH a pool it
 //     shows its own reversal — 5h is a token window like the other two.
 func TestRenderCardsClinePassPlainTokenPairAndFiveHourCountdown(t *testing.T) {
@@ -2320,8 +2933,8 @@ func TestRenderCardsUniformWidthAcrossProviders(t *testing.T) {
 
 	// The WIDEST row a card can hold lands exactly ON the card's width: a
 	// 100 % share ("100%", clinePctWidth columns) next to the widest token pair
-	// a window can print — a 13-column "9999亿/9999亿" (clineNumberWidth) —
-	// fills BOTH reserved segments completely, so the row needs no pad at all
+	// a window can print — a pair exactly as wide as clineNumberWidth — fills
+	// BOTH reserved segments completely, so the row needs no pad at all
 	// and the right border sits where the short rows put it. That is the bound
 	// the reservations exist for: every shorter row is padded inside them to
 	// this same width.

@@ -116,44 +116,70 @@ func trimTrailingZeros(s string) string {
 	return s
 }
 
-// FormatTokensYi formats a token count in the Chinese 亿 unit, the ONLY unit
-// the quota card's used/total pair uses: the count is scaled by 1e8 and
-// rendered with one decimal, and a whole 亿 drops its fraction ("13亿",
-// never "13.0亿"). There is deliberately no 万 / 千万 step and no
-// "<0.1亿"-style fallback.
+// FormatTokensYi formats a token count in the Chinese 亿 unit, the unit the
+// quota card's used/total pair uses when its total reaches 1e8: the count is
+// scaled by 1e8 and rendered with one decimal, and a whole 亿 drops its
+// fraction (never a ".0" tail).
 //
 // A NON-ZERO value that one decimal would collapse to "0" (anything below
 // 0.05 亿) is rendered with TWO decimals instead, so a tiny pool still
-// reads as a number rather than as the "no data" zero: 2_000_000 → "0.02亿",
-// 500_000 → "0.01亿". Exactly 0 — and only exactly 0, plus values below
+// reads as a number rather than as the "no data" zero. Exactly 0 — and only
+// exactly 0, plus values below
 // 0.005 亿 where even two decimals round to zero — keeps reading "0亿".
-// That is what separates "a pool of 0.02亿" from "no pool at all" (the card
-// renders the latter as "-").
+// That is what separates a pool of a few hundred-thousandths of 亿 from "no
+// pool at all" (the card renders the latter as "-").
 //
-// The two-decimal form cannot widen the column: both "9999亿" and "0.04亿"
-// are 4 characters plus the wide 亿, i.e. 6 display columns, so a pair stays
-// inside the quota card's clineNumberWidth budget of 13 columns
-// ("0.02亿/9999亿" = 6 + 1 + 6 = 13, the same as "9999亿/9999亿") and the
-// formatter is what that budget is sized against.
+// The two-decimal form is not a wider side than the whole 亿 shapes the width
+// loop below feeds: a pair of them is exactly the quota card's clineNumberWidth
+// columns, which is what that loop asserts. TestFormatTokensYi pins both the
+// precision rule and those pair widths.
 //
-// Integers never show a decimal point: 1_300_000_000 is "13亿", not
-// "13.0亿" (trailing zeros and then the point itself are trimmed, exactly
-// like FormatTokens).
+// Integers never show a decimal point (trailing zeros and then the point itself
+// are trimmed, exactly like FormatTokens).
 func FormatTokensYi(n int64) string {
+	return FormatTokensUnit(n, 1e8, "亿")
+}
+
+// FormatTokensUnit formats a token count in a Chinese unit of the caller's
+// choosing: div is the divisor that defines it (1e8 亿, 1e4 万, 1e3 千) and
+// suffix is what follows the number. It carries the precision
+// rule FormatTokensYi documents — one decimal, trailing zeros and then the point
+// trimmed, two decimals for a NON-ZERO count that one decimal would collapse to
+// "0", "0<unit>" only for exactly 0 or a value below 0.005 of the unit — in one
+// place, so every unit a quota card may pick renders the same way.
+//
+// div must be positive (a non-positive one is treated as 1, so a caller's
+// mistake renders digits rather than an "Inf").
+//
+// The scale is a float64, so a count is printed as its float64 rounding and not
+// as the exact count. At int64's top the two roundings pull in opposite
+// directions: float64 holds that count one token ABOVE it, but one decimal of the
+// resulting 亿 value rounds the sub-unit remainder away, so the string comes back
+// BELOW the exact count (the assertion pins the string). That is a display
+// rounding and not a value change (the JSON keeps the exact int64); it is also far
+// past the field a quota card reserves, so what such a total shows on the row is
+// the planusage pair ladder's own residual (see formatTokenPair).
+// TestFormatTokensUnit pins the precision rule per unit and that top-value string;
+// TestFormatTokenPairInt64Tail pins what the pair ladder does at that magnitude.
+func FormatTokensUnit(n int64, div int64, suffix string) string {
+	if div <= 0 {
+		div = 1
+	}
 	sign := ""
 	u := uint64(n)
 	if n < 0 {
 		sign = "-"
 		u = uint64(-(n + 1)) + 1
 	}
-	text := trimTrailingZeros(strconv.FormatFloat(float64(u)/1e8, 'f', 1, 64))
+	text := trimTrailingZeros(strconv.FormatFloat(float64(u)/float64(div), 'f', 1, 64))
 	if text == "0" && u > 0 {
 		// One decimal collapsed a non-zero count to zero: keep it readable
-		// with two decimals. Values below 0.005 亿 still round to zero here
-		// and stay "0亿" — the pair has nothing more precise to say.
-		text = trimTrailingZeros(strconv.FormatFloat(float64(u)/1e8, 'f', 2, 64))
+		// with two decimals. Values below 0.005 of the unit still round to
+		// zero here and keep reading "0<unit>" — the pair has nothing more
+		// precise to say.
+		text = trimTrailingZeros(strconv.FormatFloat(float64(u)/float64(div), 'f', 2, 64))
 	}
-	return sign + text + "亿"
+	return sign + text + suffix
 }
 
 // FormatPercent formats part/total*100 with one decimal and a "%" suffix
