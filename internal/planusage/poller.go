@@ -34,7 +34,7 @@ type Poller struct {
 	geminiSum          GrokTokenSum
 	geminiEstimatePath string
 
-	clinepassSumFactory func(accountID int64) GrokTokenSum
+	clinepassSumFactory func(accountID string) GrokTokenSum
 }
 
 func NewPoller(fetchers []Fetcher, cache *Cache, interval, timeout time.Duration) *Poller {
@@ -107,14 +107,14 @@ func (p *Poller) SetGeminiEstimate(sum GrokTokenSum, path string) {
 	p.mu.Unlock()
 }
 
-// SetClinePassEstimate wires ClinePass 限额估算 (metapi cline-pass token
+// SetClinePassEstimate wires ClinePass 限额估算 (magpie cline-pass token
 // consumption ÷ each window's used percent, applied to all three windows).
-// The factory receives the metapi account_id and returns a sum function
-// scoped to that account, so each account's estimate uses only its own
-// traffic. There is no estimate file: every window's period start is
-// derived from its live ResetsAt, so there is nothing to freeze for a
-// fresh window.
-func (p *Poller) SetClinePassEstimate(sumFactory func(accountID int64) GrokTokenSum) {
+// The factory receives the account's magpie providerKeyId (a 10-hex string,
+// see AccountIDFrom) and returns a sum function scoped to that account, so
+// each account's estimate uses only its own traffic. There is no estimate
+// file: every window's period start is derived from its live ResetsAt, so
+// there is nothing to freeze for a fresh window.
+func (p *Poller) SetClinePassEstimate(sumFactory func(accountID string) GrokTokenSum) {
 	p.mu.Lock()
 	p.clinepassSumFactory = sumFactory
 	p.mu.Unlock()

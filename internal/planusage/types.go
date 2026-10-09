@@ -25,7 +25,7 @@ type Window struct {
 	// available (no usage, or used fraction unknown).
 	LimitTokensEstimate int64 `json:"limit_tokens_estimate,omitempty"`
 	// MeasuredTokens is the actually measured token consumption for
-	// this window from the upstream/metapi. It is used as the total
+	// this window from the upstream / the local usage source. It is used as the total
 	// when LimitTokensEstimate is unavailable (e.g. a 100 % exhausted
 	// window) so the card can show X/X instead of "-".
 	MeasuredTokens int64 `json:"measured_tokens,omitempty"`

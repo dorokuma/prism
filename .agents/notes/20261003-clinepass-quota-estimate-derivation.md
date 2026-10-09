@@ -11,7 +11,7 @@ supersedes: ""
 - 上游只给每个窗口的 `percentUsed`，从不给绝对池子；同时拿三个窗口各自反推会得到三个互相矛盾的池（5h 1.6G / 周 4.0G / 月 5.2G）。计划里唯一被保证的关系是 **月限额 = 2×周限额**，于是只派生 **一个** 池 `L`，并把月窗口写成 `2×L`，让 `月 = 2×周` **由构造成立**而非靠算术巧合。
 - `L` 优先取**周窗口**反推（`L = tokens_w / frac_w`）；周窗口不可用（刚重置无流量、或已打满）时由**月窗口兜底**（`L = tokens_m / (2·frac_m)`，即月反推值的一半）。
 - 分子口径必须**剔除 cache**（`prompt_tokens + completion_tokens`，**不再**用 `total_tokens`）：metapi 的 `total_tokens` 含 `cache_read_tokens`，而 cache 在周窗口里占比远高于月窗口，含 cache 会把 `月/周` 反推比从 2 压到 **1.28**。
-- 5h 窗口**不参与估算**（滚动限速、自带 percent，反推只会多出一个无关的池），其卡片数字段改显示**重置倒计时**。
+- 5h 窗口**不参与估算**（滚动限速、自带 percent，反推只会多出一个无关的池），其卡片数字段改显示**重置倒计时**。［**已被取代（2026-10-08，v0.37.0 起）**：5h 窗口现按**自身反推**写回自己的 `LimitTokensEstimate`（不并入周锚定 L、不参与 月 = 2×周），卡片数字段是 token 对而非倒计时（`internal/planusage/estimate.go` 的 `fiveHour` 分支、`internal/planusage/report.go` 的 `clineTokenPairWindow`）；见 `.agents/notes/20261004-quota-card-5h-two-metrics.md`。原文保留为当时结论。］
 - 反推仍是**近似**：上游是黑箱，没有绝对真值；残差来源与幅度见「已知残差」。
 
 ## 背景

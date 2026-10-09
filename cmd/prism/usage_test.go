@@ -26,10 +26,11 @@ func TestMain(m *testing.M) {
 	agyConvDir = filepath.Join(os.TempDir(), "prism-cli-agy-conv-missing")
 	agyIndexPath = filepath.Join(os.TempDir(), "prism-cli-agy-idx-unused.db")
 	geminiEstimatePath = filepath.Join(os.TempDir(), "prism-cli-gemini-est-missing.json")
-	// A live metapi hub database must not leak cline-pass totals into CLI
-	// fixtures; tests that need the source point metapiUsageDBPath at their
-	// own temp fixture.
-	metapiUsageDBPath = filepath.Join(os.TempDir(), "prism-cli-metapi-missing", "hub.db")
+	// A live magpie usage log or provider file must not leak cline-pass
+	// totals or accounts into CLI fixtures; tests that need the source point
+	// magpieUsagePath / magpieProvidersPath at their own temp fixtures.
+	magpieUsagePath = filepath.Join(os.TempDir(), "prism-cli-magpie-missing", "usage.jsonl")
+	magpieProvidersPath = filepath.Join(os.TempDir(), "prism-cli-magpie-missing", "providers.json")
 	os.Exit(m.Run())
 }
 

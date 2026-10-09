@@ -18,8 +18,8 @@ import (
 	"github.com/dorokuma/prism/internal/agyusage"
 	"github.com/dorokuma/prism/internal/cache"
 	"github.com/dorokuma/prism/internal/config"
+	"github.com/dorokuma/prism/internal/magpieusage"
 	"github.com/dorokuma/prism/internal/mcp"
-	"github.com/dorokuma/prism/internal/metapiusage"
 	"github.com/dorokuma/prism/internal/middleware"
 	"github.com/dorokuma/prism/internal/newapi"
 	"github.com/dorokuma/prism/internal/oauth"
@@ -530,17 +530,19 @@ func main() {
 
 	quotaCache := planusage.NewCache()
 	quotaPoller := planusage.NewPoller(planusage.DefaultFetchers(), quotaCache, cfg.Quota.RefreshInterval, cfg.Quota.RequestTimeout)
-	// metapiSource is the service-side metapi gateway: the ClinePass 总额 sums
+	// magpieSource is the service-side magpie gateway: the ClinePass 总额 sums
 	// (SetClinePassEstimate below) and the account discovery (refreshQuotaAccounts)
-	// both go through it, one short-lived read-only connection per operation
-	// (see internal/metapiusage/source.go).
-	metapiSource := metapiusage.NewSource(metapiUsageDBPath)
-	// Discover ClinePass accounts from metapi (site_id=49, active only) and use
-	// them for quota polling. Each account is polled with its own api_token and
-	// its consumption is summed separately. The same call runs on SIGHUP
-	// (see the signal loop), so a metapi that was unavailable at boot — or an
-	// account added/disabled while prism runs — is picked up without a restart.
-	refreshQuotaAccounts(p, quotaPoller, metapiSource)
+	// both go through it. It holds no file handle — each sum re-stats the usage
+	// log and rescans it only when the file version changed (see
+	// internal/magpieusage/usage.go) — so one object is shared but nothing is
+	// pinned open.
+	magpieSource := newMagpieSource()
+	// Discover ClinePass accounts from magpie (providers.json) and use them for
+	// quota polling. Each account is polled with its own provider key and its
+	// consumption is summed separately. The same call runs on SIGHUP (see the
+	// signal loop), so a magpie that was unavailable at boot — or an account
+	// added/removed while prism runs — is picked up without a restart.
+	refreshQuotaAccounts(p, quotaPoller, magpieSource)
 	quotaPoller.SetOptions(cfg.Quota.Enabled, cfg.Quota.RefreshInterval, cfg.Quota.RequestTimeout)
 
 	var agyIdx *agyusage.Index
@@ -560,21 +562,30 @@ func main() {
 	if gem := planusage.CombineTokenSums(usageGemini, agySumFunc(agyIdx)); gem != nil {
 		quotaPoller.SetGeminiEstimate(gem, planusage.DefaultGeminiEstimatePath)
 	}
-	// ClinePass 总额估算：ClinePass 流量全经 metapi 转发，prism 侧没有
-	// 消耗量，故从 metapi 生产库只读求 cline-pass/* 各窗口词元和。账号与密钥
-	// 直读 metapi accounts(site_id=49)，每个账号用自己的 api_token 轮询
-	// cline.bot，消耗按 account_id 隔离求和。求和源每次求和按条短连接
-	// （open→created_at 形状自检→SUM→close），不持有常驻句柄：metapi 换库/
-	// 文件替换/数据面回滚后下一轮刷新即读到新数据，启动时库不可用（开机顺序/
-	// 权限窗口）也会在后续轮次自动恢复，不会被永久禁用。库缺失/不可读/表缺失/
-	// created_at 格式漂移 ⇒ 该窗口无总额（降级跳过），不影响快照获取与展示，
-	// 也不标记 fetch 失败；不可用/降级按状态转换各记一次 WARN、恢复记 Info，
-	// 并计入 expvar clinepass_usage_source_errors /
-	// clinepass_usage_source_status（/metrics）。
-	// metapiSource 已在上面账号发现处创建，服务侧求和与账号发现共用一个对象。
-	quotaPoller.SetClinePassEstimate(func(accountID int64) planusage.GrokTokenSum {
+	// ClinePass 总额估算：ClinePass 流量全经 magpie 转发，prism 侧没有
+	// 消耗量，故从 magpie 的用量日志（/root/.config/magpie/usage.jsonl）只读求
+	// cline-pass/* 各窗口词元和。账号与密钥直读 magpie providers.json，每个
+	// 账号用自己的 provider key 轮询 cline.bot，消耗按 magpie 的 providerKeyId
+	// 隔离求和（不是 metapi 的 account_id：magpie 无数据库，账号身份就是
+	// provider key 的 sha256 前 10 位十六进制，见 magpieusage.KeyID）。求和源不
+	// 持有文件句柄：每次求和先 stat 日志，仅当文件版本（dev+ino/size/mtime）变
+	// 化才重扫，一轮多窗口/多账号共用一次扫描；magpie 换日志文件/截断/重装后
+	// 下一轮刷新即读到新数据，启动时 magpie 未安装（无 usage.jsonl）也会在后续
+	// 轮次自动恢复，不会被永久禁用。日志缺失/不可读/非常规文件/无可用行/
+	// 行格式漂移 ⇒ 该窗口无总额（降级跳过），不影响快照获取与展示，也不标记
+	// fetch 失败；不可用/降级按状态转换各记一次 WARN、恢复记 Info，并计入
+	// expvar clinepass_usage_source_errors / clinepass_usage_source_status
+	// （/metrics）。magpieSource 已在上面账号发现处创建，服务侧求和与账号发现
+	// 共用一个对象。
+	quotaPoller.SetClinePassEstimate(func(accountID string) planusage.GrokTokenSum {
+		// ONE round per fetchOne: the poller's 5h / weekly / monthly sums of
+		// this account are all reversed against the same upstream percents, so
+		// they share the tail table and the freshness verdict taken here
+		// (magpieusage.BeginRound) — a SIGHUP landing between two windows can
+		// then not split one fetch across two rosters.
+		round := magpieSource.BeginRound(accountID)
 		return func(ctx context.Context, from, to int64) (int64, error) {
-			return metapiSource.SumClinePassTokensByAccount(ctx, accountID, from, to)
+			return round.Sum(ctx, from, to)
 		}
 	})
 	quotaPoller.Start()
@@ -697,12 +708,12 @@ func main() {
 					quotaPoller.SetOptions(newCfg.Quota.Enabled, newCfg.Quota.RefreshInterval, newCfg.Quota.RequestTimeout)
 				}
 				// Re-discover the ClinePass roster on every SIGHUP, independent of
-				// whether the config reload succeeded: the roster lives in metapi
-				// (site 49), so this is the recovery path for a metapi that was
+				// whether the config reload succeeded: the roster lives in magpie
+				// (providers.json), so this is the recovery path for a magpie that was
 				// unavailable when prism booted and for accounts added or
-				// disabled while prism runs. A failed discovery keeps the
+				// removed while prism runs. A failed discovery keeps the
 				// previous ClinePass views (see refreshQuotaAccounts).
-				refreshQuotaAccounts(p, quotaPoller, metapiSource)
+				refreshQuotaAccounts(p, quotaPoller, magpieSource)
 				// Always reload MCP tools from current config (new or old).
 				curCfg := holder.Load()
 				mcp.ClearMCPCache()
@@ -755,35 +766,35 @@ func main() {
 }
 
 // refreshQuotaAccounts rebuilds the poller's quota roster — the pool's config
-// accounts plus a fresh metapi ClinePass discovery — and installs it on the
+// accounts plus a fresh magpie ClinePass discovery — and installs it on the
 // poller. It runs at startup and on every SIGHUP, so the ClinePass block
-// survives the two cases startup-only discovery could not: metapi being
-// unavailable while prism boots, and accounts added or disabled while prism
+// survives the two cases startup-only discovery could not: magpie being
+// unavailable while prism boots, and accounts added or removed while prism
 // runs.
 //
 // Failure policy (see nextQuotaViews): a discovery ERROR keeps the previous
-// metapi-backed views — a transient metapi read failure must never make the
+// magpie-backed views — a transient magpie read failure must never make the
 // ClinePass cards silently disappear — while a successful discovery always
-// wins, including an empty one (that is how a disabled account leaves the
-// roster). A host without a metapi database reports no accounts and no error,
-// so it warns about nothing.
+// wins, including an empty one (that is how a removed account leaves the
+// roster). A host without a magpie provider file reports no accounts and no
+// error, so it warns about nothing.
 //
 // The roster is NOT re-discovered periodically: SIGHUP (or a restart) is the
 // recovery point, recorded in .agents/notes.
 //
 // A round that leaves an empty ClinePass roster although the previous round had
 // accounts is counted in clinepass_quota_roster_drops_total and logged once as
-// a WARN carrying the reason (metapi database file absent / no clinepass
+// a WARN carrying the reason (magpie providers file absent / no clinepass
 // accounts discovered / discovery failed) — see clinePassRosterDelta. The
 // current size is mirrored in clinepass_quota_accounts, so the silent-shrink
-// paths (database file gone during a SIGHUP, every account disabled, a
-// NULL/empty api_token row, a site_id rebuild) are observable instead of only
-// showing up as a missing card.
-func refreshQuotaAccounts(p *pool.Pool, poller *planusage.Poller, src *metapiusage.Source) {
+// paths (provider file gone during a SIGHUP, every ClinePass entry removed, an
+// empty provider key, a magpie-side provider rename) are observable instead of
+// only showing up as a missing card.
+func refreshQuotaAccounts(p *pool.Pool, poller *planusage.Poller, src *magpieusage.Source) {
 	configViews := make([]planusage.AccountView, 0, len(p.AllAccounts()))
 	for _, a := range p.AllAccounts() {
 		if strings.EqualFold(a.Provider(), "clinepass") {
-			// clinepass accounts are discovered from metapi, not config.
+			// clinepass accounts are discovered from magpie, not config.
 			continue
 		}
 		configViews = append(configViews, a)
@@ -791,10 +802,10 @@ func refreshQuotaAccounts(p *pool.Pool, poller *planusage.Poller, src *metapiusa
 	prev := poller.Accounts()
 	discovered, err := readClinePassAccounts(context.Background(), src)
 	if err != nil {
-		slog.Warn("read clinepass accounts from metapi failed, keeping the previous roster", "error", err)
+		slog.Warn("read clinepass accounts from magpie failed, keeping the previous roster", "error", err)
 	}
 	views := nextQuotaViews(configViews, discovered, prev, err)
-	count, dropped := clinePassRosterDelta(prev, views, metapiUsageDBPathIfPresent() != "", err)
+	count, dropped := clinePassRosterDelta(prev, views, magpieProvidersPathIfPresent() != "", err)
 	clinepassQuotaAccounts.Set(int64(count))
 	if dropped != "" {
 		clinepassQuotaRosterDrops.Add(1)

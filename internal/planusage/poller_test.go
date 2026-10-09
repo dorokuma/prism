@@ -146,11 +146,11 @@ func TestPollerClinePassEstimateApplied(t *testing.T) {
 	p := NewPoller([]Fetcher{ClinePassFetcher{QuotaURL: srv.URL, Timeout: time.Second}}, c, 30*time.Second, time.Second)
 	p.SetAccounts([]AccountView{fakeAcc{
 		name: "ClinePass", provider: "clinepass", base: "https://api.cline.bot/api/v1",
-		key: "k", client: srv.Client(), accountID: 7,
+		key: "k", client: srv.Client(), accountID: "aaaa111122",
 	}})
-	p.SetClinePassEstimate(func(accountID int64) GrokTokenSum {
-		if accountID != 7 {
-			t.Errorf("clinepass sum factory got account id %d, want the account's own 7", accountID)
+	p.SetClinePassEstimate(func(accountID string) GrokTokenSum {
+		if accountID != "aaaa111122" {
+			t.Errorf("clinepass sum factory got account id %q, want the account's own aaaa111122", accountID)
 		}
 		return func(context.Context, int64, int64) (int64, error) { return 1000, nil }
 	})
@@ -205,7 +205,7 @@ func TestPollerEstimateDispatchPerProvider(t *testing.T) {
 	// Only the clinepass sum is wired.
 	p := NewPoller(fetchers, NewCache(), 30*time.Second, time.Second)
 	p.SetAccounts(accounts)
-	p.SetClinePassEstimate(func(accountID int64) GrokTokenSum {
+	p.SetClinePassEstimate(func(accountID string) GrokTokenSum {
 		return func(context.Context, int64, int64) (int64, error) { return 1000, nil }
 	})
 	got := collect(t, p)
@@ -288,12 +288,12 @@ func TestPollerGeminiEstimateApplied(t *testing.T) {
 }
 
 // TestPollerClinePassPerAccountEstimate pins O10-1, the service-side
-// per-account wiring: the poller must hand EACH account's own metapi
-// account_id to the sum factory (AccountIDFrom(g.Accounts[0])) and write that
-// account's consumption into that account's snapshot. Before this case the
-// factory in every poller test ignored its accountID and fakeAcc.accountID was
-// never assigned, so passing 0 — or picking the wrong account of a group —
-// kept the whole suite green.
+// per-account wiring: the poller must hand EACH account's own magpie
+// providerKeyId to the sum factory (AccountIDFrom(g.Accounts[0])) and write
+// that account's consumption into that account's snapshot. Before this case
+// the factory in every poller test ignored its accountID and
+// fakeAcc.accountID was never assigned, so passing "" — or picking the wrong
+// account of a group — kept the whole suite green.
 func TestPollerClinePassPerAccountEstimate(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, clinepassUsageBody)
@@ -301,24 +301,25 @@ func TestPollerClinePassPerAccountEstimate(t *testing.T) {
 	defer srv.Close()
 
 	const tokA, tokB = "cline-token-alpha", "cline-token-bravo"
+	const idA, idB = "aaaa111122", "bbbb333344"
 	c := NewCache()
 	p := NewPoller([]Fetcher{ClinePassFetcher{QuotaURL: srv.URL, Timeout: time.Second}}, c, 30*time.Second, time.Second)
 	p.SetAccounts([]AccountView{
-		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokA, client: srv.Client(), accountID: 7},
-		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokB, client: srv.Client(), accountID: 9},
+		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokA, client: srv.Client(), accountID: idA},
+		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokB, client: srv.Client(), accountID: idB},
 	})
 
 	// Each account has its own distinct consumption, keyed by its own id.
-	consumed := map[int64]int64{7: 1000, 9: 3000}
+	consumed := map[string]int64{idA: 1000, idB: 3000}
 	var mu sync.Mutex
-	var asked []int64
-	p.SetClinePassEstimate(func(accountID int64) GrokTokenSum {
+	var asked []string
+	p.SetClinePassEstimate(func(accountID string) GrokTokenSum {
 		mu.Lock()
 		asked = append(asked, accountID)
 		mu.Unlock()
 		n, ok := consumed[accountID]
 		if !ok {
-			t.Errorf("sum factory got account id %d, want one of the accounts' own ids (7, 9)", accountID)
+			t.Errorf("sum factory got account id %q, want one of the accounts' own ids (%s, %s)", accountID, idA, idB)
 		}
 		return func(context.Context, int64, int64) (int64, error) { return n, nil }
 	})
@@ -326,11 +327,11 @@ func TestPollerClinePassPerAccountEstimate(t *testing.T) {
 	p.Refresh()
 
 	mu.Lock()
-	got := append([]int64(nil), asked...)
+	got := append([]string(nil), asked...)
 	mu.Unlock()
-	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
-	if len(got) != 2 || got[0] != 7 || got[1] != 9 {
-		t.Fatalf("factory account ids = %v, want [7 9] (one per account, its own id)", got)
+	sort.Strings(got)
+	if len(got) != 2 || got[0] != idA || got[1] != idB {
+		t.Fatalf("factory account ids = %v, want [%s %s] (one per account, its own id)", got, idA, idB)
 	}
 
 	// Each snapshot counts only its own account's consumption:
@@ -362,10 +363,10 @@ func TestPollerClinePassPerAccountEstimate(t *testing.T) {
 		t.Fatalf("snapshots = %d, want 2 (one per account)", len(byFP))
 	}
 	if got := byFP[KeyFingerprint(tokA)]; got != 11765 {
-		t.Fatalf("account 7 (1000 tokens ÷ 8%%) weekly estimate = %d, want 11765", got)
+		t.Fatalf("account %s (1000 tokens ÷ 8%%) weekly estimate = %d, want 11765", idA, got)
 	}
 	if got := byFP[KeyFingerprint(tokB)]; got != 35294 {
-		t.Fatalf("account 9 (3000 tokens ÷ 8%%) weekly estimate = %d, want 35294", got)
+		t.Fatalf("account %s (3000 tokens ÷ 8%%) weekly estimate = %d, want 35294", idB, got)
 	}
 }
 
@@ -385,8 +386,8 @@ func TestPollerFailedRoundKeepsAccountFingerprints(t *testing.T) {
 	c := NewCache()
 	p := NewPoller([]Fetcher{ClinePassFetcher{QuotaURL: srv.URL, Timeout: time.Second}}, c, 30*time.Second, time.Second)
 	p.SetAccounts([]AccountView{
-		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokA, client: srv.Client(), accountID: 7},
-		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokB, client: srv.Client(), accountID: 9},
+		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokA, client: srv.Client(), accountID: "aaaa111122"},
+		fakeAcc{name: "Cline", provider: "clinepass", base: "https://api.cline.bot/api/v1", key: tokB, client: srv.Client(), accountID: "bbbb333344"},
 	})
 	p.Refresh()
 

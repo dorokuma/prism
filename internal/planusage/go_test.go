@@ -17,7 +17,7 @@ import (
 type fakeAcc struct {
 	name, provider, base, key, authHeader string
 	client                                *http.Client
-	accountID                             int64
+	accountID                             string
 }
 
 func (a fakeAcc) Name() string         { return a.name }
@@ -26,7 +26,7 @@ func (a fakeAcc) BaseURL() string      { return a.base }
 func (a fakeAcc) Key() string          { return a.key }
 func (a fakeAcc) AuthHeader() string   { return a.authHeader }
 func (a fakeAcc) Client() *http.Client { return a.client }
-func (a fakeAcc) AccountID() int64     { return a.accountID }
+func (a fakeAcc) AccountID() string    { return a.accountID }
 
 func TestUsageURL(t *testing.T) {
 	cases := []struct {

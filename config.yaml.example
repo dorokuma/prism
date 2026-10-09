@@ -277,21 +277,56 @@ model_remap:
 #   响应里的 ~usd 是按文档额度（$12 / $30 / $60）用整数 percent 估算，不是账单。
 #
 #   总额估算（卡片/表格的「总额 X 词元」）：SuperGrok 与 Gemini 用本地
-#   词元账本（usage.db + agy 索引）反推；ClinePass 流量全经 metapi 转发，
-#   prism 侧没有消耗量，消耗取自 metapi 生产库
-#   /var/lib/metapi/data/hub.db 的 proxy_logs（只读 mode=ro 打开、带
-#   busy_timeout；按 model_requested LIKE 'cline-pass/%' 与各窗口起点
-#   [PeriodStart, now] 求和，再除以已用占比；占比 >= 100% 或为 0 的窗口
-#   不产出总额）。该库不存在、不可读或 proxy_logs 缺失时，ClinePass
+#   词元账本（usage.db + agy 索引）反推；ClinePass 流量全经 magpie 网关转发，
+#   prism 侧没有消耗量，消耗取自 magpie 的逐调用日志
+#   /root/.config/magpie/usage.jsonl（只读、流式逐行 JSON）：先过模型门槛
+#   （model 前缀 "cline-pass/"，故 cline-free/* 等其它模型家族一律不算）与时间窗
+#   （t 落在 [PeriodStart, now] 闭区间；窗口已过重置时刻（ResetsAt 不晚于 now）
+#   时上界取 ResetsAt），再按双轨归属：行带 providerKeyId 时直接
+#   归该 id（不看 provider）；无 id 且 provider == "cline" 的 keyless 行，按掩码尾
+#   （providerAccount "API key …326d"，缺省回落 host）与账号名单的 key 尾唯一匹配
+#   归属（0 命中或 ≥2 命中都不算）→ 累加 in + out
+#   （cache_read 不计入：上游百分比的口径是 prompt + completion），
+#   再除以该窗口已用占比。占比为 0 的窗口不用它自己去反推池（0 占比无法外推，
+#   不能拿它算限额）；但若池能从别的窗口锚定出来（例如月窗口已算出池），该窗口
+#   仍写这个池，卡片左半按显示占比折算——占比 0 时左半就是 0，即「0/池」。
+#   卡片左半是显示占比（displayPercent，小数路径向上取整）折算出的已用量，不总
+#   等于 JSON 的 measured_tokens（JSON 始终给精确值）。5 小时窗口在占比为 0 时
+#   不产出总额——它没有可用的锚定来源。打满（>= 100%）的窗口不由自己的占比反
+#   推：能从另一窗口锚定出池的仍写池（X/池），否则写该窗口自己的实测消耗
+#   （卡片 X/X，JSON 另给 measured_tokens）。
+#   账号 id 就是 magpie 的 providerKeyId（provider key 的 sha256 前 10 位
+#   十六进制，与 magpie 自己写在日志里的一致），账号名单（含 provider key）
+#   取自同目录 providers.json 的 clinepass 条目（key + keys[]）。ClinePass
+#   账号因此不再来自 config：config 里 provider: clinepass 的账号不进配额
+#   轮询与卡片（与 v0.34.0 起的规则一致，只是来源由 metapi 换成 magpie）。
+#   名单只在启动与 SIGHUP 时重读（发现失败保留上一份名单）；归属用的尾号表
+#   则只有「本次真的读到 providers.json」才算确认：读不到（含文件不存在）即转
+#   陈旧并停止用它归属，keyless 行一律落回未归属，直到下一次成功的发现——
+#   避免用「换 key 之前的尾号表」把新 key 的行归到旧账号（串账）。
+#   日志不存在/不可读/非常规文件/无任何可用行/行形状漂移时，ClinePass
 #   窗口只显示占用百分比（无总额），不影响快照获取与展示，也不报错。
-#   该库每次求和按条只读短连接打开（open→created_at 形状自检→SUM→
-#   close），不做常驻句柄：metapi 换库/文件替换/数据面回滚后下一轮刷新
-#   即读到新数据，prism 启动时库不可用（开机顺序/权限窗口）也会在后续
-#   轮次自动恢复，无需重启。求和前校验 created_at 形状（metapi 若把
-#   UTC 'YYYY-MM-DD HH:MM:SS' 文本改成其他格式，该轮降级不出总额，而
-#   不是静默按错窗口少算）。不可用/降级计入 /metrics 的
-#   clinepass_usage_source_errors 与 clinepass_usage_source_status，
-#   状态转换各记一次 WARN、恢复记 Info（不逐轮刷屏）。
+#   降级计入 /metrics 的 clinepass_usage_source_errors 与
+#   clinepass_usage_source_status，状态转换各记一次 WARN、恢复记 Info
+#   （不逐轮刷屏）；归属侧另有 clinepass_usage_account_unmatched_total（账号 ×
+#   每次求和）、clinepass_usage_attribution_stale_total（每次求和用了「曾经确认
+#   过、如今已转陈旧」的尾号表；从未确认过尾号表的主机不计——那是发现路径
+#   !found 的信号，否则没装 magpie 的主机会每账号每窗口每轮空涨）与
+#   clinepass_usage_unattributed_rows_total（每行 × 每次重扫，只应
+#   看是否非零、不要按增长率设阈值），三者都不改 source_status。
+#   求和按「文件 dev+ino / size / mtime 未变、且归属尾号表也未变则复用上次解析
+#   结果」缓存：
+#   一次全量扫描答完所有账号与所有窗口（每账号 3 个窗口共享；一次抓取在入口取
+#   一份「本轮归属表 + 本轮新鲜度」快照，该账号本轮三个窗口共用这一份，SIGHUP
+#   落在两次求和之间也不会让同一轮一半按新表、一半按旧表），文件被
+#   追加/截断/替换后下一轮刷新自动重扫；不常驻句柄，prism 启动时日志不可用
+#   （开机顺序/未安装 magpie）也会在后续轮次自动恢复，无需重启。行形状自检：
+#   t 必须能按 RFC3339 解析且 in/out/provider/model 齐全，否则该轮降级不出
+#   总额，而不是静默按错窗口少算；magpie 正在追加时读到的残缺末行容忍
+#   （下一次扫描补上）。
+#   历史断层：magpie 的日志只从它开始记录起有数据（无限追加、无轮转、不回填），
+#   故比日志起点更早的窗口（典型是月窗口）会少算、总额偏小；metapi 时代的历史
+#   消耗已不在其中，无法恢复。
 #   路径是代码内默认值（与 agy 用量索引 agyusage.DefaultIndexPath 的
 #   既有模式一致），不是配置键，无需在 config.yaml 中声明。
 # ---------------------------------------------------------------------------

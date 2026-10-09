@@ -1,6 +1,6 @@
 ---
-status: active # active | superseded
-superseded_by: ""
+status: superseded # active | superseded
+superseded_by: "20261007-clinepass-usage-source-magpie.md"
 supersedes: ""
 模块: "planusage, metapiusage, cmd/prism"
 ---

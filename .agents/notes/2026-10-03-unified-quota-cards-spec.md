@@ -11,10 +11,10 @@ supersedes: ""
 - `prism quota` / `GET /admin/quota` 的卡片**只剩一种版式**：**一张卡 = 一个 `(Provider, Window)` 分组**，由「标题行 + N 个账号数据行 + 底边行」组成（N = 该分组账号数）。Gemini、ClinePass、SuperGrok **一律**走这一套，不再有「ClinePass 合卡 + 其余 provider 两行式」的分叉。
 - 标题行**只**有 `<Provider> · <Window>`，**不含账号名**、**不含「估算池」**（周/月就是 `ClinePass · 周限额` / `ClinePass · 月限额`）。账号名下移到数据行的第一个元素。
 - 数据行 = `·` 色点 + 账号**显示名**（`stripNumericSuffix`：`Cline2`/`Cline1` 都显示 `Cline`）+ 胶囊条(23) + 百分比(4，右对齐) + **指标段(13，右对齐)**。
-- 指标段是**智能单指标**（见 D3 的回落矩阵）：5 小时窗口 → 重置倒计时；周/月窗口 → `已用量/总量`（**不带 `~`**）；拿不到数据 → 倒计时兜底，再不行 → `-`。
+- 指标段是**智能单指标**（见 D3 的回落矩阵）：5 小时窗口 → 重置倒计时；周/月窗口 → `已用量/总量`（**不带 `~`**）；拿不到数据 → 倒计时兜底，再不行 → `-`。［**已过时（2026-10-08）**：5h 行自 v0.37.0 起也走 token 对（按自身反推写回自己的池，`internal/planusage/report.go` 的 `clineTokenPairWindow` 含 `5h`），不再是倒计时；见 `.agents/notes/20261004-quota-card-5h-two-metrics.md`。原文保留为当时规范。］
 - 卡宽不再是固定 56 列，而是 `max(行宽, 标题所需宽)`，其中 `行宽 = 4 + 45 + nameMax`、`nameMax` = 卡内最长**显示名**单元格宽度。
 - 被**删除**的行为：`~` 标记、「· 估算池」标题段、非 ClinePass 的**两行式**（标题带账号 + 47 格胶囊行 + `已用 x% / 总额 …  倒计时` 明细行）、`已达限额` 页脚行、以及只为它们存在的 `renderWindowCard` / `cardDetailRow` / `windowDetail` / `col2Label` / `totalPart` / `cardFooter` / `cardBarRow` / `renderInfoCard` / `capsuleBar` 等函数与 `cardWidth=56`/`barCells=47` 常量。
-- **口径零改动**：估算算法（周锚定单向派生、月 = 2×周、5h 不参与估算）、分子剔 cache、`account_id <= 0` 的 WARN + expvar、`SumClinePassTokens` 的 Deprecated、JSON 字段与路径（`limit_tokens_estimate` / `measured_tokens` …）**全部不变**；行身份（`clineRowID` = 全名 + 指纹）与调色盘配色不变。
+- **口径零改动**：估算算法（周锚定单向派生、月 = 2×周、5h 不参与估算）、分子剔 cache、`account_id <= 0` 的 WARN + expvar、`SumClinePassTokens` 的 Deprecated、JSON 字段与路径（`limit_tokens_estimate` / `measured_tokens` …）**全部不变**；行身份（`clineRowID` = 全名 + 指纹）与调色盘配色不变。［**其中三项已被取代（2026-10-08）**：① 5h **参与**估算——自 v0.37.0 起按自身反推写回自己的池（不并入周锚定 L）；② `SumClinePassTokens` 已随 `internal/metapiusage` 包在本分支（`feature/magpie-usage-source`）删除，现行求和源是 magpie 逐调用日志（`internal/magpieusage`）；③ token 对的渲染（`formatTokenPair`）已改为按 亿/万/千/原值 四档**打分**选档（`.agents/notes/20261008-clinepass-c4-unit-ladder.md`）。其余各项（周锚定单向派生、月 = 2×周、分子剔 cache、`account_id <= 0` 的 WARN + expvar、JSON 字段与路径、行身份、配色）仍成立；原文保留为当时事实。］
 
 ## 背景
 - 历史版式线：`20260922-quota-capsule-bar.md`（56 列两行胶囊卡）→ `20260923-quota-tui-card-format.md` / `20260923-card-title-plain-text.md`（标题去色、标题带账号）→ `20260923-card-symmetric-gutter.md` → `20260924-card-width-60-to-56.md` → `20260924-quota-card-cn-text.md`（`已达限额` / `后重置` 中文化）→ `20260929-clinepass-multi-account-metapi.md`（**ClinePass 合卡**：一张卡一个 (profile, window)、一行一个账号）→ `20261003-clinepass-quota-estimate-derivation.md`（`~` 标记 + 「估算池」标题 + 5h 倒计时）。
@@ -86,7 +86,7 @@ supersedes: ""
 2. **无窗口卡**：`401/403` 会清空窗口（`Cache.StoreFailed`），这类快照仍要可见。取舍：该分组标题**不带窗口段**（不发明 `--` 占位），行只显示账号名 + 空指标列，失败原因照旧走 `⚠ <账号>: <本地化码>` 注记。
 
 ### D6. 与既有笔记的关系
-- `20261003-clinepass-quota-estimate-derivation.md` 的**展示契约节**（`~` 标记、「估算池」标题、5h 倒计时）**被本笔 supersede**；其**估算主体**（周锚定单向派生、月 = 2×周、剔除 cache、5h 不参与估算）**仍 active**，故不整篇标 superseded。
+- `20261003-clinepass-quota-estimate-derivation.md` 的**展示契约节**（`~` 标记、「估算池」标题、5h 倒计时）**被本笔 supersede**；其**估算主体**（周锚定单向派生、月 = 2×周、剔除 cache、5h 不参与估算）**仍 active**，故不整篇标 superseded。［**更正（2026-10-08）**：本 bullet 里「5h 不参与估算」**仍 active** 的部分已不成立——5h 自 v0.37.0 起按自身反推写回自己的池（`.agents/notes/20261004-quota-card-5h-two-metrics.md`）；周锚定单向派生 / 月 = 2×周 / 剔除 cache 三项仍 active。原文保留为当时结论。］
 - `20260922-quota-capsule-bar.md` / `20260923-quota-tui-card-format.md` / `20260924-card-width-60-to-56.md` / `20260924-quota-card-cn-text.md` 里的**两行式几何、56 列卡宽、`已达限额` 页脚、明细行文案**均被本笔取代；其中「胶囊填充 = 已用占比」「避免左边距缩进」「标题文字不上色」等规则被单行式继承。
 - `20260929-clinepass-multi-account-metapi.md` 的**合卡机制**（分组键、行身份、调色盘）被本笔提升为全局规则，内容不再限于 ClinePass。
 

@@ -1,6 +1,9 @@
 package render
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestFormatInt(t *testing.T) {
 	cases := []struct {
@@ -83,15 +86,23 @@ func TestFormatTokens(t *testing.T) {
 	}
 }
 
-// TestFormatTokensYi pins the Chinese-unit formatter the quota card's
-// used/total pair uses: ONE unit (亿), one decimal, and a whole 亿 that
-// drops its fraction. A non-zero count below 0.05 亿 — which one decimal
-// would collapse to "0" — is rendered with TWO decimals instead, so a tiny
-// pool reads as a number ("0.02亿") instead of colliding with the "no data"
-// zero; only an exact zero, and anything below 0.005 亿, reads "0亿". There
-// is no 万 / 千万 step and no "<0.1亿" fallback. "9999亿" and "0.04亿" are
-// both the widest single side, so the quota card's 13-column pair budget
-// ("0.02亿/9999亿" = 13) is never exceeded.
+// TestFormatTokensYi pins the Chinese-unit formatter for the 亿 unit: ONE unit
+// (亿), one decimal, and a whole 亿 that drops its fraction. A non-zero count
+// below 0.05 亿 — which one decimal would collapse to "0" — is rendered with
+// TWO decimals instead, so a tiny pool reads as a number instead of colliding
+// with the "no data" zero; only an exact zero, and anything below
+// 0.005 亿, reads "0亿". This function itself has no 万 / 千万 step and no
+// "<0.1亿" fallback. The width loop below feeds the shapes the quota card's
+// field is sized around (a two-decimal side against a whole 亿 side) and pins
+// that such a pair is exactly the field wide (clineNumberWidth). It is not a
+// statement about every side this function can be handed — a count in the high
+// 亿 magnitudes writes more integer digits and a wider string, which is the
+// pair ladder's own residual (see planusage.formatTokenPair).
+//
+// The 亿 unit is no longer the ONLY unit a quota card may use (a card picks 亿 /
+// 万 / 千 from the window's total, see planusage.formatTokenPair), but this is
+// still the function that defines the 亿 shape — and FormatTokensUnit, which the
+// other units go through, carries exactly the precision rule asserted here.
 func TestFormatTokensYi(t *testing.T) {
 	cases := []struct {
 		in   int64
@@ -120,11 +131,59 @@ func TestFormatTokensYi(t *testing.T) {
 			t.Errorf("FormatTokensYi(%d) = %q, want %q", c.in, got, c.want)
 		}
 	}
-	// The widest pair stays inside the quota card's clineNumberWidth = 13
-	// display columns: a two-decimal side is exactly as wide as "9999亿".
+	// The pairs fed below stay inside the quota card's clineNumberWidth display
+	// columns: a two-decimal side and a four-digit whole 亿 side are the same width.
 	for _, pair := range [][2]int64{{999_900_000_000, 999_900_000_000}, {2_000_000, 999_900_000_000}, {999_900_000_000, 2_000_000}} {
 		if w := DisplayWidth(FormatTokensYi(pair[0]) + "/" + FormatTokensYi(pair[1])); w != 13 {
 			t.Errorf("pair %v = %d display columns, want 13", pair, w)
+		}
+	}
+}
+
+// TestFormatTokensUnit pins the formatter the quota card's used/total pair goes
+// through, for every unit on its ladder: div is the divisor that defines the unit
+// (1e8 亿, 1e4 万, 1e3 千) and suffix is what follows the number, while the
+// PRECISION rule is the one 亿 defines — one decimal, trailing zeros then the
+// point trimmed, two decimals for a non-zero count one decimal would collapse to
+// "0", and "0<unit>" only for an exact zero or a value below 0.005 of the unit.
+//
+// A non-positive div renders digits (div = 1) instead of an "Inf": the divisor is
+// a caller's constant, so a mistake must stay readable rather than poison the row.
+func TestFormatTokensUnit(t *testing.T) {
+	cases := []struct {
+		in     int64
+		div    int64
+		suffix string
+		want   string
+	}{
+		// 亿 is FormatTokensYi's contract, reached through the same code path.
+		{1_300_000_000, 1e8, "亿", "13亿"},
+		{2_000_000, 1e8, "亿", "0.02亿"},
+		// int64's top: the float64 scale holds the count one token high, and one
+		// decimal then rounds the sub-unit remainder away, so the string lands below
+		// the exact count (92233720368.54775807… 亿).
+		{math.MaxInt64, 1e8, "亿", "92233720368.5亿"},
+		// 万: a whole unit, one decimal, two decimals for a tiny share.
+		{10_000_000, 1e4, "万", "1000万"},
+		{1_000_000, 1e4, "万", "100万"},
+		{20_000, 1e4, "万", "2万"},
+		{200, 1e4, "万", "0.02万"},
+		{5_000, 1e4, "万", "0.5万"},
+		// 千: the smallest unit, so a small pool is a number and not a row of zeros.
+		{1_299, 1e3, "千", "1.3千"},
+		{1_000, 1e3, "千", "1千"},
+		{20, 1e3, "千", "0.02千"},
+		{0, 1e3, "千", "0千"},
+		{4, 1e3, "千", "0千"}, // below 0.005 千: even two decimals round away
+		// A non-positive divisor is treated as 1.
+		{7, 0, "x", "7x"},
+		{7, -1e8, "x", "7x"},
+		// The sign is carried like FormatTokensYi's.
+		{-30_000, 1e4, "万", "-3万"},
+	}
+	for _, c := range cases {
+		if got := FormatTokensUnit(c.in, c.div, c.suffix); got != c.want {
+			t.Errorf("FormatTokensUnit(%d, %d, %q) = %q, want %q", c.in, c.div, c.suffix, got, c.want)
 		}
 	}
 }
