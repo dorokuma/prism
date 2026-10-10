@@ -96,11 +96,11 @@ func (p *Pool) QuotaReviveAfter() time.Duration {
 }
 
 // Release frees the concurrency slot of the given lease and wakes the
-// first queued waiter that can actually use the freed capacity: provider-
-// matched, key-matched AND within its own max and the account total right
-// now. Waking the front waiter without the capacity check would let a
-// front waiter with a too-small max or a different key consume the wakeup
-// and re-park at the back while a later usable waiter stays parked — the
+// first queued waiter that can actually use currently-free capacity:
+// key-matched AND within its own max and the account total right now.
+// Waking the front waiter without the capacity check would let a front
+// waiter with a too-small max or a different key consume the wakeup and
+// re-park at the back while a later usable waiter stays parked — the
 // mixed-key lost wakeup.
 //
 // The wake scan runs ONLY when the slot was actually released (Account.
@@ -128,17 +128,31 @@ func (p *Pool) Release(s *Slot) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.wakeNextUsable(s.acc.Provider())
+	// No priority pass: a release must wake the front-most waiter whose OWN
+	// capacity is available, whatever provider it asked for (see
+	// wakeNextUsable).
+	p.wakeNextUsable(nil)
 }
 
 func (p *Pool) MarkHealthy(a *Account) {
 	a.MarkHealthy()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// Same capacity-aware scan as Release: the freshly-healthy account
-	// may only serve waiters whose provider/key/max fit, and waking an
-	// unusable front waiter would strand the usable waiter behind it.
-	p.wakeNextUsable(a.Provider())
+	// A recovery event runs a two-pass scan (wakeNextUsable): the freshly-
+	// healthy account may only serve waiters whose provider/key/max fit, so
+	// the priority pass serves THOSE waiters first — waking an unusable
+	// front waiter would strand the usable waiter behind it. The priority
+	// pass is bound to THIS account, not to its provider: it serves the
+	// first waiter the recovered account ITSELF can serve right now (same
+	// provider or a global waiter, healthy, out of cooldown, below its own
+	// per-key and total caps), so a front waiter the recovered account
+	// cannot serve — even one a sibling account of the same provider could
+	// serve — does not swallow the recovery. Only when the recovered account
+	// can serve none of the queued waiters does the fallback pass wake the
+	// front-most waiter whose OWN capacity is available, so a recovery event
+	// is never spent on a provider that did not recover while a waiter with
+	// free capacity of its own stays parked.
+	p.wakeNextUsable(a)
 }
 
 func (p *Pool) removeWaiterAndTransfer(elem *list.Element) {
@@ -173,7 +187,9 @@ func (p *Pool) removeWaiterAndTransfer(elem *list.Element) {
 	// provider/key/max check, so the transfer can never wake a waiter that
 	// would immediately re-park.
 	if woken {
-		p.wakeNextUsable(w.provider)
+		// No priority pass: the transfer is a plain capacity-freeing wakeup
+		// (same semantics as Release), not a recovery event.
+		p.wakeNextUsable(nil)
 	}
 }
 
@@ -198,29 +214,112 @@ func (p *Pool) capacityAvailableFor(provider, key string, max int) bool {
 	return false
 }
 
-// wakeNextUsable wakes the front-most queued waiter that can use a slot of
-// the given provider ("" = any provider matches) AND has capacity available
-// for its own provider/key/max right now — the wakeup must not be spent on
-// a waiter that would immediately re-park. FIFO is preserved within the
-// usable set because the scan starts at the queue front. It is the single
-// wake path for every capacity-freeing event: Release/MarkHealthy (initial
-// wakeup after a slot frees or an account recovers) and the cancel-vs-
-// release transfer (removeWaiterAndTransfer). Must be called with p.mu
-// held.
-func (p *Pool) wakeNextUsable(provider string) {
+// accountCanServe reports whether THIS single account could serve the given
+// waiter right now: it is healthy, out of cooldown, and below both its
+// per-key cap (InFlightForKey(key) < max) and its account total cap —
+// exactly the gates trySelectLocked applies before TryAcquire. Unlike
+// capacityAvailableFor, which answers the provider-level existence question
+// ("some account of the waiter's provider could serve it"), this asks about
+// the ONE account — which is what MarkHealthy's priority pass needs: the
+// priority pass serves the waiter the RECOVERED ACCOUNT can serve, not one
+// that merely a sibling account of the same provider could. Must be called
+// with p.mu held, like every other wake-path capacity probe, so the queue
+// traversal and the account health/cooldown reads stay consistent with the
+// acquisition path.
+func accountCanServe(a *Account, w *waiter) bool {
+	return a.IsHealthy() && !a.IsInCooldown() && a.canAcquire(w.key, w.max)
+}
+
+// wakeNextUsable wakes the front-most queued waiter that can actually use
+// currently-free capacity — the wakeup must not be spent on a waiter that
+// would immediately re-park. FIFO is preserved within the usable set
+// because every scan starts at the queue front. It is the single wake path
+// for every capacity-freeing event: Release/MarkHealthy (initial wakeup
+// after a slot frees or an account recovers) and the cancel-vs-release
+// transfer (removeWaiterAndTransfer). Must be called with p.mu held.
+//
+// prefer is nil for a plain capacity-freeing wakeup (Release and the
+// cancel-vs-release transfer), which runs only the unfiltered pass below.
+// For MarkHealthy it is the recovered account and the scan runs in two
+// passes. The PRIORITY pass serves the first waiter that the RECOVERED
+// ACCOUNT ITSELF can serve right now — w.provider == "" (a global waiter)
+// or w.provider == prefer.Provider(), AND accountCanServe(prefer, w): that
+// is the pre-existing semantics of a recovery event (serve the recovered
+// provider's waiters first), narrowed from "the recovered provider" to "the
+// one account that actually recovered". Only when that pass finds nobody
+// does the FALLBACK pass run the plain unfiltered scan, so a recovery event
+// can never leave a waiter stranded whose own capacity is free — binding
+// the whole wakeup to the event's provider is what causes the mixed-
+// provider lost wakeup.
+//
+// The priority pass deliberately asks about the ONE recovered account
+// rather than about "some account of its provider": capacityAvailableFor
+// (the fallback predicate) answers a provider-level existence question, so
+// a front waiter that the recovered account cannot serve — but a sibling
+// account of the same provider can — would swallow the recovery event and
+// leave the waiter the recovered account CAN serve parked until its 60s
+// 2*AccountSelectTimeout fallback. accountCanServe adds trySelectLocked's
+// own cooldown/unhealthy skip on top of canAcquire's per-key and total
+// gates, so a woken waiter never immediately re-parks on a stale wakeup.
+//
+// Residual limitation (pre-existing, NOT fixed here): the priority pass only
+// decides WHICH waiter to wake — it does not hand the recovered account's
+// capacity over to it. The woken waiter re-runs its OWN
+// trySelectLocked(provider, key, max), which starts at the providerNextIdx /
+// nextIdx cursor and may land on a DIFFERENT account of the same provider,
+// so the capacity the recovery freed is not guaranteed to be claimed by
+// this wakeup.
+//
+// The FALLBACK scan (and Release's single scan) is deliberately NOT filtered
+// by the provider of the account whose capacity was just freed: the wakeup
+// is a queue re-check signal, not a handover of that specific slot. A woken
+// waiter re-runs its OWN
+// trySelectLocked(provider, key, max) and may land on a DIFFERENT account
+// (another account of its provider, or the full-pool cursor), so binding
+// the wakeup to the releasing account's provider strands a servable waiter
+// whose own provider has had free capacity all along — the mixed-provider
+// lost wakeup: Release(x1) wakes the front global waiter, Release(y1) then
+// finds only an X-only waiter and (with the provider filter) wakes nobody,
+// the global waiter claims y1, and x1 stays free with the X waiter parked
+// until the 60s fallback. That sequence strands the X waiter only while the
+// woken global waiter sits in the wake->acquire window — already dequeued
+// by the first scan but not yet holding its slot; once it takes x1 no waiter
+// is left behind. The waiter's OWN capacity check is the exact predicate
+// that matters: it mirrors TryAcquire's per-key and total gates, so a woken
+// waiter never immediately re-parks on a stale wakeup.
+func (p *Pool) wakeNextUsable(prefer *Account) {
+	if prefer != nil {
+		provider := prefer.Provider()
+		for elem := p.waiters.Front(); elem != nil; elem = elem.Next() {
+			w := elem.Value.(*waiter)
+			if w.provider != "" && w.provider != provider {
+				continue
+			}
+			if !accountCanServe(prefer, w) {
+				continue
+			}
+			p.wakeWaiter(elem, w)
+			return
+		}
+	}
 	for elem := p.waiters.Front(); elem != nil; elem = elem.Next() {
 		w := elem.Value.(*waiter)
-		if provider != "" && w.provider != "" && w.provider != provider {
-			continue
-		}
 		if !p.capacityAvailableFor(w.provider, w.key, w.max) {
 			continue
 		}
-		p.waiters.Remove(elem)
-		w.active = false
-		close(w.ch)
+		p.wakeWaiter(elem, w)
 		return
 	}
+}
+
+// wakeWaiter removes the given waiter from the queue, marks it inactive and
+// closes its channel — the single wake primitive shared by both passes of
+// wakeNextUsable, so the two passes can never diverge in wake mechanics.
+// Must be called with p.mu held.
+func (p *Pool) wakeWaiter(elem *list.Element, w *waiter) {
+	p.waiters.Remove(elem)
+	w.active = false
+	close(w.ch)
 }
 
 // trySelectLocked returns the account+lease for one acquisition on an
