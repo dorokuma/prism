@@ -952,3 +952,388 @@ func TestMarkHealthyInitialWakeMixedKey(t *testing.T) {
 		p.Release(s)
 	}
 }
+
+// TestReleaseMismatchedProviderWakesServableWaiter is the deterministic
+// mixed-PROVIDER lost-wakeup regression test: the wake scan runs on a
+// release of a DIFFERENT provider than the parked waiter's, while that
+// waiter's OWN provider/key/max has capacity free right now. The scan must
+// wake it — the waiter's own capacity is what decides whether it is
+// servable, not the provider of the account whose slot was just freed.
+//
+// The stranding interleaving (the bug): the X release is consumed by the
+// front-most global waiter, which the scan dequeues but which has not
+// acquired its slot yet — so x1's "m" capacity is free again while the X
+// waiter is still parked. The scan then runs on the Y release and, if it
+// filters candidates by the RELEASING account's provider, walks past the X
+// waiter, finds no other candidate and wakes nobody: x1's "m" stays free,
+// the X waiter stays parked, and no later capacity event will ever reach
+// it — it starves until the 60s 2*AccountSelectTimeout fallback (a pool
+// that mixes global ("") waiters with provider-specific waiters).
+//
+// The front waiter is a manually parked waiter struct, exactly like the
+// transfer tests above: it stands in for the wake->acquire window of a real
+// global Select (dequeued by the scan, slot not yet taken). That window
+// cannot be pinned with a real waiter because its acquisition timing is
+// scheduling-dependent.
+func TestReleaseMismatchedProviderWakesServableWaiter(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "x1", Key: "kx1", BaseURL: "http://localhost:8001", Provider: "X"},
+		{Name: "y1", Key: "ky1", BaseURL: "http://localhost:8002", Provider: "Y"},
+	}
+	p := NewPool(cfgs)
+
+	var x1, y1 *Account
+	for _, acc := range p.AllAccounts() {
+		switch acc.Name() {
+		case "x1":
+			x1 = acc
+		case "y1":
+			y1 = acc
+		}
+	}
+	if x1 == nil || y1 == nil {
+		t.Fatal("accounts not found")
+	}
+
+	// Occupy both accounts (max=1 each) so the X waiter parks on x1.
+	slotX := x1.TryAcquire("m", 1)
+	slotY := y1.TryAcquire("m", 1)
+	if slotX == nil || slotY == nil {
+		t.Fatal("occupy both accounts")
+	}
+
+	// Real X waiter: parks (x1's "m" is busy).
+	chX := make(chan slotResult, 1)
+	go func() {
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "X")
+		if err != nil {
+			chX <- slotResult{}
+			return
+		}
+		chX <- slotResult{acc: acc, slot: slot}
+	}()
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "X waiter to park")
+
+	// A global waiter parked AHEAD of the X waiter.
+	p.mu.Lock()
+	wAny := &waiter{ch: make(chan struct{}), active: true, provider: "", key: "m", max: 1}
+	p.waiters.PushFront(wAny)
+	p.mu.Unlock()
+
+	// Release x1: the scan wakes the front-most waiter whose own capacity is
+	// available — the global waiter (x1's "m" is free again) — and it has not
+	// acquired yet, so x1's "m" capacity stays free.
+	p.Release(slotX)
+	if got := x1.InFlightForKey("m"); got != 0 {
+		t.Fatalf("x1 \"m\" in-flight = %d, want 0 (the freed capacity must be free for the X waiter)", got)
+	}
+	if got := p.WaitingCount(); got != 1 {
+		t.Fatalf("WaitingCount = %d, want 1 (only the global waiter was dequeued; the X waiter is still parked)", got)
+	}
+
+	// Release y1 (provider Y). The X waiter's OWN capacity (x1's "m") is
+	// free, so it must be woken — provider-mismatched releases must not skip
+	// it.
+	p.Release(slotY)
+
+	got := waitForSlotResult(t, chX, 2*time.Second, "X waiter after the Y release")
+	if got.acc.Name() != "x1" {
+		t.Fatalf("X waiter got %q, want x1", got.acc.Name())
+	}
+	p.Release(got.slot)
+}
+
+// TestMarkHealthyPrefersRecoveredProviderWaiter pins the PRIORITY pass of
+// MarkHealthy's two-pass wake scan: a recovery event serves the waiters the
+// recovered account can serve FIRST, even when a servable waiter of another
+// provider is queued ahead of them. The scan must therefore not degenerate
+// into the plain unfiltered Release scan.
+//
+// Queue order: a Y waiter (front), then an X waiter. x1 is at capacity, x2
+// is exhausted and y1's capacity is freed out of band (an account-level
+// Release, which runs no pool wake scan), so the front Y waiter IS servable
+// right now — the wake->acquire window a real Release leaves behind
+// (dequeued waiter, capacity free again). MarkHealthy(x2) must wake the X
+// waiter, which x2 serves; waking the front Y waiter instead would spend
+// the recovery on a provider that did not recover and leave the X waiter
+// parked until its 60s 2*AccountSelectTimeout fallback.
+//
+// The front Y waiter deliberately stays parked: the priority pass stops at
+// the first waiter the recovered provider can serve, so a servable waiter
+// of another provider is only reached by the fallback pass when the
+// priority pass finds nobody (see
+// TestMarkHealthyFallbackWakesServableOtherProviderWaiter).
+func TestMarkHealthyPrefersRecoveredProviderWaiter(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "x1", Key: "kx1", BaseURL: "http://localhost:8001", Provider: "X"},
+		{Name: "x2", Key: "kx2", BaseURL: "http://localhost:8002", Provider: "X"},
+		{Name: "y1", Key: "ky1", BaseURL: "http://localhost:8003", Provider: "Y"},
+	}
+	p := NewPool(cfgs)
+
+	var x1, x2, y1 *Account
+	for _, acc := range p.AllAccounts() {
+		switch acc.Name() {
+		case "x1":
+			x1 = acc
+		case "x2":
+			x2 = acc
+		case "y1":
+			y1 = acc
+		}
+	}
+	if x1 == nil || x2 == nil || y1 == nil {
+		t.Fatal("accounts not found")
+	}
+
+	// x1 and y1 at capacity ("m", max=1); x2 exhausted while idle (a probe
+	// marked it), so its "m" counter is empty.
+	slotX1 := x1.TryAcquire("m", 1)
+	slotY1 := y1.TryAcquire("m", 1)
+	if slotX1 == nil || slotY1 == nil {
+		t.Fatal("occupy x1 and y1")
+	}
+	x2.MarkExhausted()
+
+	// Queue order: Y waiter first (y1 full), X waiter second (x1 full, x2
+	// exhausted).
+	chY := make(chan slotResult, 1)
+	chX := make(chan slotResult, 1)
+	go func() {
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "Y")
+		if err != nil {
+			chY <- slotResult{}
+			return
+		}
+		chY <- slotResult{acc: acc, slot: slot}
+	}()
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "Y waiter to park")
+	go func() {
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "X")
+		if err != nil {
+			chX <- slotResult{}
+			return
+		}
+		chX <- slotResult{acc: acc, slot: slot}
+	}()
+	waitUntil(t, func() bool { return p.WaitingCount() == 2 }, "X waiter to park")
+
+	// Free y1's capacity WITHOUT a pool wake scan: the front Y waiter is now
+	// servable while still parked.
+	if !y1.Release(slotY1) {
+		t.Fatal("account-level release of y1 must free its capacity")
+	}
+
+	// Recover x2: the priority pass must serve the X waiter.
+	p.MarkHealthy(x2)
+
+	got := waitForSlotResult(t, chX, 2*time.Second, "X waiter after MarkHealthy(x2)")
+	if got.acc.Name() != "x2" {
+		t.Fatalf("X waiter got %q, want x2", got.acc.Name())
+	}
+	expectNoSlotResult(t, chY, 200*time.Millisecond, "servable Y waiter after MarkHealthy(x2)")
+
+	// Cleanup.
+	p.Release(got.slot)
+	p.Release(slotX1)
+}
+
+// TestMarkHealthyFallbackWakesServableOtherProviderWaiter pins the FALLBACK
+// pass of MarkHealthy's two-pass wake scan: when the recovered account can
+// serve NO queued waiter that has capacity (every queued waiter belongs to
+// another provider), the recovery event must still wake the first waiter
+// whose OWN capacity is available. Without that fallback a recovery event
+// from provider Y leaves the X waiters parked even though x1's capacity has
+// been free all along — the mixed-provider lost wakeup seen from the
+// MarkHealthy side.
+//
+// x2 and y1 are exhausted and the two X waiters are queued (x1 at
+// capacity); x1's capacity is then freed out of band (account-level
+// Release runs no pool wake scan) — the wake->acquire window: x1 is free
+// while the X waiters are still parked. MarkHealthy(y1) recovers an account
+// of provider Y, which serves none of them, so only the fallback pass can
+// reach the front-most X waiter; the second X waiter must stay parked until
+// the first one's slot is released.
+func TestMarkHealthyFallbackWakesServableOtherProviderWaiter(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "x1", Key: "kx1", BaseURL: "http://localhost:8001", Provider: "X"},
+		{Name: "x2", Key: "kx2", BaseURL: "http://localhost:8002", Provider: "X"},
+		{Name: "y1", Key: "ky1", BaseURL: "http://localhost:8003", Provider: "Y"},
+	}
+	p := NewPool(cfgs)
+
+	var x1, x2, y1 *Account
+	for _, acc := range p.AllAccounts() {
+		switch acc.Name() {
+		case "x1":
+			x1 = acc
+		case "x2":
+			x2 = acc
+		case "y1":
+			y1 = acc
+		}
+	}
+	if x1 == nil || x2 == nil || y1 == nil {
+		t.Fatal("accounts not found")
+	}
+
+	// x1 at capacity; x2 and y1 exhausted (probes marked them).
+	slotX1 := x1.TryAcquire("m", 1)
+	if slotX1 == nil {
+		t.Fatal("occupy x1")
+	}
+	x2.MarkExhausted()
+	y1.MarkExhausted()
+
+	// Queue order: X waiter 1 first, X waiter 2 second (both park: x1 full,
+	// x2 exhausted).
+	chX1 := make(chan slotResult, 1)
+	chX2 := make(chan slotResult, 1)
+	go func() {
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "X")
+		if err != nil {
+			chX1 <- slotResult{}
+			return
+		}
+		chX1 <- slotResult{acc: acc, slot: slot}
+	}()
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "X waiter 1 to park")
+	go func() {
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "X")
+		if err != nil {
+			chX2 <- slotResult{}
+			return
+		}
+		chX2 <- slotResult{acc: acc, slot: slot}
+	}()
+	waitUntil(t, func() bool { return p.WaitingCount() == 2 }, "X waiter 2 to park")
+
+	// Free x1's capacity WITHOUT a pool wake scan: the X waiters are now
+	// servable while still parked.
+	if !x1.Release(slotX1) {
+		t.Fatal("account-level release of x1 must free its capacity")
+	}
+
+	// Recover y1: it serves neither X waiter, so the priority pass finds
+	// nobody and the fallback must wake the front-most X waiter.
+	p.MarkHealthy(y1)
+
+	got := waitForSlotResult(t, chX1, 2*time.Second, "X waiter 1 after MarkHealthy(y1)")
+	if got.acc.Name() != "x1" {
+		t.Fatalf("X waiter 1 got %q, want x1", got.acc.Name())
+	}
+	expectNoSlotResult(t, chX2, 200*time.Millisecond, "X waiter 2 after MarkHealthy(y1)")
+
+	// The first X waiter's release cascades the slot to the second one.
+	p.Release(got.slot)
+	got2 := waitForSlotResult(t, chX2, 2*time.Second, "X waiter 2 after the first waiter released")
+	if got2.acc.Name() != "x1" {
+		t.Fatalf("X waiter 2 got %q, want x1", got2.acc.Name())
+	}
+	p.Release(got2.slot)
+}
+
+// TestMarkHealthyWakesWaiterRecoveredAccountCanServe pins the PRIORITY pass
+// predicate of MarkHealthy's two-pass scan to the ONE account that
+// recovered, not to its provider: the pass must serve the first waiter the
+// recovered account ITSELF can serve, even when a waiter queued ahead of it
+// is servable by a SIBLING account of the same provider.
+//
+// Queue order: waiter A (provider X, key "m") then waiter B (provider X,
+// key "n"). x2 is the account that recovers and holds "m" at its per-key
+// cap; x1's "m" capacity is freed out of band (an account-level Release,
+// which runs no pool wake scan), so A IS servable right now — by x1, but not
+// by x2. B is servable by x2 ("n" is free there) and by nobody else (x1's
+// "n" is at its per-key cap). A provider-level priority predicate
+// (capacityAvailableFor("X", "m", 1) — "some X account can serve A") walks
+// past B and wakes A, spending x2's recovery on a waiter x2 cannot serve;
+// only the per-account predicate accountCanServe(x2, B) reaches B. The woken
+// waiter must therefore be B, and it must land on x2 (x1's "n" is full).
+//
+// A is deliberately NOT asserted to stay parked: the priority pass stops at
+// the first waiter the recovered account can serve, and which waiter the
+// fallback pass would pick in that case is an implementation detail, not an
+// invariant.
+func TestMarkHealthyWakesWaiterRecoveredAccountCanServe(t *testing.T) {
+	cfgs := []config.AccountConfig{
+		{Name: "x1", Key: "kx1", BaseURL: "http://localhost:8001", Provider: "X"},
+		{Name: "x2", Key: "kx2", BaseURL: "http://localhost:8002", Provider: "X"},
+	}
+	p := NewPool(cfgs)
+
+	var x1, x2 *Account
+	for _, acc := range p.AllAccounts() {
+		switch acc.Name() {
+		case "x1":
+			x1 = acc
+		case "x2":
+			x2 = acc
+		}
+	}
+	if x1 == nil || x2 == nil {
+		t.Fatal("accounts not found")
+	}
+
+	// Pin the capacity state BEFORE the recovery: x2 keeps "m" at its per-key
+	// cap (so it can never serve A) and x1 keeps "n" at its per-key cap (so it
+	// can never serve B). x1's "m" is freed out of band later.
+	slotX2M := x2.TryAcquire("m", 1)
+	slotX1M := x1.TryAcquire("m", 1)
+	slotX1N := x1.TryAcquire("n", 1)
+	if slotX2M == nil || slotX1M == nil || slotX1N == nil {
+		t.Fatal("occupy x2 \"m\", x1 \"m\" and x1 \"n\"")
+	}
+	// x2 is exhausted while idle, so BOTH waiters park (x1 is at its per-key
+	// caps for "m" and "n").
+	x2.MarkExhausted()
+
+	// Queue order: A (key "m") first, B (key "n") second.
+	chA := make(chan slotResult, 1)
+	chB := make(chan slotResult, 1)
+	go func() {
+		acc, slot, err := p.SelectByProvider(context.Background(), "m", 1, "X")
+		if err != nil {
+			chA <- slotResult{}
+			return
+		}
+		chA <- slotResult{acc: acc, slot: slot}
+	}()
+	waitUntil(t, func() bool { return p.WaitingCount() == 1 }, "waiter A (key \"m\") to park")
+	go func() {
+		acc, slot, err := p.SelectByProvider(context.Background(), "n", 1, "X")
+		if err != nil {
+			chB <- slotResult{}
+			return
+		}
+		chB <- slotResult{acc: acc, slot: slot}
+	}()
+	waitUntil(t, func() bool { return p.WaitingCount() == 2 }, "waiter B (key \"n\") to park")
+
+	// Free x1's "m" capacity WITHOUT a pool wake scan: A is now servable by x1
+	// (but not by the still-capped x2) while still parked.
+	if !x1.Release(slotX1M) {
+		t.Fatal("account-level release of x1 \"m\" must free its capacity")
+	}
+
+	// Recover x2: the priority pass must wake B, the waiter x2 itself serves.
+	p.MarkHealthy(x2)
+
+	got := waitForSlotResult(t, chB, 2*time.Second, "waiter B after MarkHealthy(x2)")
+	if got.acc.Name() != "x2" {
+		t.Fatalf("waiter B got %q, want x2 (x1's \"n\" is at its per-key cap)", got.acc.Name())
+	}
+
+	// Cleanup: B's release cascades x1's "m" capacity to A.
+	p.Release(got.slot)
+	gotA := waitForSlotResult(t, chA, 2*time.Second, "waiter A after B's release")
+	if gotA.acc.Name() != "x1" {
+		t.Fatalf("waiter A got %q, want x1", gotA.acc.Name())
+	}
+	p.Release(gotA.slot)
+	if !x1.Release(slotX1N) {
+		t.Fatal("account-level release of x1 \"n\" must free its capacity")
+	}
+	if !x2.Release(slotX2M) {
+		t.Fatal("account-level release of x2 \"m\" must free its capacity")
+	}
+}
